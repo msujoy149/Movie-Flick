@@ -9,6 +9,11 @@ import org.schabi.newpipe.extractor.playlist.PlaylistInfoItem
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import org.schabi.newpipe.extractor.stream.StreamType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import java.util.concurrent.ConcurrentHashMap
 
 class YouTube : MainAPI() {
 
@@ -755,6 +760,72 @@ class YouTube : MainAPI() {
     private val searchPageCache =
         mutableMapOf<String, org.schabi.newpipe.extractor.Page?>()
 
+    private data class TimedHomeCache(
+        val expiresAt: Long,
+        val response: HomePageResponse
+    )
+
+    private val musicHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
+    private val movieHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
+    private val liveHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
+    private val religionHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
+
+    private fun getCachedHomePage(
+        cache: ConcurrentHashMap<String, TimedHomeCache>,
+        key: String
+    ): HomePageResponse? {
+        val cached = cache[key] ?: return null
+        return if (cached.expiresAt > System.currentTimeMillis()) {
+            cached.response
+        } else {
+            cache.remove(key, cached)
+            null
+        }
+    }
+
+    private fun putCachedHomePage(
+        cache: ConcurrentHashMap<String, TimedHomeCache>,
+        key: String,
+        response: HomePageResponse,
+        ttlMs: Long
+    ) {
+        cache[key] = TimedHomeCache(
+            System.currentTimeMillis() + ttlMs,
+            response
+        )
+    }
+
+    private suspend fun fetchSearchItemsInBatches(
+        queries: List<String>,
+        batchSize: Int = 6
+    ): List<List<InfoItem>> {
+        val cleanQueries = queries
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        val results = mutableListOf<List<InfoItem>>()
+
+        for (batch in cleanQueries.chunked(batchSize)) {
+            val batchResults = coroutineScope {
+                batch.map { query ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val extractor = service.getSearchExtractor(query)
+                            extractor.fetchPage()
+                            extractor.initialPage.items.toList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                    }
+                }.awaitAll()
+            }
+            results.addAll(batchResults)
+        }
+
+        return results
+    }
+
     /*
      * --------------------------------------------------
      * HOME PAGE
@@ -862,154 +933,42 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getIndianMusicPage(
-        page: Int
-    ): HomePageResponse {
+    private suspend fun getIndianMusicPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+        getCachedHomePage(musicHomeCache, "music")?.let { return it }
 
-        if (page > 1) {
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = mutableSetOf<String>()
 
-        val results =
-            mutableListOf<SearchResponse>()
+        for (items in fetchSearchItemsInBatches(indianMusicQueries, 6)) {
+            if (results.size >= 40) break
+            for (item in items) {
+                if (results.size >= 40) break
+                if (item !is StreamInfoItem) continue
+                if (item.streamType != StreamType.VIDEO_STREAM) continue
+                if (item.isShortFormContent) continue
+                val url = item.url?.trim() ?: continue
+                if (url.isBlank() || !seenUrls.add(url)) continue
+                val title = item.name?.trim() ?: continue
+                if (title.isBlank()) continue
+                if (containsAny(title, bangladeshKeywords)) continue
+                if (containsAny(title, pakistanMusicKeywords)) continue
+                val uploader = item.uploaderName?.trim() ?: ""
+                if (containsAny(uploader, bangladeshKeywords)) continue
+                if (containsAny(uploader, pakistanMusicKeywords)) continue
 
-        val seenUrls =
-            mutableSetOf<String>()
-
-        for (query in indianMusicQueries) {
-
-            if (results.size >= 40) {
-                break
-            }
-
-            try {
-
-                val extractor =
-                    service.getSearchExtractor(query)
-
-                extractor.fetchPage()
-
-                for (item in extractor.initialPage.items) {
-
-                    if (results.size >= 40) {
-                        break
-                    }
-
-                    if (item !is StreamInfoItem) {
-                        continue
-                    }
-
-                    if (
-                        item.streamType !=
-                        StreamType.VIDEO_STREAM
-                    ) {
-                        continue
-                    }
-
-                    if (item.isShortFormContent) {
-                        continue
-                    }
-
-                    val url =
-                        item.url
-                            ?: continue
-
-                    if (url.isBlank()) {
-                        continue
-                    }
-
-                    if (!seenUrls.add(url)) {
-                        continue
-                    }
-
-                    val title =
-                        item.name
-                            ?.trim()
-                            ?: continue
-
-                    if (title.isBlank()) {
-                        continue
-                    }
-
-                    if (
-                        containsAny(
-                            title,
-                            bangladeshKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (
-                        containsAny(
-                            title,
-                            pakistanMusicKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    val uploader =
-                        item.uploaderName
-                            ?.trim()
-                            ?: ""
-
-                    if (
-                        containsAny(
-                            uploader,
-                            bangladeshKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (
-                        containsAny(
-                            uploader,
-                            pakistanMusicKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    val thumbnail =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
-
-                    results.add(
-                        newMovieSearchResponse(
-                            title,
-                            url,
-                            TvType.Movie
-                        ) {
-                            posterUrl =
-                                thumbnail
-                        }
-                    )
-                }
-
-            } catch (_: Exception) {
-                continue
+                results.add(newMovieSearchResponse(title, url, TvType.Movie) {
+                    posterUrl = item.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
+                })
             }
         }
 
-        return newHomePageResponse(
-            listOf(
-                HomePageList(
-                    "Trending Music Videos",
-                    results,
-                    false
-                )
-            ),
+        val response = newHomePageResponse(
+            listOf(HomePageList("Trending Music Videos", results, false)),
             false
         )
+        putCachedHomePage(musicHomeCache, "music", response, 10 * 60 * 1000L)
+        return response
     }
 
     /*
@@ -1018,122 +977,40 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getMoviesPage(
-        page: Int
-    ): HomePageResponse {
+    private suspend fun getMoviesPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+        getCachedHomePage(movieHomeCache, "movies")?.let { return it }
 
-        if (page > 1) {
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = mutableSetOf<String>()
 
-        val results =
-            mutableListOf<SearchResponse>()
+        for (items in fetchSearchItemsInBatches(movieQueries, 5)) {
+            if (results.size >= 40) break
+            for (item in items) {
+                if (results.size >= 40) break
+                if (item !is StreamInfoItem) continue
+                if (item.streamType != StreamType.VIDEO_STREAM) continue
+                if (item.isShortFormContent) continue
+                val url = item.url?.trim() ?: continue
+                if (url.isBlank() || !seenUrls.add(url)) continue
+                val title = item.name?.trim() ?: continue
+                if (title.isBlank()) continue
+                if (containsAny(title, bangladeshKeywords)) continue
+                val uploader = item.uploaderName?.trim() ?: ""
+                if (containsAny(uploader, bangladeshKeywords)) continue
 
-        val seenUrls =
-            mutableSetOf<String>()
-
-        for (query in movieQueries) {
-
-            if (results.size >= 40) {
-                break
-            }
-
-            try {
-
-                val extractor =
-                    service.getSearchExtractor(query)
-
-                extractor.fetchPage()
-
-                for (item in extractor.initialPage.items) {
-
-                    if (results.size >= 40) {
-                        break
-                    }
-
-                    if (item !is StreamInfoItem) {
-                        continue
-                    }
-
-                    if (
-                        item.streamType !=
-                        StreamType.VIDEO_STREAM
-                    ) {
-                        continue
-                    }
-
-                    if (item.isShortFormContent) {
-                        continue
-                    }
-
-                    val url =
-                        item.url
-                            ?: continue
-
-                    if (url.isBlank()) {
-                        continue
-                    }
-
-                    if (!seenUrls.add(url)) {
-                        continue
-                    }
-
-                    val title =
-                        item.name
-                            ?.trim()
-                            ?: continue
-
-                    if (title.isBlank()) {
-                        continue
-                    }
-
-                    if (
-                        containsAny(
-                            title,
-                            bangladeshKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    val thumbnail =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
-
-                    results.add(
-                        newMovieSearchResponse(
-                            title,
-                            url,
-                            TvType.Movie
-                        ) {
-                            posterUrl =
-                                thumbnail
-                        }
-                    )
-                }
-
-            } catch (_: Exception) {
-                continue
+                results.add(newMovieSearchResponse(title, url, TvType.Movie) {
+                    posterUrl = item.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
+                })
             }
         }
 
-        return newHomePageResponse(
-            listOf(
-                HomePageList(
-                    "Movies",
-                    results,
-                    false
-                )
-            ),
+        val response = newHomePageResponse(
+            listOf(HomePageList("Movies", results, false)),
             false
         )
+        putCachedHomePage(movieHomeCache, "movies", response, 20 * 60 * 1000L)
+        return response
     }
 
     /*
@@ -1142,99 +1019,48 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getCuratedLivePage(
-        page: Int
-    ): HomePageResponse {
+    private suspend fun getCuratedLivePage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+        getCachedHomePage(liveHomeCache, "live")?.let { return it }
 
-        if (page > 1) {
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = mutableSetOf<String>()
 
-        val results =
-            mutableListOf<SearchResponse>()
-
-        val seenUrls =
-            mutableSetOf<String>()
-
-        for (channel in allowedLiveChannels) {
-
-            try {
-
-                val extractor =
-                    service.getSearchExtractor(
-                        "$channel live"
-                    )
-
-                extractor.fetchPage()
-
-                val selected =
-                    selectOldestLiveForChannel(
-                        channel,
-                        extractor.initialPage.items
-                    )
-
-                if (selected == null) {
-                    continue
-                }
-
-                val url =
-                    selected.url
-                        ?: continue
-
-                if (url.isBlank()) {
-                    continue
-                }
-
-                if (!seenUrls.add(url)) {
-                    continue
-                }
-
-                val title =
-                    selected.name
-                        ?.trim()
-                        ?: continue
-
-                if (title.isBlank()) {
-                    continue
-                }
-
-                val thumbnail =
-                    selected.thumbnails
-                        .lastOrNull()
-                        ?.url
-                        ?.takeIf {
-                            it.isNotBlank()
+        /* Live status is checked in small parallel batches. Cache is only
+         * 60 seconds so the row stays genuinely live. */
+        for (batch in allowedLiveChannels.chunked(8)) {
+            val found = coroutineScope {
+                batch.map { channel ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val extractor = service.getSearchExtractor("$channel live")
+                            extractor.fetchPage()
+                            selectOldestLiveForChannel(channel, extractor.initialPage.items)
+                        } catch (_: Exception) {
+                            null
                         }
-
-                results.add(
-                    newMovieSearchResponse(
-                        title,
-                        url,
-                        TvType.Live
-                    ) {
-                        posterUrl =
-                            thumbnail
                     }
-                )
+                }.awaitAll()
+            }
 
-            } catch (_: Exception) {
-                continue
+            for (selected in found.filterNotNull()) {
+                val url = selected.url?.trim() ?: continue
+                if (url.isBlank() || !seenUrls.add(url)) continue
+                val title = selected.name?.trim() ?: continue
+                if (title.isBlank()) continue
+
+                results.add(newMovieSearchResponse(title, url, TvType.Live) {
+                    posterUrl = selected.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
+                })
             }
         }
 
-        return newHomePageResponse(
-            listOf(
-                HomePageList(
-                    "Live",
-                    results,
-                    false
-                )
-            ),
+        val response = newHomePageResponse(
+            listOf(HomePageList("Live", results, false)),
             false
         )
+        putCachedHomePage(liveHomeCache, "live", response, 60 * 1000L)
+        return response
     }
 
     /*
@@ -1329,160 +1155,57 @@ class YouTube : MainAPI() {
      * -> ONLY ONE Hindi Mahabharat
      */
 
-    private suspend fun getReligionPage(
-        page: Int
-    ): HomePageResponse {
+    private suspend fun getReligionPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+        getCachedHomePage(religionHomeCache, "religion")?.let { return it }
 
-        if (page > 1) {
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
+        val bengaliResults = mutableListOf<ReligionPlaylistCandidate>()
+        val hindiResults = mutableListOf<ReligionPlaylistCandidate>()
+
+        for (batch in bengaliDubbedShows.chunked(4)) {
+            val found = coroutineScope {
+                batch.map { show -> async { findBestBengaliPlaylist(show) } }.awaitAll()
+            }
+            found.filterNotNull().forEach { bengaliResults.add(it) }
         }
 
-        /*
-         * ----------------------------------------------
-         * BENGALI DUBBED SECTION
-         * ----------------------------------------------
-         */
-
-        val bengaliResults =
-            mutableListOf<ReligionPlaylistCandidate>()
-
-        for (show in bengaliDubbedShows) {
-
-            if (bengaliResults.size >= 18) {
-                break
+        for (batch in bengaliDubbedShows.chunked(4)) {
+            val found = coroutineScope {
+                batch.map { show -> async { findBestHindiPlaylist(show) } }.awaitAll()
             }
-
-            val best =
-                findBestBengaliPlaylist(
-                    show
-                )
-
-            if (best != null) {
-                bengaliResults.add(best)
-            }
+            found.filterNotNull().forEach { hindiResults.add(it) }
         }
 
-        /*
-         * ----------------------------------------------
-         * HINDI VERSION OF SAME POPULAR SHOWS
-         * ----------------------------------------------
-         *
-         * Even if Bengali version exists, Hindi version
-         * MUST also be allowed.
-         */
+        val existingHindiKeys = hindiResults.map { it.seriesKey }.toMutableSet()
 
-        val hindiResults =
-            mutableListOf<ReligionPlaylistCandidate>()
+        for (batch in additionalHindiReligionShows.chunked(6)) {
+            if (hindiResults.size >= 30) break
 
-        for (show in bengaliDubbedShows) {
-
-            if (hindiResults.size >= 18) {
-                break
+            val found = coroutineScope {
+                batch.map { query -> async { findBestAdditionalHindiPlaylist(query) } }.awaitAll()
             }
 
-            val best =
-                findBestHindiPlaylist(
-                    show
-                )
-
-            if (best != null) {
-                hindiResults.add(best)
+            for (candidate in found.filterNotNull()) {
+                if (hindiResults.size >= 30) break
+                if (!existingHindiKeys.add(candidate.seriesKey)) continue
+                hindiResults.add(candidate)
             }
         }
 
-        /*
-         * ----------------------------------------------
-         * ADDITIONAL HINDI SHOWS
-         * ----------------------------------------------
-         */
-
-        if (hindiResults.size < 30) {
-
-            val existingHindiKeys =
-                hindiResults
-                    .map {
-                        it.seriesKey
-                    }
-                    .toMutableSet()
-
-            for (query in additionalHindiReligionShows) {
-
-                if (hindiResults.size >= 30) {
-                    break
-                }
-
-                try {
-
-                    val candidate =
-                        findBestAdditionalHindiPlaylist(
-                            query
-                        )
-                            ?: continue
-
-                    if (
-                        candidate.seriesKey in
-                        existingHindiKeys
-                    ) {
-                        continue
-                    }
-
-                    existingHindiKeys.add(
-                        candidate.seriesKey
-                    )
-
-                    hindiResults.add(
-                        candidate
-                    )
-
-                } catch (_: Exception) {
-                    continue
-                }
-            }
-        }
-
-        /*
-         * ----------------------------------------------
-         * FINAL ORDER
-         * ----------------------------------------------
-         *
-         * Bengali first.
-         * Hindi second.
-         *
-         * Target:
-         * Bengali <= 18
-         * Hindi <= 30
-         *
-         * Total target <= 48.
-         */
-
-        val finalResults =
-            mutableListOf<SearchResponse>()
-
+        val finalResults = mutableListOf<SearchResponse>()
         finalResults.addAll(
-            bengaliResults.map {
-                religionCandidateToSearchResponse(it)
-            }
+            bengaliResults.distinctBy { it.seriesKey }.map { religionCandidateToSearchResponse(it) }
+        )
+        finalResults.addAll(
+            hindiResults.distinctBy { it.seriesKey }.map { religionCandidateToSearchResponse(it) }
         )
 
-        finalResults.addAll(
-            hindiResults.map {
-                religionCandidateToSearchResponse(it)
-            }
-        )
-
-        return newHomePageResponse(
-            listOf(
-                HomePageList(
-                    "Religion",
-                    finalResults,
-                    false
-                )
-            ),
+        val response = newHomePageResponse(
+            listOf(HomePageList("Religion", finalResults, false)),
             false
         )
+        putCachedHomePage(religionHomeCache, "religion", response, 30 * 60 * 1000L)
+        return response
     }
 
     /*
@@ -1504,15 +1227,12 @@ class YouTube : MainAPI() {
     private fun religionCandidateToSearchResponse(
         candidate: ReligionPlaylistCandidate
     ): SearchResponse {
-
         return newMovieSearchResponse(
             candidate.title,
             candidate.url,
             TvType.TvSeries
         ) {
-
-            posterUrl =
-                candidate.thumbnail
+            posterUrl = candidate.thumbnail
         }
     }
 
@@ -1527,132 +1247,33 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun findBestBengaliPlaylist(
-        show: BengaliDubbedShow
-    ): ReligionPlaylistCandidate? {
+    private suspend fun findBestBengaliPlaylist(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
+        val queries = show.bengaliNames.take(3).map { "$it playlist" }
+        val candidates = mutableListOf<ReligionPlaylistCandidate>()
+        val seenUrls = mutableSetOf<String>()
 
-        val candidates =
-            mutableListOf<ReligionPlaylistCandidate>()
+        for (items in fetchSearchItemsInBatches(queries, 3)) {
+            for (item in items) {
+                if (item !is PlaylistInfoItem) continue
+                val url = item.url?.trim() ?: continue
+                if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
+                if (!seenUrls.add(url)) continue
+                val title = item.name?.trim() ?: continue
+                if (title.isBlank()) continue
+                val uploader = item.uploaderName?.trim() ?: ""
+                if (!isValidBengaliDubbedPlaylist(title, uploader, show)) continue
 
-        val seenUrls =
-            mutableSetOf<String>()
-
-        /*
-         * Search the exact Bengali dubbed name first.
-         */
-
-        val queries =
-            mutableListOf<String>()
-
-        for (name in show.bengaliNames) {
-
-            queries.add(
-                "$name full episodes playlist"
-            )
-
-            queries.add(
-                "$name all episodes playlist"
-            )
-        }
-
-        for (query in queries) {
-
-            try {
-
-                val extractor =
-                    service.getSearchExtractor(query)
-
-                extractor.fetchPage()
-
-                for (item in extractor.initialPage.items) {
-
-                    if (item !is PlaylistInfoItem) {
-                        continue
-                    }
-
-                    val url =
-                        item.url
-                            ?.trim()
-                            ?: continue
-
-                    if (url.isBlank()) {
-                        continue
-                    }
-
-                    if (
-                        !url.contains(
-                            "playlist?list=",
-                            ignoreCase = true
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (!seenUrls.add(url)) {
-                        continue
-                    }
-
-                    val title =
-                        item.name
-                            ?.trim()
-                            ?: continue
-
-                    if (title.isBlank()) {
-                        continue
-                    }
-
-                    val uploader =
-                        item.uploaderName
-                            ?.trim()
-                            ?: ""
-
-                    if (
-                        !isValidBengaliDubbedPlaylist(
-                            title,
-                            uploader,
-                            show
-                        )
-                    ) {
-                        continue
-                    }
-
-                    val thumbnail =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-
-                    val score =
-                        calculateBengaliPlaylistScore(
-                            title = title,
-                            uploader = uploader,
-                            show = show
-                        )
-
-                    candidates.add(
-                        ReligionPlaylistCandidate(
-                            title = title,
-                            url = url,
-                            thumbnail = thumbnail,
-                            uploader = uploader,
-                            language = ReligionLanguage.BENGALI,
-                            seriesKey = show.key,
-                            score = score
-                        )
+                candidates.add(
+                    ReligionPlaylistCandidate(
+                        title, url, item.thumbnails.lastOrNull()?.url, uploader,
+                        ReligionLanguage.BENGALI, show.key,
+                        calculateBengaliPlaylistScore(title, uploader, show)
                     )
-                }
-
-            } catch (_: Exception) {
-                continue
+                )
             }
         }
 
-        return candidates.maxWithOrNull(
-            compareBy<ReligionPlaylistCandidate> {
-                it.score
-            }.thenByDescending {
-                it.title.length
-            }
-        )
+        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
     }
 
     /*
@@ -1661,132 +1282,35 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun findBestHindiPlaylist(
-        show: BengaliDubbedShow
-    ): ReligionPlaylistCandidate? {
-
-        val candidates =
-            mutableListOf<ReligionPlaylistCandidate>()
-
-        val seenUrls =
-            mutableSetOf<String>()
-
-        val queries =
-            mutableListOf<String>()
-
-        for (name in show.hindiNames) {
-
-            queries.add(
-                "$name full episodes playlist"
-            )
-
-            queries.add(
-                "$name all episodes playlist"
-            )
-
-            queries.add(
-                "$name complete episodes playlist"
-            )
+    private suspend fun findBestHindiPlaylist(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
+        val queries = show.hindiNames.take(2).flatMap {
+            listOf("$it playlist", "$it full episodes playlist")
         }
+        val candidates = mutableListOf<ReligionPlaylistCandidate>()
+        val seenUrls = mutableSetOf<String>()
 
-        for (query in queries) {
+        for (items in fetchSearchItemsInBatches(queries, 4)) {
+            for (item in items) {
+                if (item !is PlaylistInfoItem) continue
+                val url = item.url?.trim() ?: continue
+                if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
+                if (!seenUrls.add(url)) continue
+                val title = item.name?.trim() ?: continue
+                if (title.isBlank()) continue
+                val uploader = item.uploaderName?.trim() ?: ""
+                if (!isValidHindiPlaylist(title, uploader, show)) continue
 
-            try {
-
-                val extractor =
-                    service.getSearchExtractor(query)
-
-                extractor.fetchPage()
-
-                for (item in extractor.initialPage.items) {
-
-                    if (item !is PlaylistInfoItem) {
-                        continue
-                    }
-
-                    val url =
-                        item.url
-                            ?.trim()
-                            ?: continue
-
-                    if (url.isBlank()) {
-                        continue
-                    }
-
-                    if (
-                        !url.contains(
-                            "playlist?list=",
-                            ignoreCase = true
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (!seenUrls.add(url)) {
-                        continue
-                    }
-
-                    val title =
-                        item.name
-                            ?.trim()
-                            ?: continue
-
-                    if (title.isBlank()) {
-                        continue
-                    }
-
-                    val uploader =
-                        item.uploaderName
-                            ?.trim()
-                            ?: ""
-
-                    if (
-                        !isValidHindiPlaylist(
-                            title,
-                            uploader,
-                            show
-                        )
-                    ) {
-                        continue
-                    }
-
-                    val thumbnail =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-
-                    val score =
-                        calculateHindiPlaylistScore(
-                            title = title,
-                            uploader = uploader,
-                            show = show
-                        )
-
-                    candidates.add(
-                        ReligionPlaylistCandidate(
-                            title = title,
-                            url = url,
-                            thumbnail = thumbnail,
-                            uploader = uploader,
-                            language = ReligionLanguage.HINDI,
-                            seriesKey = show.key,
-                            score = score
-                        )
+                candidates.add(
+                    ReligionPlaylistCandidate(
+                        title, url, item.thumbnails.lastOrNull()?.url, uploader,
+                        ReligionLanguage.HINDI, show.key,
+                        calculateHindiPlaylistScore(title, uploader, show)
                     )
-                }
-
-            } catch (_: Exception) {
-                continue
+                )
             }
         }
 
-        return candidates.maxWithOrNull(
-            compareBy<ReligionPlaylistCandidate> {
-                it.score
-            }.thenByDescending {
-                it.title.length
-            }
-        )
+        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
     }
 
     /*
@@ -1795,117 +1319,36 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun findBestAdditionalHindiPlaylist(
-        query: String
-    ): ReligionPlaylistCandidate? {
+    private suspend fun findBestAdditionalHindiPlaylist(query: String): ReligionPlaylistCandidate? {
+        val items = fetchSearchItemsInBatches(
+            listOf("$query playlist", "$query full episodes playlist"),
+            2
+        ).flatten()
 
-        val candidates =
-            mutableListOf<ReligionPlaylistCandidate>()
+        val candidates = mutableListOf<ReligionPlaylistCandidate>()
+        val seenUrls = mutableSetOf<String>()
 
-        val seenUrls =
-            mutableSetOf<String>()
+        for (item in items) {
+            if (item !is PlaylistInfoItem) continue
+            val url = item.url?.trim() ?: continue
+            if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
+            if (!seenUrls.add(url)) continue
+            val title = item.name?.trim() ?: continue
+            if (title.isBlank()) continue
+            val uploader = item.uploaderName?.trim() ?: ""
+            if (!isValidGeneralHindiReligionPlaylist(title, uploader)) continue
+            val seriesKey = detectReligionSeriesKey("$query $title") ?: continue
 
-        try {
-
-            val extractor =
-                service.getSearchExtractor(
-                    "$query full episodes playlist"
+            candidates.add(
+                ReligionPlaylistCandidate(
+                    title, url, item.thumbnails.lastOrNull()?.url, uploader,
+                    ReligionLanguage.HINDI, seriesKey,
+                    calculateGeneralHindiScore(title, uploader)
                 )
-
-            extractor.fetchPage()
-
-            for (item in extractor.initialPage.items) {
-
-                if (item !is PlaylistInfoItem) {
-                    continue
-                }
-
-                val url =
-                    item.url
-                        ?.trim()
-                        ?: continue
-
-                if (url.isBlank()) {
-                    continue
-                }
-
-                if (
-                    !url.contains(
-                        "playlist?list=",
-                        ignoreCase = true
-                    )
-                ) {
-                    continue
-                }
-
-                if (!seenUrls.add(url)) {
-                    continue
-                }
-
-                val title =
-                    item.name
-                        ?.trim()
-                        ?: continue
-
-                if (title.isBlank()) {
-                    continue
-                }
-
-                val uploader =
-                    item.uploaderName
-                        ?.trim()
-                        ?: ""
-
-                if (
-                    !isValidGeneralHindiReligionPlaylist(
-                        title,
-                        uploader
-                    )
-                ) {
-                    continue
-                }
-
-                val seriesKey =
-                    detectReligionSeriesKey(
-                        "$query $title"
-                    )
-                        ?: continue
-
-                val thumbnail =
-                    item.thumbnails
-                        .lastOrNull()
-                        ?.url
-
-                val score =
-                    calculateGeneralHindiScore(
-                        title,
-                        uploader
-                    )
-
-                candidates.add(
-                    ReligionPlaylistCandidate(
-                        title = title,
-                        url = url,
-                        thumbnail = thumbnail,
-                        uploader = uploader,
-                        language = ReligionLanguage.HINDI,
-                        seriesKey = seriesKey,
-                        score = score
-                    )
-                )
-            }
-
-        } catch (_: Exception) {
-            return null
+            )
         }
 
-        return candidates.maxWithOrNull(
-            compareBy<ReligionPlaylistCandidate> {
-                it.score
-            }.thenByDescending {
-                it.title.length
-            }
-        )
+        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
     }
 
     /*
@@ -1952,7 +1395,12 @@ class YouTube : MainAPI() {
                 )
             }
 
-        if (!matchesShow) {
+        val officialChannel =
+            show.officialChannels.any {
+                combined.contains(it.lowercase())
+            }
+
+        if (!matchesShow && !officialChannel) {
             return false
         }
 
@@ -1999,7 +1447,12 @@ class YouTube : MainAPI() {
                 )
             }
 
-        if (!matchesShow) {
+        val officialChannel =
+            show.officialChannels.any {
+                combined.contains(it.lowercase())
+            }
+
+        if (!matchesShow && !officialChannel) {
             return false
         }
 
