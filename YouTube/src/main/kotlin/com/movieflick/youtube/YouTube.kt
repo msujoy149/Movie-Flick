@@ -46,16 +46,11 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * CURATED LIVE CHANNELS
+     * ALLOWED LIVE CHANNELS
      * --------------------------------------------------
      *
-     * Only these channels are allowed in the Live section.
-     *
-     * If a channel is not live, it disappears.
-     *
-     * If the same channel becomes live again, it can
-     * automatically appear again after the home page
-     * is refreshed.
+     * Only these channels are allowed in the curated
+     * Live section.
      */
     private val allowedLiveChannels = listOf(
 
@@ -116,14 +111,12 @@ class YouTube : MainAPI() {
      * MOVIE SEARCH PRIORITY
      * --------------------------------------------------
      *
-     * Priority:
-     *
      * 1. Kolkata / Indian Bengali
      * 2. Bengali dubbed
      * 3. Hindi
      *
-     * Bangladeshi Bengali movies are intentionally not
-     * searched here.
+     * Bangladeshi Bengali movie search is intentionally
+     * excluded.
      */
     private val movieQueries = listOf(
         "Kolkata Bengali full movie",
@@ -134,8 +127,11 @@ class YouTube : MainAPI() {
     )
 
     /*
-     * Words which strongly indicate Bangladeshi movie
-     * content. Those results are removed from Movies.
+     * Strong Bangladesh-specific words.
+     *
+     * These are used only as a secondary filter so that
+     * obviously Bangladeshi movie results do not enter
+     * the curated Movies section.
      */
     private val bangladeshMovieKeywords = listOf(
         "bangladesh",
@@ -262,14 +258,6 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * MOVIES
      * --------------------------------------------------
-     *
-     * Bengali / Kolkata results are added first.
-     *
-     * Bengali dubbed results come next.
-     *
-     * Hindi results come last.
-     *
-     * Bangladesh-specific movie results are filtered.
      */
     private suspend fun getMoviesPage(
         page: Int
@@ -288,6 +276,13 @@ class YouTube : MainAPI() {
         val seenUrls =
             mutableSetOf<String>()
 
+        /*
+         * Process queries in priority order.
+         *
+         * Kolkata Bengali comes first.
+         * Bengali dubbed comes second.
+         * Hindi comes last.
+         */
         for (query in movieQueries) {
 
             if (results.size >= 40) {
@@ -303,10 +298,7 @@ class YouTube : MainAPI() {
 
                 extractor.fetchPage()
 
-                val items =
-                    extractor.initialPage.items
-
-                for (item in items) {
+                for (item in extractor.initialPage.items) {
 
                     if (results.size >= 40) {
                         break
@@ -317,7 +309,8 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Do not put live streams inside Movies.
+                     * Movies section should not contain live
+                     * streams.
                      */
                     if (
                         item.streamType !=
@@ -327,7 +320,7 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Skip YouTube Shorts.
+                     * Do not show Shorts in Movies.
                      */
                     if (
                         item.isShortFormContent
@@ -357,16 +350,22 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Remove obvious Bangladeshi movie
-                     * results.
+                     * Remove obvious Bangladesh-specific
+                     * movie results.
                      */
                     if (
-                        isBangladeshMovie(
-                            title
-                        )
+                        isBangladeshMovie(title)
                     ) {
                         continue
                     }
+
+                    val thumbnail =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
 
                     results.add(
                         newMovieSearchResponse(
@@ -375,10 +374,11 @@ class YouTube : MainAPI() {
                             TvType.Movie
                         ) {
 
+                            /*
+                             * Keep YouTube's actual thumbnail.
+                             */
                             posterUrl =
-                                item.thumbnails
-                                    .lastOrNull()
-                                    ?.url
+                                thumbnail
                         }
                     )
                 }
@@ -417,21 +417,17 @@ class YouTube : MainAPI() {
      * CURATED LIVE
      * --------------------------------------------------
      *
-     * Each allowed channel is searched individually.
+     * Every allowed channel is searched individually.
      *
-     * Only:
+     * For each channel:
      *
-     *   StreamType.LIVE_STREAM
+     *   - only LIVE_STREAM is accepted
+     *   - uploader must match the allowed channel
+     *   - if multiple live streams exist,
+     *     the oldest/earliest-started live is selected
      *
-     * is accepted.
-     *
-     * Therefore:
-     *
-     * Offline channel -> not shown
-     * Live channel     -> shown
-     * Other channel    -> never shown
-     *
-     * A refresh creates a fresh list again.
+     * Therefore every channel contributes at most ONE
+     * live stream.
      */
     private suspend fun getCuratedLivePage(
         page: Int
@@ -451,16 +447,9 @@ class YouTube : MainAPI() {
             mutableSetOf<String>()
 
         /*
-         * Search every approved channel separately.
-         *
-         * This is intentionally sequential so YouTube
-         * is not hit with dozens of simultaneous requests.
+         * One channel -> one selected live stream.
          */
         for (channel in allowedLiveChannels) {
-
-            if (results.size >= 40) {
-                break
-            }
 
             try {
 
@@ -471,11 +460,55 @@ class YouTube : MainAPI() {
 
                 extractor.fetchPage()
 
-                collectLiveChannelResults(
-                    channel,
-                    extractor.initialPage.items,
-                    results,
-                    seenUrls
+                val selected =
+                    selectOldestLiveForChannel(
+                        channel,
+                        extractor.initialPage.items
+                    )
+
+                if (selected == null) {
+                    continue
+                }
+
+                val url =
+                    selected.url
+                        ?: continue
+
+                if (url.isBlank()) {
+                    continue
+                }
+
+                if (!seenUrls.add(url)) {
+                    continue
+                }
+
+                val title =
+                    selected.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                val thumbnail =
+                    selected.thumbnails
+                        .lastOrNull()
+                        ?.url
+                        ?.takeIf {
+                            it.isNotBlank()
+                        }
+
+                results.add(
+                    newMovieSearchResponse(
+                        title,
+                        url,
+                        TvType.Live
+                    ) {
+
+                        posterUrl =
+                            thumbnail
+                    }
                 )
 
             } catch (_: Exception) {
@@ -495,25 +528,33 @@ class YouTube : MainAPI() {
         )
     }
 
-    private fun collectLiveChannelResults(
+    /*
+     * --------------------------------------------------
+     * SELECT OLDEST LIVE
+     * --------------------------------------------------
+     *
+     * The YouTube/NewPipe extractor exposes the live
+     * stream start timestamp through uploadDate for
+     * currently-running live streams.
+     *
+     * The earliest timestamp is therefore selected.
+     */
+    private fun selectOldestLiveForChannel(
         allowedChannel: String,
-        items: List<InfoItem>,
-        results: MutableList<SearchResponse>,
-        seenUrls: MutableSet<String>
-    ) {
+        items: List<InfoItem>
+    ): StreamInfoItem? {
+
+        val candidates =
+            mutableListOf<StreamInfoItem>()
 
         for (item in items) {
-
-            if (results.size >= 40) {
-                return
-            }
 
             if (item !is StreamInfoItem) {
                 continue
             }
 
             /*
-             * Must be a currently live video.
+             * Must be a currently running live stream.
              */
             if (
                 item.streamType !=
@@ -527,9 +568,6 @@ class YouTube : MainAPI() {
                     ?.trim()
                     ?: continue
 
-            /*
-             * Exact normalized channel matching.
-             */
             if (
                 !isSameChannel(
                     uploader,
@@ -547,33 +585,27 @@ class YouTube : MainAPI() {
                 continue
             }
 
-            if (!seenUrls.add(url)) {
-                continue
-            }
-
-            val title =
-                item.name
-                    ?.trim()
-                    ?: continue
-
-            if (title.isBlank()) {
-                continue
-            }
-
-            results.add(
-                newMovieSearchResponse(
-                    title,
-                    url,
-                    TvType.Live
-                ) {
-
-                    posterUrl =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                }
-            )
+            candidates.add(item)
         }
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        /*
+         * Prefer the earliest known start/upload date.
+         *
+         * If a date is unavailable, keep the item as a
+         * fallback but do not let it replace a known date.
+         */
+        return candidates.minWithOrNull(
+            compareBy<StreamInfoItem> {
+                it.uploadDate
+                    ?.instant
+                    ?.toEpochMilli()
+                    ?: Long.MAX_VALUE
+            }
+        )
     }
 
     private fun isSameChannel(
@@ -604,8 +636,8 @@ class YouTube : MainAPI() {
      *
      * Normal YouTube search remains unrestricted.
      *
-     * This means users can still search for any channel,
-     * movie or video that YouTube/NewPipe can find.
+     * Users can search for channels, videos, playlists,
+     * movies, etc.
      */
     override suspend fun search(
         query: String,
@@ -722,7 +754,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * SEARCH ITEM -> CLOUDSTREAM
+     * INFO ITEM -> CLOUDSTREAM SEARCH RESPONSE
      * --------------------------------------------------
      */
     private fun InfoItem.toSearchResponse():
@@ -839,7 +871,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * VIDEO
+     * VIDEO LOAD
      * --------------------------------------------------
      */
     private suspend fun loadVideo(
@@ -1200,7 +1232,15 @@ class YouTube : MainAPI() {
      * PLAYBACK
      * --------------------------------------------------
      *
-     * Keep the working YouTube extractor playback system.
+     * Playback strategy:
+     *
+     * 1. VOD -> DASH adaptive stream
+     * 2. Live -> HLS stream
+     * 3. If manifest extraction fails -> CloudStream
+     *    generic extractor fallback
+     *
+     * This preserves the previous working playback path
+     * while giving the player a direct adaptive manifest.
      */
     override suspend fun loadLinks(
         data: String,
@@ -1209,6 +1249,159 @@ class YouTube : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
 
+        if (data.isBlank()) {
+            return false
+        }
+
+        val extractor = try {
+            service.getStreamExtractor(
+                data
+            )
+        } catch (_: Exception) {
+            return loadExtractor(
+                data,
+                subtitleCallback,
+                callback
+            )
+        }
+
+        try {
+
+            extractor.fetchPage()
+
+            val info =
+                StreamInfo.getInfo(
+                    extractor
+                )
+
+            val isLive =
+                info.streamType
+                    ?.name
+                    ?.contains(
+                        "LIVE"
+                    ) == true
+
+            /*
+             * --------------------------------------------------
+             * LIVE -> HLS
+             * --------------------------------------------------
+             *
+             * YouTube's HLS manifest is especially useful
+             * for live streams.
+             */
+            if (isLive) {
+
+                val hlsUrl =
+                    runCatching {
+                        info.hlsUrl
+                    }.getOrNull()
+
+                if (
+                    !hlsUrl.isNullOrBlank()
+                ) {
+
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name Live",
+                            url = hlsUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+
+                            referer =
+                                "https://www.youtube.com/"
+
+                            quality =
+                                Qualities.Unknown.value
+                        }
+                    )
+
+                    return true
+                }
+            }
+
+            /*
+             * --------------------------------------------------
+             * VOD -> DASH
+             * --------------------------------------------------
+             *
+             * DASH allows adaptive video/audio selection
+             * instead of locking playback to one fixed
+             * progressive stream.
+             */
+            val dashUrl =
+                runCatching {
+                    info.dashMpdUrl
+                }.getOrNull()
+
+            if (
+                !dashUrl.isNullOrBlank()
+            ) {
+
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "$name Adaptive",
+                        url = dashUrl,
+                        type = ExtractorLinkType.DASH
+                    ) {
+
+                        referer =
+                            "https://www.youtube.com/"
+
+                        quality =
+                            Qualities.Unknown.value
+                    }
+                )
+
+                return true
+            }
+
+            /*
+             * HLS fallback for non-live videos if DASH is
+             * unavailable.
+             */
+            val hlsUrl =
+                runCatching {
+                    info.hlsUrl
+                }.getOrNull()
+
+            if (
+                !hlsUrl.isNullOrBlank()
+            ) {
+
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "$name HLS",
+                        url = hlsUrl,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+
+                        referer =
+                            "https://www.youtube.com/"
+
+                        quality =
+                            Qualities.Unknown.value
+                    }
+                )
+
+                return true
+            }
+
+        } catch (_: Exception) {
+            /*
+             * Fall through to the generic CloudStream
+             * YouTube extractor below.
+             */
+        }
+
+        /*
+         * Final fallback.
+         *
+         * This is the same playback system that was already
+         * working previously.
+         */
         return loadExtractor(
             data,
             subtitleCallback,
