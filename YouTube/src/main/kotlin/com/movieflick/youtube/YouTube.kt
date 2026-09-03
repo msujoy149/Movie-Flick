@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.kiosk.KioskExtractor
+import org.schabi.newpipe.extractor.playlist.PlaylistInfoItem
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import org.schabi.newpipe.extractor.stream.StreamType
@@ -30,31 +31,26 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * HOME CATEGORIES
      * --------------------------------------------------
-     *
-     * Gaming has been removed.
-     *
-     * Movies replaces Gaming.
      */
+
     override val mainPage = mainPageOf(
         "Trending" to "Trending",
         "trending_movies_and_shows" to "Movie Trailers",
-        "trending_music" to "Music",
+        "music_india" to "Trending Music Videos",
         "movies" to "Movies",
         "live" to "Live",
-        "trending_podcasts_episodes" to "Podcasts"
+        "religion" to "Religion"
     )
 
     /*
      * --------------------------------------------------
      * ALLOWED LIVE CHANNELS
      * --------------------------------------------------
-     *
-     * Only these channels are allowed in the curated
-     * Live section.
      */
+
     private val allowedLiveChannels = listOf(
 
-        // 🇮🇳 Indian Bengali News
+        // Indian Bengali News
         "Republic Bangla",
         "ABP Ananda",
         "News18 Bangla",
@@ -66,7 +62,7 @@ class YouTube : MainAPI() {
         "Zee 24 Ghanta",
         "Ei Samay",
 
-        // 🇧🇩 Bangladeshi Bengali News
+        // Bangladeshi Bengali News
         "Jamuna TV",
         "Somoy TV",
         "Ekattor TV",
@@ -82,7 +78,7 @@ class YouTube : MainAPI() {
         "Nagorik TV",
         "Maasranga TV",
 
-        // 🇮🇳 Indian Hindi News
+        // Indian Hindi News
         "Aaj Tak",
         "Republic Bharat",
         "ABP News",
@@ -98,7 +94,7 @@ class YouTube : MainAPI() {
         "India News",
         "Good News Today",
 
-        // 🌐 Indian English News
+        // Indian English News
         "NDTV 24x7",
         "Times Now",
         "CNN-News18",
@@ -108,16 +104,31 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * MOVIE SEARCH PRIORITY
+     * INDIAN TRENDING MUSIC
      * --------------------------------------------------
      *
-     * 1. Kolkata / Indian Bengali
-     * 2. Bengali dubbed
-     * 3. Hindi
-     *
-     * Bangladeshi Bengali movie search is intentionally
-     * excluded.
+     * Priority:
+     * 1. Hindi Indian music
+     * 2. Indian Bengali music
      */
+
+    private val indianMusicQueries = listOf(
+        "Hindi trending songs India",
+        "Indian Hindi trending music",
+        "Hindi new songs trending India",
+        "Hindi songs trending India",
+        "Kolkata Bengali trending songs",
+        "Indian Bengali trending songs",
+        "Bengali new songs India",
+        "Bengali songs trending Kolkata"
+    )
+
+    /*
+     * --------------------------------------------------
+     * MOVIE SEARCH
+     * --------------------------------------------------
+     */
+
     private val movieQueries = listOf(
         "Kolkata Bengali full movie",
         "Indian Bengali full movie",
@@ -127,19 +138,170 @@ class YouTube : MainAPI() {
     )
 
     /*
-     * Strong Bangladesh-specific words.
-     *
-     * These are used only as a secondary filter so that
-     * obviously Bangladeshi movie results do not enter
-     * the curated Movies section.
+     * Bangladesh-specific keywords.
      */
-    private val bangladeshMovieKeywords = listOf(
+
+    private val bangladeshKeywords = listOf(
         "bangladesh",
         "bangladeshi",
         "dhallywood",
         "dhaka movie",
         "bd movie",
         "bangla natok"
+    )
+
+    /*
+     * Pakistan-specific music keywords.
+     */
+
+    private val pakistanMusicKeywords = listOf(
+        "pakistan",
+        "pakistani",
+        "lollywood",
+        "pakistani song",
+        "pakistani music",
+        "coke studio pakistan"
+    )
+
+    /*
+     * --------------------------------------------------
+     * RELIGION PLAYLIST SEARCH
+     * --------------------------------------------------
+     *
+     * IMPORTANT PRIORITY:
+     *
+     * 1. Bengali Hindu religious serial playlists
+     * 2. Hindi Hindu religious serial playlists
+     *
+     * Bengali queries are intentionally placed FIRST.
+     */
+
+    private val bengaliReligionQueries = listOf(
+
+        "বাংলা মহাভারত সম্পূর্ণ পর্ব playlist",
+        "বাংলা মহাভারত সিরিয়াল playlist",
+        "বাংলা রামায়ণ সম্পূর্ণ পর্ব playlist",
+        "বাংলা রামায়ণ সিরিয়াল playlist",
+        "বাংলা জয় হনুমান সিরিয়াল playlist",
+        "বাংলা শ্রীকৃষ্ণ সিরিয়াল playlist",
+        "বাংলা কৃষ্ণ সিরিয়াল সম্পূর্ণ পর্ব playlist",
+        "বাংলা বিষ্ণু পুরাণ সিরিয়াল playlist",
+        "বাংলা মহাদেব সিরিয়াল playlist",
+        "বাংলা শিব পুরাণ সিরিয়াল playlist",
+        "বাংলা গণেশ সিরিয়াল playlist",
+        "বাংলা রাধাকৃষ্ণ সিরিয়াল playlist",
+        "বাংলা সীতারাম সিরিয়াল playlist",
+        "বাংলা হিন্দু পৌরাণিক সিরিয়াল playlist",
+        "Bengali Mahabharat full episodes playlist",
+        "Bengali Ramayan full episodes playlist",
+        "Bengali Hindu mythological serial full episodes playlist",
+        "Bengali Hindu religious serial playlist"
+    )
+
+    /*
+     * Hindi queries come AFTER all Bengali queries.
+     */
+
+    private val hindiReligionQueries = listOf(
+
+        "Mahabharat Hindi serial full episodes playlist",
+        "Mahabharat Star Plus full episodes playlist",
+        "Ramayan Hindi serial full episodes playlist",
+        "Ramayan full episodes Hindi playlist",
+        "Jai Hanuman Hindi serial full episodes playlist",
+        "Jai Shri Krishna Hindi serial full episodes playlist",
+        "Shree Krishna Hindi serial full episodes playlist",
+        "Vishnu Puran Hindi serial full episodes playlist",
+        "Devon Ke Dev Mahadev full episodes playlist",
+        "Om Namah Shivay Hindi serial full episodes playlist",
+        "Shree Ganesh Hindi serial full episodes playlist",
+        "RadhaKrishn Hindi serial full episodes playlist",
+        "Siya Ke Ram full episodes playlist",
+        "Suryaputra Karn full episodes playlist",
+        "Mahakali Anth Hi Aarambh Hai full episodes playlist",
+        "Vighnaharta Ganesh full episodes playlist",
+        "Ram Siya Ke Luv Kush full episodes playlist",
+        "Hindu mythological serial full episodes playlist Hindi"
+    )
+
+    /*
+     * Words that usually indicate devotional music
+     * instead of a serial playlist.
+     */
+
+    private val religionExcludeKeywords = listOf(
+        "bhajan",
+        "bhajans",
+        "aarti",
+        "aartis",
+        "mantra",
+        "mantras",
+        "song",
+        "songs",
+        "music",
+        "playlist songs",
+        "status",
+        "shorts",
+        "remix",
+        "dj"
+    )
+
+    /*
+     * Strong Hindu serial / mythology keywords.
+     */
+
+    private val religionIncludeKeywords = listOf(
+        "mahabharat",
+        "mahabharata",
+        "মহাভারত",
+        "ramayan",
+        "ramayana",
+        "রামায়ণ",
+        "রামায়ণ",
+        "hanuman",
+        "হনুমান",
+        "bajrang",
+        "krishna",
+        "কৃষ্ণ",
+        "shri krishna",
+        "শ্রীকৃষ্ণ",
+        "jai shri krishna",
+        "vishnu",
+        "বিষ্ণু",
+        "vishnu puran",
+        "mahadev",
+        "মহাদেব",
+        "devon ke dev",
+        "shiv",
+        "shiva",
+        "শিব",
+        "om namah shivay",
+        "ganesh",
+        "ganesha",
+        "গণেশ",
+        "vighnaharta",
+        "radha",
+        "রাধা",
+        "radha krishn",
+        "sita",
+        "সীতা",
+        "siya ke ram",
+        "suryaputra karn",
+        "karn",
+        "karna",
+        "mahakali",
+        "durga",
+        "দুর্গা",
+        "parvati",
+        "পার্বতী",
+        "shani",
+        "narayan",
+        "নারায়ণ",
+        "ram siya",
+        "mythological",
+        "পৌরাণিক",
+        "ধর্মীয়",
+        "ধর্মীয়"
     )
 
     private val pageCache =
@@ -153,28 +315,28 @@ class YouTube : MainAPI() {
      * HOME PAGE
      * --------------------------------------------------
      */
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
 
-        /*
-         * Custom Movies section.
-         */
+        if (request.data == "music_india") {
+            return getIndianMusicPage(page)
+        }
+
         if (request.data == "movies") {
             return getMoviesPage(page)
         }
 
-        /*
-         * Custom curated Live section.
-         */
         if (request.data == "live") {
             return getCuratedLivePage(page)
         }
 
-        /*
-         * Standard YouTube categories.
-         */
+        if (request.data == "religion") {
+            return getReligionPage(page)
+        }
+
         val key = request.data
 
         if (page == 1) {
@@ -182,9 +344,7 @@ class YouTube : MainAPI() {
         }
 
         val extractor = try {
-            getKioskExtractor(
-                request.data
-            )
+            getKioskExtractor(request.data)
         } catch (_: Exception) {
             return newHomePageResponse(
                 emptyList(),
@@ -211,15 +371,12 @@ class YouTube : MainAPI() {
                             false
                         )
 
-                extractor.getPage(
-                    next
-                ).also {
+                extractor.getPage(next).also {
                     pageCache[key] = it.nextPage
                 }
             }
 
         } catch (_: Exception) {
-
             return newHomePageResponse(
                 emptyList(),
                 false
@@ -239,7 +396,7 @@ class YouTube : MainAPI() {
             } catch (_: Exception) {
                 request.name
             }.ifEmpty {
-                "Trending"
+                request.name
             }
 
         return newHomePageResponse(
@@ -256,9 +413,168 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
+     * INDIAN TRENDING MUSIC
+     * --------------------------------------------------
+     */
+
+    private suspend fun getIndianMusicPage(
+        page: Int
+    ): HomePageResponse {
+
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
+
+        val results =
+            mutableListOf<SearchResponse>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (query in indianMusicQueries) {
+
+            if (results.size >= 40) {
+                break
+            }
+
+            try {
+
+                val extractor =
+                    service.getSearchExtractor(
+                        query
+                    )
+
+                extractor.fetchPage()
+
+                for (item in extractor.initialPage.items) {
+
+                    if (results.size >= 40) {
+                        break
+                    }
+
+                    if (item !is StreamInfoItem) {
+                        continue
+                    }
+
+                    if (
+                        item.streamType !=
+                        StreamType.VIDEO_STREAM
+                    ) {
+                        continue
+                    }
+
+                    if (item.isShortFormContent) {
+                        continue
+                    }
+
+                    val url =
+                        item.url
+                            ?: continue
+
+                    if (url.isBlank()) {
+                        continue
+                    }
+
+                    if (!seenUrls.add(url)) {
+                        continue
+                    }
+
+                    val title =
+                        item.name
+                            ?.trim()
+                            ?: continue
+
+                    if (title.isBlank()) {
+                        continue
+                    }
+
+                    if (
+                        containsAny(
+                            title,
+                            bangladeshKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    if (
+                        containsAny(
+                            title,
+                            pakistanMusicKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    val uploader =
+                        item.uploaderName
+                            ?.trim()
+                            ?: ""
+
+                    if (
+                        containsAny(
+                            uploader,
+                            bangladeshKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    if (
+                        containsAny(
+                            uploader,
+                            pakistanMusicKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    val thumbnail =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
+
+                    results.add(
+                        newMovieSearchResponse(
+                            title,
+                            url,
+                            TvType.Movie
+                        ) {
+                            posterUrl =
+                                thumbnail
+                        }
+                    )
+                }
+
+            } catch (_: Exception) {
+                continue
+            }
+        }
+
+        return newHomePageResponse(
+            listOf(
+                HomePageList(
+                    "Trending Music Videos",
+                    results,
+                    false
+                )
+            ),
+            false
+        )
+    }
+
+    /*
+     * --------------------------------------------------
      * MOVIES
      * --------------------------------------------------
      */
+
     private suspend fun getMoviesPage(
         page: Int
     ): HomePageResponse {
@@ -276,13 +592,6 @@ class YouTube : MainAPI() {
         val seenUrls =
             mutableSetOf<String>()
 
-        /*
-         * Process queries in priority order.
-         *
-         * Kolkata Bengali comes first.
-         * Bengali dubbed comes second.
-         * Hindi comes last.
-         */
         for (query in movieQueries) {
 
             if (results.size >= 40) {
@@ -308,10 +617,6 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    /*
-                     * Movies section should not contain live
-                     * streams.
-                     */
                     if (
                         item.streamType !=
                         StreamType.VIDEO_STREAM
@@ -319,12 +624,7 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    /*
-                     * Do not show Shorts in Movies.
-                     */
-                    if (
-                        item.isShortFormContent
-                    ) {
+                    if (item.isShortFormContent) {
                         continue
                     }
 
@@ -349,12 +649,11 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    /*
-                     * Remove obvious Bangladesh-specific
-                     * movie results.
-                     */
                     if (
-                        isBangladeshMovie(title)
+                        containsAny(
+                            title,
+                            bangladeshKeywords
+                        )
                     ) {
                         continue
                     }
@@ -373,10 +672,6 @@ class YouTube : MainAPI() {
                             url,
                             TvType.Movie
                         ) {
-
-                            /*
-                             * Keep YouTube's actual thumbnail.
-                             */
                             posterUrl =
                                 thumbnail
                         }
@@ -400,35 +695,17 @@ class YouTube : MainAPI() {
         )
     }
 
-    private fun isBangladeshMovie(
-        title: String
-    ): Boolean {
-
-        val lower =
-            title.lowercase()
-
-        return bangladeshMovieKeywords.any {
-            lower.contains(it)
-        }
-    }
-
     /*
      * --------------------------------------------------
      * CURATED LIVE
      * --------------------------------------------------
      *
-     * Every allowed channel is searched individually.
+     * Exactly ONE live stream per channel.
      *
-     * For each channel:
-     *
-     *   - only LIVE_STREAM is accepted
-     *   - uploader must match the allowed channel
-     *   - if multiple live streams exist,
-     *     the oldest/earliest-started live is selected
-     *
-     * Therefore every channel contributes at most ONE
-     * live stream.
+     * If several streams are live on the same channel,
+     * the earliest-started one is selected.
      */
+
     private suspend fun getCuratedLivePage(
         page: Int
     ): HomePageResponse {
@@ -446,9 +723,6 @@ class YouTube : MainAPI() {
         val seenUrls =
             mutableSetOf<String>()
 
-        /*
-         * One channel -> one selected live stream.
-         */
         for (channel in allowedLiveChannels) {
 
             try {
@@ -505,7 +779,6 @@ class YouTube : MainAPI() {
                         url,
                         TvType.Live
                     ) {
-
                         posterUrl =
                             thumbnail
                     }
@@ -532,13 +805,8 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * SELECT OLDEST LIVE
      * --------------------------------------------------
-     *
-     * The YouTube/NewPipe extractor exposes the live
-     * stream start timestamp through uploadDate for
-     * currently-running live streams.
-     *
-     * The earliest timestamp is therefore selected.
      */
+
     private fun selectOldestLiveForChannel(
         allowedChannel: String,
         items: List<InfoItem>
@@ -553,9 +821,6 @@ class YouTube : MainAPI() {
                 continue
             }
 
-            /*
-             * Must be a currently running live stream.
-             */
             if (
                 item.streamType !=
                 StreamType.LIVE_STREAM
@@ -592,12 +857,6 @@ class YouTube : MainAPI() {
             return null
         }
 
-        /*
-         * Prefer the earliest known start/upload date.
-         *
-         * If a date is unavailable, keep the item as a
-         * fallback but do not let it replace a known date.
-         */
         return candidates.minWithOrNull(
             compareBy<StreamInfoItem> {
                 it.uploadDate
@@ -607,6 +866,245 @@ class YouTube : MainAPI() {
             }
         )
     }
+
+    /*
+     * --------------------------------------------------
+     * RELIGION
+     * --------------------------------------------------
+     *
+     * PRIORITY:
+     *
+     * Bengali playlists FIRST
+     * Hindi playlists SECOND
+     *
+     * Playlist cards only.
+     */
+
+    private suspend fun getReligionPage(
+        page: Int
+    ): HomePageResponse {
+
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
+
+        val results =
+            mutableListOf<SearchResponse>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        /*
+         * --------------------------------------------------
+         * STEP 1
+         * --------------------------------------------------
+         * Bengali playlists FIRST
+         */
+
+        collectReligionPlaylists(
+            queries = bengaliReligionQueries,
+            results = results,
+            seenUrls = seenUrls,
+            maxResults = 40
+        )
+
+        /*
+         * --------------------------------------------------
+         * STEP 2
+         * --------------------------------------------------
+         * Hindi playlists AFTER Bengali results.
+         */
+
+        if (results.size < 40) {
+
+            collectReligionPlaylists(
+                queries = hindiReligionQueries,
+                results = results,
+                seenUrls = seenUrls,
+                maxResults = 40
+            )
+        }
+
+        return newHomePageResponse(
+            listOf(
+                HomePageList(
+                    "Religion",
+                    results,
+                    false
+                )
+            ),
+            false
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * COLLECT RELIGION PLAYLISTS
+     * --------------------------------------------------
+     */
+
+    private suspend fun collectReligionPlaylists(
+        queries: List<String>,
+        results: MutableList<SearchResponse>,
+        seenUrls: MutableSet<String>,
+        maxResults: Int
+    ) {
+
+        for (query in queries) {
+
+            if (results.size >= maxResults) {
+                break
+            }
+
+            try {
+
+                val extractor =
+                    service.getSearchExtractor(
+                        query
+                    )
+
+                extractor.fetchPage()
+
+                for (item in extractor.initialPage.items) {
+
+                    if (results.size >= maxResults) {
+                        break
+                    }
+
+                    /*
+                     * Only playlists.
+                     */
+
+                    if (item !is PlaylistInfoItem) {
+                        continue
+                    }
+
+                    val url =
+                        item.url
+                            ?.trim()
+                            ?: continue
+
+                    if (url.isBlank()) {
+                        continue
+                    }
+
+                    if (
+                        !url.contains(
+                            "playlist?list=",
+                            ignoreCase = true
+                        )
+                    ) {
+                        continue
+                    }
+
+                    if (!seenUrls.add(url)) {
+                        continue
+                    }
+
+                    val title =
+                        item.name
+                            ?.trim()
+                            ?: continue
+
+                    if (title.isBlank()) {
+                        continue
+                    }
+
+                    /*
+                     * Remove devotional music playlists.
+                     */
+
+                    if (
+                        containsAny(
+                            title,
+                            religionExcludeKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    /*
+                     * Remove obvious Bangladesh results.
+                     */
+
+                    if (
+                        containsAny(
+                            title,
+                            bangladeshKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    /*
+                     * Must look like a Hindu
+                     * religious/mythological serial.
+                     */
+
+                    if (
+                        !containsAny(
+                            title,
+                            religionIncludeKeywords
+                        )
+                    ) {
+                        continue
+                    }
+
+                    val thumbnail =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
+
+                    results.add(
+                        newMovieSearchResponse(
+                            title,
+                            url,
+                            TvType.TvSeries
+                        ) {
+                            posterUrl =
+                                thumbnail
+                        }
+                    )
+                }
+
+            } catch (_: Exception) {
+                continue
+            }
+        }
+    }
+
+    /*
+     * --------------------------------------------------
+     * STRING FILTER
+     * --------------------------------------------------
+     */
+
+    private fun containsAny(
+        text: String,
+        keywords: List<String>
+    ): Boolean {
+
+        val lower =
+            text.lowercase()
+
+        return keywords.any {
+            lower.contains(
+                it.lowercase()
+            )
+        }
+    }
+
+    /*
+     * --------------------------------------------------
+     * CHANNEL COMPARISON
+     * --------------------------------------------------
+     */
 
     private fun isSameChannel(
         first: String,
@@ -631,14 +1129,12 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * SEARCH
+     * NORMAL SEARCH
      * --------------------------------------------------
      *
-     * Normal YouTube search remains unrestricted.
-     *
-     * Users can search for channels, videos, playlists,
-     * movies, etc.
+     * Search remains unrestricted.
      */
+
     override suspend fun search(
         query: String,
         page: Int
@@ -687,9 +1183,7 @@ class YouTube : MainAPI() {
                             false
                         )
 
-                extractor.getPage(
-                    next
-                ).also {
+                extractor.getPage(next).also {
                     searchPageCache[cacheKey] =
                         it.nextPage
                 }
@@ -729,6 +1223,7 @@ class YouTube : MainAPI() {
      * KIOSK
      * --------------------------------------------------
      */
+
     private fun getKioskExtractor(
         kioskId: String?
     ): KioskExtractor<out InfoItem> {
@@ -754,9 +1249,10 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * INFO ITEM -> CLOUDSTREAM SEARCH RESPONSE
+     * INFO ITEM -> SEARCH RESPONSE
      * --------------------------------------------------
      */
+
     private fun InfoItem.toSearchResponse():
         SearchResponse {
 
@@ -784,6 +1280,7 @@ class YouTube : MainAPI() {
      * LOAD
      * --------------------------------------------------
      */
+
     override suspend fun load(
         url: String
     ): LoadResponse {
@@ -874,6 +1371,7 @@ class YouTube : MainAPI() {
      * VIDEO LOAD
      * --------------------------------------------------
      */
+
     private suspend fun loadVideo(
         url: String
     ): LoadResponse {
@@ -954,6 +1452,7 @@ class YouTube : MainAPI() {
      * CHANNEL
      * --------------------------------------------------
      */
+
     private suspend fun loadChannel(
         url: String
     ): LoadResponse {
@@ -1094,7 +1593,12 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * PLAYLIST
      * --------------------------------------------------
+     *
+     * Religion playlist cards open here.
+     *
+     * Episodes are loaded in YouTube playlist order.
      */
+
     private suspend fun loadPlaylist(
         url: String
     ): LoadResponse {
@@ -1175,8 +1679,8 @@ class YouTube : MainAPI() {
                                 .lastOrNull()
                                 ?.url
                 }
-                }
             )
+            }
 
             pagesLoaded++
         }
@@ -1232,16 +1736,15 @@ class YouTube : MainAPI() {
      * PLAYBACK
      * --------------------------------------------------
      *
-     * Playback strategy:
+     * KEEP CURRENT HIGH-SPEED SYSTEM.
      *
-     * 1. VOD -> DASH adaptive stream
-     * 2. Live -> HLS stream
-     * 3. If manifest extraction fails -> CloudStream
-     *    generic extractor fallback
+     * VOD -> DASH
+     * LIVE -> HLS
+     * fallback -> CloudStream extractor
      *
-     * This preserves the previous working playback path
-     * while giving the player a direct adaptive manifest.
+     * No speed-related changes are made here.
      */
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -1254,10 +1757,13 @@ class YouTube : MainAPI() {
         }
 
         val extractor = try {
+
             service.getStreamExtractor(
                 data
             )
+
         } catch (_: Exception) {
+
             return loadExtractor(
                 data,
                 subtitleCallback,
@@ -1282,13 +1788,9 @@ class YouTube : MainAPI() {
                     ) == true
 
             /*
-             * --------------------------------------------------
              * LIVE -> HLS
-             * --------------------------------------------------
-             *
-             * YouTube's HLS manifest is especially useful
-             * for live streams.
              */
+
             if (isLive) {
 
                 val hlsUrl =
@@ -1321,14 +1823,9 @@ class YouTube : MainAPI() {
             }
 
             /*
-             * --------------------------------------------------
              * VOD -> DASH
-             * --------------------------------------------------
-             *
-             * DASH allows adaptive video/audio selection
-             * instead of locking playback to one fixed
-             * progressive stream.
              */
+
             val dashUrl =
                 runCatching {
                     info.dashMpdUrl
@@ -1358,9 +1855,9 @@ class YouTube : MainAPI() {
             }
 
             /*
-             * HLS fallback for non-live videos if DASH is
-             * unavailable.
+             * HLS fallback.
              */
+
             val hlsUrl =
                 runCatching {
                     info.hlsUrl
@@ -1391,17 +1888,11 @@ class YouTube : MainAPI() {
 
         } catch (_: Exception) {
             /*
-             * Fall through to the generic CloudStream
-             * YouTube extractor below.
+             * Fall back to the known working
+             * CloudStream extractor.
              */
         }
 
-        /*
-         * Final fallback.
-         *
-         * This is the same playback system that was already
-         * working previously.
-         */
         return loadExtractor(
             data,
             subtitleCallback,
