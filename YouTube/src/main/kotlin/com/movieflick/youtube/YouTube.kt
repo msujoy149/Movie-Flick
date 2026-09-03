@@ -27,6 +27,12 @@ class YouTube : MainAPI() {
 
     private val service = ServiceList.YouTube
 
+    /*
+     * --------------------------------------------------
+     * HOME
+     * --------------------------------------------------
+     */
+
     override val mainPage = mainPageOf(
         "Trending" to "Trending",
         "trending_movies_and_shows" to "Movie Trailers",
@@ -35,6 +41,12 @@ class YouTube : MainAPI() {
         "live" to "Live",
         "religion" to "Religion"
     )
+
+    /*
+     * --------------------------------------------------
+     * LIVE CHANNELS
+     * --------------------------------------------------
+     */
 
     private val allowedLiveChannels = listOf(
 
@@ -92,7 +104,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * INDIAN TRENDING MUSIC
+     * INDIAN MUSIC
      * --------------------------------------------------
      */
 
@@ -141,15 +153,13 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * RELIGION
+     * BENGALI RELIGION PLAYLIST SEARCH
      * --------------------------------------------------
      *
-     * Bengali playlists FIRST.
-     * Hindi playlists SECOND.
+     * Bengali is always searched first.
      */
 
     private val bengaliReligionQueries = listOf(
-
         "বাংলা মহাভারত সম্পূর্ণ পর্ব playlist",
         "বাংলা মহাভারত সিরিয়াল playlist",
         "বাংলা রামায়ণ সম্পূর্ণ পর্ব playlist",
@@ -173,8 +183,13 @@ class YouTube : MainAPI() {
         "Bengali Hindu religious serial playlist"
     )
 
-    private val hindiReligionQueries = listOf(
+    /*
+     * --------------------------------------------------
+     * HINDI RELIGION PLAYLIST SEARCH
+     * --------------------------------------------------
+     */
 
+    private val hindiReligionQueries = listOf(
         "Mahabharat Hindi serial full episodes playlist",
         "Mahabharat Star Plus full episodes playlist",
         "Ramayan Hindi serial full episodes playlist",
@@ -194,6 +209,12 @@ class YouTube : MainAPI() {
         "Ram Siya Ke Luv Kush full episodes playlist",
         "Hindu mythological serial full episodes playlist Hindi"
     )
+
+    /*
+     * --------------------------------------------------
+     * RELIGION FILTERS
+     * --------------------------------------------------
+     */
 
     private val religionExcludeKeywords = listOf(
         "bhajan",
@@ -230,7 +251,6 @@ class YouTube : MainAPI() {
         "কৃষ্ণ",
         "shri krishna",
         "শ্রীকৃষ্ণ",
-        "jai shri krishna",
 
         "vishnu",
         "বিষ্ণু",
@@ -279,6 +299,181 @@ class YouTube : MainAPI() {
         "ধর্মীয়"
     )
 
+    /*
+     * --------------------------------------------------
+     * OFFICIAL / MAIN SOURCE SIGNALS
+     * --------------------------------------------------
+     *
+     * These words increase the score of an official
+     * broadcaster / main publisher playlist.
+     */
+
+    private val officialSourceKeywords = listOf(
+        "official",
+        "official channel",
+        "official playlist",
+        "star jalsha",
+        "jalsha",
+        "starplus",
+        "star plus",
+        "sony",
+        "sony tv",
+        "sony entertainment",
+        "sony sab",
+        "sab tv",
+        "colors",
+        "colors tv",
+        "colors bangla",
+        "zee",
+        "zee bangla",
+        "zee tv",
+        "zee5",
+        "sagar pictures",
+        "sagar films",
+        "t series",
+        "t-series",
+        "shemaroo",
+        "shemaroo tv",
+        "epic",
+        "epic tv",
+        "dd national",
+        "doordarshan",
+        "dd bangla",
+        "ramayan",
+        "sita ram",
+        "star",
+        "viacom",
+        "network18"
+    )
+
+    /*
+     * Words commonly associated with personal/reposted
+     * playlists. These receive a penalty.
+     */
+
+    private val userPlaylistPenaltyKeywords = listOf(
+        "my playlist",
+        "my collection",
+        "collection",
+        "saved",
+        "favourite",
+        "favorites",
+        "favorite",
+        "best episodes",
+        "all episodes collection",
+        "fan made",
+        "fanmade",
+        "fans",
+        "fan club",
+        "personal",
+        "backup",
+        "reupload",
+        "re-upload",
+        "archive",
+        "clips",
+        "mixed",
+        "mix",
+        "part 1",
+        "part 2",
+        "part 3"
+    )
+
+    /*
+     * Known serial groups.
+     *
+     * The key is used to make sure the same serial
+     * cannot appear repeatedly.
+     */
+
+    private val religionSeriesAliases = mapOf(
+
+        "mahabharat" to listOf(
+            "mahabharat",
+            "mahabharata",
+            "মহাভারত"
+        ),
+
+        "ramayan" to listOf(
+            "ramayan",
+            "ramayana",
+            "রামায়ণ",
+            "রামায়ণ"
+        ),
+
+        "jai_hanuman" to listOf(
+            "jai hanuman",
+            "জয় হনুমান",
+            "জয় হনুমান"
+        ),
+
+        "krishna" to listOf(
+            "jai shri krishna",
+            "shree krishna",
+            "shri krishna",
+            "radha krishna",
+            "radha krishn",
+            "শ্রীকৃষ্ণ",
+            "রাধাকৃষ্ণ"
+        ),
+
+        "vishnu_puran" to listOf(
+            "vishnu puran",
+            "বিষ্ণু পুরাণ"
+        ),
+
+        "devon_ke_dev_mahadev" to listOf(
+            "devon ke dev mahadev",
+            "devon ke dev mahadev",
+            "mahadev"
+        ),
+
+        "om_namah_shivay" to listOf(
+            "om namah shivay",
+            "om namah shivaya"
+        ),
+
+        "ganesh" to listOf(
+            "vighnaharta ganesh",
+            "shree ganesh",
+            "shri ganesh",
+            "ganesh",
+            "গণেশ"
+        ),
+
+        "siya_ke_ram" to listOf(
+            "siya ke ram",
+            "ram siya ke luv kush",
+            "siya ke ram"
+        ),
+
+        "suryaputra_karn" to listOf(
+            "suryaputra karn",
+            "suryaputra karna",
+            "suryaputra"
+        ),
+
+        "mahakali" to listOf(
+            "mahakali",
+            "mahakali anth hi aarambh hai"
+        ),
+
+        "durga" to listOf(
+            "durga",
+            "দুর্গা"
+        ),
+
+        "parvati" to listOf(
+            "parvati",
+            "পার্বতী"
+        ),
+
+        "shani" to listOf(
+            "shani",
+            "shani dev",
+            "শনি"
+        )
+    )
+
     private val pageCache =
         mutableMapOf<String, org.schabi.newpipe.extractor.Page?>()
 
@@ -296,20 +491,19 @@ class YouTube : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
 
-        if (request.data == "music_india") {
-            return getIndianMusicPage(page)
-        }
+        when (request.data) {
 
-        if (request.data == "movies") {
-            return getMoviesPage(page)
-        }
+            "music_india" ->
+                return getIndianMusicPage(page)
 
-        if (request.data == "live") {
-            return getCuratedLivePage(page)
-        }
+            "movies" ->
+                return getMoviesPage(page)
 
-        if (request.data == "religion") {
-            return getReligionPage(page)
+            "live" ->
+                return getCuratedLivePage(page)
+
+            "religion" ->
+                return getReligionPage(page)
         }
 
         val key = request.data
@@ -352,6 +546,7 @@ class YouTube : MainAPI() {
             }
 
         } catch (_: Exception) {
+
             return newHomePageResponse(
                 emptyList(),
                 false
@@ -388,7 +583,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * TRENDING MUSIC
+     * INDIAN MUSIC
      * --------------------------------------------------
      */
 
@@ -838,8 +1033,13 @@ class YouTube : MainAPI() {
      * RELIGION
      * --------------------------------------------------
      *
-     * Bengali first.
-     * Hindi second.
+     * IMPORTANT:
+     *
+     * Bengali candidates are collected first.
+     * Hindi candidates are collected second.
+     *
+     * Duplicate serials are removed by SERIES KEY,
+     * NOT by playlist URL.
      */
 
     private suspend fun getReligionPage(
@@ -853,38 +1053,61 @@ class YouTube : MainAPI() {
             )
         }
 
-        val results =
-            mutableListOf<SearchResponse>()
+        val candidates =
+            mutableListOf<ReligionPlaylistCandidate>()
 
-        val seenUrls =
+        val seenPlaylistUrls =
             mutableSetOf<String>()
 
         /*
-         * FIRST:
-         * Bengali religious serial playlists.
+         * ----------------------------------------------
+         * BENGALI FIRST
+         * ----------------------------------------------
          */
 
-        collectReligionPlaylists(
+        collectReligionCandidates(
             queries = bengaliReligionQueries,
-            results = results,
-            seenUrls = seenUrls,
-            maxResults = 40
+            language = ReligionLanguage.BENGALI,
+            candidates = candidates,
+            seenPlaylistUrls = seenPlaylistUrls
         )
 
         /*
-         * SECOND:
-         * Hindi religious serial playlists.
+         * ----------------------------------------------
+         * HINDI SECOND
+         * ----------------------------------------------
          */
 
-        if (results.size < 40) {
+        collectReligionCandidates(
+            queries = hindiReligionQueries,
+            language = ReligionLanguage.HINDI,
+            candidates = candidates,
+            seenPlaylistUrls = seenPlaylistUrls
+        )
 
-            collectReligionPlaylists(
-                queries = hindiReligionQueries,
-                results = results,
-                seenUrls = seenUrls,
-                maxResults = 40
+        /*
+         * ----------------------------------------------
+         * DEDUPLICATE BY SERIAL
+         * ----------------------------------------------
+         */
+
+        val selected =
+            selectBestReligionPlaylists(
+                candidates
             )
-        }
+
+        val results =
+            selected.map { candidate ->
+
+                newMovieSearchResponse(
+                    candidate.title,
+                    candidate.url,
+                    TvType.TvSeries
+                ) {
+                    posterUrl =
+                        candidate.thumbnail
+                }
+            }
 
         return newHomePageResponse(
             listOf(
@@ -900,22 +1123,39 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * RELIGION PLAYLIST COLLECTOR
+     * RELIGION CANDIDATE
      * --------------------------------------------------
      */
 
-    private suspend fun collectReligionPlaylists(
+    private data class ReligionPlaylistCandidate(
+        val title: String,
+        val url: String,
+        val thumbnail: String?,
+        val uploader: String,
+        val language: ReligionLanguage,
+        val seriesKey: String,
+        val score: Int
+    )
+
+    private enum class ReligionLanguage {
+        BENGALI,
+        HINDI
+    }
+
+    /*
+     * --------------------------------------------------
+     * COLLECT RELIGION CANDIDATES
+     * --------------------------------------------------
+     */
+
+    private suspend fun collectReligionCandidates(
         queries: List<String>,
-        results: MutableList<SearchResponse>,
-        seenUrls: MutableSet<String>,
-        maxResults: Int
+        language: ReligionLanguage,
+        candidates: MutableList<ReligionPlaylistCandidate>,
+        seenPlaylistUrls: MutableSet<String>
     ) {
 
         for (query in queries) {
-
-            if (results.size >= maxResults) {
-                break
-            }
 
             try {
 
@@ -925,14 +1165,6 @@ class YouTube : MainAPI() {
                 extractor.fetchPage()
 
                 for (item in extractor.initialPage.items) {
-
-                    if (results.size >= maxResults) {
-                        break
-                    }
-
-                    /*
-                     * Only playlist results.
-                     */
 
                     if (item !is PlaylistInfoItem) {
                         continue
@@ -956,7 +1188,9 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    if (!seenUrls.add(url)) {
+                    if (
+                        !seenPlaylistUrls.add(url)
+                    ) {
                         continue
                     }
 
@@ -969,10 +1203,6 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    /*
-                     * Remove devotional music playlists.
-                     */
-
                     if (
                         containsAny(
                             title,
@@ -981,10 +1211,6 @@ class YouTube : MainAPI() {
                     ) {
                         continue
                     }
-
-                    /*
-                     * Remove Bangladesh results.
-                     */
 
                     if (
                         containsAny(
@@ -995,17 +1221,31 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    /*
-                     * Only recognizable Hindu
-                     * religious/mythological serials.
-                     */
-
                     if (
                         !containsAny(
                             title,
                             religionIncludeKeywords
                         )
                     ) {
+                        continue
+                    }
+
+                    val uploader =
+                        item.uploaderName
+                            ?.trim()
+                            ?: ""
+
+                    /*
+                     * Determine which serial this playlist
+                     * belongs to.
+                     */
+
+                    val seriesKey =
+                        detectReligionSeriesKey(
+                            title
+                        )
+
+                    if (seriesKey == null) {
                         continue
                     }
 
@@ -1017,15 +1257,24 @@ class YouTube : MainAPI() {
                                 it.isNotBlank()
                             }
 
-                    results.add(
-                        newMovieSearchResponse(
-                            title,
-                            url,
-                            TvType.TvSeries
-                        ) {
-                            posterUrl =
-                                thumbnail
-                        }
+                    val score =
+                        calculateReligionPlaylistScore(
+                            title = title,
+                            uploader = uploader,
+                            language = language,
+                            seriesKey = seriesKey
+                        )
+
+                    candidates.add(
+                        ReligionPlaylistCandidate(
+                            title = title,
+                            url = url,
+                            thumbnail = thumbnail,
+                            uploader = uploader,
+                            language = language,
+                            seriesKey = seriesKey,
+                            score = score
+                        )
                     )
                 }
 
@@ -1033,6 +1282,311 @@ class YouTube : MainAPI() {
                 continue
             }
         }
+    }
+
+    /*
+     * --------------------------------------------------
+     * SELECT BEST PLAYLISTS
+     * --------------------------------------------------
+     *
+     * This is the important duplicate-removal step.
+     *
+     * Same seriesKey = same serial.
+     *
+     * Only ONE playlist is retained for each serial
+     * and language.
+     */
+
+    private fun selectBestReligionPlaylists(
+        candidates: List<ReligionPlaylistCandidate>
+    ): List<ReligionPlaylistCandidate> {
+
+        /*
+         * First group by:
+         *
+         * serial + language
+         *
+         * This means Bengali Mahabharat and Hindi
+         * Mahabharat can both exist, because they are
+         * different language versions.
+         */
+
+        val groups =
+            candidates.groupBy {
+                "${it.language.name}:"
+                    .plus(it.seriesKey)
+            }
+
+        val selected =
+            mutableListOf<ReligionPlaylistCandidate>()
+
+        for ((_, group) in groups) {
+
+            val best =
+                group.maxWithOrNull(
+                    compareBy<ReligionPlaylistCandidate> {
+                        it.score
+                    }.thenByDescending {
+                        it.title.length
+                    }
+                )
+
+            if (best != null) {
+                selected.add(best)
+            }
+        }
+
+        /*
+         * Bengali groups FIRST.
+         * Hindi groups SECOND.
+         */
+
+        return selected.sortedWith(
+            compareBy<ReligionPlaylistCandidate> {
+                when (it.language) {
+                    ReligionLanguage.BENGALI -> 0
+                    ReligionLanguage.HINDI -> 1
+                }
+            }.thenByDescending {
+                it.score
+            }
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * DETECT SERIAL KEY
+     * --------------------------------------------------
+     */
+
+    private fun detectReligionSeriesKey(
+        title: String
+    ): String? {
+
+        val normalized =
+            normalizeReligionText(title)
+
+        /*
+         * Check longer/specific aliases first.
+         */
+
+        val ordered =
+            religionSeriesAliases.entries.sortedByDescending {
+                it.value.maxOf { alias ->
+                    alias.length
+                }
+            }
+
+        for ((key, aliases) in ordered) {
+
+            for (alias in aliases) {
+
+                val normalizedAlias =
+                    normalizeReligionText(
+                        alias
+                    )
+
+                if (
+                    normalized.contains(
+                        normalizedAlias
+                    )
+                ) {
+                    return key
+                }
+            }
+        }
+
+        return null
+    }
+
+    /*
+     * --------------------------------------------------
+     * PLAYLIST SCORE
+     * --------------------------------------------------
+     *
+     * Higher score = more likely to be the main /
+     * official playlist.
+     */
+
+    private fun calculateReligionPlaylistScore(
+        title: String,
+        uploader: String,
+        language: ReligionLanguage,
+        seriesKey: String
+    ): Int {
+
+        var score = 0
+
+        val combined =
+            "$title $uploader"
+                .lowercase()
+
+        /*
+         * Bengali gets an explicit language bonus.
+         *
+         * The ordering itself is already Bengali first,
+         * but this also helps select the better Bengali
+         * candidate when multiple Bengali playlists exist.
+         */
+
+        if (
+            language ==
+            ReligionLanguage.BENGALI
+        ) {
+            score += 20
+        } else {
+            score += 10
+        }
+
+        /*
+         * Official / broadcaster signals.
+         */
+
+        for (keyword in officialSourceKeywords) {
+
+            if (
+                combined.contains(
+                    keyword.lowercase()
+                )
+            ) {
+                score += 25
+            }
+        }
+
+        /*
+         * Explicit official wording.
+         */
+
+        if (
+            combined.contains("official")
+        ) {
+            score += 35
+        }
+
+        /*
+         * Complete/full episode signals.
+         */
+
+        if (
+            combined.contains(
+                "full episodes"
+            )
+        ) {
+            score += 15
+        }
+
+        if (
+            combined.contains(
+                "complete episodes"
+            )
+        ) {
+            score += 15
+        }
+
+        if (
+            combined.contains(
+                "all episodes"
+            )
+        ) {
+            score += 10
+        }
+
+        if (
+            combined.contains(
+                "সম্পূর্ণ"
+            )
+        ) {
+            score += 15
+        }
+
+        if (
+            combined.contains(
+                "সব পর্ব"
+            )
+        ) {
+            score += 10
+        }
+
+        /*
+         * Penalty for obvious personal/copied playlists.
+         */
+
+        for (keyword in userPlaylistPenaltyKeywords) {
+
+            if (
+                combined.contains(
+                    keyword.lowercase()
+                )
+            ) {
+                score -= 30
+            }
+        }
+
+        /*
+         * Very generic playlist titles get a small penalty.
+         */
+
+        val normalizedTitle =
+            normalizeReligionText(title)
+
+        if (
+            normalizedTitle == "playlist"
+        ) {
+            score -= 20
+        }
+
+        if (
+            normalizedTitle.length < 8
+        ) {
+            score -= 5
+        }
+
+        /*
+         * If uploader is present, give a small bonus.
+         */
+
+        if (uploader.isNotBlank()) {
+            score += 5
+        }
+
+        /*
+         * Specific serial aliases in the title are useful.
+         */
+
+        val aliases =
+            religionSeriesAliases[
+                seriesKey
+            ].orEmpty()
+
+        if (
+            aliases.any {
+                normalizedTitle.contains(
+                    normalizeReligionText(it)
+                )
+            }
+        ) {
+            score += 10
+        }
+
+        return score
+    }
+
+    /*
+     * --------------------------------------------------
+     * NORMALIZE RELIGION TEXT
+     * --------------------------------------------------
+     */
+
+    private fun normalizeReligionText(
+        value: String
+    ): String {
+
+        return value
+            .lowercase()
+            .replace(
+                Regex("[^\\p{L}\\p{N}]+"),
+                ""
+            )
     }
 
     /*
@@ -1085,7 +1639,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * NORMAL SEARCH
+     * SEARCH
      * --------------------------------------------------
      */
 
@@ -1203,7 +1757,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * INFO ITEM -> SEARCH RESPONSE
+     * INFO ITEM
      * --------------------------------------------------
      */
 
@@ -1322,7 +1876,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * VIDEO
+     * VIDEO LOAD
      * --------------------------------------------------
      */
 
@@ -1542,7 +2096,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * PLAYLIST
+     * PLAYLIST LOAD
      * --------------------------------------------------
      */
 
@@ -1575,7 +2129,7 @@ class YouTube : MainAPI() {
             mutableListOf<Episode>()
 
         /*
-         * FIRST PLAYLIST PAGE
+         * First playlist page.
          */
 
         var page =
@@ -1600,7 +2154,7 @@ class YouTube : MainAPI() {
         )
 
         /*
-         * ADDITIONAL PLAYLIST PAGES
+         * Additional playlist pages.
          */
 
         var pagesLoaded = 1
@@ -1689,7 +2243,15 @@ class YouTube : MainAPI() {
      * PLAYBACK
      * --------------------------------------------------
      *
-     * Current high-speed adaptive playback is kept.
+     * IMPORTANT:
+     *
+     * DO NOT CHANGE THIS SECTION.
+     *
+     * VOD -> DASH
+     * LIVE -> HLS
+     * fallback -> CloudStream extractor
+     *
+     * This keeps the current high-speed playback path.
      */
 
     override suspend fun loadLinks(
@@ -1802,7 +2364,7 @@ class YouTube : MainAPI() {
             }
 
             /*
-             * HLS fallback
+             * HLS fallback.
              */
 
             val hlsUrl =
@@ -1835,7 +2397,8 @@ class YouTube : MainAPI() {
 
         } catch (_: Exception) {
             /*
-             * Fall back to CloudStream extractor.
+             * Fallback to CloudStream's working
+             * YouTube extractor.
              */
         }
 
