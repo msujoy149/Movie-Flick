@@ -71,14 +71,22 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/build-output"
           mkdir -p "$GITHUB_WORKSPACE/build-output"
 
+          # Copy all compiled CloudStream plugins
           find "$GITHUB_WORKSPACE/src" \
             -type f \
             -name "*.cs3" \
             -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
 
+          # Copy generated plugins.json
           if [ -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
             cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
               "$GITHUB_WORKSPACE/build-output/plugins.json"
+          fi
+
+          # Copy repository manifest
+          if [ -f "$GITHUB_WORKSPACE/src/repo.json" ]; then
+            cp "$GITHUB_WORKSPACE/src/repo.json" \
+              "$GITHUB_WORKSPACE/build-output/repo.json"
           fi
 
           echo "Build output:"
@@ -117,7 +125,7 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # Copy new plugin builds
+      # Copy new plugin builds and repository files
       # --------------------------------------------------
       - name: Copy build files
         run: |
@@ -128,6 +136,23 @@ jobs:
 
           echo "Final builds branch contents:"
           ls -lah
+
+          echo ""
+          echo "Checking required repository files:"
+
+          if [ -f "repo.json" ]; then
+            echo "✓ repo.json found"
+          else
+            echo "✗ repo.json missing"
+            exit 1
+          fi
+
+          if [ -f "plugins.json" ]; then
+            echo "✓ plugins.json found"
+          else
+            echo "✗ plugins.json missing"
+            exit 1
+          fi
 
       # --------------------------------------------------
       # Push builds branch
