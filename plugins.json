@@ -1,0 +1,71 @@
+[
+    {
+        "fileHash": "sha256-9523c17e597700dbbb223e76eb7158a8d1339c3ab7bb059a46bd0780533ffff1",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 13733,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 1,
+        "internalName": "DhakaFTP",
+        "description": "Dhaka FTP",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DhakaFTP.cs3",
+        "name": "DhakaFTP"
+    },
+    {
+        "jarFileSize": 50729,
+        "fileHash": "sha256-6164db1f0614cef676d8316dced60e867fa8060b33369ab5b833aa78d4ff3ef8",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 15416,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 1,
+        "internalName": "MovieBox",
+        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.jar",
+        "description": "MovieBox provider for Movie-Flick",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
+        "name": "MovieBox",
+        "jarHash": "sha256-efaf3611a572fc41205d99a39bfffc42128c897d746d33b6acb83a33f9a61516"
+    },
+    {
+        "jarFileSize": 47633,
+        "fileHash": "sha256-a6c6cebb3e261b7a3c0df3c55c2a03e2c095c747c3fd9cc4212ca2670129e0a3",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 13686,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Other",
+            "Live",
+            "TvSeries"
+        ],
+        "version": 1,
+        "internalName": "YouTube",
+        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.jar",
+        "description": "YouTube provider for Movie-Flick",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
+        "name": "YouTube",
+        "jarHash": "sha256-e7a0535593658005631cbb6d69ce526622b0a6606248f443b148b56c51f9518c"
+    }
+]
