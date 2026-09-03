@@ -27,12 +27,6 @@ class YouTube : MainAPI() {
 
     private val service = ServiceList.YouTube
 
-    /*
-     * --------------------------------------------------
-     * HOME CATEGORIES
-     * --------------------------------------------------
-     */
-
     override val mainPage = mainPageOf(
         "Trending" to "Trending",
         "trending_movies_and_shows" to "Movie Trailers",
@@ -41,12 +35,6 @@ class YouTube : MainAPI() {
         "live" to "Live",
         "religion" to "Religion"
     )
-
-    /*
-     * --------------------------------------------------
-     * ALLOWED LIVE CHANNELS
-     * --------------------------------------------------
-     */
 
     private val allowedLiveChannels = listOf(
 
@@ -106,10 +94,6 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * INDIAN TRENDING MUSIC
      * --------------------------------------------------
-     *
-     * Priority:
-     * 1. Hindi Indian music
-     * 2. Indian Bengali music
      */
 
     private val indianMusicQueries = listOf(
@@ -125,7 +109,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * MOVIE SEARCH
+     * MOVIES
      * --------------------------------------------------
      */
 
@@ -137,10 +121,6 @@ class YouTube : MainAPI() {
         "Hindi full movie"
     )
 
-    /*
-     * Bangladesh-specific keywords.
-     */
-
     private val bangladeshKeywords = listOf(
         "bangladesh",
         "bangladeshi",
@@ -149,10 +129,6 @@ class YouTube : MainAPI() {
         "bd movie",
         "bangla natok"
     )
-
-    /*
-     * Pakistan-specific music keywords.
-     */
 
     private val pakistanMusicKeywords = listOf(
         "pakistan",
@@ -165,15 +141,11 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * RELIGION PLAYLIST SEARCH
+     * RELIGION
      * --------------------------------------------------
      *
-     * IMPORTANT PRIORITY:
-     *
-     * 1. Bengali Hindu religious serial playlists
-     * 2. Hindi Hindu religious serial playlists
-     *
-     * Bengali queries are intentionally placed FIRST.
+     * Bengali playlists FIRST.
+     * Hindi playlists SECOND.
      */
 
     private val bengaliReligionQueries = listOf(
@@ -192,15 +164,14 @@ class YouTube : MainAPI() {
         "বাংলা রাধাকৃষ্ণ সিরিয়াল playlist",
         "বাংলা সীতারাম সিরিয়াল playlist",
         "বাংলা হিন্দু পৌরাণিক সিরিয়াল playlist",
+
         "Bengali Mahabharat full episodes playlist",
         "Bengali Ramayan full episodes playlist",
+        "Bengali Jai Hanuman serial full episodes playlist",
+        "Bengali Shri Krishna serial full episodes playlist",
         "Bengali Hindu mythological serial full episodes playlist",
         "Bengali Hindu religious serial playlist"
     )
-
-    /*
-     * Hindi queries come AFTER all Bengali queries.
-     */
 
     private val hindiReligionQueries = listOf(
 
@@ -224,11 +195,6 @@ class YouTube : MainAPI() {
         "Hindu mythological serial full episodes playlist Hindi"
     )
 
-    /*
-     * Words that usually indicate devotional music
-     * instead of a serial playlist.
-     */
-
     private val religionExcludeKeywords = listOf(
         "bhajan",
         "bhajans",
@@ -246,58 +212,67 @@ class YouTube : MainAPI() {
         "dj"
     )
 
-    /*
-     * Strong Hindu serial / mythology keywords.
-     */
-
     private val religionIncludeKeywords = listOf(
         "mahabharat",
         "mahabharata",
         "মহাভারত",
+
         "ramayan",
         "ramayana",
         "রামায়ণ",
         "রামায়ণ",
+
         "hanuman",
         "হনুমান",
         "bajrang",
+
         "krishna",
         "কৃষ্ণ",
         "shri krishna",
         "শ্রীকৃষ্ণ",
         "jai shri krishna",
+
         "vishnu",
         "বিষ্ণু",
         "vishnu puran",
+
         "mahadev",
         "মহাদেব",
         "devon ke dev",
+
         "shiv",
         "shiva",
         "শিব",
         "om namah shivay",
+
         "ganesh",
         "ganesha",
         "গণেশ",
         "vighnaharta",
+
         "radha",
         "রাধা",
         "radha krishn",
+
         "sita",
         "সীতা",
         "siya ke ram",
+
         "suryaputra karn",
         "karn",
         "karna",
+
         "mahakali",
         "durga",
         "দুর্গা",
         "parvati",
         "পার্বতী",
+
         "shani",
         "narayan",
         "নারায়ণ",
         "ram siya",
+
         "mythological",
         "পৌরাণিক",
         "ধর্মীয়",
@@ -413,7 +388,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * INDIAN TRENDING MUSIC
+     * TRENDING MUSIC
      * --------------------------------------------------
      */
 
@@ -443,9 +418,7 @@ class YouTube : MainAPI() {
             try {
 
                 val extractor =
-                    service.getSearchExtractor(
-                        query
-                    )
+                    service.getSearchExtractor(query)
 
                 extractor.fetchPage()
 
@@ -601,9 +574,7 @@ class YouTube : MainAPI() {
             try {
 
                 val extractor =
-                    service.getSearchExtractor(
-                        query
-                    )
+                    service.getSearchExtractor(query)
 
                 extractor.fetchPage()
 
@@ -697,13 +668,8 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * CURATED LIVE
+     * LIVE
      * --------------------------------------------------
-     *
-     * Exactly ONE live stream per channel.
-     *
-     * If several streams are live on the same channel,
-     * the earliest-started one is selected.
      */
 
     private suspend fun getCuratedLivePage(
@@ -803,7 +769,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * SELECT OLDEST LIVE
+     * OLDEST LIVE STREAM
      * --------------------------------------------------
      */
 
@@ -872,12 +838,8 @@ class YouTube : MainAPI() {
      * RELIGION
      * --------------------------------------------------
      *
-     * PRIORITY:
-     *
-     * Bengali playlists FIRST
-     * Hindi playlists SECOND
-     *
-     * Playlist cards only.
+     * Bengali first.
+     * Hindi second.
      */
 
     private suspend fun getReligionPage(
@@ -898,10 +860,8 @@ class YouTube : MainAPI() {
             mutableSetOf<String>()
 
         /*
-         * --------------------------------------------------
-         * STEP 1
-         * --------------------------------------------------
-         * Bengali playlists FIRST
+         * FIRST:
+         * Bengali religious serial playlists.
          */
 
         collectReligionPlaylists(
@@ -912,10 +872,8 @@ class YouTube : MainAPI() {
         )
 
         /*
-         * --------------------------------------------------
-         * STEP 2
-         * --------------------------------------------------
-         * Hindi playlists AFTER Bengali results.
+         * SECOND:
+         * Hindi religious serial playlists.
          */
 
         if (results.size < 40) {
@@ -942,7 +900,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * COLLECT RELIGION PLAYLISTS
+     * RELIGION PLAYLIST COLLECTOR
      * --------------------------------------------------
      */
 
@@ -962,9 +920,7 @@ class YouTube : MainAPI() {
             try {
 
                 val extractor =
-                    service.getSearchExtractor(
-                        query
-                    )
+                    service.getSearchExtractor(query)
 
                 extractor.fetchPage()
 
@@ -975,7 +931,7 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Only playlists.
+                     * Only playlist results.
                      */
 
                     if (item !is PlaylistInfoItem) {
@@ -1027,7 +983,7 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Remove obvious Bangladesh results.
+                     * Remove Bangladesh results.
                      */
 
                     if (
@@ -1040,8 +996,8 @@ class YouTube : MainAPI() {
                     }
 
                     /*
-                     * Must look like a Hindu
-                     * religious/mythological serial.
+                     * Only recognizable Hindu
+                     * religious/mythological serials.
                      */
 
                     if (
@@ -1131,8 +1087,6 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * NORMAL SEARCH
      * --------------------------------------------------
-     *
-     * Search remains unrestricted.
      */
 
     override suspend fun search(
@@ -1368,7 +1322,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * VIDEO LOAD
+     * VIDEO
      * --------------------------------------------------
      */
 
@@ -1377,9 +1331,7 @@ class YouTube : MainAPI() {
     ): LoadResponse {
 
         val extractor =
-            service.getStreamExtractor(
-                url
-            )
+            service.getStreamExtractor(url)
 
         extractor.fetchPage()
 
@@ -1458,9 +1410,7 @@ class YouTube : MainAPI() {
     ): LoadResponse {
 
         val extractor =
-            service.getChannelExtractor(
-                url
-            )
+            service.getChannelExtractor(url)
 
         extractor.fetchPage()
 
@@ -1488,10 +1438,11 @@ class YouTube : MainAPI() {
                 it.url.contains(
                     "/videos"
                 )
-            } ?: tabs.firstOrNull()
-            ?: throw RuntimeException(
-                "No videos tab found"
-            )
+            }
+                ?: tabs.firstOrNull()
+                ?: throw RuntimeException(
+                    "No videos tab found"
+                )
 
         val videosExtractor =
             service.getChannelTabExtractor(
@@ -1593,10 +1544,6 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * PLAYLIST
      * --------------------------------------------------
-     *
-     * Religion playlist cards open here.
-     *
-     * Episodes are loaded in YouTube playlist order.
      */
 
     private suspend fun loadPlaylist(
@@ -1604,9 +1551,7 @@ class YouTube : MainAPI() {
     ): LoadResponse {
 
         val extractor =
-            service.getPlaylistExtractor(
-                url
-            )
+            service.getPlaylistExtractor(url)
 
         extractor.fetchPage()
 
@@ -1629,6 +1574,10 @@ class YouTube : MainAPI() {
         val episodes =
             mutableListOf<Episode>()
 
+        /*
+         * FIRST PLAYLIST PAGE
+         */
+
         var page =
             extractor.getInitialPage()
 
@@ -1649,6 +1598,10 @@ class YouTube : MainAPI() {
                 }
             }
         )
+
+        /*
+         * ADDITIONAL PLAYLIST PAGES
+         */
 
         var pagesLoaded = 1
 
@@ -1678,9 +1631,9 @@ class YouTube : MainAPI() {
                             item.thumbnails
                                 .lastOrNull()
                                 ?.url
+                    }
                 }
             )
-            }
 
             pagesLoaded++
         }
@@ -1736,13 +1689,7 @@ class YouTube : MainAPI() {
      * PLAYBACK
      * --------------------------------------------------
      *
-     * KEEP CURRENT HIGH-SPEED SYSTEM.
-     *
-     * VOD -> DASH
-     * LIVE -> HLS
-     * fallback -> CloudStream extractor
-     *
-     * No speed-related changes are made here.
+     * Current high-speed adaptive playback is kept.
      */
 
     override suspend fun loadLinks(
@@ -1855,7 +1802,7 @@ class YouTube : MainAPI() {
             }
 
             /*
-             * HLS fallback.
+             * HLS fallback
              */
 
             val hlsUrl =
@@ -1888,8 +1835,7 @@ class YouTube : MainAPI() {
 
         } catch (_: Exception) {
             /*
-             * Fall back to the known working
-             * CloudStream extractor.
+             * Fall back to CloudStream extractor.
              */
         }
 
