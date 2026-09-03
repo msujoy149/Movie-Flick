@@ -153,66 +153,385 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * BENGALI RELIGION PLAYLIST SEARCH
+     * BENGALI DUBBED RELIGIOUS SERIALS
      * --------------------------------------------------
      *
-     * Bengali is always searched first.
+     * ONLY Hindi-origin religious/mythological shows
+     * that have Bengali dubbed versions are targeted here.
+     *
+     * Direct Kolkata-original religious serials are NOT
+     * the priority.
+     *
+     * Bengali candidates are always collected first.
      */
 
-    private val bengaliReligionQueries = listOf(
-        "বাংলা মহাভারত সম্পূর্ণ পর্ব playlist",
-        "বাংলা মহাভারত সিরিয়াল playlist",
-        "বাংলা রামায়ণ সম্পূর্ণ পর্ব playlist",
-        "বাংলা রামায়ণ সিরিয়াল playlist",
-        "বাংলা জয় হনুমান সিরিয়াল playlist",
-        "বাংলা শ্রীকৃষ্ণ সিরিয়াল playlist",
-        "বাংলা কৃষ্ণ সিরিয়াল সম্পূর্ণ পর্ব playlist",
-        "বাংলা বিষ্ণু পুরাণ সিরিয়াল playlist",
-        "বাংলা মহাদেব সিরিয়াল playlist",
-        "বাংলা শিব পুরাণ সিরিয়াল playlist",
-        "বাংলা গণেশ সিরিয়াল playlist",
-        "বাংলা রাধাকৃষ্ণ সিরিয়াল playlist",
-        "বাংলা সীতারাম সিরিয়াল playlist",
-        "বাংলা হিন্দু পৌরাণিক সিরিয়াল playlist",
+    private data class BengaliDubbedShow(
+        val key: String,
+        val bengaliNames: List<String>,
+        val hindiNames: List<String>,
+        val officialChannels: List<String>
+    )
 
-        "Bengali Mahabharat full episodes playlist",
-        "Bengali Ramayan full episodes playlist",
-        "Bengali Jai Hanuman serial full episodes playlist",
-        "Bengali Shri Krishna serial full episodes playlist",
-        "Bengali Hindu mythological serial full episodes playlist",
-        "Bengali Hindu religious serial playlist"
+    private val bengaliDubbedShows = listOf(
+
+        BengaliDubbedShow(
+            key = "mahabharat",
+            bengaliNames = listOf(
+                "মহাভারত",
+                "Mahabharat Bangla",
+                "Mahabharat Bengali",
+                "Mahabharat Bengali dubbed",
+                "Mahabharat Bangla dubbed"
+            ),
+            hindiNames = listOf(
+                "Mahabharat 2013",
+                "Mahabharat Star Plus"
+            ),
+            officialChannels = listOf(
+                "Star Jalsha",
+                "Star Plus",
+                "Star Bharat"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "siya_ke_ram",
+            bengaliNames = listOf(
+                "সীতা",
+                "Sita Bangla",
+                "Sita Bengali",
+                "Siya Ke Ram Bengali",
+                "Siya Ke Ram Bangla"
+            ),
+            hindiNames = listOf(
+                "Siya Ke Ram",
+                "Siya Ke Ram Star Plus"
+            ),
+            officialChannels = listOf(
+                "Star Jalsha",
+                "Star Plus"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "jai_shri_krishna",
+            bengaliNames = listOf(
+                "জয় শ্রী কৃষ্ণ",
+                "জয় শ্রী কৃষ্ণ",
+                "Jai Shri Krishna Bengali",
+                "Jai Shri Krishna Bangla"
+            ),
+            hindiNames = listOf(
+                "Jai Shri Krishna",
+                "Jai Shri Krishna Colors"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV",
+                "Sagar Pictures"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "devadidev_mahadev",
+            bengaliNames = listOf(
+                "দেবাদিদেব মহাদেব",
+                "দেবাদিদেব মহাদেব বাংলা",
+                "Devadidev Mahadev Bangla",
+                "Devon Ke Dev Mahadev Bengali",
+                "Devon Ke Dev Mahadev Bangla"
+            ),
+            hindiNames = listOf(
+                "Devon Ke Dev Mahadev",
+                "Devon Ke Dev Mahadev Life OK"
+            ),
+            officialChannels = listOf(
+                "Star Jalsha",
+                "Life OK",
+                "Star Bharat"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "sankatmochan_hanuman",
+            bengaliNames = listOf(
+                "মহাবলী হনুমান",
+                "মহাবলী হনুমান বাংলা",
+                "Sankatmochan Mahabali Hanuman Bengali",
+                "Sankatmochan Mahabali Hanuman Bangla"
+            ),
+            hindiNames = listOf(
+                "Sankatmochan Mahabali Hanuman",
+                "Mahabali Hanuman Sony"
+            ),
+            officialChannels = listOf(
+                "Sony AATH",
+                "Sony Entertainment Television"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "radhakrishn",
+            bengaliNames = listOf(
+                "রাধা কৃষ্ণ",
+                "রাধাকৃষ্ণ",
+                "Radha Krishna Bengali",
+                "RadhaKrishn Bangla",
+                "RadhaKrishn Bengali"
+            ),
+            hindiNames = listOf(
+                "RadhaKrishn",
+                "Radha Krishn Star Bharat"
+            ),
+            officialChannels = listOf(
+                "Star Jalsha",
+                "Star Bharat"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "karmaphal_shani",
+            bengaliNames = listOf(
+                "কর্মফল দাতা শনি",
+                "কর্মফলদাতা শনি",
+                "জয় জয় শনি দেব",
+                "Karmaphal Daata Shani Bengali",
+                "Karmaphal Daata Shani Bangla"
+            ),
+            hindiNames = listOf(
+                "Karmaphal Daata Shani",
+                "Shani Colors TV"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "vighnaharta_ganesh",
+            bengaliNames = listOf(
+                "বিঘ্নহর্তা শ্রী গণেশ",
+                "বিঘ্নহর্তা গণেশ",
+                "Vighnaharta Ganesh Bengali",
+                "Vighnaharta Ganesh Bangla"
+            ),
+            hindiNames = listOf(
+                "Vighnaharta Ganesh",
+                "Vighnaharta Shree Ganesh"
+            ),
+            officialChannels = listOf(
+                "Sony AATH",
+                "Sony Entertainment Television"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "shrimad_ramayan",
+            bengaliNames = listOf(
+                "শ্রীমদ রামায়ণ",
+                "শ্রীমদ রামায়ণ",
+                "Shrimad Ramayan Bangla",
+                "Shrimad Ramayan Bengali"
+            ),
+            hindiNames = listOf(
+                "Shrimad Ramayan",
+                "Shrimad Ramayan Sony"
+            ),
+            officialChannels = listOf(
+                "Sony AATH",
+                "Sony Entertainment Television",
+                "Sony LIV"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "legend_of_hanuman",
+            bengaliNames = listOf(
+                "The Legend of Hanuman Bengali",
+                "The Legend of Hanuman Bangla",
+                "Legend of Hanuman Bangla"
+            ),
+            hindiNames = listOf(
+                "The Legend of Hanuman",
+                "Legend of Hanuman Hindi"
+            ),
+            officialChannels = listOf(
+                "Disney",
+                "DisneyPlusHotstar",
+                "Hotstar"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "suryaputra_karn",
+            bengaliNames = listOf(
+                "সূর্যপুত্র কর্ণ",
+                "Suryaputra Karn Bengali",
+                "Suryaputra Karn Bangla"
+            ),
+            hindiNames = listOf(
+                "Suryaputra Karn"
+            ),
+            officialChannels = listOf(
+                "Sony AATH",
+                "Sony Entertainment Television",
+                "Sony Pal"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "dwarkadheesh",
+            bengaliNames = listOf(
+                "দ্বারকাধীশ",
+                "দ্বারকাধীশ ভগবান শ্রী কৃষ্ণ",
+                "Dwarkadheesh Bengali",
+                "Dwarkadheesh Bangla"
+            ),
+            hindiNames = listOf(
+                "Dwarkadheesh Bhagwaan Shree Krishna",
+                "Dwarkadheesh"
+            ),
+            officialChannels = listOf(
+                "Life OK",
+                "Star Bharat"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "mahakali",
+            bengaliNames = listOf(
+                "মহাকালী",
+                "মহাকালী অন্ত হি আরম্ভ হ্যায়",
+                "Mahakali Bengali",
+                "Mahakali Bangla"
+            ),
+            hindiNames = listOf(
+                "Mahakali Anth Hi Aarambh Hai",
+                "Mahakali Colors"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "jai_hanuman",
+            bengaliNames = listOf(
+                "জয় হনুমান",
+                "জয় হনুমান",
+                "Jai Hanuman Bengali",
+                "Jai Hanuman Bangla"
+            ),
+            hindiNames = listOf(
+                "Jai Hanuman"
+            ),
+            officialChannels = listOf(
+                "Sony AATH",
+                "Sony Entertainment Television"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "mahima_shani",
+            bengaliNames = listOf(
+                "জয় জয় শনি দেব",
+                "মহিমা শনি দেব কি বাংলা",
+                "Mahima Shani Dev Ki Bengali",
+                "Mahima Shani Dev Ki Bangla"
+            ),
+            hindiNames = listOf(
+                "Mahima Shani Dev Ki"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "bal_krishna",
+            bengaliNames = listOf(
+                "বাল কৃষ্ণ",
+                "Bal Krishna Bengali",
+                "Bal Krishna Bangla"
+            ),
+            hindiNames = listOf(
+                "Bal Krishna",
+                "Bal Krishna Hindi serial"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV"
+            )
+        ),
+
+        BengaliDubbedShow(
+            key = "yashomati_nandlala",
+            bengaliNames = listOf(
+                "যশোমতী মাইয়া কে নন্দলালা",
+                "Yashomati Maiyaa Ke Nandlala Bengali",
+                "Yashomati Maiyaa Ke Nandlala Bangla"
+            ),
+            hindiNames = listOf(
+                "Yashomati Maiyaa Ke Nandlala"
+            ),
+            officialChannels = listOf(
+                "Colors Bangla",
+                "Colors TV"
+            )
+        )
     )
 
     /*
      * --------------------------------------------------
-     * HINDI RELIGION PLAYLIST SEARCH
+     * ADDITIONAL HINDI RELIGIOUS SERIALS
      * --------------------------------------------------
+     *
+     * These are used after the Bengali-dubbed section.
      */
 
-    private val hindiReligionQueries = listOf(
-        "Mahabharat Hindi serial full episodes playlist",
-        "Mahabharat Star Plus full episodes playlist",
-        "Ramayan Hindi serial full episodes playlist",
-        "Ramayan full episodes Hindi playlist",
-        "Jai Hanuman Hindi serial full episodes playlist",
-        "Jai Shri Krishna Hindi serial full episodes playlist",
-        "Shree Krishna Hindi serial full episodes playlist",
-        "Vishnu Puran Hindi serial full episodes playlist",
-        "Devon Ke Dev Mahadev full episodes playlist",
-        "Om Namah Shivay Hindi serial full episodes playlist",
-        "Shree Ganesh Hindi serial full episodes playlist",
-        "RadhaKrishn Hindi serial full episodes playlist",
-        "Siya Ke Ram full episodes playlist",
-        "Suryaputra Karn full episodes playlist",
-        "Mahakali Anth Hi Aarambh Hai full episodes playlist",
-        "Vighnaharta Ganesh full episodes playlist",
-        "Ram Siya Ke Luv Kush full episodes playlist",
-        "Hindu mythological serial full episodes playlist Hindi"
+    private val additionalHindiReligionShows = listOf(
+        "Ramayan Ramanand Sagar",
+        "Shri Krishna Ramanand Sagar",
+        "Mahabharat 1988",
+        "Om Namah Shivay",
+        "Vishnu Puran",
+        "Jai Shri Krishna",
+        "Devon Ke Dev Mahadev",
+        "Vighnaharta Ganesh",
+        "Jai Hanuman",
+        "RadhaKrishn",
+        "Siya Ke Ram",
+        "Suryaputra Karn",
+        "Karmaphal Daata Shani",
+        "Mahakali Anth Hi Aarambh Hai",
+        "Sankatmochan Mahabali Hanuman",
+        "Dwarkadheesh Bhagwaan Shree Krishna",
+        "Shani Dev",
+        "Karamphal Data Shani",
+        "Ganesh Leela",
+        "Ram Siya Ke Luv Kush",
+        "Jag Janani Maa Durga",
+        "Jai Jag Janani Maa Durga",
+        "Santoshi Maa",
+        "Sita",
+        "Sita Ram",
+        "Luv Kush",
+        "Radha Krishna",
+        "Krishna Arjun",
+        "Kahat Hanuman Jai Shri Ram",
+        "Sharabha",
+        "Paramavatar Shri Krishna",
+        "RadhaKrishn full episodes",
+        "Mahabharat full episodes Hindi",
+        "Ramayan full episodes Hindi"
     )
 
     /*
      * --------------------------------------------------
-     * RELIGION FILTERS
+     * RELIGION EXCLUDE
      * --------------------------------------------------
      */
 
@@ -226,163 +545,42 @@ class YouTube : MainAPI() {
         "song",
         "songs",
         "music",
+        "devotional songs",
         "playlist songs",
         "status",
         "shorts",
         "remix",
-        "dj"
-    )
-
-    private val religionIncludeKeywords = listOf(
-        "mahabharat",
-        "mahabharata",
-        "মহাভারত",
-
-        "ramayan",
-        "ramayana",
-        "রামায়ণ",
-        "রামায়ণ",
-
-        "hanuman",
-        "হনুমান",
-        "bajrang",
-
-        "krishna",
-        "কৃষ্ণ",
-        "shri krishna",
-        "শ্রীকৃষ্ণ",
-
-        "vishnu",
-        "বিষ্ণু",
-        "vishnu puran",
-
-        "mahadev",
-        "মহাদেব",
-        "devon ke dev",
-
-        "shiv",
-        "shiva",
-        "শিব",
-        "om namah shivay",
-
-        "ganesh",
-        "ganesha",
-        "গণেশ",
-        "vighnaharta",
-
-        "radha",
-        "রাধা",
-        "radha krishn",
-
-        "sita",
-        "সীতা",
-        "siya ke ram",
-
-        "suryaputra karn",
-        "karn",
-        "karna",
-
-        "mahakali",
-        "durga",
-        "দুর্গা",
-        "parvati",
-        "পার্বতী",
-
-        "shani",
-        "narayan",
-        "নারায়ণ",
-        "ram siya",
-
-        "mythological",
-        "পৌরাণিক",
-        "ধর্মীয়",
-        "ধর্মীয়"
-    )
-
-    /*
-     * --------------------------------------------------
-     * OFFICIAL / MAIN SOURCE SIGNALS
-     * --------------------------------------------------
-     *
-     * These words increase the score of an official
-     * broadcaster / main publisher playlist.
-     */
-
-    private val officialSourceKeywords = listOf(
-        "official",
-        "official channel",
-        "official playlist",
-        "star jalsha",
-        "jalsha",
-        "starplus",
-        "star plus",
-        "sony",
-        "sony tv",
-        "sony entertainment",
-        "sony sab",
-        "sab tv",
-        "colors",
-        "colors tv",
-        "colors bangla",
-        "zee",
-        "zee bangla",
-        "zee tv",
-        "zee5",
-        "sagar pictures",
-        "sagar films",
-        "t series",
-        "t-series",
-        "shemaroo",
-        "shemaroo tv",
-        "epic",
-        "epic tv",
-        "dd national",
-        "doordarshan",
-        "dd bangla",
-        "ramayan",
-        "sita ram",
-        "star",
-        "viacom",
-        "network18"
-    )
-
-    /*
-     * Words commonly associated with personal/reposted
-     * playlists. These receive a penalty.
-     */
-
-    private val userPlaylistPenaltyKeywords = listOf(
-        "my playlist",
-        "my collection",
-        "collection",
-        "saved",
-        "favourite",
-        "favorites",
-        "favorite",
-        "best episodes",
-        "all episodes collection",
+        "dj",
+        "edit",
+        "fan edit",
         "fan made",
         "fanmade",
-        "fans",
-        "fan club",
-        "personal",
-        "backup",
-        "reupload",
-        "re-upload",
-        "archive",
-        "clips",
-        "mixed",
-        "mix",
-        "part 1",
-        "part 2",
-        "part 3"
+        "reaction",
+        "review",
+        "explained",
+        "story explained",
+        "recap"
     )
 
     /*
-     * Known serial groups.
-     *
-     * The key is used to make sure the same serial
-     * cannot appear repeatedly.
+     * --------------------------------------------------
+     * BANGLADESH EXCLUDE
+     * --------------------------------------------------
+     */
+
+    private val religionBangladeshKeywords = listOf(
+        "bangladesh",
+        "bangladeshi",
+        "dhallywood",
+        "dhaka",
+        "bd",
+        "bangla natok"
+    )
+
+    /*
+     * --------------------------------------------------
+     * RELIGION SERIES ALIASES
+     * --------------------------------------------------
      */
 
     private val religionSeriesAliases = mapOf(
@@ -400,31 +598,107 @@ class YouTube : MainAPI() {
             "রামায়ণ"
         ),
 
+        "siya_ke_ram" to listOf(
+            "siya ke ram",
+            "sita",
+            "সীতা"
+        ),
+
+        "jai_shri_krishna" to listOf(
+            "jai shri krishna",
+            "shree krishna",
+            "shri krishna",
+            "জয় শ্রী কৃষ্ণ",
+            "জয় শ্রী কৃষ্ণ"
+        ),
+
+        "devadidev_mahadev" to listOf(
+            "devon ke dev mahadev",
+            "devadidev mahadev",
+            "devadidev",
+            "mahadev",
+            "দেবাদিদেব মহাদেব",
+            "মহাদেব"
+        ),
+
+        "sankatmochan_hanuman" to listOf(
+            "sankatmochan mahabali hanuman",
+            "mahabali hanuman",
+            "মহাবলী হনুমান"
+        ),
+
+        "radhakrishn" to listOf(
+            "radhakrishn",
+            "radha krishna",
+            "radha krishn",
+            "রাধাকৃষ্ণ",
+            "রাধা কৃষ্ণ"
+        ),
+
+        "karmaphal_shani" to listOf(
+            "karmaphal daata shani",
+            "karmphal data shani",
+            "karmaphal shani",
+            "কর্মফল দাতা শনি"
+        ),
+
+        "vighnaharta_ganesh" to listOf(
+            "vighnaharta ganesh",
+            "shree ganesh",
+            "shri ganesh",
+            "বিঘ্নহর্তা গণেশ",
+            "গণেশ"
+        ),
+
+        "shrimad_ramayan" to listOf(
+            "shrimad ramayan",
+            "শ্রীমদ রামায়ণ",
+            "শ্রীমদ রামায়ণ"
+        ),
+
+        "legend_of_hanuman" to listOf(
+            "legend of hanuman"
+        ),
+
+        "suryaputra_karn" to listOf(
+            "suryaputra karn",
+            "suryaputra karna",
+            "সূর্যপুত্র কর্ণ"
+        ),
+
+        "dwarkadheesh" to listOf(
+            "dwarkadheesh",
+            "dwarkadhish",
+            "দ্বারকাধীশ"
+        ),
+
+        "mahakali" to listOf(
+            "mahakali",
+            "mahakali anth hi aarambh hai",
+            "মহাকালী"
+        ),
+
         "jai_hanuman" to listOf(
             "jai hanuman",
             "জয় হনুমান",
             "জয় হনুমান"
         ),
 
-        "krishna" to listOf(
-            "jai shri krishna",
-            "shree krishna",
-            "shri krishna",
-            "radha krishna",
-            "radha krishn",
-            "শ্রীকৃষ্ণ",
-            "রাধাকৃষ্ণ"
+        "mahima_shani" to listOf(
+            "mahima shani dev ki",
+            "mahima shani",
+            "জয় জয় শনি দেব"
         ),
 
-        "vishnu_puran" to listOf(
-            "vishnu puran",
-            "বিষ্ণু পুরাণ"
+        "bal_krishna" to listOf(
+            "bal krishna",
+            "বাল কৃষ্ণ"
         ),
 
-        "devon_ke_dev_mahadev" to listOf(
-            "devon ke dev mahadev",
-            "devon ke dev mahadev",
-            "mahadev"
+        "yashomati_nandlala" to listOf(
+            "yashomati maiyaa ke nandlala",
+            "yashomati",
+            "যশোমতী"
         ),
 
         "om_namah_shivay" to listOf(
@@ -432,45 +706,46 @@ class YouTube : MainAPI() {
             "om namah shivaya"
         ),
 
-        "ganesh" to listOf(
-            "vighnaharta ganesh",
-            "shree ganesh",
-            "shri ganesh",
-            "ganesh",
-            "গণেশ"
+        "vishnu_puran" to listOf(
+            "vishnu puran",
+            "বিষ্ণু পুরাণ"
         ),
 
-        "siya_ke_ram" to listOf(
-            "siya ke ram",
+        "ram_siyaa_ke_luv_kush" to listOf(
             "ram siya ke luv kush",
-            "siya ke ram"
+            "ram siya ke luvkush"
         ),
 
-        "suryaputra_karn" to listOf(
-            "suryaputra karn",
-            "suryaputra karna",
-            "suryaputra"
+        "jag_janani_durga" to listOf(
+            "jag janani maa durga",
+            "jag janani durga"
         ),
 
-        "mahakali" to listOf(
-            "mahakali",
-            "mahakali anth hi aarambh hai"
+        "santoshi_maa" to listOf(
+            "santoshi maa",
+            "santoshi ma"
         ),
 
-        "durga" to listOf(
-            "durga",
-            "দুর্গা"
+        "paramavatar_shri_krishna" to listOf(
+            "paramavatar shri krishna",
+            "paramavatar krishna"
         ),
 
-        "parvati" to listOf(
-            "parvati",
-            "পার্বতী"
+        "kahat_hanuman" to listOf(
+            "kahat hanuman jai shri ram"
         ),
 
-        "shani" to listOf(
-            "shani",
+        "shani_dev" to listOf(
             "shani dev",
-            "শনি"
+            "shani"
+        ),
+
+        "krishna_arjun" to listOf(
+            "krishna arjun"
+        ),
+
+        "ganesh_leela" to listOf(
+            "ganesh leela"
         )
     )
 
@@ -964,7 +1239,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * OLDEST LIVE STREAM
+     * OLDEST LIVE
      * --------------------------------------------------
      */
 
@@ -1033,13 +1308,25 @@ class YouTube : MainAPI() {
      * RELIGION
      * --------------------------------------------------
      *
+     * FINAL ORDER:
+     *
+     * 1. Bengali dubbed religious serials
+     * 2. Hindi versions of those serials
+     * 3. Other Hindi religious/mythological serials
+     *
      * IMPORTANT:
      *
-     * Bengali candidates are collected first.
-     * Hindi candidates are collected second.
+     * Bengali Mahabharat != Hindi Mahabharat
      *
-     * Duplicate serials are removed by SERIES KEY,
-     * NOT by playlist URL.
+     * Therefore both can appear.
+     *
+     * But:
+     *
+     * Bengali Mahabharat playlist x10
+     * -> ONLY ONE Bengali Mahabharat
+     *
+     * Hindi Mahabharat playlist x10
+     * -> ONLY ONE Hindi Mahabharat
      */
 
     private suspend fun getReligionPage(
@@ -1053,67 +1340,144 @@ class YouTube : MainAPI() {
             )
         }
 
-        val candidates =
+        /*
+         * ----------------------------------------------
+         * BENGALI DUBBED SECTION
+         * ----------------------------------------------
+         */
+
+        val bengaliResults =
             mutableListOf<ReligionPlaylistCandidate>()
 
-        val seenPlaylistUrls =
-            mutableSetOf<String>()
+        for (show in bengaliDubbedShows) {
+
+            if (bengaliResults.size >= 18) {
+                break
+            }
+
+            val best =
+                findBestBengaliPlaylist(
+                    show
+                )
+
+            if (best != null) {
+                bengaliResults.add(best)
+            }
+        }
 
         /*
          * ----------------------------------------------
-         * BENGALI FIRST
+         * HINDI VERSION OF SAME POPULAR SHOWS
          * ----------------------------------------------
+         *
+         * Even if Bengali version exists, Hindi version
+         * MUST also be allowed.
          */
 
-        collectReligionCandidates(
-            queries = bengaliReligionQueries,
-            language = ReligionLanguage.BENGALI,
-            candidates = candidates,
-            seenPlaylistUrls = seenPlaylistUrls
-        )
+        val hindiResults =
+            mutableListOf<ReligionPlaylistCandidate>()
+
+        for (show in bengaliDubbedShows) {
+
+            if (hindiResults.size >= 18) {
+                break
+            }
+
+            val best =
+                findBestHindiPlaylist(
+                    show
+                )
+
+            if (best != null) {
+                hindiResults.add(best)
+            }
+        }
 
         /*
          * ----------------------------------------------
-         * HINDI SECOND
+         * ADDITIONAL HINDI SHOWS
          * ----------------------------------------------
          */
 
-        collectReligionCandidates(
-            queries = hindiReligionQueries,
-            language = ReligionLanguage.HINDI,
-            candidates = candidates,
-            seenPlaylistUrls = seenPlaylistUrls
-        )
+        if (hindiResults.size < 30) {
 
-        /*
-         * ----------------------------------------------
-         * DEDUPLICATE BY SERIAL
-         * ----------------------------------------------
-         */
+            val existingHindiKeys =
+                hindiResults
+                    .map {
+                        it.seriesKey
+                    }
+                    .toMutableSet()
 
-        val selected =
-            selectBestReligionPlaylists(
-                candidates
-            )
+            for (query in additionalHindiReligionShows) {
 
-        val results =
-            selected.map { candidate ->
+                if (hindiResults.size >= 30) {
+                    break
+                }
 
-                newMovieSearchResponse(
-                    candidate.title,
-                    candidate.url,
-                    TvType.TvSeries
-                ) {
-                    posterUrl =
-                        candidate.thumbnail
+                try {
+
+                    val candidate =
+                        findBestAdditionalHindiPlaylist(
+                            query
+                        )
+                            ?: continue
+
+                    if (
+                        candidate.seriesKey in
+                        existingHindiKeys
+                    ) {
+                        continue
+                    }
+
+                    existingHindiKeys.add(
+                        candidate.seriesKey
+                    )
+
+                    hindiResults.add(
+                        candidate
+                    )
+
+                } catch (_: Exception) {
+                    continue
                 }
             }
+        }
+
+        /*
+         * ----------------------------------------------
+         * FINAL ORDER
+         * ----------------------------------------------
+         *
+         * Bengali first.
+         * Hindi second.
+         *
+         * Target:
+         * Bengali <= 18
+         * Hindi <= 30
+         *
+         * Total target <= 48.
+         */
+
+        val finalResults =
+            mutableListOf<SearchResponse>()
+
+        finalResults.addAll(
+            bengaliResults.map {
+                it.toSearchResponse()
+            }
+        )
+
+        finalResults.addAll(
+            hindiResults.map {
+                it.toSearchResponse()
+            }
+        )
 
         return newHomePageResponse(
             listOf(
                 HomePageList(
                     "Religion",
-                    results,
+                    finalResults,
                     false
                 )
             ),
@@ -1123,7 +1487,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * RELIGION CANDIDATE
+     * RELIGION PLAYLIST CANDIDATE
      * --------------------------------------------------
      */
 
@@ -1135,7 +1499,21 @@ class YouTube : MainAPI() {
         val language: ReligionLanguage,
         val seriesKey: String,
         val score: Int
-    )
+    ) {
+
+        fun toSearchResponse(): SearchResponse {
+
+            return newMovieSearchResponse(
+                title,
+                url,
+                TvType.TvSeries
+            ) {
+
+                posterUrl =
+                    thumbnail
+            }
+        }
+    }
 
     private enum class ReligionLanguage {
         BENGALI,
@@ -1144,16 +1522,37 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * COLLECT RELIGION CANDIDATES
+     * BEST BENGALI PLAYLIST
      * --------------------------------------------------
      */
 
-    private suspend fun collectReligionCandidates(
-        queries: List<String>,
-        language: ReligionLanguage,
-        candidates: MutableList<ReligionPlaylistCandidate>,
-        seenPlaylistUrls: MutableSet<String>
-    ) {
+    private suspend fun findBestBengaliPlaylist(
+        show: BengaliDubbedShow
+    ): ReligionPlaylistCandidate? {
+
+        val candidates =
+            mutableListOf<ReligionPlaylistCandidate>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        /*
+         * Search the exact Bengali dubbed name first.
+         */
+
+        val queries =
+            mutableListOf<String>()
+
+        for (name in show.bengaliNames) {
+
+            queries.add(
+                "$name full episodes playlist"
+            )
+
+            queries.add(
+                "$name all episodes playlist"
+            )
+        }
 
         for (query in queries) {
 
@@ -1188,9 +1587,7 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    if (
-                        !seenPlaylistUrls.add(url)
-                    ) {
+                    if (!seenUrls.add(url)) {
                         continue
                     }
 
@@ -1203,49 +1600,18 @@ class YouTube : MainAPI() {
                         continue
                     }
 
-                    if (
-                        containsAny(
-                            title,
-                            religionExcludeKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (
-                        containsAny(
-                            title,
-                            bangladeshKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
-                    if (
-                        !containsAny(
-                            title,
-                            religionIncludeKeywords
-                        )
-                    ) {
-                        continue
-                    }
-
                     val uploader =
                         item.uploaderName
                             ?.trim()
                             ?: ""
 
-                    /*
-                     * Determine which serial this playlist
-                     * belongs to.
-                     */
-
-                    val seriesKey =
-                        detectReligionSeriesKey(
-                            title
+                    if (
+                        !isValidBengaliDubbedPlaylist(
+                            title,
+                            uploader,
+                            show
                         )
-
-                    if (seriesKey == null) {
+                    ) {
                         continue
                     }
 
@@ -1253,16 +1619,12 @@ class YouTube : MainAPI() {
                         item.thumbnails
                             .lastOrNull()
                             ?.url
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
 
                     val score =
-                        calculateReligionPlaylistScore(
+                        calculateBengaliPlaylistScore(
                             title = title,
                             uploader = uploader,
-                            language = language,
-                            seriesKey = seriesKey
+                            show = show
                         )
 
                     candidates.add(
@@ -1271,8 +1633,8 @@ class YouTube : MainAPI() {
                             url = url,
                             thumbnail = thumbnail,
                             uploader = uploader,
-                            language = language,
-                            seriesKey = seriesKey,
+                            language = ReligionLanguage.BENGALI,
+                            seriesKey = show.key,
                             score = score
                         )
                     )
@@ -1282,100 +1644,808 @@ class YouTube : MainAPI() {
                 continue
             }
         }
-    }
 
-    /*
-     * --------------------------------------------------
-     * SELECT BEST PLAYLISTS
-     * --------------------------------------------------
-     *
-     * This is the important duplicate-removal step.
-     *
-     * Same seriesKey = same serial.
-     *
-     * Only ONE playlist is retained for each serial
-     * and language.
-     */
-
-    private fun selectBestReligionPlaylists(
-        candidates: List<ReligionPlaylistCandidate>
-    ): List<ReligionPlaylistCandidate> {
-
-        /*
-         * First group by:
-         *
-         * serial + language
-         *
-         * This means Bengali Mahabharat and Hindi
-         * Mahabharat can both exist, because they are
-         * different language versions.
-         */
-
-        val groups =
-            candidates.groupBy {
-                "${it.language.name}:"
-                    .plus(it.seriesKey)
-            }
-
-        val selected =
-            mutableListOf<ReligionPlaylistCandidate>()
-
-        for ((_, group) in groups) {
-
-            val best =
-                group.maxWithOrNull(
-                    compareBy<ReligionPlaylistCandidate> {
-                        it.score
-                    }.thenByDescending {
-                        it.title.length
-                    }
-                )
-
-            if (best != null) {
-                selected.add(best)
-            }
-        }
-
-        /*
-         * Bengali groups FIRST.
-         * Hindi groups SECOND.
-         */
-
-        return selected.sortedWith(
+        return candidates.maxWithOrNull(
             compareBy<ReligionPlaylistCandidate> {
-                when (it.language) {
-                    ReligionLanguage.BENGALI -> 0
-                    ReligionLanguage.HINDI -> 1
-                }
-            }.thenByDescending {
                 it.score
+            }.thenByDescending {
+                it.title.length
             }
         )
     }
 
     /*
      * --------------------------------------------------
-     * DETECT SERIAL KEY
+     * BEST HINDI PLAYLIST
+     * --------------------------------------------------
+     */
+
+    private suspend fun findBestHindiPlaylist(
+        show: BengaliDubbedShow
+    ): ReligionPlaylistCandidate? {
+
+        val candidates =
+            mutableListOf<ReligionPlaylistCandidate>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        val queries =
+            mutableListOf<String>()
+
+        for (name in show.hindiNames) {
+
+            queries.add(
+                "$name full episodes playlist"
+            )
+
+            queries.add(
+                "$name all episodes playlist"
+            )
+
+            queries.add(
+                "$name complete episodes playlist"
+            )
+        }
+
+        for (query in queries) {
+
+            try {
+
+                val extractor =
+                    service.getSearchExtractor(query)
+
+                extractor.fetchPage()
+
+                for (item in extractor.initialPage.items) {
+
+                    if (item !is PlaylistInfoItem) {
+                        continue
+                    }
+
+                    val url =
+                        item.url
+                            ?.trim()
+                            ?: continue
+
+                    if (url.isBlank()) {
+                        continue
+                    }
+
+                    if (
+                        !url.contains(
+                            "playlist?list=",
+                            ignoreCase = true
+                        )
+                    ) {
+                        continue
+                    }
+
+                    if (!seenUrls.add(url)) {
+                        continue
+                    }
+
+                    val title =
+                        item.name
+                            ?.trim()
+                            ?: continue
+
+                    if (title.isBlank()) {
+                        continue
+                    }
+
+                    val uploader =
+                        item.uploaderName
+                            ?.trim()
+                            ?: ""
+
+                    if (
+                        !isValidHindiPlaylist(
+                            title,
+                            uploader,
+                            show
+                        )
+                    ) {
+                        continue
+                    }
+
+                    val thumbnail =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+
+                    val score =
+                        calculateHindiPlaylistScore(
+                            title = title,
+                            uploader = uploader,
+                            show = show
+                        )
+
+                    candidates.add(
+                        ReligionPlaylistCandidate(
+                            title = title,
+                            url = url,
+                            thumbnail = thumbnail,
+                            uploader = uploader,
+                            language = ReligionLanguage.HINDI,
+                            seriesKey = show.key,
+                            score = score
+                        )
+                    )
+                }
+
+            } catch (_: Exception) {
+                continue
+            }
+        }
+
+        return candidates.maxWithOrNull(
+            compareBy<ReligionPlaylistCandidate> {
+                it.score
+            }.thenByDescending {
+                it.title.length
+            }
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * ADDITIONAL HINDI PLAYLIST
+     * --------------------------------------------------
+     */
+
+    private suspend fun findBestAdditionalHindiPlaylist(
+        query: String
+    ): ReligionPlaylistCandidate? {
+
+        val candidates =
+            mutableListOf<ReligionPlaylistCandidate>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        try {
+
+            val extractor =
+                service.getSearchExtractor(
+                    "$query full episodes playlist"
+                )
+
+            extractor.fetchPage()
+
+            for (item in extractor.initialPage.items) {
+
+                if (item !is PlaylistInfoItem) {
+                    continue
+                }
+
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: continue
+
+                if (url.isBlank()) {
+                    continue
+                }
+
+                if (
+                    !url.contains(
+                        "playlist?list=",
+                        ignoreCase = true
+                    )
+                ) {
+                    continue
+                }
+
+                if (!seenUrls.add(url)) {
+                    continue
+                }
+
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                val uploader =
+                    item.uploaderName
+                        ?.trim()
+                        ?: ""
+
+                if (
+                    !isValidGeneralHindiReligionPlaylist(
+                        title,
+                        uploader
+                    )
+                ) {
+                    continue
+                }
+
+                val seriesKey =
+                    detectReligionSeriesKey(
+                        "$query $title"
+                    )
+                        ?: continue
+
+                val thumbnail =
+                    item.thumbnails
+                        .lastOrNull()
+                        ?.url
+
+                val score =
+                    calculateGeneralHindiScore(
+                        title,
+                        uploader
+                    )
+
+                candidates.add(
+                    ReligionPlaylistCandidate(
+                        title = title,
+                        url = url,
+                        thumbnail = thumbnail,
+                        uploader = uploader,
+                        language = ReligionLanguage.HINDI,
+                        seriesKey = seriesKey,
+                        score = score
+                    )
+                )
+            }
+
+        } catch (_: Exception) {
+            return null
+        }
+
+        return candidates.maxWithOrNull(
+            compareBy<ReligionPlaylistCandidate> {
+                it.score
+            }.thenByDescending {
+                it.title.length
+            }
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * BENGALI DUB VALIDATION
+     * --------------------------------------------------
+     */
+
+    private fun isValidBengaliDubbedPlaylist(
+        title: String,
+        uploader: String,
+        show: BengaliDubbedShow
+    ): Boolean {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        if (
+            containsAny(
+                combined,
+                religionExcludeKeywords
+            )
+        ) {
+            return false
+        }
+
+        if (
+            containsAny(
+                combined,
+                religionBangladeshKeywords
+            )
+        ) {
+            return false
+        }
+
+        /*
+         * Must match the intended show.
+         */
+
+        val matchesShow =
+            show.bengaliNames.any {
+                combined.contains(
+                    it.lowercase()
+                )
+            }
+
+        if (!matchesShow) {
+            return false
+        }
+
+        return true
+    }
+
+    /*
+     * --------------------------------------------------
+     * HINDI VALIDATION
+     * --------------------------------------------------
+     */
+
+    private fun isValidHindiPlaylist(
+        title: String,
+        uploader: String,
+        show: BengaliDubbedShow
+    ): Boolean {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        if (
+            containsAny(
+                combined,
+                religionExcludeKeywords
+            )
+        ) {
+            return false
+        }
+
+        if (
+            containsAny(
+                combined,
+                religionBangladeshKeywords
+            )
+        ) {
+            return false
+        }
+
+        val matchesShow =
+            show.hindiNames.any {
+                combined.contains(
+                    it.lowercase()
+                )
+            }
+
+        if (!matchesShow) {
+            return false
+        }
+
+        return true
+    }
+
+    /*
+     * --------------------------------------------------
+     * GENERAL HINDI VALIDATION
+     * --------------------------------------------------
+     */
+
+    private fun isValidGeneralHindiReligionPlaylist(
+        title: String,
+        uploader: String
+    ): Boolean {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        if (
+            containsAny(
+                combined,
+                religionExcludeKeywords
+            )
+        ) {
+            return false
+        }
+
+        if (
+            containsAny(
+                combined,
+                religionBangladeshKeywords
+            )
+        ) {
+            return false
+        }
+
+        /*
+         * Hindi/Indian signal.
+         */
+
+        val hasHindiSignal =
+            combined.contains("hindi") ||
+                combined.contains("india") ||
+                combined.contains("serial") ||
+                combined.contains("episodes") ||
+                combined.contains("star plus") ||
+                combined.contains("colors") ||
+                combined.contains("sony") ||
+                combined.contains("life ok")
+
+        if (!hasHindiSignal) {
+            return false
+        }
+
+        /*
+         * Must match a known religious/mythological show.
+         */
+
+        return detectReligionSeriesKey(
+            combined
+        ) != null
+    }
+
+    /*
+     * --------------------------------------------------
+     * BENGALI SCORE
+     * --------------------------------------------------
+     */
+
+    private fun calculateBengaliPlaylistScore(
+        title: String,
+        uploader: String,
+        show: BengaliDubbedShow
+    ): Int {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        var score = 100
+
+        /*
+         * Strong Bengali-dub signal.
+         */
+
+        if (
+            combined.contains("bangla")
+        ) {
+            score += 35
+        }
+
+        if (
+            combined.contains("bengali")
+        ) {
+            score += 35
+        }
+
+        if (
+            combined.contains("বাংলা")
+        ) {
+            score += 40
+        }
+
+        if (
+            combined.contains("dub")
+        ) {
+            score += 20
+        }
+
+        if (
+            combined.contains("ডাব")
+        ) {
+            score += 20
+        }
+
+        /*
+         * Full playlist signals.
+         */
+
+        if (
+            combined.contains(
+                "full episodes"
+            )
+        ) {
+            score += 25
+        }
+
+        if (
+            combined.contains(
+                "complete episodes"
+            )
+        ) {
+            score += 25
+        }
+
+        if (
+            combined.contains(
+                "all episodes"
+            )
+        ) {
+            score += 20
+        }
+
+        if (
+            combined.contains(
+                "সম্পূর্ণ"
+            )
+        ) {
+            score += 20
+        }
+
+        /*
+         * Official broadcaster.
+         */
+
+        for (channel in show.officialChannels) {
+
+            if (
+                combined.contains(
+                    channel.lowercase()
+                )
+            ) {
+                score += 80
+            }
+        }
+
+        /*
+         * Explicit official signal.
+         */
+
+        if (
+            combined.contains("official")
+        ) {
+            score += 100
+        }
+
+        /*
+         * Penalty for personal/copy playlists.
+         */
+
+        if (
+            combined.contains("my playlist")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("fan made")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("fanmade")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("collection")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("saved")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("backup")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("reupload")
+        ) {
+            score -= 80
+        }
+
+        if (
+            combined.contains("archive")
+        ) {
+            score -= 50
+        }
+
+        return score
+    }
+
+    /*
+     * --------------------------------------------------
+     * HINDI SCORE
+     * --------------------------------------------------
+     */
+
+    private fun calculateHindiPlaylistScore(
+        title: String,
+        uploader: String,
+        show: BengaliDubbedShow
+    ): Int {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        var score = 100
+
+        if (
+            combined.contains("hindi")
+        ) {
+            score += 25
+        }
+
+        if (
+            combined.contains("full episodes")
+        ) {
+            score += 25
+        }
+
+        if (
+            combined.contains("complete episodes")
+        ) {
+            score += 25
+        }
+
+        if (
+            combined.contains("all episodes")
+        ) {
+            score += 20
+        }
+
+        for (channel in show.officialChannels) {
+
+            if (
+                combined.contains(
+                    channel.lowercase()
+                )
+            ) {
+                score += 80
+            }
+        }
+
+        if (
+            combined.contains("official")
+        ) {
+            score += 100
+        }
+
+        if (
+            combined.contains("my playlist")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("fan made")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("fanmade")
+        ) {
+            score -= 100
+        }
+
+        if (
+            combined.contains("collection")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("saved")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("backup")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("reupload")
+        ) {
+            score -= 80
+        }
+
+        return score
+    }
+
+    /*
+     * --------------------------------------------------
+     * GENERAL HINDI SCORE
+     * --------------------------------------------------
+     */
+
+    private fun calculateGeneralHindiScore(
+        title: String,
+        uploader: String
+    ): Int {
+
+        val combined =
+            "$title $uploader".lowercase()
+
+        var score = 100
+
+        if (
+            combined.contains("official")
+        ) {
+            score += 100
+        }
+
+        if (
+            combined.contains("full episodes")
+        ) {
+            score += 30
+        }
+
+        if (
+            combined.contains("complete episodes")
+        ) {
+            score += 30
+        }
+
+        if (
+            combined.contains("all episodes")
+        ) {
+            score += 20
+        }
+
+        if (
+            combined.contains("star plus")
+        ) {
+            score += 70
+        }
+
+        if (
+            combined.contains("colors")
+        ) {
+            score += 70
+        }
+
+        if (
+            combined.contains("sony")
+        ) {
+            score += 70
+        }
+
+        if (
+            combined.contains("life ok")
+        ) {
+            score += 60
+        }
+
+        if (
+            combined.contains("star bharat")
+        ) {
+            score += 70
+        }
+
+        if (
+            combined.contains("fan")
+        ) {
+            score -= 80
+        }
+
+        if (
+            combined.contains("collection")
+        ) {
+            score -= 60
+        }
+
+        if (
+            combined.contains("reupload")
+        ) {
+            score -= 80
+        }
+
+        return score
+    }
+
+    /*
+     * --------------------------------------------------
+     * DETECT SERIES KEY
      * --------------------------------------------------
      */
 
     private fun detectReligionSeriesKey(
-        title: String
+        text: String
     ): String? {
 
         val normalized =
-            normalizeReligionText(title)
-
-        /*
-         * Check longer/specific aliases first.
-         */
+            normalizeReligionText(text)
 
         val ordered =
-            religionSeriesAliases.entries.sortedByDescending {
-                it.value.maxOf { alias ->
-                    alias.length
+            religionSeriesAliases.entries
+                .sortedByDescending {
+                    it.value.maxOfOrNull {
+                        alias ->
+                        alias.length
+                    } ?: 0
                 }
-            }
 
         for ((key, aliases) in ordered) {
 
@@ -1401,178 +2471,6 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * PLAYLIST SCORE
-     * --------------------------------------------------
-     *
-     * Higher score = more likely to be the main /
-     * official playlist.
-     */
-
-    private fun calculateReligionPlaylistScore(
-        title: String,
-        uploader: String,
-        language: ReligionLanguage,
-        seriesKey: String
-    ): Int {
-
-        var score = 0
-
-        val combined =
-            "$title $uploader"
-                .lowercase()
-
-        /*
-         * Bengali gets an explicit language bonus.
-         *
-         * The ordering itself is already Bengali first,
-         * but this also helps select the better Bengali
-         * candidate when multiple Bengali playlists exist.
-         */
-
-        if (
-            language ==
-            ReligionLanguage.BENGALI
-        ) {
-            score += 20
-        } else {
-            score += 10
-        }
-
-        /*
-         * Official / broadcaster signals.
-         */
-
-        for (keyword in officialSourceKeywords) {
-
-            if (
-                combined.contains(
-                    keyword.lowercase()
-                )
-            ) {
-                score += 25
-            }
-        }
-
-        /*
-         * Explicit official wording.
-         */
-
-        if (
-            combined.contains("official")
-        ) {
-            score += 35
-        }
-
-        /*
-         * Complete/full episode signals.
-         */
-
-        if (
-            combined.contains(
-                "full episodes"
-            )
-        ) {
-            score += 15
-        }
-
-        if (
-            combined.contains(
-                "complete episodes"
-            )
-        ) {
-            score += 15
-        }
-
-        if (
-            combined.contains(
-                "all episodes"
-            )
-        ) {
-            score += 10
-        }
-
-        if (
-            combined.contains(
-                "সম্পূর্ণ"
-            )
-        ) {
-            score += 15
-        }
-
-        if (
-            combined.contains(
-                "সব পর্ব"
-            )
-        ) {
-            score += 10
-        }
-
-        /*
-         * Penalty for obvious personal/copied playlists.
-         */
-
-        for (keyword in userPlaylistPenaltyKeywords) {
-
-            if (
-                combined.contains(
-                    keyword.lowercase()
-                )
-            ) {
-                score -= 30
-            }
-        }
-
-        /*
-         * Very generic playlist titles get a small penalty.
-         */
-
-        val normalizedTitle =
-            normalizeReligionText(title)
-
-        if (
-            normalizedTitle == "playlist"
-        ) {
-            score -= 20
-        }
-
-        if (
-            normalizedTitle.length < 8
-        ) {
-            score -= 5
-        }
-
-        /*
-         * If uploader is present, give a small bonus.
-         */
-
-        if (uploader.isNotBlank()) {
-            score += 5
-        }
-
-        /*
-         * Specific serial aliases in the title are useful.
-         */
-
-        val aliases =
-            religionSeriesAliases[
-                seriesKey
-            ].orEmpty()
-
-        if (
-            aliases.any {
-                normalizedTitle.contains(
-                    normalizeReligionText(it)
-                )
-            }
-        ) {
-            score += 10
-        }
-
-        return score
-    }
-
-    /*
-     * --------------------------------------------------
      * NORMALIZE RELIGION TEXT
      * --------------------------------------------------
      */
@@ -1591,7 +2489,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * STRING FILTER
+     * STRING HELPERS
      * --------------------------------------------------
      */
 
@@ -1639,7 +2537,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * SEARCH
+     * NORMAL SEARCH
      * --------------------------------------------------
      */
 
@@ -1876,7 +2774,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * VIDEO LOAD
+     * VIDEO
      * --------------------------------------------------
      */
 
@@ -2096,7 +2994,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * PLAYLIST LOAD
+     * PLAYLIST
      * --------------------------------------------------
      */
 
@@ -2245,13 +3143,13 @@ class YouTube : MainAPI() {
      *
      * IMPORTANT:
      *
-     * DO NOT CHANGE THIS SECTION.
+     * This section is kept unchanged.
      *
      * VOD -> DASH
      * LIVE -> HLS
      * fallback -> CloudStream extractor
      *
-     * This keeps the current high-speed playback path.
+     * No proxy/server is added.
      */
 
     override suspend fun loadLinks(
@@ -2397,7 +3295,7 @@ class YouTube : MainAPI() {
 
         } catch (_: Exception) {
             /*
-             * Fallback to CloudStream's working
+             * Fall back to CloudStream's working
              * YouTube extractor.
              */
         }
