@@ -1,9 +1,27 @@
 package com.movieflick.dhakaftp
 
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.ExtractorLink
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SearchResponseList
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.newEpisode
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newSearchResponseList
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
-import java.net.URLEncoder
+import java.net.URI
+import java.net.URLDecoder
 
 class DhakaFTP : MainAPI() {
 
@@ -30,13 +48,26 @@ class DhakaFTP : MainAPI() {
     )
 
     private val rootFolders = listOf(
-        "English Movies" to "http://172.16.50.7/DHAKA-FLIX-7/English%20Movies/",
-        "Hindi Movies" to "http://172.16.50.14/DHAKA-FLIX-14/Hindi%20Movies/",
-        "Kolkata Bangla Movies" to "http://172.16.50.7/DHAKA-FLIX-7/Kolkata%20Bangla%20Movies/",
-        "South Indian Hindi Dubbed" to "http://172.16.50.14/DHAKA-FLIX-14/SOUTH%20INDIAN%20MOVIES/Hindi%20Dubbed/",
-        "TV Web Series" to "http://172.16.50.12/DHAKA-FLIX-12/TV-WEB-Series/",
-        "K-Drama" to "http://172.16.50.14/DHAKA-FLIX-14/KOREAN%20TV%20%26%20WEB%20Series/",
-        "Anime" to "http://172.16.50.14/DHAKA-FLIX-14/Animation%20Movies/"
+        "English Movies" to
+            "http://172.16.50.7/DHAKA-FLIX-7/English%20Movies/",
+
+        "Hindi Movies" to
+            "http://172.16.50.14/DHAKA-FLIX-14/Hindi%20Movies/",
+
+        "Kolkata Bangla Movies" to
+            "http://172.16.50.7/DHAKA-FLIX-7/Kolkata%20Bangla%20Movies/",
+
+        "South Indian Hindi Dubbed" to
+            "http://172.16.50.14/DHAKA-FLIX-14/SOUTH%20INDIAN%20MOVIES/Hindi%20Dubbed/",
+
+        "TV Web Series" to
+            "http://172.16.50.12/DHAKA-FLIX-12/TV-WEB-Series/",
+
+        "K-Drama" to
+            "http://172.16.50.14/DHAKA-FLIX-14/KOREAN%20TV%20%26%20WEB%20Series/",
+
+        "Anime" to
+            "http://172.16.50.14/DHAKA-FLIX-14/Animation%20Movies/"
     )
 
     override val mainPage = mainPageOf(
@@ -58,17 +89,19 @@ class DhakaFTP : MainAPI() {
         val items = mutableListOf<SearchResponse>()
 
         try {
-            val entries = getDirectoryEntries(request.data)
-
-            entries
-                .filter { isVideo(it.url()) }
-                .take(40)
+            getDirectoryEntries(request.data)
                 .forEach { element ->
-                    parseVideo(element)?.let {
-                        items.add(it)
+
+                    val url = element.absoluteUrl()
+
+                    if (!isVideo(url)) {
+                        return@forEach
+                    }
+
+                    parseVideo(element)?.let { item ->
+                        items.add(item)
                     }
                 }
-
         } catch (_: Exception) {
             return newHomePageResponse(
                 emptyList(),
@@ -80,7 +113,7 @@ class DhakaFTP : MainAPI() {
             listOf(
                 HomePageList(
                     request.name,
-                    items,
+                    items.take(40),
                     false
                 )
             ),
@@ -104,18 +137,17 @@ class DhakaFTP : MainAPI() {
 
         for ((_, rootUrl) in rootFolders) {
 
+            if (results.size >= 50) {
+                break
+            }
+
             try {
                 searchDirectory(
                     rootUrl,
-                    query,
+                    query.trim(),
                     results,
                     0
                 )
-
-                if (results.size >= 50) {
-                    break
-                }
-
             } catch (_: Exception) {
                 continue
             }
@@ -134,7 +166,10 @@ class DhakaFTP : MainAPI() {
         depth: Int
     ) {
 
-        if (depth > 6 || results.size >= 50) {
+        if (
+            depth > 6 ||
+            results.size >= 50
+        ) {
             return
         }
 
@@ -150,35 +185,40 @@ class DhakaFTP : MainAPI() {
                 return
             }
 
-            val url = element.url()
+            val url = element.absoluteUrl()
+
+            if (url.isBlank()) {
+                continue
+            }
 
             if (isVideo(url)) {
 
-                val title =
-                    element.text()
-                        .trim()
-                        .ifBlank {
-                            url.substringAfterLast("/")
-                        }
+                val title = element.text()
+                    .trim()
+                    .ifBlank {
+                        url.substringAfterLast("/")
+                            .substringBeforeLast(".")
+                    }
 
                 if (
+                    query.isBlank() ||
                     title.contains(
                         query,
                         ignoreCase = true
                     )
                 ) {
-                    parseVideo(element)?.let {
-                        results.add(it)
+                    parseVideo(element)?.let { item ->
+                        results.add(item)
                     }
                 }
 
             } else if (isDirectory(url)) {
 
-                val folderName =
-                    element.text()
-                        .trim()
+                val folderName = element.text()
+                    .trim()
 
                 if (
+                    folderName.isNotBlank() &&
                     folderName.contains(
                         query,
                         ignoreCase = true
@@ -207,10 +247,8 @@ class DhakaFTP : MainAPI() {
         url: String
     ): List<Element> {
 
-        val response =
-            app.get(url)
-
-        return response.document
+        return app.get(url)
+            .document
             .select("a[href]")
     }
 
@@ -218,19 +256,18 @@ class DhakaFTP : MainAPI() {
         element: Element
     ): SearchResponse? {
 
-        val url = element.url()
+        val url = element.absoluteUrl()
 
         if (!isVideo(url)) {
             return null
         }
 
-        val title =
-            element.text()
-                .trim()
-                .ifBlank {
-                    url.substringAfterLast("/")
-                        .substringBeforeLast(".")
-                }
+        val title = element.text()
+            .trim()
+            .ifBlank {
+                url.substringAfterLast("/")
+                    .substringBeforeLast(".")
+            }
 
         return newMovieSearchResponse(
             title,
@@ -245,9 +282,9 @@ class DhakaFTP : MainAPI() {
 
         if (isVideo(url)) {
 
-            val title =
-                url.substringAfterLast("/")
-                    .substringBeforeLast(".")
+            val title = url
+                .substringAfterLast("/")
+                .substringBeforeLast(".")
 
             return newMovieLoadResponse(
                 title,
@@ -257,27 +294,23 @@ class DhakaFTP : MainAPI() {
             )
         }
 
-        val entries =
-            getDirectoryEntries(url)
+        val entries = getDirectoryEntries(url)
 
-        val episodes =
-            mutableListOf<Episode>()
+        val episodes = mutableListOf<Episode>()
 
         entries
-            .filter { isVideo(it.url()) }
+            .filter { isVideo(it.absoluteUrl()) }
             .forEach { element ->
 
-                val videoUrl =
-                    element.url()
+                val videoUrl = element.absoluteUrl()
 
-                val title =
-                    element.text()
-                        .trim()
-                        .ifBlank {
-                            videoUrl
-                                .substringAfterLast("/")
-                                .substringBeforeLast(".")
-                        }
+                val title = element.text()
+                    .trim()
+                    .ifBlank {
+                        videoUrl
+                            .substringAfterLast("/")
+                            .substringBeforeLast(".")
+                    }
 
                 episodes.add(
                     newEpisode(videoUrl) {
@@ -286,13 +319,14 @@ class DhakaFTP : MainAPI() {
                 )
             }
 
-        val folderName =
-            url.trimEnd("/")
-                .substringAfterLast("/")
-                .let {
-                    java.net.URLDecoder
-                        .decode(it, "UTF-8")
-                }
+        val folderName = try {
+            URLDecoder.decode(
+                url.trimEnd('/').substringAfterLast('/'),
+                "UTF-8"
+            )
+        } catch (_: Exception) {
+            url.trimEnd('/').substringAfterLast('/')
+        }
 
         return newTvSeriesLoadResponse(
             folderName.ifBlank {
@@ -319,7 +353,7 @@ class DhakaFTP : MainAPI() {
                 name,
                 name,
                 data,
-                ExtractorLinkType.VIDEO
+                com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
             ) {
                 referer = data
                 quality = Qualities.Unknown.value
@@ -333,9 +367,9 @@ class DhakaFTP : MainAPI() {
         url: String
     ): Boolean {
 
-        val cleanUrl =
-            url.substringBefore("?")
-                .lowercase()
+        val cleanUrl = url
+            .substringBefore("?")
+            .lowercase()
 
         return videoExtensions.any {
             cleanUrl.endsWith(it)
@@ -346,44 +380,32 @@ class DhakaFTP : MainAPI() {
         url: String
     ): Boolean {
 
-        val cleanUrl =
-            url.substringBefore("?")
-
-        return !isVideo(cleanUrl)
+        return url.endsWith("/") &&
+            !isVideo(url)
     }
 
-    private fun Element.url(): String {
+    private fun Element.absoluteUrl(): String {
 
-        val href =
-            attr("href")
-                .trim()
+        val href = attr("href")
+            .trim()
 
         if (href.isBlank()) {
             return ""
         }
 
         return when {
-            href.startsWith("http://") ->
-                href
+            href.startsWith("http://") ||
+                href.startsWith("https://") -> href
 
-            href.startsWith("https://") ->
-                href
-
-            else ->
-                absoluteUrl(href)
-        }
-    }
-
-    private fun absoluteUrl(
-        href: String
-    ): String {
-
-        return try {
-            java.net.URI(mainUrl)
-                .resolve(href)
-                .toString()
-        } catch (_: Exception) {
-            href
+            else -> {
+                try {
+                    URI(this@DhakaFTP.mainUrl)
+                        .resolve(href)
+                        .toString()
+                } catch (_: Exception) {
+                    href
+                }
+            }
         }
     }
 }
