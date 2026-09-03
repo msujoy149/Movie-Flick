@@ -1463,13 +1463,13 @@ class YouTube : MainAPI() {
 
         finalResults.addAll(
             bengaliResults.map {
-                it.toSearchResponse()
+                religionCandidateToSearchResponse(it)
             }
         )
 
         finalResults.addAll(
             hindiResults.map {
-                it.toSearchResponse()
+                religionCandidateToSearchResponse(it)
             }
         )
 
@@ -1499,19 +1499,20 @@ class YouTube : MainAPI() {
         val language: ReligionLanguage,
         val seriesKey: String,
         val score: Int
-    ) {
+    )
 
-        fun toSearchResponse(): SearchResponse {
+    private fun religionCandidateToSearchResponse(
+        candidate: ReligionPlaylistCandidate
+    ): SearchResponse {
 
-            return newMovieSearchResponse(
-                title,
-                url,
-                TvType.TvSeries
-            ) {
+        return newMovieSearchResponse(
+            candidate.title,
+            candidate.url,
+            TvType.TvSeries
+        ) {
 
-                posterUrl =
-                    thumbnail
-            }
+            posterUrl =
+                candidate.thumbnail
         }
     }
 
@@ -3057,7 +3058,7 @@ class YouTube : MainAPI() {
 
         var pagesLoaded = 1
 
-        val maxPages = 5
+        val maxPages = 25
 
         while (
             page.hasNextPage() &&
