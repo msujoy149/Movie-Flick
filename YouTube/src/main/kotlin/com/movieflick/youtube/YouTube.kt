@@ -1,27 +1,8 @@
 package com.movieflick.youtube
 
-import com.lagradost.cloudstream3.Actor
-import com.lagradost.cloudstream3.ActorData
-import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.ExtractorLink
-import com.lagradost.cloudstream3.HomePageList
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SearchResponseList
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.newEpisode
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
-import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.newSearchResponseList
-import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
 import org.schabi.newpipe.extractor.InfoItem
-import org.schabi.newpipe.extractor.Page
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.kiosk.KioskExtractor
 import org.schabi.newpipe.extractor.stream.StreamInfo
@@ -52,16 +33,11 @@ class YouTube : MainAPI() {
         "live" to "Live"
     )
 
-    /*
-     * NewPipe uses continuation pages.
-     * CloudStream uses numeric page numbers.
-     * These caches connect the two systems.
-     */
-    private val mainPageCache =
-        mutableMapOf<String, Page?>()
+    private val pageCache =
+        mutableMapOf<String, org.schabi.newpipe.extractor.Page?>()
 
     private val searchPageCache =
-        mutableMapOf<String, Page?>()
+        mutableMapOf<String, org.schabi.newpipe.extractor.Page?>()
 
     override suspend fun getMainPage(
         page: Int,
@@ -71,49 +47,62 @@ class YouTube : MainAPI() {
         val key = request.data
 
         if (page == 1) {
-            mainPageCache.remove(key)
+            pageCache.remove(key)
         }
 
-        val extractor = getKioskExtractor(request.data)
+        val extractor = getKioskExtractor(
+            request.data
+        )
 
         val pageData = try {
+
             if (page == 1) {
+
                 extractor.fetchPage()
 
                 extractor.initialPage.also {
-                    mainPageCache[key] = it.nextPage
+                    pageCache[key] = it.nextPage
                 }
-            } else {
-                val nextPage = mainPageCache[key]
-                    ?: return newHomePageResponse(
-                        emptyList(),
-                        false
-                    )
 
-                extractor.getPage(nextPage).also {
-                    mainPageCache[key] = it.nextPage
+            } else {
+
+                val next =
+                    pageCache[key]
+                        ?: return newHomePageResponse(
+                            emptyList(),
+                            false
+                        )
+
+                extractor.getPage(
+                    next
+                ).also {
+                    pageCache[key] = it.nextPage
                 }
             }
+
         } catch (_: Exception) {
+
             return newHomePageResponse(
                 emptyList(),
                 false
             )
         }
 
-        val results = pageData.items.mapNotNull {
-            it.toSearchResponse()
-        }
-
-        val headerName = try {
-            extractor.name.ifBlank {
-                request.name
+        val results =
+            pageData.items.map {
+                it.toSearchResponse()
             }
-        } catch (_: Exception) {
-            request.name
-        }.ifBlank {
-            "YouTube"
-        }
+
+        val headerName =
+            try {
+                extractor.name.ifEmpty {
+                    request.name
+                }
+            } catch (_: Exception) {
+                request.name
+            }.ifEmpty {
+                "Trending"
+            }
 
         return newHomePageResponse(
             listOf(
@@ -132,36 +121,65 @@ class YouTube : MainAPI() {
         page: Int
     ): SearchResponseList {
 
-        val extractor = service.getSearchExtractor(query)
+        val cleanQuery = query.trim()
 
-        val pageData = try {
-            if (page == 1 || !searchPageCache.containsKey(query)) {
-                extractor.fetchPage()
-
-                extractor.initialPage.also {
-                    searchPageCache[query] = it.nextPage
-                }
-            } else {
-                val nextPage = searchPageCache[query]
-                    ?: return newSearchResponseList(
-                        emptyList(),
-                        false
-                    )
-
-                extractor.getPage(nextPage).also {
-                    searchPageCache[query] = it.nextPage
-                }
-            }
-        } catch (_: Exception) {
+        if (cleanQuery.isBlank()) {
             return newSearchResponseList(
                 emptyList(),
                 false
             )
         }
 
-        val results = pageData.items.mapNotNull {
-            it.toSearchResponse()
+        val cacheKey = cleanQuery
+
+        val extractor =
+            service.getSearchExtractor(
+                cleanQuery
+            )
+
+        val pageData = try {
+
+            if (
+                page == 1 ||
+                !searchPageCache.containsKey(cacheKey)
+            ) {
+
+                extractor.fetchPage()
+
+                extractor.initialPage.also {
+                    searchPageCache[cacheKey] =
+                        it.nextPage
+                }
+
+            } else {
+
+                val next =
+                    searchPageCache[cacheKey]
+                        ?: return newSearchResponseList(
+                            emptyList(),
+                            false
+                        )
+
+                extractor.getPage(
+                    next
+                ).also {
+                    searchPageCache[cacheKey] =
+                        it.nextPage
+                }
+            }
+
+        } catch (_: Exception) {
+
+            return newSearchResponseList(
+                emptyList(),
+                false
+            )
         }
+
+        val results =
+            pageData.items.map {
+                it.toSearchResponse()
+            }
 
         return newSearchResponseList(
             results,
@@ -173,29 +191,43 @@ class YouTube : MainAPI() {
         kioskId: String?
     ): KioskExtractor<out InfoItem> {
 
-        return if (kioskId.isNullOrBlank()) {
-            service.kioskList.getDefaultKioskExtractor(null)
+        return if (
+            kioskId.isNullOrBlank()
+        ) {
+
+            service.kioskList
+                .getDefaultKioskExtractor(
+                    null
+                )
+
         } else {
-            service.kioskList.getExtractorById(
-                kioskId,
-                null
-            )
+
+            service.kioskList
+                .getExtractorById(
+                    kioskId,
+                    null
+                )
         }
     }
 
-    private fun InfoItem.toSearchResponse(): SearchResponse? {
+    private fun InfoItem.toSearchResponse(): SearchResponse {
 
-        val itemUrl = url ?: return null
-        val itemName = name ?: return null
+        val itemName =
+            name ?: "Unknown"
+
+        val itemUrl =
+            url ?: ""
 
         return newMovieSearchResponse(
             itemName,
             itemUrl,
             TvType.Others
         ) {
-            posterUrl = thumbnails
-                .lastOrNull()
-                ?.url
+
+            posterUrl =
+                thumbnails
+                    .lastOrNull()
+                    ?.url
         }
     }
 
@@ -203,16 +235,23 @@ class YouTube : MainAPI() {
         url: String
     ): LoadResponse {
 
-        return when (getUrlType(url)) {
-            UrlType.Playlist -> loadPlaylist(url)
-            UrlType.Video -> loadVideo(url)
-            UrlType.Channel -> loadChannel(url)
+        return when (
+            getUrlType(url)
+        ) {
 
-            UrlType.Unknown -> {
+            UrlType.Video ->
+                loadVideo(url)
+
+            UrlType.Channel ->
+                loadChannel(url)
+
+            UrlType.Playlist ->
+                loadPlaylist(url)
+
+            UrlType.Unknown ->
                 throw RuntimeException(
                     "Unsupported YouTube URL"
                 )
-            }
         }
     }
 
@@ -223,41 +262,49 @@ class YouTube : MainAPI() {
         Unknown
     }
 
-    /*
-     * Playlist is checked before video.
-     *
-     * This is important for:
-     * https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID
-     */
-    private fun getUrlType(url: String): UrlType {
+    private fun getUrlType(
+        url: String
+    ): UrlType {
 
-        val cleanUrl = url.lowercase()
+        val cleanUrl =
+            url.lowercase()
 
         return when {
-            cleanUrl.contains("/playlist?list=") ->
-                UrlType.Playlist
 
-            cleanUrl.contains("&list=") &&
-                cleanUrl.contains("/watch?v=") ->
-                UrlType.Playlist
-
-            cleanUrl.contains("/watch?v=") ->
+            cleanUrl.contains(
+                "/watch?v="
+            ) ->
                 UrlType.Video
 
-            cleanUrl.contains("youtu.be/") ->
+            cleanUrl.contains(
+                "youtu.be/"
+            ) ->
                 UrlType.Video
 
-            cleanUrl.contains("/channel/") ->
+            cleanUrl.contains(
+                "/channel/"
+            ) ->
                 UrlType.Channel
 
-            cleanUrl.contains("/@") ->
+            cleanUrl.contains(
+                "/@"
+            ) ->
                 UrlType.Channel
 
-            cleanUrl.contains("/c/") ->
+            cleanUrl.contains(
+                "/c/"
+            ) ->
                 UrlType.Channel
 
-            cleanUrl.contains("/user/") ->
+            cleanUrl.contains(
+                "/user/"
+            ) ->
                 UrlType.Channel
+
+            cleanUrl.contains(
+                "/playlist?list="
+            ) ->
+                UrlType.Playlist
 
             else ->
                 UrlType.Unknown
@@ -269,17 +316,23 @@ class YouTube : MainAPI() {
     ): LoadResponse {
 
         val extractor =
-            service.getStreamExtractor(url)
+            service.getStreamExtractor(
+                url
+            )
 
         extractor.fetchPage()
 
         val info =
-            StreamInfo.getInfo(extractor)
+            StreamInfo.getInfo(
+                extractor
+            )
 
         val isLive =
-            info.streamType?.name
-                ?.contains("LIVE", ignoreCase = true)
-                == true
+            info.streamType
+                ?.name
+                ?.contains(
+                    "LIVE"
+                ) == true
 
         return newMovieLoadResponse(
             info.name,
@@ -292,9 +345,10 @@ class YouTube : MainAPI() {
             url
         ) {
 
-            plot = info.description
-                .content
-                .toString()
+            plot =
+                info.description
+                    .content
+                    .toString()
 
             posterUrl =
                 info.thumbnails
@@ -302,11 +356,14 @@ class YouTube : MainAPI() {
                     ?.url
 
             if (info.duration > 0) {
-                duration = info.duration.toInt()
+                duration =
+                    info.duration.toInt()
             }
 
             info.uploaderName
-                ?.takeIf { it.isNotBlank() }
+                ?.takeIf {
+                    it.isNotBlank()
+                }
                 ?.let { uploader ->
 
                     actors = listOf(
@@ -322,9 +379,10 @@ class YouTube : MainAPI() {
                     )
                 }
 
-            tags = info.tags
-                ?.take(5)
-                ?.toList()
+            tags =
+                info.tags
+                    ?.take(5)
+                    ?.toList()
         }
     }
 
@@ -333,14 +391,14 @@ class YouTube : MainAPI() {
     ): LoadResponse {
 
         val extractor =
-            service.getChannelExtractor(url)
+            service.getChannelExtractor(
+                url
+            )
 
         extractor.fetchPage()
 
         val channelName =
-            extractor.name.ifBlank {
-                "YouTube Channel"
-            }
+            extractor.name
 
         val channelDescription =
             extractor.description
@@ -355,25 +413,23 @@ class YouTube : MainAPI() {
                 .lastOrNull()
                 ?.url
 
-        val videosTab =
+        val tabs =
             extractor.tabs
-                .firstOrNull {
-                    it.url.contains(
-                        "/videos",
-                        ignoreCase = true
-                    )
-                }
-                ?: extractor.tabs.firstOrNull()
-                ?: throw RuntimeException(
-                    "No YouTube channel videos tab found"
+
+        val videosTab =
+            tabs.firstOrNull {
+                it.url.contains(
+                    "/videos"
                 )
+            } ?: tabs.firstOrNull()
+            ?: throw RuntimeException(
+                "No videos tab found"
+            )
 
         val videosExtractor =
             service.getChannelTabExtractor(
                 videosTab
             )
-
-        videosExtractor.fetchPage()
 
         val episodes =
             mutableListOf<Episode>()
@@ -381,16 +437,26 @@ class YouTube : MainAPI() {
         var page =
             videosExtractor.initialPage
 
-        addChannelEpisodes(
-            episodes,
-            page
+        episodes.addAll(
+            page.items.map { item ->
+
+                newEpisode(
+                    item.url
+                ) {
+
+                    name =
+                        item.name
+
+                    posterUrl =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                }
+            }
         )
 
-        /*
-         * Five continuation pages are loaded.
-         * This keeps channel loading reasonably fast.
-         */
         var pagesLoaded = 1
+
         val maxPages = 5
 
         while (
@@ -403,9 +469,22 @@ class YouTube : MainAPI() {
                     page.nextPage
                 )
 
-            addChannelEpisodes(
-                episodes,
-                page
+            episodes.addAll(
+                page.items.map { item ->
+
+                    newEpisode(
+                        item.url
+                    ) {
+
+                        name =
+                            item.name
+
+                        posterUrl =
+                            item.thumbnails
+                                .lastOrNull()
+                                ?.url
+                    }
+                }
             )
 
             pagesLoaded++
@@ -418,18 +497,19 @@ class YouTube : MainAPI() {
             episodes
         ) {
 
-            plot = channelDescription
+            plot =
+                channelDescription
 
             posterUrl =
-                channelAvatar ?: channelBanner
+                channelBanner
 
             backgroundPosterUrl =
                 channelBanner
 
-            tags = listOf(
-                "YouTube",
-                "Channel"
-            )
+            tags =
+                listOf(
+                    "Channel"
+                )
 
             actors = listOf(
                 ActorData(
@@ -442,46 +522,19 @@ class YouTube : MainAPI() {
         }
     }
 
-    private fun addChannelEpisodes(
-        episodes: MutableList<Episode>,
-        page: Page
-    ) {
-
-        page.items.forEach { item ->
-
-            val itemUrl =
-                item.url ?: return@forEach
-
-            val itemName =
-                item.name ?: "YouTube Video"
-
-            episodes.add(
-                newEpisode(itemUrl) {
-
-                    name = itemName
-
-                    posterUrl =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                }
-            )
-        }
-    }
-
     private suspend fun loadPlaylist(
         url: String
     ): LoadResponse {
 
         val extractor =
-            service.getPlaylistExtractor(url)
+            service.getPlaylistExtractor(
+                url
+            )
 
         extractor.fetchPage()
 
         val playlistName =
-            extractor.name.ifBlank {
-                "YouTube Playlist"
-            }
+            extractor.name
 
         val playlistDescription =
             extractor.description
@@ -502,12 +555,26 @@ class YouTube : MainAPI() {
         var page =
             extractor.getInitialPage()
 
-        addPlaylistEpisodes(
-            episodes,
-            page
+        episodes.addAll(
+            page.items.map { item ->
+
+                newEpisode(
+                    item.url
+                ) {
+
+                    name =
+                        item.name
+
+                    posterUrl =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                }
+            }
         )
 
         var pagesLoaded = 1
+
         val maxPages = 5
 
         while (
@@ -520,9 +587,22 @@ class YouTube : MainAPI() {
                     page.nextPage
                 )
 
-            addPlaylistEpisodes(
-                episodes,
-                page
+            episodes.addAll(
+                page.items.map { item ->
+
+                    newEpisode(
+                        item.url
+                    ) {
+
+                        name =
+                            item.name
+
+                        posterUrl =
+                            item.thumbnails
+                                .lastOrNull()
+                                ?.url
+                }
+                }
             )
 
             pagesLoaded++
@@ -535,32 +615,35 @@ class YouTube : MainAPI() {
             episodes
         ) {
 
-            plot = playlistDescription
+            plot =
+                playlistDescription
 
             posterUrl =
                 playlistThumbnail
 
             tags =
-                if (uploaderName.isNotBlank()) {
+                if (
+                    uploaderName.isNotBlank()
+                ) {
                     listOf(
-                        "YouTube",
-                        "Playlist",
                         "Channel: $uploaderName"
                     )
                 } else {
                     listOf(
-                        "YouTube",
                         "Playlist"
                     )
                 }
 
-            if (uploaderName.isNotBlank()) {
+            if (
+                uploaderName.isNotBlank()
+            ) {
 
                 actors = listOf(
                     ActorData(
                         Actor(
                             uploaderName,
-                            extractor.uploaderAvatars
+                            extractor
+                                .uploaderAvatars
                                 .lastOrNull()
                                 ?.url
                                 ?: ""
@@ -571,38 +654,6 @@ class YouTube : MainAPI() {
         }
     }
 
-    private fun addPlaylistEpisodes(
-        episodes: MutableList<Episode>,
-        page: Page
-    ) {
-
-        page.items.forEach { item ->
-
-            val itemUrl =
-                item.url ?: return@forEach
-
-            val itemName =
-                item.name ?: "YouTube Video"
-
-            episodes.add(
-                newEpisode(itemUrl) {
-
-                    name = itemName
-
-                    posterUrl =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                }
-            )
-        }
-    }
-
-    /*
-     * No third-party streaming proxy is created here.
-     * CloudStream receives the YouTube URL and uses
-     * its extractor system for playback.
-     */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -611,7 +662,7 @@ class YouTube : MainAPI() {
     ): Boolean {
 
         return loadExtractor(
-            "https://www.youtube.com/watch?v=$data",
+            data,
             subtitleCallback,
             callback
         )
