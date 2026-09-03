@@ -81,23 +81,40 @@ jobs:
           if [ -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
             cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
               "$GITHUB_WORKSPACE/build-output/plugins.json"
+          else
+            echo "ERROR: plugins.json was not generated"
+            exit 1
           fi
 
-          # Copy repository manifest
-          if [ -f "$GITHUB_WORKSPACE/src/repo.json" ]; then
-            cp "$GITHUB_WORKSPACE/src/repo.json" \
-              "$GITHUB_WORKSPACE/build-output/repo.json"
-          fi
+          # --------------------------------------------------
+          # Generate repo.json directly
+          # --------------------------------------------------
+          cat > "$GITHUB_WORKSPACE/build-output/repo.json" <<'EOF'
+          {
+            "name": "movieflick",
+            "description": "movieflick CloudStream Extensions | 149",
+            "manifestVersion": 1,
+            "pluginLists": [
+              "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/plugins.json"
+            ]
+          }
+          EOF
 
           echo "Build output:"
           ls -lah "$GITHUB_WORKSPACE/build-output"
 
+          echo ""
+          echo "Generated repo.json:"
+          cat "$GITHUB_WORKSPACE/build-output/repo.json"
+
       # --------------------------------------------------
-      # Create or checkout builds branch
+      # Prepare builds branch
       # --------------------------------------------------
       - name: Prepare builds branch
         run: |
           cd "$GITHUB_WORKSPACE"
+
+          rm -rf builds
 
           git clone \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
@@ -125,12 +142,12 @@ jobs:
           fi
 
       # --------------------------------------------------
-      # Copy new plugin builds and repository files
+      # Copy build files
       # --------------------------------------------------
       - name: Copy build files
         run: |
           cp -f "$GITHUB_WORKSPACE/build-output/"* \
-            "$GITHUB_WORKSPACE/builds/" 2>/dev/null || true
+            "$GITHUB_WORKSPACE/builds/"
 
           cd "$GITHUB_WORKSPACE/builds"
 
@@ -138,7 +155,7 @@ jobs:
           ls -lah
 
           echo ""
-          echo "Checking required repository files:"
+          echo "Checking required files..."
 
           if [ -f "repo.json" ]; then
             echo "✓ repo.json found"
@@ -153,6 +170,10 @@ jobs:
             echo "✗ plugins.json missing"
             exit 1
           fi
+
+          echo ""
+          echo "repo.json content:"
+          cat repo.json
 
       # --------------------------------------------------
       # Push builds branch
