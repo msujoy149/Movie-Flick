@@ -1,13 +1,12 @@
 package com.movieflick.dhakaftp
 
-import android.content.Context
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class DhakaFTPPlugin : Plugin() {
+class DhakaFTPPlugin : BasePlugin() {
 
-    override fun load(context: Context) {
+    override fun load() {
         registerMainAPI(DhakaFTP())
     }
 }
