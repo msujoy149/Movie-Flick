@@ -673,6 +673,7 @@ class KhulnaPlex : MainAPI() {
             card.selectFirst("time[datetime]")
                 ?.attr("datetime")
         )
+            .filterNotNull()
             .filter { it.isNotBlank() }
 
         for (value in values) {
