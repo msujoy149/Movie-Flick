@@ -13,7 +13,7 @@ import java.util.Locale
 
 class KhulnaPlex : MainAPI() {
 
-    override var mainUrl = "http://khulnaplex.com"
+    override var mainUrl = "https://khulnaplex.com"
     override var name = "Khulna Plex"
     override var lang = "bn"
 
@@ -58,21 +58,43 @@ class KhulnaPlex : MainAPI() {
     }
 
     private val mediaExtensions = setOf(
-        ".m3u8", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts"
+        ".m3u8", ".mpd", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts"
     )
 
     private val maxHomeItems = 25
 
-    private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
+    private fun commonHeaders(referer: String): MutableMap<String, String> = mutableMapOf(
         "User-Agent" to
             "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-        "Accept" to
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.9",
         "Referer" to referer,
         "Connection" to "keep-alive"
     )
+
+    private fun pageHeaders(referer: String = "$mainUrl/"): Map<String, String> =
+        commonHeaders(referer).apply {
+            this["Accept"] =
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            this["Sec-Fetch-Dest"] = "document"
+            this["Sec-Fetch-Mode"] = "navigate"
+            this["Sec-Fetch-Site"] = "same-origin"
+        }
+
+    private fun mediaHeaders(referer: String): Map<String, String> =
+        commonHeaders(referer).apply {
+            this["Accept"] = "*/*"
+            this["Origin"] = originOf(referer)
+            this["Sec-Fetch-Dest"] = "video"
+            this["Sec-Fetch-Mode"] = "cors"
+            this["Sec-Fetch-Site"] = "same-origin"
+            this["Accept-Encoding"] = "identity"
+        }
+
+    private fun originOf(url: String): String = runCatching {
+        val uri = URI(url)
+        "${uri.scheme}://${uri.host}${if (uri.port > 0) ":${uri.port}" else ""}"
+    }.getOrElse { mainUrl }
 
     private suspend fun getDocument(url: String): Document? {
         val normalized = url.trim()
@@ -87,7 +109,7 @@ class KhulnaPlex : MainAPI() {
 
         for (candidate in candidates) {
             val document = runCatching {
-                app.get(candidate, headers = browserHeaders(candidate)).document
+                app.get(candidate, headers = pageHeaders(candidate)).document
             }.getOrNull()
             if (document != null) return document
         }
@@ -175,11 +197,9 @@ class KhulnaPlex : MainAPI() {
             }
         }
 
-        // Keep the watch page as the CloudStream data.
-        // loadLinks() will fetch the page again and collect EVERY playable
-        // source exposed by KhulnaPlex, including the <video><source> URL and
-        // the site's download.php stream fallback. This is more reliable than
-        // saving only the first URL during load().
+        // Keep the watch page as the canonical data. loadLinks() resolves the
+        // playable source from the same page when Play is pressed, so the
+        // player always receives a fresh MP4/MKV/M3U8/download URL.
         return newMovieLoadResponse(
             title,
             url,
@@ -199,89 +219,178 @@ class KhulnaPlex : MainAPI() {
         if (data.isBlank()) return false
 
         if (isMediaUrl(data)) {
-            val candidates = linkedSetOf<String>()
-            candidates.add(data)
-            if (data.startsWith("https://", true) && data.contains("khulnaplex.com", true)) {
-                candidates.add("http://" + data.removePrefix("https://"))
-            } else if (data.startsWith("http://", true) && data.contains("khulnaplex.com", true)) {
-                candidates.add("https://" + data.removePrefix("http://"))
-            }
-
-            candidates.forEach { media ->
-                emitMediaLink(media, "$mainUrl/", callback)
-            }
-            return candidates.isNotEmpty()
+            emitMediaAlternatives(
+                urls = listOf(data),
+                referer = "$mainUrl/",
+                callback = callback
+            )
+            return true
         }
 
-        val response = runCatching {
-            app.get(data, headers = browserHeaders(data))
-        }.getOrNull() ?: return false
+        val pageUrls = linkedSetOf<String>()
+        pageUrls.add(data)
+        if (data.startsWith("https://", true)) {
+            pageUrls.add("http://" + data.removePrefix("https://"))
+        } else if (data.startsWith("http://", true)) {
+            pageUrls.add("https://" + data.removePrefix("http://"))
+        }
 
-        val document = response.document
-        val html = response.text
+        /*
+         * IMPORTANT:
+         * 1. Fetch the actual watch page.
+         * 2. Read the <video><source> / script URLs.
+         * 3. Read the site's download.php URL.
+         * 4. Put the site's download endpoint FIRST because it is the
+         *    server-supported delivery route for the same file.
+         * 5. Add the raw media URL as a direct fallback.
+         *
+         * The previous versions emitted the raw MP4 first. When that endpoint
+         * returned a non-2xx response to Media3, the player stopped with
+         * ERROR_CODE_IO_BAD_HTTP_STATUS (2004) instead of getting to the
+         * site's own download endpoint.
+         */
+        for (pageUrl in pageUrls) {
+            val response = runCatching {
+                app.get(pageUrl, headers = pageHeaders(pageUrl))
+            }.getOrNull() ?: continue
 
-        // Collect the actual media source from the watch page.
-        val directMedia = extractMediaUrls(document, html, data)
-            .sortedBy { mediaPriority(it) }
+            val document = response.document
+            val html = response.text
 
-        // KhulnaPlex also exposes a download.php URL for the exact same file.
-        // On some Android/ExoPlayer/network combinations the raw /uploads/...
-        // URL returns a bad HTTP status while download.php is still streamable.
-        val downloadUrls = document.select(
-            "a[href*='download.php']"
-        ).mapNotNull { anchor ->
-            anchor.attr("href")
-                .trim()
-                .takeIf { it.isNotBlank() }
-                ?.let { absoluteUrl(it, data) }
-        }.distinct()
+            val downloadUrls = extractDownloadUrls(document, html, pageUrl)
+            val directMedia = extractMediaUrls(document, html, pageUrl)
+                .sortedBy { mediaPriority(it) }
 
-        // Emit direct media first, then the site's own download endpoint as a
-        // fallback. Both receive the watch-page Referer and browser headers.
-        val emitted = linkedSetOf<String>()
+            val ordered = linkedSetOf<String>()
+            downloadUrls.forEach { ordered.add(it) }
+            directMedia.forEach { ordered.add(it) }
 
-        directMedia.forEach { media ->
-            val candidates = linkedSetOf<String>()
-            candidates.add(media)
-            if (media.startsWith("https://", true) && media.contains("khulnaplex.com", true)) {
-                candidates.add("http://" + media.removePrefix("https://"))
-            } else if (media.startsWith("http://", true) && media.contains("khulnaplex.com", true)) {
-                candidates.add("https://" + media.removePrefix("http://"))
+            if (ordered.isNotEmpty()) {
+                emitMediaAlternatives(
+                    urls = ordered.toList(),
+                    referer = pageUrl,
+                    callback = callback
+                )
+                return true
             }
 
-            candidates.forEach { candidate ->
-                if (emitted.add(candidate)) {
-                    emitMediaLink(candidate, data, callback, "Direct")
+            val iframes = document.select("iframe[src], iframe[data-src]")
+                .mapNotNull { iframe ->
+                    iframe.attr("src")
+                        .ifBlank { iframe.attr("data-src") }
+                        .takeIf { it.isNotBlank() }
+                        ?.let { absoluteUrl(it, pageUrl) }
+                }
+                .distinct()
+
+            for (iframe in iframes) {
+                if (runCatching {
+                        loadExtractor(iframe, pageUrl, subtitleCallback, callback)
+                    }.getOrDefault(false)) {
+                    return true
                 }
             }
         }
 
-        downloadUrls.forEach { downloadUrl ->
-            if (emitted.add(downloadUrl)) {
-                emitMediaLink(downloadUrl, data, callback, "Khulna Plex Download")
-            }
-        }
-
-        if (emitted.isNotEmpty()) return true
-
-        val iframes = document.select("iframe[src], iframe[data-src]")
-            .mapNotNull { iframe ->
-                iframe.attr("src")
-                    .ifBlank { iframe.attr("data-src") }
-                    .takeIf { it.isNotBlank() }
-                    ?.let { absoluteUrl(it, data) }
-            }
-            .distinct()
-
-        for (iframe in iframes) {
-            if (runCatching {
-                    loadExtractor(iframe, subtitleCallback, callback)
-                    true
-                }.getOrDefault(false)) return true
-        }
-
         return false
     }
+
+    private suspend fun emitMediaAlternatives(
+        urls: List<String>,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val unique = linkedSetOf<String>()
+
+        // Prefer the exact scheme already used by the watch page, then add a
+        // same-host scheme fallback. This avoids blindly preferring HTTPS when
+        // the site is currently serving its media over HTTP, or vice versa.
+        urls.forEach { original ->
+            val candidates = linkedSetOf<String>()
+            candidates.add(original)
+
+            if (original.startsWith("http://", true) && original.contains("khulnaplex.com", true)) {
+                candidates.add("https://" + original.removePrefix("http://"))
+            } else if (original.startsWith("https://", true) && original.contains("khulnaplex.com", true)) {
+                candidates.add("http://" + original.removePrefix("https://"))
+            }
+
+            candidates.forEach { candidate ->
+                if (unique.add(candidate)) {
+                    emitMediaLink(
+                        mediaUrl = candidate,
+                        referer = referer,
+                        callback = callback,
+                        label = if (candidate.contains("download.php", true)) {
+                            "Khulna Plex Download"
+                        } else if (candidate.contains(".m3u8", true)) {
+                            "Khulna Plex HLS"
+                        } else {
+                            "Khulna Plex Direct"
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun extractDownloadUrls(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        document.select("a[href*='download.php'], a.download-btn").forEach { anchor ->
+            val href = anchor.attr("href").trim()
+            if (href.isNotBlank() && href.contains("download.php", true)) {
+                found.add(absoluteUrl(cleanUrl(href), baseUrl))
+            }
+        }
+
+        val cleanHtml = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val regex = Regex(
+            """(?i)(?:https?://[^"'<>\s]+|(?:/|\.\.?/)?download\.php\?[^"'<>\s)]+)"""
+        )
+
+        regex.findAll(cleanHtml).forEach { match ->
+            val value = cleanUrl(match.value)
+            if (value.contains("download.php", true)) {
+                found.add(absoluteUrl(value, baseUrl))
+            }
+        }
+
+        // If the page exposes only the raw /uploads/videos/... file, build the
+        // same site's download endpoint from that exact file path as a fallback.
+        if (found.isEmpty()) {
+            val rawFile = extractMediaUrls(document, cleanHtml, baseUrl)
+                .firstOrNull { it.contains("/uploads/videos/", true) }
+            if (rawFile != null) {
+                val path = runCatching { URI(rawFile).rawPath.trimStart('/') }
+                    .getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                if (path != null) {
+                    val encoded = URLEncoder.encode(path, StandardCharsets.UTF_8.toString())
+                        .replace("+", "%20")
+                    found.add(absoluteUrl("/download.php?file=$encoded", baseUrl))
+                }
+            }
+        }
+
+        return found.distinct()
+    }
+
+    private fun cleanUrl(raw: String): String = raw
+        .trim()
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("&amp;", "&")
+        .trim('"', '\'', '`')
+        .trimEnd(',', ';', ')', ']', '}')
 
     private fun extractMediaUrls(
         document: Document,
@@ -635,14 +744,15 @@ class KhulnaPlex : MainAPI() {
             .getOrElse { url.lowercase(Locale.ROOT) }
         return when {
             path.endsWith(".m3u8") -> 0
-            path.endsWith(".mp4") -> 1
-            path.endsWith(".mkv") -> 2
-            path.endsWith(".webm") -> 3
-            path.endsWith(".mov") -> 4
-            path.endsWith(".m4v") -> 5
-            path.endsWith(".flv") -> 6
-            path.endsWith(".ts") -> 7
-            path.endsWith(".avi") -> 8
+            path.endsWith(".mpd") -> 1
+            path.endsWith(".mp4") -> 2
+            path.endsWith(".mkv") -> 3
+            path.endsWith(".webm") -> 4
+            path.endsWith(".mov") -> 5
+            path.endsWith(".m4v") -> 6
+            path.endsWith(".flv") -> 7
+            path.endsWith(".ts") -> 8
+            path.endsWith(".avi") -> 9
             else -> 99
         }
     }
@@ -653,7 +763,11 @@ class KhulnaPlex : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         label: String = "Direct"
     ) {
-        val type = if (mediaUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+        val type = when {
+            mediaUrl.contains(".m3u8", true) -> ExtractorLinkType.M3U8
+            mediaUrl.contains(".mpd", true) -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
         val lower = mediaUrl.lowercase(Locale.ROOT)
         val quality = when {
             "2160" in lower || "4k" in lower -> Qualities.P2160.value
@@ -667,7 +781,7 @@ class KhulnaPlex : MainAPI() {
         callback(newExtractorLink(name, label, mediaUrl, type) {
             this.referer = referer
             this.quality = quality
-            this.headers = browserHeaders(referer)
+            this.headers = mediaHeaders(referer)
         })
     }
 
