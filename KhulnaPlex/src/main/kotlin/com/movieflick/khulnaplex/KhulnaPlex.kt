@@ -444,7 +444,7 @@ class KhulnaPlex : MainAPI() {
             anchor.attr("data-published-at"),
             anchor.attr("datetime"),
             card.selectFirst("time[datetime]")?.attr("datetime")
-        ).filter { it.isNotBlank() }
+        ).filterNotNull().filter { it.isNotBlank() }
 
         for (value in values) {
             val clean = value.trim()
