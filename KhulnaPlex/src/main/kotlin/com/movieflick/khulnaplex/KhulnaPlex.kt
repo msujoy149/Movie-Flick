@@ -48,6 +48,16 @@ class KhulnaPlex : MainAPI() {
         val isSeries: Boolean
     )
 
+    private fun SiteItem.toSearchResponse(): SearchResponse {
+        return if (isSeries) {
+            newTvSeriesSearchResponse(title, url, poster)
+        } else {
+            newMovieSearchResponse(title, url, TvType.Movie) {
+                posterUrl = poster
+            }
+        }
+    }
+
     private val mediaExtensions = setOf(
         ".m3u8", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts"
     )
@@ -457,7 +467,7 @@ class KhulnaPlex : MainAPI() {
             all.contains("poster") || all.contains("cover") || all.contains("thumb")
         }
 
-        val selected = preferred ?: images.first()
+        val selected: Element = preferred ?: images.first()
         return imageSource(selected)?.let { absoluteUrl(it, pageUrl) }
     }
 
@@ -553,7 +563,7 @@ class KhulnaPlex : MainAPI() {
         return mediaExtensions.any { path.endsWith(it) }
     }
 
-    private fun emitMediaLink(
+    private suspend fun emitMediaLink(
         mediaUrl: String,
         referer: String,
         callback: (ExtractorLink) -> Unit
