@@ -2,6 +2,7 @@ package com.movieflick.khulnaplex
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
@@ -76,17 +77,17 @@ class KhulnaPlex : MainAPI() {
         )
     }
 
-    private suspend fun getKhulnaResponse(url: String): NiceResponse? {
-        val response = runCatching {
-            app.get(url, headers = browserHeaders())
+    private suspend fun getKhulnaDocument(url: String): org.jsoup.nodes.Document? {
+        val document = runCatching {
+            app.get(url, headers = browserHeaders()).document
         }.getOrNull()
 
-        if (response != null) return response
+        if (document != null) return document
 
         if (url.startsWith("http://", ignoreCase = true)) {
             val httpsUrl = "https://" + url.removePrefix("http://")
             return runCatching {
-                app.get(httpsUrl, headers = browserHeaders("$mainUrl/"))
+                app.get(httpsUrl, headers = browserHeaders("$mainUrl/")).document
             }.getOrNull()
         }
 
@@ -98,12 +99,11 @@ class KhulnaPlex : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val response = getKhulnaResponse(url) ?: return newHomePageResponse(
+        val document = getKhulnaDocument(url) ?: return newHomePageResponse(
             request,
             emptyList(),
             false
         )
-        val document = response.document
 
         val items = parseItems(document, request.data, request.name)
         val responses = items.map { it.toSearchResponse() }
@@ -146,13 +146,13 @@ class KhulnaPlex : MainAPI() {
 
         for (url in candidates) {
             val result = runCatching {
-                val response = getKhulnaResponse(url) ?: return@runCatching Triple(
+                val document = getKhulnaDocument(url) ?: return@runCatching Triple(
                     emptyList(),
                     org.jsoup.Jsoup.parse(""),
                     url
                 )
-                val items = parseItems(response.document, url, "Search")
-                Triple(items, response.document, url)
+                val items = parseItems(document, url, "Search")
+                Triple(items, document, url)
             }.getOrNull() ?: continue
 
             if (result.first.isNotEmpty()) {
@@ -167,7 +167,7 @@ class KhulnaPlex : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val response = getKhulnaResponse(url) ?: run {
+        val document = getKhulnaDocument(url) ?: run {
             return newMovieLoadResponse(
                 titleFromUrl(url),
                 url,
@@ -176,7 +176,6 @@ class KhulnaPlex : MainAPI() {
             )
         }
 
-        val document = response.document
         val pageTitle = extractPageTitle(document).ifBlank { titleFromUrl(url) }
         val poster = extractPoster(document, url)
 
@@ -220,7 +219,9 @@ class KhulnaPlex : MainAPI() {
             return true
         }
 
-        val response = getKhulnaResponse(data) ?: return false
+        val response = runCatching {
+            app.get(data, headers = browserHeaders(data))
+        }.getOrNull() ?: return false
 
         val document = response.document
         val found = linkedSetOf<String>()
