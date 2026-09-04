@@ -21,11 +21,11 @@
         "name": "DhakaFTP"
     },
     {
-        "jarFileSize": 113164,
-        "fileHash": "sha256-d4009b294c2ad10f42e2509ce4693001e7f5126af2ee5f02ff9aa2879efd65c1",
+        "jarFileSize": 119787,
+        "fileHash": "sha256-0650f6a828987fca22c430604facc8503861071ada47ed951227b93eded2214a",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 33721,
+        "fileSize": 35260,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -42,7 +42,7 @@
         "description": "Khulna Plex provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.cs3",
         "name": "KhulnaPlex",
-        "jarHash": "sha256-fa0277154b0324d70d7e2781f0583c9fb8bb1235a3e9750c353096567b6b4400"
+        "jarHash": "sha256-be5c41b422b9fcc6d1ba09be814ec7158bcf4b94a762df4b5b64cc08ad332f69"
     },
     {
         "jarFileSize": 50729,
