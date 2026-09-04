@@ -457,9 +457,9 @@ class KhulnaPlex : MainAPI() {
             )
         }
 
-        val contentType = headerValue(response.headers, "Content-Type").orEmpty()
-        val acceptRanges = headerValue(response.headers, "Accept-Ranges").orEmpty()
-        val contentRange = headerValue(response.headers, "Content-Range").orEmpty()
+        val contentType = response.headers["Content-Type"].orEmpty()
+        val acceptRanges = response.headers["Accept-Ranges"].orEmpty()
+        val contentRange = response.headers["Content-Range"].orEmpty()
 
         val rangeSupported =
             response.code == 206 ||
@@ -476,14 +476,6 @@ class KhulnaPlex : MainAPI() {
             rangeSupported = rangeSupported
         )
     }
-
-    private fun headerValue(
-        headers: Map<String, String>,
-        name: String
-    ): String? =
-        headers.entries
-            .firstOrNull { it.key.equals(name, ignoreCase = true) }
-            ?.value
 
     private suspend fun emitBestMediaLinks(
         ranked: List<MediaProbe>,
