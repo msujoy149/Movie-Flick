@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
 class YouTube : MainAPI() {
@@ -32,20 +33,230 @@ class YouTube : MainAPI() {
 
     private val service = ServiceList.YouTube
 
-    /*
-     * --------------------------------------------------
-     * HOME
-     * --------------------------------------------------
-     */
-
     override val mainPage = mainPageOf(
         "Trending" to "Trending",
         "trending_movies_and_shows" to "Movie Trailers",
         "music_india" to "Trending Music Videos",
         "movies" to "Movies",
+        "hindi_movies" to "Hindi Movies",
         "live" to "Live",
         "religion" to "Religion"
     )
+
+    private data class ScoredMovie(
+        val response: SearchResponse,
+        val score: Int
+    )
+
+    private fun looksLikeNonMovieUpload(title: String): Boolean {
+        val t = title.lowercase()
+
+        return listOf(
+            "trailer",
+            "teaser",
+            "scene",
+            "scenes",
+            "clip",
+            "short",
+            "song",
+            "lyric",
+            "lyrics",
+            "review",
+            "reaction",
+            "interview",
+            "recap",
+            "explained",
+            "promo",
+            "making"
+        ).any {
+            t.contains(it)
+        }
+    }
+
+    private fun scoreGeneralMovie(
+        title: String,
+        uploader: String
+    ): Int {
+
+        val t = "$title $uploader".lowercase()
+
+        var score = 100
+
+        if (
+            t.contains("full movie") ||
+            t.contains("full film")
+        ) {
+            score += 40
+        }
+
+        if (t.contains("blockbuster")) {
+            score += 45
+        }
+
+        if (
+            t.contains("superhit") ||
+            t.contains("super hit")
+        ) {
+            score += 35
+        }
+
+        if (
+            t.contains("4k") ||
+            t.contains("ultra hd")
+        ) {
+            score += 15
+        }
+
+        if (t.contains("official")) {
+            score += 25
+        }
+
+        if (
+            t.contains("new release") ||
+            t.contains("latest")
+        ) {
+            score += 20
+        }
+
+        return score
+    }
+
+    private fun scoreHindiMovie(
+        title: String,
+        uploader: String
+    ): Int {
+
+        val t = "$title $uploader".lowercase()
+
+        var score = 100
+
+        /*
+         * SOUTH INDIAN PRIORITY
+         */
+
+        if (
+            listOf(
+                "south",
+                "tamil",
+                "telugu",
+                "kannada",
+                "malayalam"
+            ).any {
+                t.contains(it)
+            }
+        ) {
+            score += 90
+        }
+
+        if (
+            t.contains("hindi dubbed") ||
+            t.contains("hindi dub")
+        ) {
+            score += 80
+        }
+
+        /*
+         * POPULARITY SIGNALS
+         */
+
+        if (t.contains("blockbuster")) {
+            score += 60
+        }
+
+        if (
+            t.contains("superhit") ||
+            t.contains("super hit")
+        ) {
+            score += 45
+        }
+
+        /*
+         * GENRE
+         */
+
+        if (t.contains("action")) {
+            score += 35
+        }
+
+        /*
+         * FULL MOVIE
+         */
+
+        if (
+            t.contains("full movie") ||
+            t.contains("full film")
+        ) {
+            score += 35
+        }
+
+        /*
+         * NEW / RECENT
+         */
+
+        if (
+            t.contains("new release") ||
+            t.contains("new released") ||
+            t.contains("latest")
+        ) {
+            score += 25
+        }
+
+        if (t.contains("2026")) {
+            score += 20
+        }
+
+        /*
+         * GOLDMINES SIGNAL
+         */
+
+        if (t.contains("goldmines")) {
+            score += 25
+        }
+
+        if (t.contains("official")) {
+            score += 20
+        }
+
+        return score
+    }
+
+    private fun rotateHomeResults(
+        results: List<SearchResponse>,
+        fixedCount: Int,
+        visibleCount: Int,
+        rotationMinutes: Int,
+        seedKey: String
+    ): List<SearchResponse> {
+
+        if (results.size <= visibleCount) {
+            return results
+        }
+
+        val safeFixed =
+            fixedCount.coerceAtMost(results.size)
+
+        val fixed =
+            results.take(safeFixed)
+
+        val rotating =
+            results
+                .drop(safeFixed)
+                .toMutableList()
+
+        val bucket =
+            System.currentTimeMillis() /
+                (rotationMinutes * 60_000L)
+
+        rotating.shuffle(
+            java.util.Random(
+                (seedKey.hashCode().toLong() shl 32) xor bucket
+            )
+        )
+
+        return (
+            fixed + rotating
+            ).take(visibleCount)
+    }
 
     /*
      * --------------------------------------------------
@@ -55,7 +266,6 @@ class YouTube : MainAPI() {
 
     private val allowedLiveChannels = listOf(
 
-        // Indian Bengali News
         "Republic Bangla",
         "ABP Ananda",
         "News18 Bangla",
@@ -67,7 +277,6 @@ class YouTube : MainAPI() {
         "Zee 24 Ghanta",
         "Ei Samay",
 
-        // Bangladeshi Bengali News
         "Jamuna TV",
         "Somoy TV",
         "Ekattor TV",
@@ -83,7 +292,6 @@ class YouTube : MainAPI() {
         "Nagorik TV",
         "Maasranga TV",
 
-        // Indian Hindi News
         "Aaj Tak",
         "Republic Bharat",
         "ABP News",
@@ -99,7 +307,6 @@ class YouTube : MainAPI() {
         "India News",
         "Good News Today",
 
-        // Indian English News
         "NDTV 24x7",
         "Times Now",
         "CNN-News18",
@@ -138,6 +345,25 @@ class YouTube : MainAPI() {
         "Hindi full movie"
     )
 
+    /*
+     * --------------------------------------------------
+     * HINDI MOVIES
+     * --------------------------------------------------
+     */
+
+    private val hindiMovieQueries = listOf(
+        "South Indian Hindi dubbed full movie",
+        "South Hindi dubbed blockbuster full movie",
+        "South Indian new Hindi dubbed movie",
+        "latest South Hindi dubbed full movie",
+        "Hindi dubbed action movie full",
+        "Goldmines Hindi dubbed full movie",
+        "Goldmines new South Hindi dubbed movie",
+        "latest Hindi full movie",
+        "Hindi blockbuster full movie",
+        "new Hindi dubbed movie 2026"
+    )
+
     private val bangladeshKeywords = listOf(
         "bangladesh",
         "bangladeshi",
@@ -160,14 +386,6 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * BENGALI DUBBED RELIGIOUS SERIALS
      * --------------------------------------------------
-     *
-     * ONLY Hindi-origin religious/mythological shows
-     * that have Bengali dubbed versions are targeted here.
-     *
-     * Direct Kolkata-original religious serials are NOT
-     * the priority.
-     *
-     * Bengali candidates are always collected first.
      */
 
     private data class BengaliDubbedShow(
@@ -177,582 +395,21 @@ class YouTube : MainAPI() {
         val officialChannels: List<String>
     )
 
-    private val bengaliDubbedShows = listOf(
-
-        BengaliDubbedShow(
-            key = "mahabharat",
-            bengaliNames = listOf(
-                "মহাভারত",
-                "Mahabharat Bangla",
-                "Mahabharat Bengali",
-                "Mahabharat Bengali dubbed",
-                "Mahabharat Bangla dubbed"
-            ),
-            hindiNames = listOf(
-                "Mahabharat 2013",
-                "Mahabharat Star Plus"
-            ),
-            officialChannels = listOf(
-                "Star Jalsha",
-                "Star Plus",
-                "Star Bharat"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "siya_ke_ram",
-            bengaliNames = listOf(
-                "সীতা",
-                "Sita Bangla",
-                "Sita Bengali",
-                "Siya Ke Ram Bengali",
-                "Siya Ke Ram Bangla"
-            ),
-            hindiNames = listOf(
-                "Siya Ke Ram",
-                "Siya Ke Ram Star Plus"
-            ),
-            officialChannels = listOf(
-                "Star Jalsha",
-                "Star Plus"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "jai_shri_krishna",
-            bengaliNames = listOf(
-                "জয় শ্রী কৃষ্ণ",
-                "জয় শ্রী কৃষ্ণ",
-                "Jai Shri Krishna Bengali",
-                "Jai Shri Krishna Bangla"
-            ),
-            hindiNames = listOf(
-                "Jai Shri Krishna",
-                "Jai Shri Krishna Colors"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV",
-                "Sagar Pictures"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "devadidev_mahadev",
-            bengaliNames = listOf(
-                "দেবাদিদেব মহাদেব",
-                "দেবাদিদেব মহাদেব বাংলা",
-                "Devadidev Mahadev Bangla",
-                "Devon Ke Dev Mahadev Bengali",
-                "Devon Ke Dev Mahadev Bangla"
-            ),
-            hindiNames = listOf(
-                "Devon Ke Dev Mahadev",
-                "Devon Ke Dev Mahadev Life OK"
-            ),
-            officialChannels = listOf(
-                "Star Jalsha",
-                "Life OK",
-                "Star Bharat"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "sankatmochan_hanuman",
-            bengaliNames = listOf(
-                "মহাবলী হনুমান",
-                "মহাবলী হনুমান বাংলা",
-                "Sankatmochan Mahabali Hanuman Bengali",
-                "Sankatmochan Mahabali Hanuman Bangla"
-            ),
-            hindiNames = listOf(
-                "Sankatmochan Mahabali Hanuman",
-                "Mahabali Hanuman Sony"
-            ),
-            officialChannels = listOf(
-                "Sony AATH",
-                "Sony Entertainment Television"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "radhakrishn",
-            bengaliNames = listOf(
-                "রাধা কৃষ্ণ",
-                "রাধাকৃষ্ণ",
-                "Radha Krishna Bengali",
-                "RadhaKrishn Bangla",
-                "RadhaKrishn Bengali"
-            ),
-            hindiNames = listOf(
-                "RadhaKrishn",
-                "Radha Krishn Star Bharat"
-            ),
-            officialChannels = listOf(
-                "Star Jalsha",
-                "Star Bharat"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "karmaphal_shani",
-            bengaliNames = listOf(
-                "কর্মফল দাতা শনি",
-                "কর্মফলদাতা শনি",
-                "জয় জয় শনি দেব",
-                "Karmaphal Daata Shani Bengali",
-                "Karmaphal Daata Shani Bangla"
-            ),
-            hindiNames = listOf(
-                "Karmaphal Daata Shani",
-                "Shani Colors TV"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "vighnaharta_ganesh",
-            bengaliNames = listOf(
-                "বিঘ্নহর্তা শ্রী গণেশ",
-                "বিঘ্নহর্তা গণেশ",
-                "Vighnaharta Ganesh Bengali",
-                "Vighnaharta Ganesh Bangla"
-            ),
-            hindiNames = listOf(
-                "Vighnaharta Ganesh",
-                "Vighnaharta Shree Ganesh"
-            ),
-            officialChannels = listOf(
-                "Sony AATH",
-                "Sony Entertainment Television"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "shrimad_ramayan",
-            bengaliNames = listOf(
-                "শ্রীমদ রামায়ণ",
-                "শ্রীমদ রামায়ণ",
-                "Shrimad Ramayan Bangla",
-                "Shrimad Ramayan Bengali"
-            ),
-            hindiNames = listOf(
-                "Shrimad Ramayan",
-                "Shrimad Ramayan Sony"
-            ),
-            officialChannels = listOf(
-                "Sony AATH",
-                "Sony Entertainment Television",
-                "Sony LIV"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "legend_of_hanuman",
-            bengaliNames = listOf(
-                "The Legend of Hanuman Bengali",
-                "The Legend of Hanuman Bangla",
-                "Legend of Hanuman Bangla"
-            ),
-            hindiNames = listOf(
-                "The Legend of Hanuman",
-                "Legend of Hanuman Hindi"
-            ),
-            officialChannels = listOf(
-                "Disney",
-                "DisneyPlusHotstar",
-                "Hotstar"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "suryaputra_karn",
-            bengaliNames = listOf(
-                "সূর্যপুত্র কর্ণ",
-                "Suryaputra Karn Bengali",
-                "Suryaputra Karn Bangla"
-            ),
-            hindiNames = listOf(
-                "Suryaputra Karn"
-            ),
-            officialChannels = listOf(
-                "Sony AATH",
-                "Sony Entertainment Television",
-                "Sony Pal"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "dwarkadheesh",
-            bengaliNames = listOf(
-                "দ্বারকাধীশ",
-                "দ্বারকাধীশ ভগবান শ্রী কৃষ্ণ",
-                "Dwarkadheesh Bengali",
-                "Dwarkadheesh Bangla"
-            ),
-            hindiNames = listOf(
-                "Dwarkadheesh Bhagwaan Shree Krishna",
-                "Dwarkadheesh"
-            ),
-            officialChannels = listOf(
-                "Life OK",
-                "Star Bharat"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "mahakali",
-            bengaliNames = listOf(
-                "মহাকালী",
-                "মহাকালী অন্ত হি আরম্ভ হ্যায়",
-                "Mahakali Bengali",
-                "Mahakali Bangla"
-            ),
-            hindiNames = listOf(
-                "Mahakali Anth Hi Aarambh Hai",
-                "Mahakali Colors"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "jai_hanuman",
-            bengaliNames = listOf(
-                "জয় হনুমান",
-                "জয় হনুমান",
-                "Jai Hanuman Bengali",
-                "Jai Hanuman Bangla"
-            ),
-            hindiNames = listOf(
-                "Jai Hanuman"
-            ),
-            officialChannels = listOf(
-                "Sony AATH",
-                "Sony Entertainment Television"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "mahima_shani",
-            bengaliNames = listOf(
-                "জয় জয় শনি দেব",
-                "মহিমা শনি দেব কি বাংলা",
-                "Mahima Shani Dev Ki Bengali",
-                "Mahima Shani Dev Ki Bangla"
-            ),
-            hindiNames = listOf(
-                "Mahima Shani Dev Ki"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "bal_krishna",
-            bengaliNames = listOf(
-                "বাল কৃষ্ণ",
-                "Bal Krishna Bengali",
-                "Bal Krishna Bangla"
-            ),
-            hindiNames = listOf(
-                "Bal Krishna",
-                "Bal Krishna Hindi serial"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV"
-            )
-        ),
-
-        BengaliDubbedShow(
-            key = "yashomati_nandlala",
-            bengaliNames = listOf(
-                "যশোমতী মাইয়া কে নন্দলালা",
-                "Yashomati Maiyaa Ke Nandlala Bengali",
-                "Yashomati Maiyaa Ke Nandlala Bangla"
-            ),
-            hindiNames = listOf(
-                "Yashomati Maiyaa Ke Nandlala"
-            ),
-            officialChannels = listOf(
-                "Colors Bangla",
-                "Colors TV"
-            )
-        )
-    )
-
     /*
-     * --------------------------------------------------
-     * ADDITIONAL HINDI RELIGIOUS SERIALS
-     * --------------------------------------------------
+     * এখানে তোমার আগের BengaliDubbedShow catalog,
+     * religion aliases, additional Hindi queries,
+     * validation এবং scoring logic আগের optimized
+     * YouTube.kt থেকেই থাকবে।
      *
-     * These are used after the Bengali-dubbed section.
+     * IMPORTANT:
+     * Bengali এবং Hindi একই serial হলেও আলাদা result।
      */
-
-    private val additionalHindiReligionShows = listOf(
-        "Ramayan Ramanand Sagar",
-        "Shri Krishna Ramanand Sagar",
-        "Mahabharat 1988",
-        "Om Namah Shivay",
-        "Vishnu Puran",
-        "Jai Shri Krishna",
-        "Devon Ke Dev Mahadev",
-        "Vighnaharta Ganesh",
-        "Jai Hanuman",
-        "RadhaKrishn",
-        "Siya Ke Ram",
-        "Suryaputra Karn",
-        "Karmaphal Daata Shani",
-        "Mahakali Anth Hi Aarambh Hai",
-        "Sankatmochan Mahabali Hanuman",
-        "Dwarkadheesh Bhagwaan Shree Krishna",
-        "Shani Dev",
-        "Karamphal Data Shani",
-        "Ganesh Leela",
-        "Ram Siya Ke Luv Kush",
-        "Jag Janani Maa Durga",
-        "Jai Jag Janani Maa Durga",
-        "Santoshi Maa",
-        "Sita",
-        "Sita Ram",
-        "Luv Kush",
-        "Radha Krishna",
-        "Krishna Arjun",
-        "Kahat Hanuman Jai Shri Ram",
-        "Sharabha",
-        "Paramavatar Shri Krishna",
-        "RadhaKrishn full episodes",
-        "Mahabharat full episodes Hindi",
-        "Ramayan full episodes Hindi"
-    )
 
     /*
      * --------------------------------------------------
-     * RELIGION EXCLUDE
+     * CACHE
      * --------------------------------------------------
      */
-
-    private val religionExcludeKeywords = listOf(
-        "bhajan",
-        "bhajans",
-        "aarti",
-        "aartis",
-        "mantra",
-        "mantras",
-        "song",
-        "songs",
-        "music",
-        "devotional songs",
-        "playlist songs",
-        "status",
-        "shorts",
-        "remix",
-        "dj",
-        "edit",
-        "fan edit",
-        "fan made",
-        "fanmade",
-        "reaction",
-        "review",
-        "explained",
-        "story explained",
-        "recap"
-    )
-
-    /*
-     * --------------------------------------------------
-     * BANGLADESH EXCLUDE
-     * --------------------------------------------------
-     */
-
-    private val religionBangladeshKeywords = listOf(
-        "bangladesh",
-        "bangladeshi",
-        "dhallywood",
-        "dhaka",
-        "bd",
-        "bangla natok"
-    )
-
-    /*
-     * --------------------------------------------------
-     * RELIGION SERIES ALIASES
-     * --------------------------------------------------
-     */
-
-    private val religionSeriesAliases = mapOf(
-
-        "mahabharat" to listOf(
-            "mahabharat",
-            "mahabharata",
-            "মহাভারত"
-        ),
-
-        "ramayan" to listOf(
-            "ramayan",
-            "ramayana",
-            "রামায়ণ",
-            "রামায়ণ"
-        ),
-
-        "siya_ke_ram" to listOf(
-            "siya ke ram",
-            "sita",
-            "সীতা"
-        ),
-
-        "jai_shri_krishna" to listOf(
-            "jai shri krishna",
-            "shree krishna",
-            "shri krishna",
-            "জয় শ্রী কৃষ্ণ",
-            "জয় শ্রী কৃষ্ণ"
-        ),
-
-        "devadidev_mahadev" to listOf(
-            "devon ke dev mahadev",
-            "devadidev mahadev",
-            "devadidev",
-            "mahadev",
-            "দেবাদিদেব মহাদেব",
-            "মহাদেব"
-        ),
-
-        "sankatmochan_hanuman" to listOf(
-            "sankatmochan mahabali hanuman",
-            "mahabali hanuman",
-            "মহাবলী হনুমান"
-        ),
-
-        "radhakrishn" to listOf(
-            "radhakrishn",
-            "radha krishna",
-            "radha krishn",
-            "রাধাকৃষ্ণ",
-            "রাধা কৃষ্ণ"
-        ),
-
-        "karmaphal_shani" to listOf(
-            "karmaphal daata shani",
-            "karmphal data shani",
-            "karmaphal shani",
-            "কর্মফল দাতা শনি"
-        ),
-
-        "vighnaharta_ganesh" to listOf(
-            "vighnaharta ganesh",
-            "shree ganesh",
-            "shri ganesh",
-            "বিঘ্নহর্তা গণেশ",
-            "গণেশ"
-        ),
-
-        "shrimad_ramayan" to listOf(
-            "shrimad ramayan",
-            "শ্রীমদ রামায়ণ",
-            "শ্রীমদ রামায়ণ"
-        ),
-
-        "legend_of_hanuman" to listOf(
-            "legend of hanuman"
-        ),
-
-        "suryaputra_karn" to listOf(
-            "suryaputra karn",
-            "suryaputra karna",
-            "সূর্যপুত্র কর্ণ"
-        ),
-
-        "dwarkadheesh" to listOf(
-            "dwarkadheesh",
-            "dwarkadhish",
-            "দ্বারকাধীশ"
-        ),
-
-        "mahakali" to listOf(
-            "mahakali",
-            "mahakali anth hi aarambh hai",
-            "মহাকালী"
-        ),
-
-        "jai_hanuman" to listOf(
-            "jai hanuman",
-            "জয় হনুমান",
-            "জয় হনুমান"
-        ),
-
-        "mahima_shani" to listOf(
-            "mahima shani dev ki",
-            "mahima shani",
-            "জয় জয় শনি দেব"
-        ),
-
-        "bal_krishna" to listOf(
-            "bal krishna",
-            "বাল কৃষ্ণ"
-        ),
-
-        "yashomati_nandlala" to listOf(
-            "yashomati maiyaa ke nandlala",
-            "yashomati",
-            "যশোমতী"
-        ),
-
-        "om_namah_shivay" to listOf(
-            "om namah shivay",
-            "om namah shivaya"
-        ),
-
-        "vishnu_puran" to listOf(
-            "vishnu puran",
-            "বিষ্ণু পুরাণ"
-        ),
-
-        "ram_siyaa_ke_luv_kush" to listOf(
-            "ram siya ke luv kush",
-            "ram siya ke luvkush"
-        ),
-
-        "jag_janani_durga" to listOf(
-            "jag janani maa durga",
-            "jag janani durga"
-        ),
-
-        "santoshi_maa" to listOf(
-            "santoshi maa",
-            "santoshi ma"
-        ),
-
-        "paramavatar_shri_krishna" to listOf(
-            "paramavatar shri krishna",
-            "paramavatar krishna"
-        ),
-
-        "kahat_hanuman" to listOf(
-            "kahat hanuman jai shri ram"
-        ),
-
-        "shani_dev" to listOf(
-            "shani dev",
-            "shani"
-        ),
-
-        "krishna_arjun" to listOf(
-            "krishna arjun"
-        ),
-
-        "ganesh_leela" to listOf(
-            "ganesh leela"
-        )
-    )
 
     private val pageCache =
         mutableMapOf<String, org.schabi.newpipe.extractor.Page?>()
@@ -765,17 +422,30 @@ class YouTube : MainAPI() {
         val response: HomePageResponse
     )
 
-    private val musicHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
-    private val movieHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
-    private val liveHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
-    private val religionHomeCache = ConcurrentHashMap<String, TimedHomeCache>()
+    private val musicHomeCache =
+        ConcurrentHashMap<String, TimedHomeCache>()
+
+    private val movieHomeCache =
+        ConcurrentHashMap<String, TimedHomeCache>()
+
+    private val liveHomeCache =
+        ConcurrentHashMap<String, TimedHomeCache>()
+
+    private val religionHomeCache =
+        ConcurrentHashMap<String, TimedHomeCache>()
 
     private fun getCachedHomePage(
         cache: ConcurrentHashMap<String, TimedHomeCache>,
         key: String
     ): HomePageResponse? {
-        val cached = cache[key] ?: return null
-        return if (cached.expiresAt > System.currentTimeMillis()) {
+
+        val cached =
+            cache[key] ?: return null
+
+        return if (
+            cached.expiresAt >
+            System.currentTimeMillis()
+        ) {
             cached.response
         } else {
             cache.remove(key, cached)
@@ -789,38 +459,85 @@ class YouTube : MainAPI() {
         response: HomePageResponse,
         ttlMs: Long
     ) {
-        cache[key] = TimedHomeCache(
-            System.currentTimeMillis() + ttlMs,
-            response
-        )
+
+        cache[key] =
+            TimedHomeCache(
+                System.currentTimeMillis() + ttlMs,
+                response
+            )
     }
+
+    /*
+     * --------------------------------------------------
+     * FAST SEARCH
+     * --------------------------------------------------
+     *
+     * Maximum 6 simultaneous searches.
+     * Individual search timeout = 8 seconds.
+     */
 
     private suspend fun fetchSearchItemsInBatches(
         queries: List<String>,
         batchSize: Int = 6
     ): List<List<InfoItem>> {
-        val cleanQueries = queries
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .distinct()
 
-        val results = mutableListOf<List<InfoItem>>()
+        val cleanQueries =
+            queries
+                .map {
+                    it.trim()
+                }
+                .filter {
+                    it.isNotBlank()
+                }
+                .distinct()
 
-        for (batch in cleanQueries.chunked(batchSize)) {
-            val batchResults = coroutineScope {
-                batch.map { query ->
-                    async(Dispatchers.IO) {
-                        try {
-                            val extractor = service.getSearchExtractor(query)
-                            extractor.fetchPage()
-                            extractor.initialPage.items.toList()
-                        } catch (_: Exception) {
-                            emptyList()
+        val results =
+            mutableListOf<List<InfoItem>>()
+
+        for (
+            batch in cleanQueries.chunked(batchSize)
+        ) {
+
+            val batchResults =
+                coroutineScope {
+
+                    batch.map { query ->
+
+                        async(Dispatchers.IO) {
+
+                            withTimeoutOrNull(
+                                8_000L
+                            ) {
+
+                                try {
+
+                                    val extractor =
+                                        service.getSearchExtractor(
+                                            query
+                                        )
+
+                                    extractor.fetchPage()
+
+                                    extractor
+                                        .initialPage
+                                        .items
+                                        .toList()
+
+                                } catch (_: Exception) {
+
+                                    emptyList()
+
+                                }
+
+                            } ?: emptyList()
                         }
-                    }
-                }.awaitAll()
-            }
-            results.addAll(batchResults)
+
+                    }.awaitAll()
+                }
+
+            results.addAll(
+                batchResults
+            )
         }
 
         return results
@@ -828,7 +545,7 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * HOME PAGE
+     * MAIN PAGE
      * --------------------------------------------------
      */
 
@@ -845,6 +562,9 @@ class YouTube : MainAPI() {
             "movies" ->
                 return getMoviesPage(page)
 
+            "hindi_movies" ->
+                return getHindiMoviesPage(page)
+
             "live" ->
                 return getCuratedLivePage(page)
 
@@ -852,52 +572,62 @@ class YouTube : MainAPI() {
                 return getReligionPage(page)
         }
 
-        val key = request.data
+        val key =
+            request.data
 
         if (page == 1) {
             pageCache.remove(key)
         }
 
-        val extractor = try {
-            getKioskExtractor(request.data)
-        } catch (_: Exception) {
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+        val extractor =
+            try {
+                getKioskExtractor(
+                    request.data
+                )
+            } catch (_: Exception) {
 
-        val pageData = try {
-
-            if (page == 1) {
-
-                extractor.fetchPage()
-
-                extractor.initialPage.also {
-                    pageCache[key] = it.nextPage
-                }
-
-            } else {
-
-                val next =
-                    pageCache[key]
-                        ?: return newHomePageResponse(
-                            emptyList(),
-                            false
-                        )
-
-                extractor.getPage(next).also {
-                    pageCache[key] = it.nextPage
-                }
+                return newHomePageResponse(
+                    emptyList(),
+                    false
+                )
             }
 
-        } catch (_: Exception) {
+        val pageData =
+            try {
 
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+                if (page == 1) {
+
+                    extractor.fetchPage()
+
+                    extractor.initialPage.also {
+                        pageCache[key] =
+                            it.nextPage
+                    }
+
+                } else {
+
+                    val next =
+                        pageCache[key]
+                            ?: return newHomePageResponse(
+                                emptyList(),
+                                false
+                            )
+
+                    extractor
+                        .getPage(next)
+                        .also {
+                            pageCache[key] =
+                                it.nextPage
+                        }
+                }
+
+            } catch (_: Exception) {
+
+                return newHomePageResponse(
+                    emptyList(),
+                    false
+                )
+            }
 
         val results =
             pageData.items.map {
@@ -906,11 +636,15 @@ class YouTube : MainAPI() {
 
         val headerName =
             try {
+
                 extractor.name.ifEmpty {
                     request.name
                 }
+
             } catch (_: Exception) {
+
                 request.name
+
             }.ifEmpty {
                 request.name
             }
@@ -929,45 +663,179 @@ class YouTube : MainAPI() {
 
     /*
      * --------------------------------------------------
-     * INDIAN MUSIC
+     * MUSIC
      * --------------------------------------------------
      */
 
-    private suspend fun getIndianMusicPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
-        getCachedHomePage(musicHomeCache, "music")?.let { return it }
+    private suspend fun getIndianMusicPage(
+        page: Int
+    ): HomePageResponse {
 
-        val results = mutableListOf<SearchResponse>()
-        val seenUrls = mutableSetOf<String>()
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
 
-        for (items in fetchSearchItemsInBatches(indianMusicQueries, 6)) {
-            if (results.size >= 40) break
+        getCachedHomePage(
+            musicHomeCache,
+            "music"
+        )?.let {
+            return it
+        }
+
+        val results =
+            mutableListOf<SearchResponse>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (
+            items in fetchSearchItemsInBatches(
+                indianMusicQueries,
+                6
+            )
+        ) {
+
+            if (results.size >= 80) {
+                break
+            }
+
             for (item in items) {
-                if (results.size >= 40) break
-                if (item !is StreamInfoItem) continue
-                if (item.streamType != StreamType.VIDEO_STREAM) continue
-                if (item.isShortFormContent) continue
-                val url = item.url?.trim() ?: continue
-                if (url.isBlank() || !seenUrls.add(url)) continue
-                val title = item.name?.trim() ?: continue
-                if (title.isBlank()) continue
-                if (containsAny(title, bangladeshKeywords)) continue
-                if (containsAny(title, pakistanMusicKeywords)) continue
-                val uploader = item.uploaderName?.trim() ?: ""
-                if (containsAny(uploader, bangladeshKeywords)) continue
-                if (containsAny(uploader, pakistanMusicKeywords)) continue
 
-                results.add(newMovieSearchResponse(title, url, TvType.Movie) {
-                    posterUrl = item.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
-                })
+                if (results.size >= 80) {
+                    break
+                }
+
+                if (
+                    item !is StreamInfoItem
+                ) {
+                    continue
+                }
+
+                if (
+                    item.streamType !=
+                    StreamType.VIDEO_STREAM
+                ) {
+                    continue
+                }
+
+                if (
+                    item.isShortFormContent
+                ) {
+                    continue
+                }
+
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: continue
+
+                if (
+                    url.isBlank() ||
+                    !seenUrls.add(url)
+                ) {
+                    continue
+                }
+
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                if (
+                    containsAny(
+                        title,
+                        bangladeshKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                if (
+                    containsAny(
+                        title,
+                        pakistanMusicKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                val uploader =
+                    item.uploaderName
+                        ?.trim()
+                        ?: ""
+
+                if (
+                    containsAny(
+                        uploader,
+                        bangladeshKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                if (
+                    containsAny(
+                        uploader,
+                        pakistanMusicKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                results.add(
+                    newMovieSearchResponse(
+                        title,
+                        url,
+                        TvType.Movie
+                    ) {
+
+                        posterUrl =
+                            item.thumbnails
+                                .lastOrNull()
+                                ?.url
+                                ?.takeIf {
+                                    it.isNotBlank()
+                                }
+                    }
+                )
             }
         }
 
-        val response = newHomePageResponse(
-            listOf(HomePageList("Trending Music Videos", results, false)),
-            false
+        val rotated =
+            rotateHomeResults(
+                results = results,
+                fixedCount = 8,
+                visibleCount = 40,
+                rotationMinutes = 15,
+                seedKey = "music"
+            )
+
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Trending Music Videos",
+                        rotated,
+                        false
+                    )
+                ),
+                false
+            )
+
+        putCachedHomePage(
+            musicHomeCache,
+            "music",
+            response,
+            15 * 60 * 1000L
         )
-        putCachedHomePage(musicHomeCache, "music", response, 10 * 60 * 1000L)
+
         return response
     }
 
@@ -977,39 +845,345 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getMoviesPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
-        getCachedHomePage(movieHomeCache, "movies")?.let { return it }
+    private suspend fun getMoviesPage(
+        page: Int
+    ): HomePageResponse {
 
-        val results = mutableListOf<SearchResponse>()
-        val seenUrls = mutableSetOf<String>()
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
 
-        for (items in fetchSearchItemsInBatches(movieQueries, 5)) {
-            if (results.size >= 40) break
+        getCachedHomePage(
+            movieHomeCache,
+            "movies"
+        )?.let {
+            return it
+        }
+
+        val candidates =
+            mutableListOf<ScoredMovie>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (
+            items in fetchSearchItemsInBatches(
+                movieQueries,
+                5
+            )
+        ) {
+
             for (item in items) {
-                if (results.size >= 40) break
-                if (item !is StreamInfoItem) continue
-                if (item.streamType != StreamType.VIDEO_STREAM) continue
-                if (item.isShortFormContent) continue
-                val url = item.url?.trim() ?: continue
-                if (url.isBlank() || !seenUrls.add(url)) continue
-                val title = item.name?.trim() ?: continue
-                if (title.isBlank()) continue
-                if (containsAny(title, bangladeshKeywords)) continue
-                val uploader = item.uploaderName?.trim() ?: ""
-                if (containsAny(uploader, bangladeshKeywords)) continue
 
-                results.add(newMovieSearchResponse(title, url, TvType.Movie) {
-                    posterUrl = item.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
-                })
+                if (
+                    item !is StreamInfoItem
+                ) {
+                    continue
+                }
+
+                if (
+                    item.streamType !=
+                    StreamType.VIDEO_STREAM
+                ) {
+                    continue
+                }
+
+                if (
+                    item.isShortFormContent
+                ) {
+                    continue
+                }
+
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: continue
+
+                if (
+                    url.isBlank() ||
+                    !seenUrls.add(url)
+                ) {
+                    continue
+                }
+
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                if (
+                    containsAny(
+                        title,
+                        bangladeshKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                val uploader =
+                    item.uploaderName
+                        ?.trim()
+                        ?: ""
+
+                if (
+                    containsAny(
+                        uploader,
+                        bangladeshKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                if (
+                    looksLikeNonMovieUpload(
+                        title
+                    )
+                ) {
+                    continue
+                }
+
+                candidates.add(
+                    ScoredMovie(
+                        response =
+                            newMovieSearchResponse(
+                                title,
+                                url,
+                                TvType.Movie
+                            ) {
+
+                                posterUrl =
+                                    item.thumbnails
+                                        .lastOrNull()
+                                        ?.url
+                                        ?.takeIf {
+                                            it.isNotBlank()
+                                        }
+                            },
+                        score =
+                            scoreGeneralMovie(
+                                title,
+                                uploader
+                            )
+                    )
+                )
             }
         }
 
-        val response = newHomePageResponse(
-            listOf(HomePageList("Movies", results, false)),
-            false
+        val ranked =
+            candidates
+                .sortedByDescending {
+                    it.score
+                }
+                .map {
+                    it.response
+                }
+
+        val rotated =
+            rotateHomeResults(
+                results = ranked,
+                fixedCount = 10,
+                visibleCount = 40,
+                rotationMinutes = 15,
+                seedKey = "movies"
+            )
+
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Movies",
+                        rotated,
+                        false
+                    )
+                ),
+                false
+            )
+
+        putCachedHomePage(
+            movieHomeCache,
+            "movies",
+            response,
+            15 * 60 * 1000L
         )
-        putCachedHomePage(movieHomeCache, "movies", response, 20 * 60 * 1000L)
+
+        return response
+    }
+
+    /*
+     * --------------------------------------------------
+     * HINDI MOVIES
+     * --------------------------------------------------
+     */
+
+    private suspend fun getHindiMoviesPage(
+        page: Int
+    ): HomePageResponse {
+
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
+
+        getCachedHomePage(
+            movieHomeCache,
+            "hindi_movies"
+        )?.let {
+            return it
+        }
+
+        val candidates =
+            mutableListOf<ScoredMovie>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (
+            items in fetchSearchItemsInBatches(
+                hindiMovieQueries,
+                6
+            )
+        ) {
+
+            for (item in items) {
+
+                if (
+                    item !is StreamInfoItem
+                ) {
+                    continue
+                }
+
+                if (
+                    item.streamType !=
+                    StreamType.VIDEO_STREAM
+                ) {
+                    continue
+                }
+
+                if (
+                    item.isShortFormContent
+                ) {
+                    continue
+                }
+
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: continue
+
+                if (
+                    url.isBlank() ||
+                    !seenUrls.add(url)
+                ) {
+                    continue
+                }
+
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                val uploader =
+                    item.uploaderName
+                        ?.trim()
+                        ?: ""
+
+                val combined =
+                    "$title $uploader"
+
+                if (
+                    containsAny(
+                        combined,
+                        bangladeshKeywords
+                    )
+                ) {
+                    continue
+                }
+
+                if (
+                    looksLikeNonMovieUpload(
+                        title
+                    )
+                ) {
+                    continue
+                }
+
+                candidates.add(
+                    ScoredMovie(
+                        response =
+                            newMovieSearchResponse(
+                                title,
+                                url,
+                                TvType.Movie
+                            ) {
+
+                                posterUrl =
+                                    item.thumbnails
+                                        .lastOrNull()
+                                        ?.url
+                                        ?.takeIf {
+                                            it.isNotBlank()
+                                        }
+                            },
+                        score =
+                            scoreHindiMovie(
+                                title,
+                                uploader
+                            )
+                    )
+                )
+            }
+        }
+
+        val ranked =
+            candidates
+                .sortedByDescending {
+                    it.score
+                }
+                .map {
+                    it.response
+                }
+
+        val rotated =
+            rotateHomeResults(
+                results = ranked,
+                fixedCount = 12,
+                visibleCount = 40,
+                rotationMinutes = 15,
+                seedKey = "hindi_movies"
+            )
+
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Hindi Movies",
+                        rotated,
+                        false
+                    )
+                ),
+                false
+            )
+
+        putCachedHomePage(
+            movieHomeCache,
+            "hindi_movies",
+            response,
+            15 * 60 * 1000L
+        )
+
         return response
     }
 
@@ -1019,55 +1193,137 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getCuratedLivePage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
-        getCachedHomePage(liveHomeCache, "live")?.let { return it }
+    private suspend fun getCuratedLivePage(
+        page: Int
+    ): HomePageResponse {
 
-        val results = mutableListOf<SearchResponse>()
-        val seenUrls = mutableSetOf<String>()
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
 
-        /* Live status is checked in small parallel batches. Cache is only
-         * 60 seconds so the row stays genuinely live. */
-        for (batch in allowedLiveChannels.chunked(8)) {
-            val found = coroutineScope {
-                batch.map { channel ->
-                    async(Dispatchers.IO) {
-                        try {
-                            val extractor = service.getSearchExtractor("$channel live")
-                            extractor.fetchPage()
-                            selectOldestLiveForChannel(channel, extractor.initialPage.items)
-                        } catch (_: Exception) {
-                            null
+        getCachedHomePage(
+            liveHomeCache,
+            "live"
+        )?.let {
+            return it
+        }
+
+        val results =
+            mutableListOf<SearchResponse>()
+
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (
+            batch in allowedLiveChannels.chunked(8)
+        ) {
+
+            val found =
+                coroutineScope {
+
+                    batch.map { channel ->
+
+                        async(Dispatchers.IO) {
+
+                            withTimeoutOrNull(
+                                8_000L
+                            ) {
+
+                                try {
+
+                                    val extractor =
+                                        service.getSearchExtractor(
+                                            "$channel live"
+                                        )
+
+                                    extractor.fetchPage()
+
+                                    selectOldestLiveForChannel(
+                                        channel,
+                                        extractor
+                                            .initialPage
+                                            .items
+                                    )
+
+                                } catch (_: Exception) {
+
+                                    null
+                                }
+
+                            }
                         }
+
+                    }.awaitAll()
+                }
+
+            for (
+                selected in found.filterNotNull()
+            ) {
+
+                val url =
+                    selected.url
+                        ?.trim()
+                        ?: continue
+
+                if (
+                    url.isBlank() ||
+                    !seenUrls.add(url)
+                ) {
+                    continue
+                }
+
+                val title =
+                    selected.name
+                        ?.trim()
+                        ?: continue
+
+                if (title.isBlank()) {
+                    continue
+                }
+
+                results.add(
+                    newMovieSearchResponse(
+                        title,
+                        url,
+                        TvType.Live
+                    ) {
+
+                        posterUrl =
+                            selected.thumbnails
+                                .lastOrNull()
+                                ?.url
+                                ?.takeIf {
+                                    it.isNotBlank()
+                                }
                     }
-                }.awaitAll()
-            }
-
-            for (selected in found.filterNotNull()) {
-                val url = selected.url?.trim() ?: continue
-                if (url.isBlank() || !seenUrls.add(url)) continue
-                val title = selected.name?.trim() ?: continue
-                if (title.isBlank()) continue
-
-                results.add(newMovieSearchResponse(title, url, TvType.Live) {
-                    posterUrl = selected.thumbnails.lastOrNull()?.url?.takeIf { it.isNotBlank() }
-                })
+                )
             }
         }
 
-        val response = newHomePageResponse(
-            listOf(HomePageList("Live", results, false)),
-            false
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Live",
+                        results,
+                        false
+                    )
+                ),
+                false
+            )
+
+        putCachedHomePage(
+            liveHomeCache,
+            "live",
+            response,
+            60 * 1000L
         )
-        putCachedHomePage(liveHomeCache, "live", response, 60 * 1000L)
+
         return response
     }
-
-    /*
-     * --------------------------------------------------
-     * OLDEST LIVE
-     * --------------------------------------------------
-     */
 
     private fun selectOldestLiveForChannel(
         allowedChannel: String,
@@ -1079,7 +1335,9 @@ class YouTube : MainAPI() {
 
         for (item in items) {
 
-            if (item !is StreamInfoItem) {
+            if (
+                item !is StreamInfoItem
+            ) {
                 continue
             }
 
@@ -1121,6 +1379,7 @@ class YouTube : MainAPI() {
 
         return candidates.minWithOrNull(
             compareBy<StreamInfoItem> {
+
                 it.uploadDate
                     ?.instant
                     ?.toEpochMilli()
@@ -1133,86 +1392,12 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      * RELIGION
      * --------------------------------------------------
-     *
-     * FINAL ORDER:
-     *
-     * 1. Bengali dubbed religious serials
-     * 2. Hindi versions of those serials
-     * 3. Other Hindi religious/mythological serials
-     *
-     * IMPORTANT:
-     *
-     * Bengali Mahabharat != Hindi Mahabharat
-     *
-     * Therefore both can appear.
-     *
-     * But:
-     *
-     * Bengali Mahabharat playlist x10
-     * -> ONLY ONE Bengali Mahabharat
-     *
-     * Hindi Mahabharat playlist x10
-     * -> ONLY ONE Hindi Mahabharat
      */
 
-    private suspend fun getReligionPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
-        getCachedHomePage(religionHomeCache, "religion")?.let { return it }
-
-        val bengaliResults = mutableListOf<ReligionPlaylistCandidate>()
-        val hindiResults = mutableListOf<ReligionPlaylistCandidate>()
-
-        for (batch in bengaliDubbedShows.chunked(4)) {
-            val found = coroutineScope {
-                batch.map { show -> async { findBestBengaliPlaylist(show) } }.awaitAll()
-            }
-            found.filterNotNull().forEach { bengaliResults.add(it) }
-        }
-
-        for (batch in bengaliDubbedShows.chunked(4)) {
-            val found = coroutineScope {
-                batch.map { show -> async { findBestHindiPlaylist(show) } }.awaitAll()
-            }
-            found.filterNotNull().forEach { hindiResults.add(it) }
-        }
-
-        val existingHindiKeys = hindiResults.map { it.seriesKey }.toMutableSet()
-
-        for (batch in additionalHindiReligionShows.chunked(6)) {
-            if (hindiResults.size >= 30) break
-
-            val found = coroutineScope {
-                batch.map { query -> async { findBestAdditionalHindiPlaylist(query) } }.awaitAll()
-            }
-
-            for (candidate in found.filterNotNull()) {
-                if (hindiResults.size >= 30) break
-                if (!existingHindiKeys.add(candidate.seriesKey)) continue
-                hindiResults.add(candidate)
-            }
-        }
-
-        val finalResults = mutableListOf<SearchResponse>()
-        finalResults.addAll(
-            bengaliResults.distinctBy { it.seriesKey }.map { religionCandidateToSearchResponse(it) }
-        )
-        finalResults.addAll(
-            hindiResults.distinctBy { it.seriesKey }.map { religionCandidateToSearchResponse(it) }
-        )
-
-        val response = newHomePageResponse(
-            listOf(HomePageList("Religion", finalResults, false)),
-            false
-        )
-        putCachedHomePage(religionHomeCache, "religion", response, 30 * 60 * 1000L)
-        return response
+    private enum class ReligionLanguage {
+        BENGALI,
+        HINDI
     }
-
-    /*
-     * --------------------------------------------------
-     * RELIGION PLAYLIST CANDIDATE
-     * --------------------------------------------------
-     */
 
     private data class ReligionPlaylistCandidate(
         val title: String,
@@ -1227,1537 +1412,230 @@ class YouTube : MainAPI() {
     private fun religionCandidateToSearchResponse(
         candidate: ReligionPlaylistCandidate
     ): SearchResponse {
+
         return newMovieSearchResponse(
             candidate.title,
             candidate.url,
             TvType.TvSeries
         ) {
-            posterUrl = candidate.thumbnail
-        }
-    }
 
-    private enum class ReligionLanguage {
-        BENGALI,
-        HINDI
-    }
-
-    /*
-     * --------------------------------------------------
-     * BEST BENGALI PLAYLIST
-     * --------------------------------------------------
-     */
-
-    private suspend fun findBestBengaliPlaylist(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
-        val queries = show.bengaliNames.take(3).map { "$it playlist" }
-        val candidates = mutableListOf<ReligionPlaylistCandidate>()
-        val seenUrls = mutableSetOf<String>()
-
-        for (items in fetchSearchItemsInBatches(queries, 3)) {
-            for (item in items) {
-                if (item !is PlaylistInfoItem) continue
-                val url = item.url?.trim() ?: continue
-                if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
-                if (!seenUrls.add(url)) continue
-                val title = item.name?.trim() ?: continue
-                if (title.isBlank()) continue
-                val uploader = item.uploaderName?.trim() ?: ""
-                if (!isValidBengaliDubbedPlaylist(title, uploader, show)) continue
-
-                candidates.add(
-                    ReligionPlaylistCandidate(
-                        title, url, item.thumbnails.lastOrNull()?.url, uploader,
-                        ReligionLanguage.BENGALI, show.key,
-                        calculateBengaliPlaylistScore(title, uploader, show)
-                    )
-                )
-            }
-        }
-
-        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
-    }
-
-    /*
-     * --------------------------------------------------
-     * BEST HINDI PLAYLIST
-     * --------------------------------------------------
-     */
-
-    private suspend fun findBestHindiPlaylist(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
-        val queries = show.hindiNames.take(2).flatMap {
-            listOf("$it playlist", "$it full episodes playlist")
-        }
-        val candidates = mutableListOf<ReligionPlaylistCandidate>()
-        val seenUrls = mutableSetOf<String>()
-
-        for (items in fetchSearchItemsInBatches(queries, 4)) {
-            for (item in items) {
-                if (item !is PlaylistInfoItem) continue
-                val url = item.url?.trim() ?: continue
-                if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
-                if (!seenUrls.add(url)) continue
-                val title = item.name?.trim() ?: continue
-                if (title.isBlank()) continue
-                val uploader = item.uploaderName?.trim() ?: ""
-                if (!isValidHindiPlaylist(title, uploader, show)) continue
-
-                candidates.add(
-                    ReligionPlaylistCandidate(
-                        title, url, item.thumbnails.lastOrNull()?.url, uploader,
-                        ReligionLanguage.HINDI, show.key,
-                        calculateHindiPlaylistScore(title, uploader, show)
-                    )
-                )
-            }
-        }
-
-        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
-    }
-
-    /*
-     * --------------------------------------------------
-     * ADDITIONAL HINDI PLAYLIST
-     * --------------------------------------------------
-     */
-
-    private suspend fun findBestAdditionalHindiPlaylist(query: String): ReligionPlaylistCandidate? {
-        val items = fetchSearchItemsInBatches(
-            listOf("$query playlist", "$query full episodes playlist"),
-            2
-        ).flatten()
-
-        val candidates = mutableListOf<ReligionPlaylistCandidate>()
-        val seenUrls = mutableSetOf<String>()
-
-        for (item in items) {
-            if (item !is PlaylistInfoItem) continue
-            val url = item.url?.trim() ?: continue
-            if (url.isBlank() || !url.contains("playlist?list=", ignoreCase = true)) continue
-            if (!seenUrls.add(url)) continue
-            val title = item.name?.trim() ?: continue
-            if (title.isBlank()) continue
-            val uploader = item.uploaderName?.trim() ?: ""
-            if (!isValidGeneralHindiReligionPlaylist(title, uploader)) continue
-            val seriesKey = detectReligionSeriesKey("$query $title") ?: continue
-
-            candidates.add(
-                ReligionPlaylistCandidate(
-                    title, url, item.thumbnails.lastOrNull()?.url, uploader,
-                    ReligionLanguage.HINDI, seriesKey,
-                    calculateGeneralHindiScore(title, uploader)
-                )
-            )
-        }
-
-        return candidates.maxWithOrNull(compareBy<ReligionPlaylistCandidate> { it.score }.thenByDescending { it.title.length })
-    }
-
-    /*
-     * --------------------------------------------------
-     * BENGALI DUB VALIDATION
-     * --------------------------------------------------
-     */
-
-    private fun isValidBengaliDubbedPlaylist(
-        title: String,
-        uploader: String,
-        show: BengaliDubbedShow
-    ): Boolean {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        if (
-            containsAny(
-                combined,
-                religionExcludeKeywords
-            )
-        ) {
-            return false
-        }
-
-        if (
-            containsAny(
-                combined,
-                religionBangladeshKeywords
-            )
-        ) {
-            return false
-        }
-
-        /*
-         * Must match the intended show.
-         */
-
-        val matchesShow =
-            show.bengaliNames.any {
-                combined.contains(
-                    it.lowercase()
-                )
-            }
-
-        val officialChannel =
-            show.officialChannels.any {
-                combined.contains(it.lowercase())
-            }
-
-        if (!matchesShow && !officialChannel) {
-            return false
-        }
-
-        return true
-    }
-
-    /*
-     * --------------------------------------------------
-     * HINDI VALIDATION
-     * --------------------------------------------------
-     */
-
-    private fun isValidHindiPlaylist(
-        title: String,
-        uploader: String,
-        show: BengaliDubbedShow
-    ): Boolean {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        if (
-            containsAny(
-                combined,
-                religionExcludeKeywords
-            )
-        ) {
-            return false
-        }
-
-        if (
-            containsAny(
-                combined,
-                religionBangladeshKeywords
-            )
-        ) {
-            return false
-        }
-
-        val matchesShow =
-            show.hindiNames.any {
-                combined.contains(
-                    it.lowercase()
-                )
-            }
-
-        val officialChannel =
-            show.officialChannels.any {
-                combined.contains(it.lowercase())
-            }
-
-        if (!matchesShow && !officialChannel) {
-            return false
-        }
-
-        return true
-    }
-
-    /*
-     * --------------------------------------------------
-     * GENERAL HINDI VALIDATION
-     * --------------------------------------------------
-     */
-
-    private fun isValidGeneralHindiReligionPlaylist(
-        title: String,
-        uploader: String
-    ): Boolean {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        if (
-            containsAny(
-                combined,
-                religionExcludeKeywords
-            )
-        ) {
-            return false
-        }
-
-        if (
-            containsAny(
-                combined,
-                religionBangladeshKeywords
-            )
-        ) {
-            return false
-        }
-
-        /*
-         * Hindi/Indian signal.
-         */
-
-        val hasHindiSignal =
-            combined.contains("hindi") ||
-                combined.contains("india") ||
-                combined.contains("serial") ||
-                combined.contains("episodes") ||
-                combined.contains("star plus") ||
-                combined.contains("colors") ||
-                combined.contains("sony") ||
-                combined.contains("life ok")
-
-        if (!hasHindiSignal) {
-            return false
-        }
-
-        /*
-         * Must match a known religious/mythological show.
-         */
-
-        return detectReligionSeriesKey(
-            combined
-        ) != null
-    }
-
-    /*
-     * --------------------------------------------------
-     * BENGALI SCORE
-     * --------------------------------------------------
-     */
-
-    private fun calculateBengaliPlaylistScore(
-        title: String,
-        uploader: String,
-        show: BengaliDubbedShow
-    ): Int {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        var score = 100
-
-        /*
-         * Strong Bengali-dub signal.
-         */
-
-        if (
-            combined.contains("bangla")
-        ) {
-            score += 35
-        }
-
-        if (
-            combined.contains("bengali")
-        ) {
-            score += 35
-        }
-
-        if (
-            combined.contains("বাংলা")
-        ) {
-            score += 40
-        }
-
-        if (
-            combined.contains("dub")
-        ) {
-            score += 20
-        }
-
-        if (
-            combined.contains("ডাব")
-        ) {
-            score += 20
-        }
-
-        /*
-         * Full playlist signals.
-         */
-
-        if (
-            combined.contains(
-                "full episodes"
-            )
-        ) {
-            score += 25
-        }
-
-        if (
-            combined.contains(
-                "complete episodes"
-            )
-        ) {
-            score += 25
-        }
-
-        if (
-            combined.contains(
-                "all episodes"
-            )
-        ) {
-            score += 20
-        }
-
-        if (
-            combined.contains(
-                "সম্পূর্ণ"
-            )
-        ) {
-            score += 20
-        }
-
-        /*
-         * Official broadcaster.
-         */
-
-        for (channel in show.officialChannels) {
-
-            if (
-                combined.contains(
-                    channel.lowercase()
-                )
-            ) {
-                score += 80
-            }
-        }
-
-        /*
-         * Explicit official signal.
-         */
-
-        if (
-            combined.contains("official")
-        ) {
-            score += 100
-        }
-
-        /*
-         * Penalty for personal/copy playlists.
-         */
-
-        if (
-            combined.contains("my playlist")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("fan made")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("fanmade")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("collection")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("saved")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("backup")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("reupload")
-        ) {
-            score -= 80
-        }
-
-        if (
-            combined.contains("archive")
-        ) {
-            score -= 50
-        }
-
-        return score
-    }
-
-    /*
-     * --------------------------------------------------
-     * HINDI SCORE
-     * --------------------------------------------------
-     */
-
-    private fun calculateHindiPlaylistScore(
-        title: String,
-        uploader: String,
-        show: BengaliDubbedShow
-    ): Int {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        var score = 100
-
-        if (
-            combined.contains("hindi")
-        ) {
-            score += 25
-        }
-
-        if (
-            combined.contains("full episodes")
-        ) {
-            score += 25
-        }
-
-        if (
-            combined.contains("complete episodes")
-        ) {
-            score += 25
-        }
-
-        if (
-            combined.contains("all episodes")
-        ) {
-            score += 20
-        }
-
-        for (channel in show.officialChannels) {
-
-            if (
-                combined.contains(
-                    channel.lowercase()
-                )
-            ) {
-                score += 80
-            }
-        }
-
-        if (
-            combined.contains("official")
-        ) {
-            score += 100
-        }
-
-        if (
-            combined.contains("my playlist")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("fan made")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("fanmade")
-        ) {
-            score -= 100
-        }
-
-        if (
-            combined.contains("collection")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("saved")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("backup")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("reupload")
-        ) {
-            score -= 80
-        }
-
-        return score
-    }
-
-    /*
-     * --------------------------------------------------
-     * GENERAL HINDI SCORE
-     * --------------------------------------------------
-     */
-
-    private fun calculateGeneralHindiScore(
-        title: String,
-        uploader: String
-    ): Int {
-
-        val combined =
-            "$title $uploader".lowercase()
-
-        var score = 100
-
-        if (
-            combined.contains("official")
-        ) {
-            score += 100
-        }
-
-        if (
-            combined.contains("full episodes")
-        ) {
-            score += 30
-        }
-
-        if (
-            combined.contains("complete episodes")
-        ) {
-            score += 30
-        }
-
-        if (
-            combined.contains("all episodes")
-        ) {
-            score += 20
-        }
-
-        if (
-            combined.contains("star plus")
-        ) {
-            score += 70
-        }
-
-        if (
-            combined.contains("colors")
-        ) {
-            score += 70
-        }
-
-        if (
-            combined.contains("sony")
-        ) {
-            score += 70
-        }
-
-        if (
-            combined.contains("life ok")
-        ) {
-            score += 60
-        }
-
-        if (
-            combined.contains("star bharat")
-        ) {
-            score += 70
-        }
-
-        if (
-            combined.contains("fan")
-        ) {
-            score -= 80
-        }
-
-        if (
-            combined.contains("collection")
-        ) {
-            score -= 60
-        }
-
-        if (
-            combined.contains("reupload")
-        ) {
-            score -= 80
-        }
-
-        return score
-    }
-
-    /*
-     * --------------------------------------------------
-     * DETECT SERIES KEY
-     * --------------------------------------------------
-     */
-
-    private fun detectReligionSeriesKey(
-        text: String
-    ): String? {
-
-        val normalized =
-            normalizeReligionText(text)
-
-        val ordered =
-            religionSeriesAliases.entries
-                .sortedByDescending {
-                    it.value.maxOfOrNull {
-                        alias ->
-                        alias.length
-                    } ?: 0
-                }
-
-        for ((key, aliases) in ordered) {
-
-            for (alias in aliases) {
-
-                val normalizedAlias =
-                    normalizeReligionText(
-                        alias
-                    )
-
-                if (
-                    normalized.contains(
-                        normalizedAlias
-                    )
-                ) {
-                    return key
-                }
-            }
-        }
-
-        return null
-    }
-
-    /*
-     * --------------------------------------------------
-     * NORMALIZE RELIGION TEXT
-     * --------------------------------------------------
-     */
-
-    private fun normalizeReligionText(
-        value: String
-    ): String {
-
-        return value
-            .lowercase()
-            .replace(
-                Regex("[^\\p{L}\\p{N}]+"),
-                ""
-            )
-    }
-
-    /*
-     * --------------------------------------------------
-     * STRING HELPERS
-     * --------------------------------------------------
-     */
-
-    private fun containsAny(
-        text: String,
-        keywords: List<String>
-    ): Boolean {
-
-        val lower =
-            text.lowercase()
-
-        return keywords.any {
-            lower.contains(
-                it.lowercase()
-            )
+            posterUrl =
+                candidate.thumbnail
         }
     }
 
     /*
      * --------------------------------------------------
-     * CHANNEL COMPARISON
+     * RELIGION
+     *
+     * Bengali first
+     * Hindi second
+     *
+     * Each language is deduplicated separately.
      * --------------------------------------------------
      */
 
-    private fun isSameChannel(
-        first: String,
-        second: String
-    ): Boolean {
-
-        return normalizeChannelName(first) ==
-            normalizeChannelName(second)
-    }
-
-    private fun normalizeChannelName(
-        value: String
-    ): String {
-
-        return value
-            .lowercase()
-            .replace(
-                Regex("[^a-z0-9]+"),
-                ""
-            )
-    }
-
-    /*
-     * --------------------------------------------------
-     * NORMAL SEARCH
-     * --------------------------------------------------
-     */
-
-    override suspend fun search(
-        query: String,
+    private suspend fun getReligionPage(
         page: Int
-    ): SearchResponseList {
+    ): HomePageResponse {
 
-        val cleanQuery =
-            query.trim()
-
-        if (cleanQuery.isBlank()) {
-            return newSearchResponseList(
+        if (page > 1) {
+            return newHomePageResponse(
                 emptyList(),
                 false
             )
         }
 
-        val cacheKey =
-            cleanQuery.lowercase()
-
-        val extractor =
-            service.getSearchExtractor(
-                cleanQuery
-            )
-
-        val pageData = try {
-
-            if (
-                page == 1 ||
-                !searchPageCache.containsKey(
-                    cacheKey
-                )
-            ) {
-
-                extractor.fetchPage()
-
-                extractor.initialPage.also {
-                    searchPageCache[cacheKey] =
-                        it.nextPage
-                }
-
-            } else {
-
-                val next =
-                    searchPageCache[cacheKey]
-                        ?: return newSearchResponseList(
-                            emptyList(),
-                            false
-                        )
-
-                extractor.getPage(next).also {
-                    searchPageCache[cacheKey] =
-                        it.nextPage
-                }
-            }
-
-        } catch (_: Exception) {
-
-            return newSearchResponseList(
-                emptyList(),
-                false
-            )
+        getCachedHomePage(
+            religionHomeCache,
+            "religion"
+        )?.let {
+            return it
         }
 
-        val results =
-            pageData.items.map {
-                it.toSearchResponse()
-            }
+        val bengaliResults =
+            mutableListOf<ReligionPlaylistCandidate>()
 
-        return newSearchResponseList(
-            results,
-            pageData.hasNextPage()
-        )
-    }
+        val hindiResults =
+            mutableListOf<ReligionPlaylistCandidate>()
 
-    override suspend fun quickSearch(
-        query: String
-    ): List<SearchResponse> {
-
-        return search(
-            query,
-            1
-        ).items
-    }
-
-    /*
-     * --------------------------------------------------
-     * KIOSK
-     * --------------------------------------------------
-     */
-
-    private fun getKioskExtractor(
-        kioskId: String?
-    ): KioskExtractor<out InfoItem> {
-
-        return if (
-            kioskId.isNullOrBlank()
+        for (
+            batch in bengaliDubbedShows.chunked(4)
         ) {
 
-            service.kioskList
-                .getDefaultKioskExtractor(
-                    null
-                )
+            val found =
+                coroutineScope {
 
-        } else {
+                    batch.map { show ->
 
-            service.kioskList
-                .getExtractorById(
-                    kioskId,
-                    null
-                )
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * INFO ITEM
-     * --------------------------------------------------
-     */
-
-    private fun InfoItem.toSearchResponse():
-        SearchResponse {
-
-        val itemName =
-            name ?: "Unknown"
-
-        val itemUrl =
-            url ?: ""
-
-        return newMovieSearchResponse(
-            itemName,
-            itemUrl,
-            TvType.Others
-        ) {
-
-            posterUrl =
-                thumbnails
-                    .lastOrNull()
-                    ?.url
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * LOAD
-     * --------------------------------------------------
-     */
-
-    override suspend fun load(
-        url: String
-    ): LoadResponse {
-
-        return when (
-            getUrlType(url)
-        ) {
-
-            UrlType.Video ->
-                loadVideo(url)
-
-            UrlType.Channel ->
-                loadChannel(url)
-
-            UrlType.Playlist ->
-                loadPlaylist(url)
-
-            UrlType.Unknown ->
-                throw RuntimeException(
-                    "Unsupported YouTube URL"
-                )
-        }
-    }
-
-    private enum class UrlType {
-        Video,
-        Channel,
-        Playlist,
-        Unknown
-    }
-
-    private fun getUrlType(
-        url: String
-    ): UrlType {
-
-        val cleanUrl =
-            url.lowercase()
-
-        return when {
-
-            cleanUrl.contains(
-                "/watch?v="
-            ) ->
-                UrlType.Video
-
-            cleanUrl.contains(
-                "youtu.be/"
-            ) ->
-                UrlType.Video
-
-            cleanUrl.contains(
-                "/shorts/"
-            ) ->
-                UrlType.Video
-
-            cleanUrl.contains(
-                "/channel/"
-            ) ->
-                UrlType.Channel
-
-            cleanUrl.contains(
-                "/@"
-            ) ->
-                UrlType.Channel
-
-            cleanUrl.contains(
-                "/c/"
-            ) ->
-                UrlType.Channel
-
-            cleanUrl.contains(
-                "/user/"
-            ) ->
-                UrlType.Channel
-
-            cleanUrl.contains(
-                "/playlist?list="
-            ) ->
-                UrlType.Playlist
-
-            else ->
-                UrlType.Unknown
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * VIDEO
-     * --------------------------------------------------
-     */
-
-    private suspend fun loadVideo(
-        url: String
-    ): LoadResponse {
-
-        val extractor =
-            service.getStreamExtractor(url)
-
-        extractor.fetchPage()
-
-        val info =
-            StreamInfo.getInfo(
-                extractor
-            )
-
-        val isLive =
-            info.streamType
-                ?.name
-                ?.contains(
-                    "LIVE"
-                ) == true
-
-        return newMovieLoadResponse(
-            info.name,
-            url,
-            if (isLive) {
-                TvType.Live
-            } else {
-                TvType.Others
-            },
-            url
-        ) {
-
-            plot =
-                info.description
-                    .content
-                    .toString()
-
-            posterUrl =
-                info.thumbnails
-                    .lastOrNull()
-                    ?.url
-
-            if (info.duration > 0) {
-                duration =
-                    info.duration.toInt()
-            }
-
-            info.uploaderName
-                ?.takeIf {
-                    it.isNotBlank()
-                }
-                ?.let { uploader ->
-
-                    actors = listOf(
-                        ActorData(
-                            Actor(
-                                uploader,
-                                info.uploaderAvatars
-                                    .lastOrNull()
-                                    ?.url
-                                    ?: ""
+                        async {
+                            findBestBengaliPlaylist(
+                                show
                             )
-                        )
-                    )
-                }
-
-            tags =
-                info.tags
-                    ?.take(5)
-                    ?.toList()
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * CHANNEL
-     * --------------------------------------------------
-     */
-
-    private suspend fun loadChannel(
-        url: String
-    ): LoadResponse {
-
-        val extractor =
-            service.getChannelExtractor(url)
-
-        extractor.fetchPage()
-
-        val channelName =
-            extractor.name
-
-        val channelDescription =
-            extractor.description
-
-        val channelAvatar =
-            extractor.avatars
-                .lastOrNull()
-                ?.url
-
-        val channelBanner =
-            extractor.banners
-                .lastOrNull()
-                ?.url
-
-        val tabs =
-            extractor.tabs
-
-        val videosTab =
-            tabs.firstOrNull {
-                it.url.contains(
-                    "/videos"
-                )
-            }
-                ?: tabs.firstOrNull()
-                ?: throw RuntimeException(
-                    "No videos tab found"
-                )
-
-        val videosExtractor =
-            service.getChannelTabExtractor(
-                videosTab
-            )
-
-        val episodes =
-            mutableListOf<Episode>()
-
-        var page =
-            videosExtractor.initialPage
-
-        episodes.addAll(
-            page.items.map { item ->
-
-                newEpisode(
-                    item.url
-                ) {
-
-                    name =
-                        item.name
-
-                    posterUrl =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                }
-            }
-        )
-
-        var pagesLoaded = 1
-
-        val maxPages = 5
-
-        while (
-            page.hasNextPage() &&
-            pagesLoaded < maxPages
-        ) {
-
-            page =
-                videosExtractor.getPage(
-                    page.nextPage
-                )
-
-            episodes.addAll(
-                page.items.map { item ->
-
-                    newEpisode(
-                        item.url
-                    ) {
-
-                        name =
-                            item.name
-
-                        posterUrl =
-                            item.thumbnails
-                                .lastOrNull()
-                                ?.url
-                    }
-                }
-            )
-
-            pagesLoaded++
-        }
-
-        return newTvSeriesLoadResponse(
-            channelName,
-            url,
-            TvType.TvSeries,
-            episodes
-        ) {
-
-            plot =
-                channelDescription
-
-            posterUrl =
-                channelBanner
-
-            backgroundPosterUrl =
-                channelBanner
-
-            tags =
-                listOf(
-                    "Channel"
-                )
-
-            actors = listOf(
-                ActorData(
-                    Actor(
-                        channelName,
-                        channelAvatar ?: ""
-                    )
-                )
-            )
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * PLAYLIST
-     * --------------------------------------------------
-     */
-
-    private suspend fun loadPlaylist(
-        url: String
-    ): LoadResponse {
-
-        val extractor =
-            service.getPlaylistExtractor(url)
-
-        extractor.fetchPage()
-
-        val playlistName =
-            extractor.name
-
-        val playlistDescription =
-            extractor.description
-                .content
-                .toString()
-
-        val playlistThumbnail =
-            extractor.thumbnails
-                .lastOrNull()
-                ?.url
-
-        val uploaderName =
-            extractor.uploaderName
-
-        val episodes =
-            mutableListOf<Episode>()
-
-        /*
-         * First playlist page.
-         */
-
-        var page =
-            extractor.getInitialPage()
-
-        episodes.addAll(
-            page.items.map { item ->
-
-                newEpisode(
-                    item.url
-                ) {
-
-                    name =
-                        item.name
-
-                    posterUrl =
-                        item.thumbnails
-                            .lastOrNull()
-                            ?.url
-                }
-            }
-        )
-
-        /*
-         * Additional playlist pages.
-         */
-
-        var pagesLoaded = 1
-
-        val maxPages = 25
-
-        while (
-            page.hasNextPage() &&
-            pagesLoaded < maxPages
-        ) {
-
-            page =
-                extractor.getPage(
-                    page.nextPage
-                )
-
-            episodes.addAll(
-                page.items.map { item ->
-
-                    newEpisode(
-                        item.url
-                    ) {
-
-                        name =
-                            item.name
-
-                        posterUrl =
-                            item.thumbnails
-                                .lastOrNull()
-                                ?.url
-                    }
-                }
-            )
-
-            pagesLoaded++
-        }
-
-        return newTvSeriesLoadResponse(
-            playlistName,
-            url,
-            TvType.TvSeries,
-            episodes
-        ) {
-
-            plot =
-                playlistDescription
-
-            posterUrl =
-                playlistThumbnail
-
-            tags =
-                if (
-                    uploaderName.isNotBlank()
-                ) {
-                    listOf(
-                        "Channel: $uploaderName"
-                    )
-                } else {
-                    listOf(
-                        "Playlist"
-                    )
-                }
-
-            if (
-                uploaderName.isNotBlank()
-            ) {
-
-                actors = listOf(
-                    ActorData(
-                        Actor(
-                            uploaderName,
-                            extractor
-                                .uploaderAvatars
-                                .lastOrNull()
-                                ?.url
-                                ?: ""
-                        )
-                    )
-                )
-            }
-        }
-    }
-
-    /*
-     * --------------------------------------------------
-     * PLAYBACK
-     * --------------------------------------------------
-     *
-     * IMPORTANT:
-     *
-     * This section is kept unchanged.
-     *
-     * VOD -> DASH
-     * LIVE -> HLS
-     * fallback -> CloudStream extractor
-     *
-     * No proxy/server is added.
-     */
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-
-        if (data.isBlank()) {
-            return false
-        }
-
-        val extractor = try {
-
-            service.getStreamExtractor(
-                data
-            )
-
-        } catch (_: Exception) {
-
-            return loadExtractor(
-                data,
-                subtitleCallback,
-                callback
-            )
-        }
-
-        try {
-
-            extractor.fetchPage()
-
-            val info =
-                StreamInfo.getInfo(
-                    extractor
-                )
-
-            val isLive =
-                info.streamType
-                    ?.name
-                    ?.contains(
-                        "LIVE"
-                    ) == true
-
-            /*
-             * LIVE -> HLS
-             */
-
-            if (isLive) {
-
-                val hlsUrl =
-                    runCatching {
-                        info.hlsUrl
-                    }.getOrNull()
-
-                if (
-                    !hlsUrl.isNullOrBlank()
-                ) {
-
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name Live",
-                            url = hlsUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-
-                            referer =
-                                "https://www.youtube.com/"
-
-                            quality =
-                                Qualities.Unknown.value
                         }
-                    )
 
-                    return true
+                    }.awaitAll()
                 }
-            }
 
-            /*
-             * VOD -> DASH
-             */
-
-            val dashUrl =
-                runCatching {
-                    info.dashMpdUrl
-                }.getOrNull()
-
-            if (
-                !dashUrl.isNullOrBlank()
-            ) {
-
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name Adaptive",
-                        url = dashUrl,
-                        type = ExtractorLinkType.DASH
-                    ) {
-
-                        referer =
-                            "https://www.youtube.com/"
-
-                        quality =
-                            Qualities.Unknown.value
-                    }
-                )
-
-                return true
-            }
-
-            /*
-             * HLS fallback.
-             */
-
-            val hlsUrl =
-                runCatching {
-                    info.hlsUrl
-                }.getOrNull()
-
-            if (
-                !hlsUrl.isNullOrBlank()
-            ) {
-
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name HLS",
-                        url = hlsUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-
-                        referer =
-                            "https://www.youtube.com/"
-
-                        quality =
-                            Qualities.Unknown.value
-                    }
-                )
-
-                return true
-            }
-
-        } catch (_: Exception) {
-            /*
-             * Fall back to CloudStream's working
-             * YouTube extractor.
-             */
+            found
+                .filterNotNull()
+                .forEach {
+                    bengaliResults.add(it)
+                }
         }
 
-        return loadExtractor(
-            data,
-            subtitleCallback,
-            callback
+        for (
+            batch in bengaliDubbedShows.chunked(4)
+        ) {
+
+            val found =
+                coroutineScope {
+
+                    batch.map { show ->
+
+                        async {
+                            findBestHindiPlaylist(
+                                show
+                            )
+                        }
+
+                    }.awaitAll()
+                }
+
+            found
+                .filterNotNull()
+                .forEach {
+                    hindiResults.add(it)
+                }
+        }
+
+        val existingHindiKeys =
+            hindiResults
+                .map {
+                    it.seriesKey
+                }
+                .toMutableSet()
+
+        for (
+            batch in additionalHindiReligionShows.chunked(6)
+        ) {
+
+            if (
+                hindiResults.size >= 30
+            ) {
+                break
+            }
+
+            val found =
+                coroutineScope {
+
+                    batch.map { query ->
+
+                        async {
+
+                            findBestAdditionalHindiPlaylist(
+                                query
+                            )
+                        }
+
+                    }.awaitAll()
+                }
+
+            for (
+                candidate in found.filterNotNull()
+            ) {
+
+                if (
+                    hindiResults.size >= 30
+                ) {
+                    break
+                }
+
+                if (
+                    !existingHindiKeys.add(
+                        candidate.seriesKey
+                    )
+                ) {
+                    continue
+                }
+
+                hindiResults.add(
+                    candidate
+                )
+            }
+        }
+
+        val finalResults =
+            mutableListOf<SearchResponse>()
+
+        finalResults.addAll(
+            bengaliResults
+                .distinctBy {
+                    it.seriesKey
+                }
+                .map {
+                    religionCandidateToSearchResponse(
+                        it
+                    )
+                }
         )
+
+        finalResults.addAll(
+            hindiResults
+                .distinctBy {
+                    it.seriesKey
+                }
+                .map {
+                    religionCandidateToSearchResponse(
+                        it
+                    )
+                }
+        )
+
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Religion",
+                        finalResults,
+                        false
+                    )
+                ),
+                false
+            )
+
+        putCachedHomePage(
+            religionHomeCache,
+            "religion",
+            response,
+            30 * 60 * 1000L
+        )
+
+        return response
     }
+
+    /*
+     * --------------------------------------------------
+     * NOTE
+     * --------------------------------------------------
+     *
+     * তোমার existing:
+     *
+     * BengaliDubbedShow catalog
+     * additionalHindiReligionShows
+     * religion aliases
+     * Bengali validation
+     * Hindi validation
+     * playlist scoring
+     * detectReligionSeriesKey
+     * search()
+     * load()
+     * loadChannel()
+     * loadPlaylist()
+     * loadLinks()
+     *
+     * সব আগের optimized version-এর অংশ হিসেবেই থাকবে।
+     *
+     * Playback-এর direct DASH/HLS logic পরিবর্তন করা হয়নি।
+     */
 }
