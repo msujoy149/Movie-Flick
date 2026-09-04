@@ -448,7 +448,7 @@ class KhulnaPlex : MainAPI() {
      * - <source src>
      * - data-video / data-src / data-file / ...
      * - URLs embedded in JavaScript player objects
-     * - direct /uploads/videos/*.mp4 / *.mkv / *.webm / *.m3u8 / *.mpd
+     * - direct media files such as .mp4, .mkv, .webm, .m3u8, and .mpd
      */
     private fun extractMediaUrls(
         document: Document,
