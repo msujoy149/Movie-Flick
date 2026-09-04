@@ -50,7 +50,9 @@ class KhulnaPlex : MainAPI() {
 
     private fun SiteItem.toSearchResponse(): SearchResponse {
         return if (isSeries) {
-            newTvSeriesSearchResponse(title, url, poster)
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                posterUrl = poster
+            }
         } else {
             newMovieSearchResponse(title, url, TvType.Movie) {
                 posterUrl = poster
@@ -467,7 +469,7 @@ class KhulnaPlex : MainAPI() {
             all.contains("poster") || all.contains("cover") || all.contains("thumb")
         }
 
-        val selected: Element = preferred ?: images.first()
+        val selected = preferred ?: return null
         return imageSource(selected)?.let { absoluteUrl(it, pageUrl) }
     }
 
