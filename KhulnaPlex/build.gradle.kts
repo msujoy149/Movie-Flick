@@ -1,4 +1,4 @@
-version = 5
+version = 6
 
 cloudstream {
     description = "Khulna Plex provider for Movie-Flick"
