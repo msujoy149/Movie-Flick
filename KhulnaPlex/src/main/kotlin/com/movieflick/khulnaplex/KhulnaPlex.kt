@@ -13,7 +13,7 @@ import java.util.Locale
 
 class KhulnaPlex : MainAPI() {
 
-    override var mainUrl = "http://khulnaplex.com"
+    override var mainUrl = "https://khulnaplex.com"
     override var name = "Khulna Plex"
     override var lang = "bn"
 
@@ -94,56 +94,23 @@ class KhulnaPlex : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // CloudStream normally asks for page 1 first.  We intentionally collect
-        // several website pages here so a category row contains many cards at once.
-        if (page > 1) {
-            val document = getDocument(pageUrl(request.data, page))
-                ?: return newHomePageResponse(request, emptyList(), false)
-            val items = parseItems(document, request.data, request.name, page)
-            return newHomePageResponse(
-                request,
-                items.map { it.toSearchResponse() },
-                hasNextPage(document, page)
-            )
-        }
+        val url = pageUrl(request.data, page)
+        val document = getDocument(url)
+            ?: return newHomePageResponse(request, emptyList(), false)
 
-        val all = linkedMapOf<String, SiteItem>()
-        var anyNext = false
-        var loadedPages = 0
-
-        for (sitePage in 1..maxPagesToCollect) {
-            val url = pageUrl(request.data, sitePage)
-            val document = getDocument(url) ?: break
-            loadedPages++
-
-            val items = parseItems(document, request.data, request.name, sitePage)
-            for (item in items) {
-                all[item.url] = item
-            }
-
-            val next = hasNextPage(document, sitePage)
-            anyNext = anyNext || next
-
-            if (all.size >= maxHomeItems) break
-            if (!next && sitePage > 1) break
-            if (!next && items.isEmpty()) break
-        }
-
-        // Most movie sites already order their listing newest-first.  If the
-        // page exposes an upload/created/modified timestamp, use that timestamp
-        // to make the newest item win. Otherwise discovery order is retained.
-        val sorted = all.values
-            .sortedWith(
-                compareByDescending<SiteItem> { it.sortTime > 0 }
-                    .thenByDescending { it.sortTime }
-                    .thenBy { it.discoveryOrder }
-            )
+        /*
+         * KhulnaPlex already puts many movie cards on one listing page.
+         * Do NOT fetch 10-12 pages here: that makes CloudStream slow and can
+         * cause the home request to time out. We parse every card on the
+         * current page and expose up to 25 of them.
+         */
+        val items = parseItems(document, request.data, request.name, page)
             .take(maxHomeItems)
 
         return newHomePageResponse(
             request,
-            sorted.map { it.toSearchResponse() },
-            anyNext || loadedPages >= maxPagesToCollect
+            items.map { it.toSearchResponse() },
+            hasNextPage(document, page)
         )
     }
 
@@ -291,20 +258,21 @@ class KhulnaPlex : MainAPI() {
             }
         }
 
-        document.select("video, video source, source, a[href]").forEach { element ->
+        document.select(
+            "video, video source, source, a[href], " +
+                "[src], [data-src], [data-video], [data-file], [data-url], " +
+                "[data-source], [data-stream], [data-file-url], [data-video-url]"
+        ).forEach { element ->
             add(element.attr("src"))
             add(element.attr("data-src"))
             add(element.attr("data-video"))
             add(element.attr("data-file"))
             add(element.attr("data-url"))
+            add(element.attr("data-source"))
+            add(element.attr("data-stream"))
+            add(element.attr("data-file-url"))
+            add(element.attr("data-video-url"))
             add(element.attr("href"))
-        }
-
-        document.select("[data-src], [data-video], [data-file], [data-url]").forEach { element ->
-            add(element.attr("data-src"))
-            add(element.attr("data-video"))
-            add(element.attr("data-file"))
-            add(element.attr("data-url"))
         }
 
         val cleanedHtml = html
@@ -323,7 +291,7 @@ class KhulnaPlex : MainAPI() {
 
         // Catch JavaScript player objects even when the key is unusual.
         val keyRegex = Regex(
-            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|videoUrl|stream|streamUrl)\\s*[:=]\\s*[\"']([^\"']+)[\"']"""
+            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl)\s*[:=]\s*["']([^"']+)["']"""
         )
         keyRegex.findAll(cleanedHtml).forEach { add(it.groupValues[1]) }
 
@@ -339,81 +307,165 @@ class KhulnaPlex : MainAPI() {
         val result = linkedMapOf<String, SiteItem>()
         var order = page.toLong() * 1_000_000L
 
-        document.select("a[href]").forEach { anchor ->
-            val href = anchor.attr("href").trim()
-            if (!looksLikeContentLink(href)) return@forEach
+        /*
+         * Some KhulnaPlex cards use a normal <a href="watch.php?...">,
+         * while others may use data-href/data-url/onclick. Collect BOTH
+         * forms instead of using the second form only as a fallback.
+         */
+        document.select("a[href], [data-href], [data-url], [data-link], [onclick]")
+            .forEach { element ->
 
-            val absolute = absoluteUrl(href, sourceUrl)
-            val card = findCard(anchor)
-            val title = extractCardTitle(anchor, card)
-                .ifBlank { titleFromUrl(absolute) }
-                .let(::cleanTitle)
+                val href = when {
+                    element.tagName() == "a" && element.attr("href").isNotBlank() ->
+                        element.attr("href").trim()
 
-            if (title.isBlank() || isNavigationTitle(title)) return@forEach
+                    else ->
+                        listOf(
+                            element.attr("data-href"),
+                            element.attr("data-url"),
+                            element.attr("data-link"),
+                            element.attr("onclick")
+                        ).firstNotNullOfOrNull { raw ->
+                            extractContentUrl(raw)
+                        }.orEmpty()
+                }
 
-            val poster = extractPosterFromElement(card, sourceUrl)
-            val series = isSeriesUrl(absolute) ||
-                sectionName.contains("TV", true) ||
-                absolute.contains("type=series", true) ||
-                absolute.contains("type=tv", true)
+                if (!looksLikeContentLink(href)) return@forEach
 
-            val sortTime = extractSortTime(card, anchor)
-
-            result[absolute] = SiteItem(
-                title = title,
-                url = absolute,
-                poster = poster,
-                isSeries = series,
-                sortTime = sortTime,
-                discoveryOrder = order++
-            )
-        }
-
-        if (result.isEmpty()) {
-            document.select("[data-href], [data-url], [data-link], [onclick]").forEach { element ->
-                val raw = listOf(
-                    element.attr("data-href"),
-                    element.attr("data-url"),
-                    element.attr("data-link"),
-                    element.attr("onclick")
-                ).firstOrNull { looksLikeContentLink(it) } ?: return@forEach
-
-                val href = extractContentUrl(raw) ?: return@forEach
                 val absolute = absoluteUrl(href, sourceUrl)
+                if (!looksLikeContentLink(absolute)) return@forEach
+
                 val card = findCard(element)
-                val title = cleanTitle(extractCardTitle(element, card).ifBlank { titleFromUrl(absolute) })
+
+                val title = cleanTitle(
+                    extractCardTitle(element, card)
+                        .ifBlank { titleFromUrl(absolute) }
+                )
+
                 if (title.isBlank() || isNavigationTitle(title)) return@forEach
 
-                result[absolute] = SiteItem(
+                val series = isSeriesUrl(absolute) ||
+                    sectionName.contains("TV", ignoreCase = true) ||
+                    absolute.contains("type=series", ignoreCase = true) ||
+                    absolute.contains("type=tv", ignoreCase = true)
+
+                val item = SiteItem(
                     title = title,
                     url = absolute,
                     poster = extractPosterFromElement(card, sourceUrl),
-                    isSeries = isSeriesUrl(absolute) || sectionName.contains("TV", true),
+                    isSeries = series,
                     sortTime = extractSortTime(card, element),
                     discoveryOrder = order++
                 )
+
+                // Same watch URL can appear on several nested elements.
+                // Keep the first occurrence so website order is preserved.
+                if (!result.containsKey(absolute)) {
+                    result[absolute] = item
+                }
             }
+
+        /*
+         * If the page uses a JS-only card with no recognizable watch.php URL
+         * in the attributes, inspect onclick/data attributes directly.
+         */
+        if (result.isEmpty()) {
+            document.select("[data-href], [data-url], [data-link], [onclick]")
+                .forEach { element ->
+                    val raw = listOf(
+                        element.attr("data-href"),
+                        element.attr("data-url"),
+                        element.attr("data-link"),
+                        element.attr("onclick")
+                    ).firstOrNull { it.isNotBlank() } ?: return@forEach
+
+                    val href = extractContentUrl(raw) ?: return@forEach
+                    val absolute = absoluteUrl(href, sourceUrl)
+
+                    if (!looksLikeContentLink(absolute)) return@forEach
+
+                    val card = findCard(element)
+                    val title = cleanTitle(
+                        extractCardTitle(element, card)
+                            .ifBlank { titleFromUrl(absolute) }
+                    )
+
+                    if (title.isBlank() || isNavigationTitle(title)) return@forEach
+
+                    result[absolute] = SiteItem(
+                        title = title,
+                        url = absolute,
+                        poster = extractPosterFromElement(card, sourceUrl),
+                        isSeries = isSeriesUrl(absolute) ||
+                            sectionName.contains("TV", ignoreCase = true),
+                        sortTime = extractSortTime(card, element),
+                        discoveryOrder = order++
+                    )
+                }
         }
 
-        return result.values.toList()
+        /*
+         * IMPORTANT:
+         * Do not sort by the visible movie year.  "2026" on a card is the
+         * release year, not the upload time. When KhulnaPlex exposes a real
+         * upload/created timestamp we use it; otherwise the site's own card
+         * order is preserved. The site listing is already newest-first.
+         */
+        val values = result.values.toList()
+
+        val hasRealTimestamp = values.any { it.sortTime > 0L }
+
+        return if (hasRealTimestamp) {
+            values.sortedWith(
+                compareByDescending<SiteItem> { it.sortTime }
+                    .thenBy { it.discoveryOrder }
+            )
+        } else {
+            values.sortedBy { it.discoveryOrder }
+        }
     }
 
     private fun extractSortTime(card: Element, anchor: Element): Long {
         val values = listOf(
-            card.attr("data-created"), card.attr("data-uploaded"), card.attr("data-upload-date"),
-            card.attr("data-date"), card.attr("data-time"), card.attr("datetime"),
-            anchor.attr("data-created"), anchor.attr("data-uploaded"), anchor.attr("data-date"),
+            card.attr("data-created"),
+            card.attr("data-uploaded"),
+            card.attr("data-upload-date"),
+            card.attr("data-created-at"),
+            card.attr("data-uploaded-at"),
+            card.attr("data-published"),
+            card.attr("data-published-at"),
+            card.attr("datetime"),
+            anchor.attr("data-created"),
+            anchor.attr("data-uploaded"),
+            anchor.attr("data-upload-date"),
+            anchor.attr("data-created-at"),
+            anchor.attr("data-uploaded-at"),
+            anchor.attr("data-published"),
+            anchor.attr("data-published-at"),
             anchor.attr("datetime"),
-            card.selectFirst("time[datetime]")?.attr("datetime"),
-            card.selectFirst("time")?.text()
-        ).filterNot { it.isNullOrBlank() }.map { it!!.trim() }
+            card.selectFirst("time[datetime]")?.attr("datetime")
+        ).filter { it.isNotBlank() }
 
         for (value in values) {
-            value.toLongOrNull()?.let { number ->
-                return if (number < 10_000_000_000L) number * 1000L else number
+            val clean = value.trim()
+
+            /*
+             * Ignore a plain four-digit year such as 2026. That is the
+             * movie's release year, not its upload time.
+             */
+            if (Regex("""^\d{4}$""").matches(clean)) continue
+
+            clean.toLongOrNull()?.let { number ->
+                return if (number < 10_000_000_000L) {
+                    number * 1000L
+                } else {
+                    number
+                }
             }
-            parseDate(value)?.let { return it }
+
+            parseDate(clean)?.let { return it }
         }
+
         return 0L
     }
 
@@ -616,9 +668,29 @@ class KhulnaPlex : MainAPI() {
         })
     }
 
-    private fun extractContentUrl(raw: String): String? = Regex(
-        """(?i)(?:https?://[^"'\\s]+|(?:/|\\.\\.?/)?watch\\.php\\?[^"'\\s)]+)"""
-    ).find(raw)?.value?.trim(',', ')', '"', '\'')?.replace("&amp;", "&")
+    private fun extractContentUrl(raw: String): String? {
+        if (raw.isBlank()) return null
+
+        val cleaned = raw
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val patterns = listOf(
+            Regex("""(?i)https?://[^"'<>\\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?watch\.php\?[^"'<>\\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?(?:movie|series|show|details)\.php\?[^"'<>\\s)]+""")
+        )
+
+        for (pattern in patterns) {
+            val match = pattern.find(cleaned)?.value ?: continue
+            return match
+                .trim(',', ';', ')', ']', '}', '"', '\'')
+                .replace("&amp;", "&")
+        }
+
+        return null
+    }
 
     private fun absoluteUrl(raw: String, base: String): String {
         val value = raw.trim()
