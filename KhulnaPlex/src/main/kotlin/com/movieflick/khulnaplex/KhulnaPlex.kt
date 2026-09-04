@@ -13,7 +13,7 @@ import java.util.Locale
 
 class KhulnaPlex : MainAPI() {
 
-    override var mainUrl = "https://khulnaplex.com"
+    override var mainUrl = "http://khulnaplex.com"
     override var name = "Khulna Plex"
     override var lang = "bn"
 
@@ -207,16 +207,6 @@ class KhulnaPlex : MainAPI() {
         }
     }
 
-    private data class MediaProbe(
-        val url: String,
-        val kind: Int,
-        val status: Int,
-        val contentType: String,
-        val acceptRanges: String,
-        val contentRange: String,
-        val rangeSupported: Boolean
-    )
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -226,47 +216,32 @@ class KhulnaPlex : MainAPI() {
         if (data.isBlank()) return false
 
         /*
-         * A raw media URL can arrive here when the user opens one directly.
-         * Do not try to fetch it as HTML.
+         * Direct media URLs are emitted immediately. We do not probe them with
+         * HEAD requests because some video hosts reject HEAD while allowing the
+         * normal GET/Range requests used by the player.
          */
         if (isMediaUrl(data)) {
-            val candidates = linkedSetOf<String>()
-            candidates.add(data)
-
-            if (data.startsWith("http://", true) && data.contains("khulnaplex.com", true)) {
-                candidates.add("https://" + data.removePrefix("http://"))
-            } else if (data.startsWith("https://", true) && data.contains("khulnaplex.com", true)) {
-                candidates.add("http://" + data.removePrefix("https://"))
+            val variants = mediaVariants(data, "$mainUrl/")
+            variants.forEachIndexed { index, mediaUrl ->
+                emitMediaLink(
+                    mediaUrl = mediaUrl,
+                    referer = "$mainUrl/",
+                    callback = callback,
+                    label = if (index == 0) "Khulna Plex Direct" else "Khulna Plex HTTPS Fallback"
+                )
             }
-
-            val ranked = rankMediaCandidates(
-                candidates.toList(),
-                referer = "$mainUrl/",
-                allowDownloadFallback = false
-            )
-
-            if (ranked.isNotEmpty()) {
-                emitBestMediaLinks(ranked, "$mainUrl/", callback)
-                return true
-            }
-
-            return false
+            return variants.isNotEmpty()
         }
 
         val pageUrls = linkedSetOf<String>()
         pageUrls.add(data)
 
-        if (data.startsWith("https://", true)) {
-            pageUrls.add("http://" + data.removePrefix("https://"))
-        } else if (data.startsWith("http://", true)) {
+        if (data.startsWith("http://", true)) {
             pageUrls.add("https://" + data.removePrefix("http://"))
+        } else if (data.startsWith("https://", true)) {
+            pageUrls.add("http://" + data.removePrefix("https://"))
         }
 
-        /*
-         * Resolve playback at Play time, not when the card is created.
-         * This gives us a fresh watch page and the actual current media
-         * source for every click.
-         */
         for (pageUrl in pageUrls) {
             val response = runCatching {
                 app.get(pageUrl, headers = pageHeaders(pageUrl))
@@ -276,47 +251,48 @@ class KhulnaPlex : MainAPI() {
             val html = response.text
 
             /*
-             * FIRST choice:
-             *   real <source src="...mp4/mkv/...">
+             * KhulnaPlex's watch page exposes the real media inside:
+             *   <video>
+             *      <source src="uploads/videos/...mp4">
+             *   </video>
              *
-             * SECOND choice:
-             *   HLS / DASH if the page exposes one.
-             *
-             * LAST choice:
-             *   download.php endpoint.
-             *
-             * This is intentionally the opposite of v7. The website's
-             * download endpoint can behave like a file download rather than
-             * a seekable progressive video stream.
+             * We extract that URL directly and do not turn the website's
+             * download.php endpoint into the primary playback source.
              */
-            val direct = extractMediaUrls(document, html, pageUrl)
-            val downloads = extractDownloadUrls(document, html, pageUrl)
+            val directSources = extractMediaUrls(document, html, pageUrl)
+                .flatMap { mediaVariants(it, pageUrl) }
+                .distinct()
 
-            val all = linkedSetOf<String>()
-            direct.forEach { all.add(it) }
-            downloads.forEach { all.add(it) }
-
-            if (all.isNotEmpty()) {
-                val ranked = rankMediaCandidates(
-                    urls = all.toList(),
-                    referer = pageUrl,
-                    allowDownloadFallback = true
-                )
-
-                if (ranked.isNotEmpty()) {
-                    /*
-                     * Emit the best playable source first and retain at most
-                     * one fallback. This prevents CloudStream from selecting
-                     * an arbitrary lower-quality download endpoint.
-                     */
-                    emitBestMediaLinks(ranked, pageUrl, callback)
-                    return true
-                }
+            if (directSources.isNotEmpty()) {
+                /*
+                 * Put the first working scheme first. For KhulnaPlex itself we
+                 * intentionally prefer HTTP because the supplied site source is
+                 * published as an HTTP URL; HTTPS remains available as a backup.
+                 */
+                directSources
+                    .distinct()
+                    .take(6)
+                    .forEachIndexed { index, mediaUrl ->
+                        emitMediaLink(
+                            mediaUrl = mediaUrl,
+                            referer = pageUrl,
+                            callback = callback,
+                            label = when {
+                                mediaUrl.contains(".m3u8", true) ->
+                                    if (index == 0) "Khulna Plex HLS" else "Khulna Plex HLS Fallback"
+                                mediaUrl.contains(".mpd", true) ->
+                                    if (index == 0) "Khulna Plex DASH" else "Khulna Plex DASH Fallback"
+                                index == 0 -> "Khulna Plex Direct"
+                                else -> "Khulna Plex HTTPS Fallback"
+                            }
+                        )
+                    }
+                return true
             }
 
             /*
-             * If the page contains an embedded player instead of a file,
-             * let CloudStream's registered extractors handle it.
+             * If there is no direct file, try a registered CloudStream extractor
+             * for an embedded player.
              */
             val iframes = document.select("iframe[src], iframe[data-src]")
                 .mapNotNull { iframe ->
@@ -339,260 +315,42 @@ class KhulnaPlex : MainAPI() {
         return false
     }
 
-    private suspend fun rankMediaCandidates(
-        urls: List<String>,
-        referer: String,
-        allowDownloadFallback: Boolean
-    ): List<MediaProbe> {
-        val unique = linkedSetOf<String>()
-        urls.forEach { raw ->
-            val cleaned = cleanUrl(raw)
-            if (cleaned.isNotBlank()) unique.add(cleaned)
-
-            /*
-             * Only add scheme alternatives for Khulna Plex itself.
-             * For third-party iframe/CDN URLs we must not invent a scheme.
-             */
-            if (cleaned.startsWith("http://", true) && cleaned.contains("khulnaplex.com", true)) {
-                unique.add("https://" + cleaned.removePrefix("http://"))
-            } else if (cleaned.startsWith("https://", true) && cleaned.contains("khulnaplex.com", true)) {
-                unique.add("http://" + cleaned.removePrefix("https://"))
-            }
-        }
-
-        val probes = unique.mapNotNull { url ->
-            if (!allowDownloadFallback && url.contains("download.php", true)) {
-                null
-            } else {
-                probeMediaCandidate(url, referer)
-            }
-        }
-
-        /*
-         * Score:
-         * 1000 = HLS
-         *  950 = DASH
-         *  900 = direct progressive media with real Range/206 support
-         *  800 = direct media that advertises byte ranges
-         *  700 = direct video with usable Content-Type
-         *  500 = downloadable file endpoint
-         *
-         * A server-side Range capability matters because Media3 uses byte
-         * range requests for progressive media. A source that only behaves
-         * like a full-file download can otherwise sit forever at 00:00 while
-         * data is consumed.
-         */
-        return probes
-            .sortedWith(
-                compareByDescending<MediaProbe> {
-                    val successful =
-                        it.status in 200..399 || it.status == 206
-
-                    when {
-                        it.kind == 3 && successful -> 1000
-                        it.kind == 4 && successful -> 950
-                        it.kind == 1 && it.rangeSupported && successful -> 900
-                        it.kind == 1 && it.acceptRanges.contains("bytes", true) && successful -> 800
-                        it.kind == 1 && it.contentType.startsWith("video/", true) && successful -> 700
-                        it.kind == 2 && successful -> 500
-
-                        /*
-                         * Some video servers disable HEAD even though their
-                         * GET endpoint works perfectly. status == 0 means
-                         * the probe itself failed, so keep the candidate as
-                         * an unknown last-resort source instead of deleting
-                         * it from the candidate list.
-                         */
-                        it.kind == 1 -> 400
-                        it.kind == 2 -> 300
-                        else -> 100
-                    }
-                }.thenBy { mediaPriority(it.url) }
-            )
-    }
-
-    private suspend fun probeMediaCandidate(
-        url: String,
+    /*
+     * Always return the exact URL plus a scheme fallback for KhulnaPlex.
+     * This avoids selecting the website's download.php endpoint and gives the
+     * native player both HTTP and HTTPS forms of the actual media file.
+     */
+    private fun mediaVariants(
+        rawUrl: String,
         referer: String
-    ): MediaProbe? {
-        val kind = when {
-            url.contains(".m3u8", true) -> 3
-            url.contains(".mpd", true) -> 4
-            url.contains("download.php", true) -> 2
-            else -> 1
-        }
-
-        /*
-         * HLS/DASH are playlist documents; probing them with a byte range is
-         * unnecessary and can confuse some servers. A normal HEAD is enough.
-         */
-        val headers = mediaHeaders(referer).toMutableMap()
-        if (kind == 1 || kind == 2) {
-            headers["Range"] = "bytes=0-0"
-        }
-
-        val response = runCatching {
-            app.head(
-                url,
-                headers = headers,
-                referer = referer,
-                timeout = 5L
-            )
-        }.getOrNull()
-
-        /*
-         * HEAD is only a lightweight capability probe. Some hosts reject
-         * HEAD while accepting GET, so a failed HEAD must NOT make us throw
-         * away an otherwise valid media URL.
-         */
-        if (response == null) {
-            return MediaProbe(
-                url = url,
-                kind = kind,
-                status = 0,
-                contentType = "",
-                acceptRanges = "",
-                contentRange = "",
-                rangeSupported = false
-            )
-        }
-
-        val contentType = response.headers["Content-Type"].orEmpty()
-        val acceptRanges = response.headers["Accept-Ranges"].orEmpty()
-        val contentRange = response.headers["Content-Range"].orEmpty()
-
-        val rangeSupported =
-            response.code == 206 ||
-                acceptRanges.contains("bytes", ignoreCase = true) ||
-                contentRange.startsWith("bytes ", ignoreCase = true)
-
-        return MediaProbe(
-            url = url,
-            kind = kind,
-            status = response.code,
-            contentType = contentType,
-            acceptRanges = acceptRanges,
-            contentRange = contentRange,
-            rangeSupported = rangeSupported
-        )
-    }
-
-    private suspend fun emitBestMediaLinks(
-        ranked: List<MediaProbe>,
-        referer: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        if (ranked.isEmpty()) return
-
-        /*
-         * Emit the best source only for automatic playback.
-         *
-         * When a direct progressive source is Range-capable, it is the only
-         * source we need. The player can therefore not accidentally choose a
-         * download endpoint and sit at 00:00.
-         *
-         * If the best source is an HLS/DASH manifest, emit that one.
-         *
-         * When no Range-capable source exists, use the best direct candidate
-         * as the last-resort source.
-         */
-        val best =
-            ranked.firstOrNull { it.rangeSupported || it.kind >= 3 }
-                ?: ranked.firstOrNull { it.kind == 1 }
-                ?: ranked.firstOrNull()
-
-        if (best != null) {
-            /*
-             * This is deliberately one automatic source: the player should
-             * not start with a full-file download endpoint when a real
-             * progressive video URL is available.
-             */
-            emitMediaLink(
-                mediaUrl = best.url,
-                referer = referer,
-                callback = callback,
-                label = when (best.kind) {
-                    3 -> "Khulna Plex HLS"
-                    4 -> "Khulna Plex DASH"
-                    2 -> "Khulna Plex Download"
-                    else -> "Khulna Plex Direct"
-                }
-            )
-        }
-
-        /*
-         * Keep one backup only when it is a genuinely different type.
-         * This makes the Source menu useful without flooding it with HTTP/
-         * HTTPS duplicates.
-         */
-        val backup = ranked.firstOrNull { candidate ->
-            candidate.url != best?.url &&
-                candidate.kind != best?.kind
-        }
-
-        if (backup != null) {
-            emitMediaLink(
-                mediaUrl = backup.url,
-                referer = referer,
-                callback = callback,
-                label = when (backup.kind) {
-                    3 -> "Khulna Plex HLS Fallback"
-                    4 -> "Khulna Plex DASH Fallback"
-                    2 -> "Khulna Plex Download Fallback"
-                    else -> "Khulna Plex Direct Fallback"
-                }
-            )
-        }
-    }
-
-    private fun extractDownloadUrls(
-        document: Document,
-        html: String,
-        baseUrl: String
     ): List<String> {
-        val found = linkedSetOf<String>()
+        val cleaned = cleanUrl(rawUrl)
+        if (cleaned.isBlank()) return emptyList()
 
-        document.select("a[href*='download.php'], a.download-btn").forEach { anchor ->
-            val href = anchor.attr("href").trim()
-            if (href.isNotBlank() && href.contains("download.php", true)) {
-                found.add(absoluteUrl(cleanUrl(href), baseUrl))
+        val hostIsKhulna = cleaned.contains("khulnaplex.com", true) ||
+            referer.contains("khulnaplex.com", true)
+
+        if (!hostIsKhulna) return listOf(cleaned)
+
+        return when {
+            cleaned.startsWith("http://", true) -> listOf(
+                cleaned,
+                "https://" + cleaned.removePrefix("http://")
+            )
+            cleaned.startsWith("https://", true) -> listOf(
+                "http://" + cleaned.removePrefix("https://"),
+                cleaned
+            )
+            cleaned.startsWith("//") -> listOf(
+                "http:$cleaned",
+                "https:$cleaned"
+            )
+            else -> {
+                val http = absoluteUrl(cleaned, "http://khulnaplex.com/")
+                val https = absoluteUrl(cleaned, "https://khulnaplex.com/")
+                listOf(http, https)
             }
-        }
-
-        val cleanHtml = html
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-            .replace("&amp;", "&")
-
-        val regex = Regex(
-            """(?i)(?:https?://[^"'<>\s]+|(?:/|\.\.?/)?download\.php\?[^"'<>\s)]+)"""
-        )
-
-        regex.findAll(cleanHtml).forEach { match ->
-            val value = cleanUrl(match.value)
-            if (value.contains("download.php", true)) {
-                found.add(absoluteUrl(value, baseUrl))
-            }
-        }
-
-        // If the page exposes only the raw /uploads/videos/... file, build the
-        // same site's download endpoint from that exact file path as a fallback.
-        if (found.isEmpty()) {
-            val rawFile = extractMediaUrls(document, cleanHtml, baseUrl)
-                .firstOrNull { it.contains("/uploads/videos/", true) }
-            if (rawFile != null) {
-                val path = runCatching { URI(rawFile).rawPath.trimStart('/') }
-                    .getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-                if (path != null) {
-                    val encoded = URLEncoder.encode(path, StandardCharsets.UTF_8.toString())
-                        .replace("+", "%20")
-                    found.add(absoluteUrl("/download.php?file=$encoded", baseUrl))
-                }
-            }
-        }
-
-        return found.distinct()
+        }.distinct()
     }
 
     private fun cleanUrl(raw: String): String = raw
@@ -612,25 +370,17 @@ class KhulnaPlex : MainAPI() {
 
         fun add(raw: String?) {
             if (raw.isNullOrBlank()) return
-            var value = raw.trim()
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-                .trim('"', '\'', '`')
-                .trimEnd(',', ';', ')', ']', '}')
-
-            // Remove JavaScript string wrappers sometimes found around URLs.
-            value = value.replace("\\x2F", "/")
+            val value = cleanUrl(raw).replace("\\x2F", "/")
             if (value.startsWith("http://") || value.startsWith("https://") ||
-                value.startsWith("//") || value.startsWith("/") || value.startsWith("../") ||
-                value.startsWith("./")) {
+                value.startsWith("//") || value.startsWith("/") ||
+                value.startsWith("../") || value.startsWith("./")) {
                 val fixed = absoluteUrl(value, baseUrl)
                 if (isMediaUrl(fixed)) found.add(fixed)
             }
         }
 
         document.select(
-            "video, video source, source, a[href], " +
+            "video, video source, source, " +
                 "[src], [data-src], [data-video], [data-file], [data-url], " +
                 "[data-source], [data-stream], [data-file-url], [data-video-url]"
         ).forEach { element ->
@@ -643,7 +393,6 @@ class KhulnaPlex : MainAPI() {
             add(element.attr("data-stream"))
             add(element.attr("data-file-url"))
             add(element.attr("data-video-url"))
-            add(element.attr("href"))
         }
 
         val cleanedHtml = html
@@ -652,21 +401,47 @@ class KhulnaPlex : MainAPI() {
             .replace("\\u003A", ":")
             .replace("&amp;", "&")
 
-        // Catch direct URLs such as:
-        // /uploads/videos/1788502957_Coyote_vs._Acme_2026.mp4
-        // https://khulnaplex.com/uploads/videos/...mp4
         val directRegex = Regex(
-            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^"'<>\s\\]+?\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
+            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^"'<>\s\\]+?\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
         )
         directRegex.findAll(cleanedHtml).forEach { add(it.value) }
 
-        // Catch JavaScript player objects even when the key is unusual.
         val keyRegex = Regex(
             """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl)\s*[:=]\s*["']([^"']+)["']"""
         )
         keyRegex.findAll(cleanedHtml).forEach { add(it.groupValues[1]) }
 
         return found.toList()
+    }
+
+    private suspend fun emitMediaLink(
+        mediaUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+        label: String = "Khulna Plex Direct"
+    ) {
+        val type = when {
+            mediaUrl.contains(".m3u8", true) -> ExtractorLinkType.M3U8
+            mediaUrl.contains(".mpd", true) -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
+
+        val lower = mediaUrl.lowercase(Locale.ROOT)
+        val quality = when {
+            "2160" in lower || "4k" in lower -> Qualities.P2160.value
+            "1440" in lower -> Qualities.P1440.value
+            "1080" in lower -> Qualities.P1080.value
+            "720" in lower -> Qualities.P720.value
+            "480" in lower -> Qualities.P480.value
+            "360" in lower -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+
+        callback(newExtractorLink(name, label, mediaUrl, type) {
+            this.referer = referer
+            this.quality = quality
+            this.headers = mediaHeaders(referer)
+        })
     }
 
     private fun parseItems(
@@ -966,34 +741,6 @@ class KhulnaPlex : MainAPI() {
             path.endsWith(".avi") -> 9
             else -> 99
         }
-    }
-
-    private suspend fun emitMediaLink(
-        mediaUrl: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-        label: String = "Direct"
-    ) {
-        val type = when {
-            mediaUrl.contains(".m3u8", true) -> ExtractorLinkType.M3U8
-            mediaUrl.contains(".mpd", true) -> ExtractorLinkType.DASH
-            else -> ExtractorLinkType.VIDEO
-        }
-        val lower = mediaUrl.lowercase(Locale.ROOT)
-        val quality = when {
-            "2160" in lower || "4k" in lower -> Qualities.P2160.value
-            "1440" in lower -> Qualities.P1440.value
-            "1080" in lower -> Qualities.P1080.value
-            "720" in lower -> Qualities.P720.value
-            "480" in lower -> Qualities.P480.value
-            "360" in lower -> Qualities.P360.value
-            else -> Qualities.Unknown.value
-        }
-        callback(newExtractorLink(name, label, mediaUrl, type) {
-            this.referer = referer
-            this.quality = quality
-            this.headers = mediaHeaders(referer)
-        })
     }
 
     private fun extractContentUrl(raw: String): String? {
