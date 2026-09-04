@@ -164,7 +164,6 @@ class KhulnaPlex : MainAPI() {
 
         val title = extractPageTitle(document).ifBlank { titleFromUrl(url) }
         val poster = extractPoster(document, url)
-        val media = extractMediaUrls(document, document.html(), url).firstOrNull()
         val series = isSeriesUrl(url) || looksLikeSeriesPage(document)
 
         if (series) {
@@ -176,14 +175,16 @@ class KhulnaPlex : MainAPI() {
             }
         }
 
-        // Important: when the watch page already exposes the real MP4/M3U8,
-        // store that real media URL as CloudStream data. This avoids a second
-        // fragile extraction step when the user presses Play.
+        // Keep the watch page as the CloudStream data.
+        // loadLinks() will fetch the page again and collect EVERY playable
+        // source exposed by KhulnaPlex, including the <video><source> URL and
+        // the site's download.php stream fallback. This is more reliable than
+        // saving only the first URL during load().
         return newMovieLoadResponse(
             title,
             url,
             if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
-            media ?: url
+            url
         ) {
             posterUrl = poster
         }
@@ -218,25 +219,50 @@ class KhulnaPlex : MainAPI() {
 
         val document = response.document
         val html = response.text
-        val media = extractMediaUrls(document, html, data)
 
-        // Prefer direct files first.  KhulnaPlex's supplied MP4 should therefore
-        // go straight to the CloudStream native video player.
-        val best = media.minByOrNull { mediaPriority(it) }
-        if (best != null) {
+        // Collect the actual media source from the watch page.
+        val directMedia = extractMediaUrls(document, html, data)
+            .sortedBy { mediaPriority(it) }
+
+        // KhulnaPlex also exposes a download.php URL for the exact same file.
+        // On some Android/ExoPlayer/network combinations the raw /uploads/...
+        // URL returns a bad HTTP status while download.php is still streamable.
+        val downloadUrls = document.select(
+            "a[href*='download.php']"
+        ).mapNotNull { anchor ->
+            anchor.attr("href")
+                .trim()
+                .takeIf { it.isNotBlank() }
+                ?.let { absoluteUrl(it, data) }
+        }.distinct()
+
+        // Emit direct media first, then the site's own download endpoint as a
+        // fallback. Both receive the watch-page Referer and browser headers.
+        val emitted = linkedSetOf<String>()
+
+        directMedia.forEach { media ->
             val candidates = linkedSetOf<String>()
-            candidates.add(best)
-            if (best.startsWith("https://", true) && best.contains("khulnaplex.com", true)) {
-                candidates.add("http://" + best.removePrefix("https://"))
-            } else if (best.startsWith("http://", true) && best.contains("khulnaplex.com", true)) {
-                candidates.add("https://" + best.removePrefix("http://"))
+            candidates.add(media)
+            if (media.startsWith("https://", true) && media.contains("khulnaplex.com", true)) {
+                candidates.add("http://" + media.removePrefix("https://"))
+            } else if (media.startsWith("http://", true) && media.contains("khulnaplex.com", true)) {
+                candidates.add("https://" + media.removePrefix("http://"))
             }
 
-            candidates.forEach { media ->
-                emitMediaLink(media, data, callback)
+            candidates.forEach { candidate ->
+                if (emitted.add(candidate)) {
+                    emitMediaLink(candidate, data, callback, "Direct")
+                }
             }
-            return true
         }
+
+        downloadUrls.forEach { downloadUrl ->
+            if (emitted.add(downloadUrl)) {
+                emitMediaLink(downloadUrl, data, callback, "Khulna Plex Download")
+            }
+        }
+
+        if (emitted.isNotEmpty()) return true
 
         val iframes = document.select("iframe[src], iframe[data-src]")
             .mapNotNull { iframe ->
@@ -624,7 +650,8 @@ class KhulnaPlex : MainAPI() {
     private suspend fun emitMediaLink(
         mediaUrl: String,
         referer: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        label: String = "Direct"
     ) {
         val type = if (mediaUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val lower = mediaUrl.lowercase(Locale.ROOT)
@@ -637,7 +664,7 @@ class KhulnaPlex : MainAPI() {
             "360" in lower -> Qualities.P360.value
             else -> Qualities.Unknown.value
         }
-        callback(newExtractorLink(name, name, mediaUrl, type) {
+        callback(newExtractorLink(name, label, mediaUrl, type) {
             this.referer = referer
             this.quality = quality
             this.headers = browserHeaders(referer)
