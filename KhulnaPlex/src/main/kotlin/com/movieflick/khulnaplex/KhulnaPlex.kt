@@ -13,7 +13,7 @@ import java.util.Locale
 
 class KhulnaPlex : MainAPI() {
 
-    override var mainUrl = "https://khulnaplex.com"
+    override var mainUrl = "http://khulnaplex.com"
     override var name = "Khulna Plex"
     override var lang = "bn"
 
@@ -79,10 +79,10 @@ class KhulnaPlex : MainAPI() {
         val candidates = linkedSetOf<String>()
         candidates.add(normalized)
 
-        if (normalized.startsWith("https://", true)) {
-            candidates.add("http://" + normalized.removePrefix("https://"))
-        } else if (normalized.startsWith("http://", true)) {
+        if (normalized.startsWith("http://", true)) {
             candidates.add("https://" + normalized.removePrefix("http://"))
+        } else if (normalized.startsWith("https://", true)) {
+            candidates.add("http://" + normalized.removePrefix("https://"))
         }
 
         for (candidate in candidates) {
@@ -198,8 +198,18 @@ class KhulnaPlex : MainAPI() {
         if (data.isBlank()) return false
 
         if (isMediaUrl(data)) {
-            emitMediaLink(data, data, callback)
-            return true
+            val candidates = linkedSetOf<String>()
+            candidates.add(data)
+            if (data.startsWith("https://", true) && data.contains("khulnaplex.com", true)) {
+                candidates.add("http://" + data.removePrefix("https://"))
+            } else if (data.startsWith("http://", true) && data.contains("khulnaplex.com", true)) {
+                candidates.add("https://" + data.removePrefix("http://"))
+            }
+
+            candidates.forEach { media ->
+                emitMediaLink(media, "$mainUrl/", callback)
+            }
+            return candidates.isNotEmpty()
         }
 
         val response = runCatching {
@@ -214,7 +224,17 @@ class KhulnaPlex : MainAPI() {
         // go straight to the CloudStream native video player.
         val best = media.minByOrNull { mediaPriority(it) }
         if (best != null) {
-            emitMediaLink(best, data, callback)
+            val candidates = linkedSetOf<String>()
+            candidates.add(best)
+            if (best.startsWith("https://", true) && best.contains("khulnaplex.com", true)) {
+                candidates.add("http://" + best.removePrefix("https://"))
+            } else if (best.startsWith("http://", true) && best.contains("khulnaplex.com", true)) {
+                candidates.add("https://" + best.removePrefix("http://"))
+            }
+
+            candidates.forEach { media ->
+                emitMediaLink(media, data, callback)
+            }
             return true
         }
 
@@ -620,6 +640,7 @@ class KhulnaPlex : MainAPI() {
         callback(newExtractorLink(name, name, mediaUrl, type) {
             this.referer = referer
             this.quality = quality
+            this.headers = browserHeaders(referer)
         })
     }
 
