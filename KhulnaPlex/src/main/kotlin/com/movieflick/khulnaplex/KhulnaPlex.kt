@@ -62,7 +62,6 @@ class KhulnaPlex : MainAPI() {
     )
 
     private val maxHomeItems = 25
-    private val maxPagesToCollect = 12
 
     private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
         "User-Agent" to
@@ -76,17 +75,23 @@ class KhulnaPlex : MainAPI() {
     )
 
     private suspend fun getDocument(url: String): Document? {
-        val direct = runCatching {
-            app.get(url, headers = browserHeaders(url)).document
-        }.getOrNull()
-        if (direct != null) return direct
+        val normalized = url.trim()
+        val candidates = linkedSetOf<String>()
+        candidates.add(normalized)
 
-        if (url.startsWith("http://", true)) {
-            val https = "https://" + url.removePrefix("http://")
-            return runCatching {
-                app.get(https, headers = browserHeaders("https://khulnaplex.com/")).document
-            }.getOrNull()
+        if (normalized.startsWith("https://", true)) {
+            candidates.add("http://" + normalized.removePrefix("https://"))
+        } else if (normalized.startsWith("http://", true)) {
+            candidates.add("https://" + normalized.removePrefix("http://"))
         }
+
+        for (candidate in candidates) {
+            val document = runCatching {
+                app.get(candidate, headers = browserHeaders(candidate)).document
+            }.getOrNull()
+            if (document != null) return document
+        }
+
         return null
     }
 
@@ -285,7 +290,7 @@ class KhulnaPlex : MainAPI() {
         // /uploads/videos/1788502957_Coyote_vs._Acme_2026.mp4
         // https://khulnaplex.com/uploads/videos/...mp4
         val directRegex = Regex(
-            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^\"'<>\\s\\\\]+?\\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\\?[^\"'<>\\s\\\\]*)?"""
+            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^"'<>\s\\]+?\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
         )
         directRegex.findAll(cleanedHtml).forEach { add(it.value) }
 
@@ -307,49 +312,48 @@ class KhulnaPlex : MainAPI() {
         val result = linkedMapOf<String, SiteItem>()
         var order = page.toLong() * 1_000_000L
 
-        /*
-         * Some KhulnaPlex cards use a normal <a href="watch.php?...">,
-         * while others may use data-href/data-url/onclick. Collect BOTH
-         * forms instead of using the second form only as a fallback.
-         */
-        document.select("a[href], [data-href], [data-url], [data-link], [onclick]")
-            .forEach { element ->
+        // KhulnaPlex uses JavaScript cards such as:
+        //   <div class="movie-card" onclick="openMovie(994)">
+        //   <div class="movie-card" onclick="openSeries(99)">
+        // Those IDs are converted to the real watch.php URL by
+        // extractContentUrl(). Normal <a href> cards are also supported.
+        val elements = document.select(
+            ".movie-card, .movie-grid .movie-card, " +
+                "a[href], [data-href], [data-url], [data-link], [onclick]"
+        )
 
-                val href = when {
-                    element.tagName() == "a" && element.attr("href").isNotBlank() ->
-                        element.attr("href").trim()
+        elements.forEach { element ->
+            val rawCandidates = listOf(
+                element.attr("href"),
+                element.attr("data-href"),
+                element.attr("data-url"),
+                element.attr("data-link"),
+                element.attr("onclick")
+            ).filter { it.isNotBlank() }
 
-                    else ->
-                        listOf(
-                            element.attr("data-href"),
-                            element.attr("data-url"),
-                            element.attr("data-link"),
-                            element.attr("onclick")
-                        ).firstNotNullOfOrNull { raw ->
-                            extractContentUrl(raw)
-                        }.orEmpty()
-                }
+            val href = rawCandidates.asSequence()
+                .mapNotNull { extractContentUrl(it) }
+                .firstOrNull()
+                ?: return@forEach
 
-                if (!looksLikeContentLink(href)) return@forEach
+            val absolute = absoluteUrl(href, sourceUrl)
+            if (!looksLikeContentLink(absolute)) return@forEach
 
-                val absolute = absoluteUrl(href, sourceUrl)
-                if (!looksLikeContentLink(absolute)) return@forEach
+            val card = findCard(element)
+            val title = cleanTitle(
+                extractCardTitle(element, card)
+                    .ifBlank { titleFromUrl(absolute) }
+            )
 
-                val card = findCard(element)
+            if (title.isBlank() || isNavigationTitle(title)) return@forEach
 
-                val title = cleanTitle(
-                    extractCardTitle(element, card)
-                        .ifBlank { titleFromUrl(absolute) }
-                )
+            val series = isSeriesUrl(absolute) ||
+                sectionName.contains("TV", ignoreCase = true) ||
+                absolute.contains("type=series", ignoreCase = true) ||
+                absolute.contains("type=tv", ignoreCase = true)
 
-                if (title.isBlank() || isNavigationTitle(title)) return@forEach
-
-                val series = isSeriesUrl(absolute) ||
-                    sectionName.contains("TV", ignoreCase = true) ||
-                    absolute.contains("type=series", ignoreCase = true) ||
-                    absolute.contains("type=tv", ignoreCase = true)
-
-                val item = SiteItem(
+            if (!result.containsKey(absolute)) {
+                result[absolute] = SiteItem(
                     title = title,
                     url = absolute,
                     poster = extractPosterFromElement(card, sourceUrl),
@@ -357,62 +361,13 @@ class KhulnaPlex : MainAPI() {
                     sortTime = extractSortTime(card, element),
                     discoveryOrder = order++
                 )
-
-                // Same watch URL can appear on several nested elements.
-                // Keep the first occurrence so website order is preserved.
-                if (!result.containsKey(absolute)) {
-                    result[absolute] = item
-                }
             }
-
-        /*
-         * If the page uses a JS-only card with no recognizable watch.php URL
-         * in the attributes, inspect onclick/data attributes directly.
-         */
-        if (result.isEmpty()) {
-            document.select("[data-href], [data-url], [data-link], [onclick]")
-                .forEach { element ->
-                    val raw = listOf(
-                        element.attr("data-href"),
-                        element.attr("data-url"),
-                        element.attr("data-link"),
-                        element.attr("onclick")
-                    ).firstOrNull { it.isNotBlank() } ?: return@forEach
-
-                    val href = extractContentUrl(raw) ?: return@forEach
-                    val absolute = absoluteUrl(href, sourceUrl)
-
-                    if (!looksLikeContentLink(absolute)) return@forEach
-
-                    val card = findCard(element)
-                    val title = cleanTitle(
-                        extractCardTitle(element, card)
-                            .ifBlank { titleFromUrl(absolute) }
-                    )
-
-                    if (title.isBlank() || isNavigationTitle(title)) return@forEach
-
-                    result[absolute] = SiteItem(
-                        title = title,
-                        url = absolute,
-                        poster = extractPosterFromElement(card, sourceUrl),
-                        isSeries = isSeriesUrl(absolute) ||
-                            sectionName.contains("TV", ignoreCase = true),
-                        sortTime = extractSortTime(card, element),
-                        discoveryOrder = order++
-                    )
-                }
         }
 
-        /*
-         * IMPORTANT:
-         * Do not sort by the visible movie year.  "2026" on a card is the
-         * release year, not the upload time. When KhulnaPlex exposes a real
-         * upload/created timestamp we use it; otherwise the site's own card
-         * order is preserved. The site listing is already newest-first.
-         */
         val values = result.values.toList()
 
+        // KhulnaPlex already orders its listing cards newest-first. We preserve
+        // that order unless the site exposes a real upload/created timestamp.
         val hasRealTimestamp = values.any { it.sortTime > 0L }
 
         return if (hasRealTimestamp) {
@@ -537,7 +492,7 @@ class KhulnaPlex : MainAPI() {
             if (text.isNotBlank()) return text
         }
         anchor.attr("aria-label").trim().takeIf { it.isNotBlank() }?.let { return it }
-        card.selectFirst("img")?.attr("alt")?.trim().takeIf { !it.isNullOrBlank() }?.let { return it!! }
+        card.selectFirst("img")?.attr("alt")?.trim().takeIf { !it.isNullOrBlank() }?.let { return it }
         return anchor.text().trim()
     }
 
@@ -675,11 +630,24 @@ class KhulnaPlex : MainAPI() {
             .replace("\\/", "/")
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
+            .trim()
+
+        // This is the important KhulnaPlex mapping. The website's cards do not
+        // contain watch.php hrefs; they call these JavaScript functions instead.
+        Regex("""(?i)openMovie\s*\(\s*(\d+)\s*\)""")
+            .find(cleaned)?.groupValues?.getOrNull(1)?.let { id ->
+                return "/watch.php?id=$id&type=movie"
+            }
+
+        Regex("""(?i)openSeries\s*\(\s*(\d+)\s*\)""")
+            .find(cleaned)?.groupValues?.getOrNull(1)?.let { id ->
+                return "/watch.php?id=$id&type=series&season=1&episode=1"
+            }
 
         val patterns = listOf(
-            Regex("""(?i)https?://[^"'<>\\s)]+"""),
-            Regex("""(?i)(?:/|\.\.?/)?watch\.php\?[^"'<>\\s)]+"""),
-            Regex("""(?i)(?:/|\.\.?/)?(?:movie|series|show|details)\.php\?[^"'<>\\s)]+""")
+            Regex("""(?i)https?://[^"'<>\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?watch\.php\?[^"'<>\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?(?:movie|series|show|details)\.php\?[^"'<>\s)]+""")
         )
 
         for (pattern in patterns) {
