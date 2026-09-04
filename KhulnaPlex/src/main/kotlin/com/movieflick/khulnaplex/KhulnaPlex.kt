@@ -64,14 +64,46 @@ class KhulnaPlex : MainAPI() {
         ".m3u8", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts"
     )
 
+    private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> {
+        return mapOf(
+            "User-Agent" to
+                "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Accept" to
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Referer" to referer
+        )
+    }
+
+    private suspend fun getKhulnaResponse(url: String): NiceResponse? {
+        val response = runCatching {
+            app.get(url, headers = browserHeaders())
+        }.getOrNull()
+
+        if (response != null) return response
+
+        if (url.startsWith("http://", ignoreCase = true)) {
+            val httpsUrl = "https://" + url.removePrefix("http://")
+            return runCatching {
+                app.get(httpsUrl, headers = browserHeaders("$mainUrl/"))
+            }.getOrNull()
+        }
+
+        return null
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val document = runCatching { app.get(url).document }.getOrElse {
-            return newHomePageResponse(request, emptyList(), false)
-        }
+        val response = getKhulnaResponse(url) ?: return newHomePageResponse(
+            request,
+            emptyList(),
+            false
+        )
+        val document = response.document
 
         val items = parseItems(document, request.data, request.name)
         val responses = items.map { it.toSearchResponse() }
@@ -114,7 +146,11 @@ class KhulnaPlex : MainAPI() {
 
         for (url in candidates) {
             val result = runCatching {
-                val response = app.get(url)
+                val response = getKhulnaResponse(url) ?: return@runCatching Triple(
+                    emptyList(),
+                    org.jsoup.Jsoup.parse(""),
+                    url
+                )
                 val items = parseItems(response.document, url, "Search")
                 Triple(items, response.document, url)
             }.getOrNull() ?: continue
@@ -131,7 +167,7 @@ class KhulnaPlex : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val response = runCatching { app.get(url) }.getOrElse {
+        val response = getKhulnaResponse(url) ?: run {
             return newMovieLoadResponse(
                 titleFromUrl(url),
                 url,
@@ -184,9 +220,7 @@ class KhulnaPlex : MainAPI() {
             return true
         }
 
-        val response = runCatching {
-            app.get(data, headers = mapOf("Referer" to "$mainUrl/"))
-        }.getOrNull() ?: return false
+        val response = getKhulnaResponse(data) ?: return false
 
         val document = response.document
         val found = linkedSetOf<String>()
@@ -310,21 +344,23 @@ class KhulnaPlex : MainAPI() {
     ): List<SiteItem> {
         val result = linkedMapOf<String, SiteItem>()
 
-        /* Primary selector: the movie/series cards link to watch.php. */
+        // KhulnaPlex cards normally link to watch.php?id=...&type=movie.
         document.select("a[href]").forEach { anchor ->
             val href = anchor.attr("href").trim()
             if (!looksLikeContentLink(href)) return@forEach
 
             val absolute = absoluteUrl(href, sourceUrl)
-            val isSeries = isSeriesUrl(absolute) || sectionName.contains("TV", true) ||
-                absolute.contains("type=series", true) || absolute.contains("type=tv", true)
+            val isSeries = isSeriesUrl(absolute) ||
+                sectionName.contains("TV", ignoreCase = true) ||
+                absolute.contains("type=series", ignoreCase = true) ||
+                absolute.contains("type=tv", ignoreCase = true)
 
             val card = findCard(anchor)
             val poster = extractPosterFromElement(card, sourceUrl)
-            val title = extractCardTitle(anchor, card).ifBlank { titleFromUrl(absolute) }
+            val title = extractCardTitle(anchor, card)
+                .ifBlank { titleFromUrl(absolute) }
 
-            if (title.isBlank()) return@forEach
-            if (isNavigationTitle(title)) return@forEach
+            if (title.isBlank() || isNavigationTitle(title)) return@forEach
 
             result[absolute] = SiteItem(
                 title = cleanTitle(title),
@@ -334,7 +370,47 @@ class KhulnaPlex : MainAPI() {
             )
         }
 
+        // Fallback for layouts using data-href/data-url/onclick.
+        if (result.isEmpty()) {
+            document.select("[data-href], [data-url], [data-link], [onclick]")
+                .forEach { element ->
+                    val raw = listOf(
+                        element.attr("data-href"),
+                        element.attr("data-url"),
+                        element.attr("data-link"),
+                        element.attr("onclick")
+                    ).firstOrNull { looksLikeContentLink(it) } ?: return@forEach
+
+                    val href = extractContentUrl(raw) ?: return@forEach
+                    val absolute = absoluteUrl(href, sourceUrl)
+                    val card = findCard(element)
+                    val poster = extractPosterFromElement(card, sourceUrl)
+                    val title = extractCardTitle(element, card)
+                        .ifBlank { titleFromUrl(absolute) }
+
+                    if (title.isBlank() || isNavigationTitle(title)) return@forEach
+
+                    result[absolute] = SiteItem(
+                        title = cleanTitle(title),
+                        url = absolute,
+                        poster = poster,
+                        isSeries = isSeriesUrl(absolute) ||
+                            sectionName.contains("TV", ignoreCase = true)
+                    )
+                }
+        }
+
         return result.values.toList()
+    }
+
+    private fun extractContentUrl(raw: String): String? {
+        val match = Regex(
+            """(?i)(?:https?://[^"'\\s]+|(?:/|\\.\\.?/)?watch\\.php\\?[^"'\\s)]+)"""
+        ).find(raw) ?: return null
+
+        return match.value
+            .trim(',', ')', '"', '\'')
+            .replace("&amp;", "&")
     }
 
     private fun parseEpisodes(
@@ -459,18 +535,42 @@ class KhulnaPlex : MainAPI() {
 
         if (!ogImage.isNullOrBlank()) return absoluteUrl(ogImage, pageUrl)
 
-        val images = element.select("img[src], img[data-src], img[data-lazy-src]")
-        if (images.isEmpty()) return null
+        val images = element.select(
+            "img[src], img[data-src], img[data-lazy-src], img[data-original]"
+        )
 
         val preferred = images.firstOrNull { image ->
-            val src = imageSource(image)
+            val src = imageSource(image).orEmpty()
             val alt = image.attr("alt")
-            val all = "$src $alt".lowercase(Locale.ROOT)
-            all.contains("poster") || all.contains("cover") || all.contains("thumb")
+            val cls = image.className()
+            val all = "$src $alt $cls".lowercase(Locale.ROOT)
+
+            all.contains("poster") ||
+                all.contains("cover") ||
+                all.contains("thumb") ||
+                all.contains("movie")
+        } ?: images.firstOrNull()
+
+        if (preferred != null) {
+            return imageSource(preferred)?.let { absoluteUrl(it, pageUrl) }
         }
 
-        val selected = preferred ?: return null
-        return imageSource(selected)?.let { absoluteUrl(it, pageUrl) }
+        val styleValue = element
+            .select("[style*=background]")
+            .map { it.attr("style") }
+            .firstOrNull { it.contains("url(", ignoreCase = true) }
+
+        if (!styleValue.isNullOrBlank()) {
+            val match = Regex(
+                """(?i)background(?:-image)?\\s*:[^;]*url\\(\\s*['"]?([^'")]+)['"]?\\s*\\)"""
+            ).find(styleValue)
+
+            if (match != null) {
+                return absoluteUrl(match.groupValues[1], pageUrl)
+            }
+        }
+
+        return null
     }
 
     private fun imageSource(image: Element): String? {
@@ -512,10 +612,13 @@ class KhulnaPlex : MainAPI() {
 
         return lower.contains("watch.php") ||
             lower.contains("movie.php") ||
-            lower.contains("series.php?id=") ||
-            lower.contains("show.php?id=") ||
-            lower.contains("details.php?id=") ||
-            lower.contains("movie?id=")
+            lower.contains("series.php") ||
+            lower.contains("show.php") ||
+            lower.contains("details.php") ||
+            lower.contains("movie?id=") ||
+            lower.contains("type=movie") ||
+            lower.contains("type=series") ||
+            lower.contains("type=tv")
     }
 
     private fun looksLikeEpisodeLink(href: String): Boolean {
