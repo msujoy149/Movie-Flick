@@ -7,6 +7,8 @@ import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 class KhulnaPlex : MainAPI() {
@@ -24,14 +26,6 @@ class KhulnaPlex : MainAPI() {
         TvType.Anime
     )
 
-    /*
-     * IMPORTANT HOME ORDER
-     *
-     * Search is intentionally NOT a home-page section.
-     * CloudStream's own global search calls search() below.
-     *
-     * Anime is deliberately LAST.
-     */
     override val mainPage = mainPageOf(
         "$mainUrl/movies.php" to "All Movies",
         "$mainUrl/movies.php?category=hindi" to "Hindi Movies",
@@ -46,7 +40,9 @@ class KhulnaPlex : MainAPI() {
         val title: String,
         val url: String,
         val poster: String?,
-        val isSeries: Boolean
+        val isSeries: Boolean,
+        val sortTime: Long,
+        val discoveryOrder: Long
     )
 
     private fun SiteItem.toSearchResponse(): SearchResponse {
@@ -62,35 +58,35 @@ class KhulnaPlex : MainAPI() {
     }
 
     private val mediaExtensions = setOf(
-        ".m3u8", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts"
+        ".m3u8", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts"
     )
 
-    private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> {
-        return mapOf(
-            "User-Agent" to
-                "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-            "Accept" to
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Referer" to referer
-        )
-    }
+    private val maxHomeItems = 25
+    private val maxPagesToCollect = 12
 
-    private suspend fun getKhulnaDocument(url: String): org.jsoup.nodes.Document? {
-        val document = runCatching {
-            app.get(url, headers = browserHeaders()).document
+    private fun browserHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
+        "User-Agent" to
+            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "Accept" to
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to referer,
+        "Connection" to "keep-alive"
+    )
+
+    private suspend fun getDocument(url: String): Document? {
+        val direct = runCatching {
+            app.get(url, headers = browserHeaders(url)).document
         }.getOrNull()
+        if (direct != null) return direct
 
-        if (document != null) return document
-
-        if (url.startsWith("http://", ignoreCase = true)) {
-            val httpsUrl = "https://" + url.removePrefix("http://")
+        if (url.startsWith("http://", true)) {
+            val https = "https://" + url.removePrefix("http://")
             return runCatching {
-                app.get(httpsUrl, headers = browserHeaders("$mainUrl/")).document
+                app.get(https, headers = browserHeaders("https://khulnaplex.com/")).document
             }.getOrNull()
         }
-
         return null
     }
 
@@ -98,67 +94,80 @@ class KhulnaPlex : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = pageUrl(request.data, page)
-        val document = getKhulnaDocument(url) ?: return newHomePageResponse(
+        // CloudStream normally asks for page 1 first.  We intentionally collect
+        // several website pages here so a category row contains many cards at once.
+        if (page > 1) {
+            val document = getDocument(pageUrl(request.data, page))
+                ?: return newHomePageResponse(request, emptyList(), false)
+            val items = parseItems(document, request.data, request.name, page)
+            return newHomePageResponse(
+                request,
+                items.map { it.toSearchResponse() },
+                hasNextPage(document, page)
+            )
+        }
+
+        val all = linkedMapOf<String, SiteItem>()
+        var anyNext = false
+        var loadedPages = 0
+
+        for (sitePage in 1..maxPagesToCollect) {
+            val url = pageUrl(request.data, sitePage)
+            val document = getDocument(url) ?: break
+            loadedPages++
+
+            val items = parseItems(document, request.data, request.name, sitePage)
+            for (item in items) {
+                all[item.url] = item
+            }
+
+            val next = hasNextPage(document, sitePage)
+            anyNext = anyNext || next
+
+            if (all.size >= maxHomeItems) break
+            if (!next && sitePage > 1) break
+            if (!next && items.isEmpty()) break
+        }
+
+        // Most movie sites already order their listing newest-first.  If the
+        // page exposes an upload/created/modified timestamp, use that timestamp
+        // to make the newest item win. Otherwise discovery order is retained.
+        val sorted = all.values
+            .sortedWith(
+                compareByDescending<SiteItem> { it.sortTime > 0 }
+                    .thenByDescending { it.sortTime }
+                    .thenBy { it.discoveryOrder }
+            )
+            .take(maxHomeItems)
+
+        return newHomePageResponse(
             request,
-            emptyList(),
-            false
+            sorted.map { it.toSearchResponse() },
+            anyNext || loadedPages >= maxPagesToCollect
         )
-
-        val items = parseItems(document, request.data, request.name)
-        val responses = items.map { it.toSearchResponse() }
-        val hasNext = hasNextPage(document, page)
-
-        return newHomePageResponse(request, responses, hasNext)
     }
 
-    /*
-     * CloudStream global search -> KhulnaPlex search.php.
-     * No separate Search row is added to the home page.
-     *
-     * The site URL supplied by the user is search.php, but the exact
-     * query parameter is not visible from the screenshots. We therefore
-     * try the common parameters in a controlled fallback order.
-     */
     override suspend fun search(
         query: String,
         page: Int
     ): SearchResponseList {
-        val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) {
-            return newSearchResponseList(emptyList(), false)
-        }
+        val q = query.trim()
+        if (q.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        val encoded = URLEncoder.encode(cleanQuery, StandardCharsets.UTF_8.toString())
-        val candidates = if (page <= 1) {
-            listOf(
-                "$mainUrl/search.php?q=$encoded",
-                "$mainUrl/search.php?query=$encoded",
-                "$mainUrl/search.php?search=$encoded"
-            )
-        } else {
-            listOf(
-                "$mainUrl/search.php?q=$encoded&page=$page",
-                "$mainUrl/search.php?query=$encoded&page=$page",
-                "$mainUrl/search.php?search=$encoded&page=$page"
-            )
-        }
+        val encoded = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
+        val candidates = listOf(
+            "$mainUrl/search.php?q=$encoded${if (page > 1) "&page=$page" else ""}",
+            "$mainUrl/search.php?query=$encoded${if (page > 1) "&page=$page" else ""}",
+            "$mainUrl/search.php?search=$encoded${if (page > 1) "&page=$page" else ""}"
+        )
 
         for (url in candidates) {
-            val result = runCatching {
-                val document = getKhulnaDocument(url) ?: return@runCatching Triple(
-                    emptyList(),
-                    org.jsoup.Jsoup.parse(""),
-                    url
-                )
-                val items = parseItems(document, url, "Search")
-                Triple(items, document, url)
-            }.getOrNull() ?: continue
-
-            if (result.first.isNotEmpty()) {
+            val document = getDocument(url) ?: continue
+            val items = parseItems(document, url, "Search", page)
+            if (items.isNotEmpty()) {
                 return newSearchResponseList(
-                    result.first.map { it.toSearchResponse() },
-                    hasNextPage(result.second, page)
+                    items.take(maxHomeItems).map { it.toSearchResponse() },
+                    hasNextPage(document, page)
                 )
             }
         }
@@ -167,39 +176,42 @@ class KhulnaPlex : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = getKhulnaDocument(url) ?: run {
+        if (isMediaUrl(url)) {
             return newMovieLoadResponse(
                 titleFromUrl(url),
                 url,
-                TvType.Movie,
+                if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
                 url
             )
         }
 
-        val pageTitle = extractPageTitle(document).ifBlank { titleFromUrl(url) }
+        val document = getDocument(url)
+        if (document == null) {
+            return newMovieLoadResponse(titleFromUrl(url), url, TvType.Movie, url)
+        }
+
+        val title = extractPageTitle(document).ifBlank { titleFromUrl(url) }
         val poster = extractPoster(document, url)
+        val media = extractMediaUrls(document, document.html(), url).firstOrNull()
+        val series = isSeriesUrl(url) || looksLikeSeriesPage(document)
 
-        val isSeries = isSeriesUrl(url) || looksLikeSeriesPage(document)
-
-        if (isSeries) {
+        if (series) {
             val episodes = parseEpisodes(document, url)
             if (episodes.isNotEmpty()) {
-                return newTvSeriesLoadResponse(
-                    pageTitle,
-                    url,
-                    TvType.TvSeries,
-                    episodes
-                ) {
+                return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                     posterUrl = poster
                 }
             }
         }
 
+        // Important: when the watch page already exposes the real MP4/M3U8,
+        // store that real media URL as CloudStream data. This avoids a second
+        // fragile extraction step when the user presses Play.
         return newMovieLoadResponse(
-            pageTitle,
+            title,
             url,
             if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
-            url
+            media ?: url
         ) {
             posterUrl = poster
         }
@@ -213,7 +225,6 @@ class KhulnaPlex : MainAPI() {
     ): Boolean {
         if (data.isBlank()) return false
 
-        // Direct media URLs go straight to CloudStream's native player.
         if (isMediaUrl(data)) {
             emitMediaLink(data, data, callback)
             return true
@@ -224,227 +235,221 @@ class KhulnaPlex : MainAPI() {
         }.getOrNull() ?: return false
 
         val document = response.document
-        val found = linkedSetOf<String>()
+        val html = response.text
+        val media = extractMediaUrls(document, html, data)
 
-        fun addCandidate(raw: String?) {
-            if (raw.isNullOrBlank()) return
-            val cleaned = cleanMediaCandidate(raw) ?: return
-            val fixed = absoluteUrl(cleaned, data)
-            if (isMediaUrl(fixed)) found.add(fixed)
-        }
-
-        // 1) Native HTML5 video/source tags.
-        document.select("video, video source, source").forEach { element ->
-            addCandidate(element.attr("src"))
-            addCandidate(element.attr("data-src"))
-            addCandidate(element.attr("data-video"))
-            addCandidate(element.attr("data-url"))
-            addCandidate(element.attr("data-file"))
-        }
-
-        // 2) Direct media links hidden in anchors/data attributes.
-        document.select("a[href], [data-src], [data-video], [data-file], [data-url]")
-            .forEach { element ->
-                addCandidate(element.attr("href"))
-                addCandidate(element.attr("data-src"))
-                addCandidate(element.attr("data-video"))
-                addCandidate(element.attr("data-file"))
-                addCandidate(element.attr("data-url"))
-            }
-
-        // 3) Player configuration embedded in JavaScript.
-        val rawHtml = response.text
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-            .replace("&amp;", "&")
-
-        val quotedMediaRegex = Regex(
-            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl)\s*[:=]\s*[\"']([^\"']+\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|ts)(?:\?[^\"'<> ]*)?)[\"']"""
-        )
-        quotedMediaRegex.findAll(rawHtml).forEach { match ->
-            addCandidate(match.groupValues[1])
-        }
-
-        val absoluteMediaRegex = Regex(
-            """(?i)https?://[^\"'<>\s]+?\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|ts)(?:\?[^\"'<>\s]*)?"""
-        )
-        absoluteMediaRegex.findAll(rawHtml).forEach { match ->
-            addCandidate(match.value)
-        }
-
-        val relativeMediaRegex = Regex(
-            """(?i)(?:/|\.\.?/)[^\"'<>\s]+?\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|ts)(?:\?[^\"'<>\s]*)?"""
-        )
-        relativeMediaRegex.findAll(rawHtml).forEach { match ->
-            addCandidate(match.value)
-        }
-
-        // Preference: M3U8/HLS -> MP4 -> MKV -> other direct video.
-        val bestMedia = found.minByOrNull { mediaPriority(it) }
-        if (bestMedia != null) {
-            emitMediaLink(bestMedia, data, callback)
+        // Prefer direct files first.  KhulnaPlex's supplied MP4 should therefore
+        // go straight to the CloudStream native video player.
+        val best = media.minByOrNull { mediaPriority(it) }
+        if (best != null) {
+            emitMediaLink(best, data, callback)
             return true
         }
 
-        // 4) External iframe/player fallback through CloudStream extractors.
-        val iframeCandidates = document
-            .select("iframe[src], iframe[data-src]")
-            .mapNotNull { element ->
-                val raw = element.attr("src")
-                    .ifBlank { element.attr("data-src") }
-                raw.takeIf { it.isNotBlank() }?.let { absoluteUrl(it, data) }
+        val iframes = document.select("iframe[src], iframe[data-src]")
+            .mapNotNull { iframe ->
+                iframe.attr("src")
+                    .ifBlank { iframe.attr("data-src") }
+                    .takeIf { it.isNotBlank() }
+                    ?.let { absoluteUrl(it, data) }
             }
             .distinct()
 
-        for (iframe in iframeCandidates) {
-            val ok = runCatching {
-                loadExtractor(iframe, subtitleCallback, callback)
-                true
-            }.getOrDefault(false)
-            if (ok) return true
+        for (iframe in iframes) {
+            if (runCatching {
+                    loadExtractor(iframe, subtitleCallback, callback)
+                    true
+                }.getOrDefault(false)) return true
         }
 
         return false
     }
 
-    private fun cleanMediaCandidate(raw: String): String? {
-        var value = raw.trim()
-        if (value.isBlank()) return null
+    private fun extractMediaUrls(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
 
-        value = value
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+            var value = raw.trim()
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .trim('"', '\'', '`')
+                .trimEnd(',', ';', ')', ']', '}')
+
+            // Remove JavaScript string wrappers sometimes found around URLs.
+            value = value.replace("\\x2F", "/")
+            if (value.startsWith("http://") || value.startsWith("https://") ||
+                value.startsWith("//") || value.startsWith("/") || value.startsWith("../") ||
+                value.startsWith("./")) {
+                val fixed = absoluteUrl(value, baseUrl)
+                if (isMediaUrl(fixed)) found.add(fixed)
+            }
+        }
+
+        document.select("video, video source, source, a[href]").forEach { element ->
+            add(element.attr("src"))
+            add(element.attr("data-src"))
+            add(element.attr("data-video"))
+            add(element.attr("data-file"))
+            add(element.attr("data-url"))
+            add(element.attr("href"))
+        }
+
+        document.select("[data-src], [data-video], [data-file], [data-url]").forEach { element ->
+            add(element.attr("data-src"))
+            add(element.attr("data-video"))
+            add(element.attr("data-file"))
+            add(element.attr("data-url"))
+        }
+
+        val cleanedHtml = html
             .replace("\\/", "/")
             .replace("\\u0026", "&")
+            .replace("\\u003A", ":")
             .replace("&amp;", "&")
-            .trim('"', '\'')
-            .trimEnd(',', ';', ')', ']', '}')
 
-        return value.takeIf { it.isNotBlank() }
-    }
+        // Catch direct URLs such as:
+        // /uploads/videos/1788502957_Coyote_vs._Acme_2026.mp4
+        // https://khulnaplex.com/uploads/videos/...mp4
+        val directRegex = Regex(
+            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^\"'<>\\s\\\\]+?\\.(?:m3u8|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\\?[^\"'<>\\s\\\\]*)?"""
+        )
+        directRegex.findAll(cleanedHtml).forEach { add(it.value) }
 
-    private fun mediaPriority(url: String): Int {
-        val path = runCatching { URI(url).path.lowercase(Locale.ROOT) }
-            .getOrElse { url.lowercase(Locale.ROOT) }
+        // Catch JavaScript player objects even when the key is unusual.
+        val keyRegex = Regex(
+            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|videoUrl|stream|streamUrl)\\s*[:=]\\s*[\"']([^\"']+)[\"']"""
+        )
+        keyRegex.findAll(cleanedHtml).forEach { add(it.groupValues[1]) }
 
-        return when {
-            path.endsWith(".m3u8") -> 0
-            path.endsWith(".mp4") -> 1
-            path.endsWith(".mkv") -> 2
-            path.endsWith(".webm") -> 3
-            path.endsWith(".mov") -> 4
-            path.endsWith(".m4v") -> 5
-            path.endsWith(".ts") -> 6
-            path.endsWith(".avi") -> 7
-            else -> 99
-        }
+        return found.toList()
     }
 
     private fun parseItems(
-        document: org.jsoup.nodes.Document,
+        document: Document,
         sourceUrl: String,
-        sectionName: String
+        sectionName: String,
+        page: Int
     ): List<SiteItem> {
         val result = linkedMapOf<String, SiteItem>()
+        var order = page.toLong() * 1_000_000L
 
-        // KhulnaPlex cards normally link to watch.php?id=...&type=movie.
         document.select("a[href]").forEach { anchor ->
             val href = anchor.attr("href").trim()
             if (!looksLikeContentLink(href)) return@forEach
 
             val absolute = absoluteUrl(href, sourceUrl)
-            val isSeries = isSeriesUrl(absolute) ||
-                sectionName.contains("TV", ignoreCase = true) ||
-                absolute.contains("type=series", ignoreCase = true) ||
-                absolute.contains("type=tv", ignoreCase = true)
-
             val card = findCard(anchor)
-            val poster = extractPosterFromElement(card, sourceUrl)
             val title = extractCardTitle(anchor, card)
                 .ifBlank { titleFromUrl(absolute) }
+                .let(::cleanTitle)
 
             if (title.isBlank() || isNavigationTitle(title)) return@forEach
 
+            val poster = extractPosterFromElement(card, sourceUrl)
+            val series = isSeriesUrl(absolute) ||
+                sectionName.contains("TV", true) ||
+                absolute.contains("type=series", true) ||
+                absolute.contains("type=tv", true)
+
+            val sortTime = extractSortTime(card, anchor)
+
             result[absolute] = SiteItem(
-                title = cleanTitle(title),
+                title = title,
                 url = absolute,
                 poster = poster,
-                isSeries = isSeries
+                isSeries = series,
+                sortTime = sortTime,
+                discoveryOrder = order++
             )
         }
 
-        // Fallback for layouts using data-href/data-url/onclick.
         if (result.isEmpty()) {
-            document.select("[data-href], [data-url], [data-link], [onclick]")
-                .forEach { element ->
-                    val raw = listOf(
-                        element.attr("data-href"),
-                        element.attr("data-url"),
-                        element.attr("data-link"),
-                        element.attr("onclick")
-                    ).firstOrNull { looksLikeContentLink(it) } ?: return@forEach
+            document.select("[data-href], [data-url], [data-link], [onclick]").forEach { element ->
+                val raw = listOf(
+                    element.attr("data-href"),
+                    element.attr("data-url"),
+                    element.attr("data-link"),
+                    element.attr("onclick")
+                ).firstOrNull { looksLikeContentLink(it) } ?: return@forEach
 
-                    val href = extractContentUrl(raw) ?: return@forEach
-                    val absolute = absoluteUrl(href, sourceUrl)
-                    val card = findCard(element)
-                    val poster = extractPosterFromElement(card, sourceUrl)
-                    val title = extractCardTitle(element, card)
-                        .ifBlank { titleFromUrl(absolute) }
+                val href = extractContentUrl(raw) ?: return@forEach
+                val absolute = absoluteUrl(href, sourceUrl)
+                val card = findCard(element)
+                val title = cleanTitle(extractCardTitle(element, card).ifBlank { titleFromUrl(absolute) })
+                if (title.isBlank() || isNavigationTitle(title)) return@forEach
 
-                    if (title.isBlank() || isNavigationTitle(title)) return@forEach
-
-                    result[absolute] = SiteItem(
-                        title = cleanTitle(title),
-                        url = absolute,
-                        poster = poster,
-                        isSeries = isSeriesUrl(absolute) ||
-                            sectionName.contains("TV", ignoreCase = true)
-                    )
-                }
+                result[absolute] = SiteItem(
+                    title = title,
+                    url = absolute,
+                    poster = extractPosterFromElement(card, sourceUrl),
+                    isSeries = isSeriesUrl(absolute) || sectionName.contains("TV", true),
+                    sortTime = extractSortTime(card, element),
+                    discoveryOrder = order++
+                )
+            }
         }
 
         return result.values.toList()
     }
 
-    private fun extractContentUrl(raw: String): String? {
-        val match = Regex(
-            """(?i)(?:https?://[^"'\\s]+|(?:/|\\.\\.?/)?watch\\.php\\?[^"'\\s)]+)"""
-        ).find(raw) ?: return null
+    private fun extractSortTime(card: Element, anchor: Element): Long {
+        val values = listOf(
+            card.attr("data-created"), card.attr("data-uploaded"), card.attr("data-upload-date"),
+            card.attr("data-date"), card.attr("data-time"), card.attr("datetime"),
+            anchor.attr("data-created"), anchor.attr("data-uploaded"), anchor.attr("data-date"),
+            anchor.attr("datetime"),
+            card.selectFirst("time[datetime]")?.attr("datetime"),
+            card.selectFirst("time")?.text()
+        ).filterNot { it.isNullOrBlank() }.map { it!!.trim() }
 
-        return match.value
-            .trim(',', ')', '"', '\'')
-            .replace("&amp;", "&")
+        for (value in values) {
+            value.toLongOrNull()?.let { number ->
+                return if (number < 10_000_000_000L) number * 1000L else number
+            }
+            parseDate(value)?.let { return it }
+        }
+        return 0L
     }
 
-    private fun parseEpisodes(
-        document: org.jsoup.nodes.Document,
-        baseUrl: String
-    ): List<Episode> {
-        val result = linkedMapOf<String, Episode>()
+    private fun parseDate(value: String): Long? {
+        val patterns = listOf(
+            "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd",
+            "dd-MM-yyyy HH:mm:ss", "dd-MM-yyyy HH:mm", "dd-MM-yyyy",
+            "dd/MM/yyyy HH:mm:ss", "dd/MM/yyyy HH:mm", "dd/MM/yyyy",
+            "MMM dd, yyyy HH:mm:ss", "MMM dd, yyyy HH:mm", "MMM dd, yyyy"
+        )
+        for (pattern in patterns) {
+            val parsed = runCatching {
+                SimpleDateFormat(pattern, Locale.ENGLISH).parse(value)?.time
+            }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return null
+    }
 
+    private fun parseEpisodes(document: Document, baseUrl: String): List<Episode> {
+        val result = linkedMapOf<String, Episode>()
         document.select("a[href]").forEach { anchor ->
             val href = anchor.attr("href").trim()
             if (!looksLikeEpisodeLink(href)) return@forEach
-
             val absolute = absoluteUrl(href, baseUrl)
             if (absolute == baseUrl) return@forEach
-
             val title = cleanTitle(anchor.text().ifBlank { "Episode" })
-            val episodeNumber = episodeNumber(anchor, title, absolute)
-
             result[absolute] = newEpisode(absolute) {
                 name = title
                 season = 1
-                episode = episodeNumber
+                episode = episodeNumber(anchor, title, absolute)
             }
         }
 
-        /* If no episode links exist but the page contains a direct video,
-         * expose it as one episode instead of producing an empty series. */
         if (result.isEmpty()) {
-            val direct = document.select("video source, video, source")
-                .mapNotNull { it.attr("src").ifBlank { it.attr("data-src") }.takeIf(String::isNotBlank) }
-                .map { absoluteUrl(it, baseUrl) }
-                .firstOrNull { isMediaUrl(it) }
-
+            val direct = extractMediaUrls(document, document.html(), baseUrl).firstOrNull()
             if (direct != null) {
                 result[direct] = newEpisode(direct) {
                     name = "Episode 1"
@@ -459,187 +464,93 @@ class KhulnaPlex : MainAPI() {
 
     private fun findCard(anchor: Element): Element {
         var current: Element? = anchor
-        repeat(6) {
+        repeat(8) {
             val element = current ?: return@repeat
-            val text = element.text()
-            val imageCount = element.select("img").size
-            val className = element.className().lowercase(Locale.ROOT)
-
-            if (imageCount > 0 ||
-                className.contains("card") ||
-                className.contains("movie") ||
-                className.contains("item") ||
-                className.contains("poster")) {
-                return element
-            }
+            val cls = element.className().lowercase(Locale.ROOT)
+            if (element.select("img").isNotEmpty() ||
+                cls.contains("card") || cls.contains("movie") ||
+                cls.contains("item") || cls.contains("poster")) return element
             current = element.parent()
         }
         return anchor
     }
 
     private fun extractCardTitle(anchor: Element, card: Element): String {
-        val titleSelectors = listOf(
-            ".title",
-            ".movie-title",
-            ".movie_name",
-            ".name",
-            "h2",
-            "h3",
-            "h4",
-            "strong"
+        val selectors = listOf(
+            ".title", ".movie-title", ".movie_name", ".name",
+            "h1", "h2", "h3", "h4", "strong"
         )
-
-        for (selector in titleSelectors) {
+        for (selector in selectors) {
             val text = card.selectFirst(selector)?.text()?.trim().orEmpty()
             if (text.isNotBlank()) return text
         }
-
-        val aria = anchor.attr("aria-label").trim()
-        if (aria.isNotBlank()) return aria
-
-        val imgAlt = card.selectFirst("img")?.attr("alt")?.trim().orEmpty()
-        if (imgAlt.isNotBlank()) return imgAlt
-
+        anchor.attr("aria-label").trim().takeIf { it.isNotBlank() }?.let { return it }
+        card.selectFirst("img")?.attr("alt")?.trim().takeIf { !it.isNullOrBlank() }?.let { return it!! }
         return anchor.text().trim()
     }
 
-    private fun extractPoster(
-        document: org.jsoup.nodes.Document,
-        pageUrl: String
-    ): String? {
-        return extractPosterFromElement(document, pageUrl)
-    }
+    private fun extractPoster(document: Document, pageUrl: String): String? =
+        extractPosterFromElement(document, pageUrl)
 
-    private fun extractPosterFromElement(
-        element: Element,
-        pageUrl: String
-    ): String? {
-        // Use the thumbnail/poster already supplied by KhulnaPlex.
-        // No separate/manual poster URL is required.
-        val videoPoster = element
-            .select("video[poster], video[data-poster]")
+    private fun extractPosterFromElement(element: Element, pageUrl: String): String? {
+        val videoPoster = element.select("video[poster], video[data-poster]")
             .asSequence()
-            .mapNotNull { video ->
-                video.attr("poster")
-                    .ifBlank { video.attr("data-poster") }
-                    .takeIf { it.isNotBlank() }
-            }
+            .mapNotNull { it.attr("poster").ifBlank { it.attr("data-poster") }.takeIf(String::isNotBlank) }
             .map { absoluteUrl(it, pageUrl) }
             .firstOrNull()
-
         if (!videoPoster.isNullOrBlank()) return videoPoster
 
-        val ogImage = element
-            .selectFirst("meta[property=og:image], meta[name=twitter:image]")
-            ?.attr("content")
-            ?.trim()
+        val meta = element.selectFirst("meta[property=og:image], meta[name=twitter:image]")?.attr("content")?.trim()
+        if (!meta.isNullOrBlank()) return absoluteUrl(meta, pageUrl)
 
-        if (!ogImage.isNullOrBlank()) return absoluteUrl(ogImage, pageUrl)
-
-        val images = element.select(
-            "img[src], img[data-src], img[data-lazy-src], img[data-original]"
-        )
-
+        val images = element.select("img[src], img[data-src], img[data-lazy-src], img[data-original], img[data-poster]")
         val preferred = images.firstOrNull { image ->
-            val src = imageSource(image).orEmpty()
-            val alt = image.attr("alt")
-            val cls = image.className()
-            val all = "$src $alt $cls".lowercase(Locale.ROOT)
-
-            all.contains("poster") ||
-                all.contains("cover") ||
-                all.contains("thumb") ||
-                all.contains("movie")
+            val all = "${imageSource(image)} ${image.attr("alt")} ${image.className()}".lowercase(Locale.ROOT)
+            all.contains("poster") || all.contains("cover") || all.contains("thumb") || all.contains("movie")
         } ?: images.firstOrNull()
+        if (preferred != null) imageSource(preferred)?.let { return absoluteUrl(it, pageUrl) }
 
-        if (preferred != null) {
-            return imageSource(preferred)?.let { absoluteUrl(it, pageUrl) }
-        }
-
-        val styleValue = element
-            .select("[style*=background]")
+        val style = element.select("[style*=background]")
             .map { it.attr("style") }
-            .firstOrNull { it.contains("url(", ignoreCase = true) }
-
-        if (!styleValue.isNullOrBlank()) {
-            val match = Regex(
-                """(?i)background(?:-image)?\\s*:[^;]*url\\(\\s*['"]?([^'")]+)['"]?\\s*\\)"""
-            ).find(styleValue)
-
-            if (match != null) {
-                return absoluteUrl(match.groupValues[1], pageUrl)
+            .firstOrNull { it.contains("url(", true) }
+        if (!style.isNullOrBlank()) {
+            Regex("(?i)url\\(\\s*['\"]?([^'\")]+)['\"]?\\s*\\)").find(style)?.groupValues?.getOrNull(1)?.let {
+                return absoluteUrl(it, pageUrl)
             }
         }
-
         return null
     }
 
-    private fun imageSource(image: Element): String? {
-        return sequenceOf(
-            image.attr("data-src"),
-            image.attr("data-lazy-src"),
-            image.attr("data-original"),
-            image.attr("src")
-        ).firstOrNull { it.isNotBlank() }
-    }
-
-    private fun extractPageTitle(document: org.jsoup.nodes.Document): String {
-        val selectors = listOf(
-            "h1",
-            "h2",
-            ".movie-title",
-            ".movie_name",
-            ".title",
-            "meta[property=og:title]"
-        )
-
-        for (selector in selectors) {
-            val element = document.selectFirst(selector) ?: continue
-            val text = if (element.tagName() == "meta") {
-                element.attr("content")
-            } else {
-                element.text()
-            }.trim()
-            if (text.isNotBlank()) return cleanTitle(text)
-        }
-
-        return cleanTitle(document.title())
-    }
+    private fun imageSource(image: Element): String? = sequenceOf(
+        image.attr("data-poster"), image.attr("data-src"), image.attr("data-lazy-src"),
+        image.attr("data-original"), image.attr("src")
+    ).firstOrNull { it.isNotBlank() }
 
     private fun looksLikeContentLink(href: String): Boolean {
         val lower = href.lowercase(Locale.ROOT)
         if (lower.isBlank() || lower.startsWith("#") || lower.startsWith("javascript:")) return false
-        if (lower.startsWith("mailto:") || lower.startsWith("tel:")) return false
-
-        return lower.contains("watch.php") ||
-            lower.contains("movie.php") ||
-            lower.contains("series.php") ||
-            lower.contains("show.php") ||
-            lower.contains("details.php") ||
-            lower.contains("movie?id=") ||
-            lower.contains("type=movie") ||
-            lower.contains("type=series") ||
-            lower.contains("type=tv")
+        return lower.contains("watch.php") || lower.contains("movie.php") ||
+            lower.contains("series.php") || lower.contains("show.php") ||
+            lower.contains("details.php") || lower.contains("movie?id=") ||
+            lower.contains("type=movie") || lower.contains("type=series") || lower.contains("type=tv")
     }
 
     private fun looksLikeEpisodeLink(href: String): Boolean {
         val lower = href.lowercase(Locale.ROOT)
-        if (!looksLikeContentLink(href)) return false
-        return lower.contains("episode") ||
-            lower.contains("ep=") ||
-            lower.contains("episode=") ||
-            lower.contains("season=") ||
-            lower.contains("type=episode")
+        return looksLikeContentLink(href) && (
+            lower.contains("episode") || lower.contains("ep=") ||
+                lower.contains("episode=") || lower.contains("season=") || lower.contains("type=episode")
+            )
     }
 
-    private fun hasNextPage(document: org.jsoup.nodes.Document, currentPage: Int): Boolean {
-        val next = document.select("a[href]").firstOrNull { anchor ->
+    private fun hasNextPage(document: Document, currentPage: Int): Boolean {
+        return document.select("a[href]").any { anchor ->
             val text = anchor.text().trim().lowercase(Locale.ROOT)
             val rel = anchor.attr("rel").lowercase(Locale.ROOT)
             text == "next" || text.contains("next") || rel == "next" ||
-                anchor.attr("aria-label").contains("next", true)
+                anchor.attr("aria-label").contains("next", true) ||
+                anchor.attr("href").contains("page=${currentPage + 1}")
         }
-        return next != null || document.select("a[href*=page=${currentPage + 1}]").isNotEmpty()
     }
 
     private fun pageUrl(base: String, page: Int): String {
@@ -649,24 +560,38 @@ class KhulnaPlex : MainAPI() {
 
     private fun isSeriesUrl(url: String): Boolean {
         val lower = url.lowercase(Locale.ROOT)
-        return lower.contains("series.php") ||
-            lower.contains("show.php") ||
-            lower.contains("type=series") ||
-            lower.contains("type=tv")
+        return lower.contains("series.php") || lower.contains("show.php") ||
+            lower.contains("type=series") || lower.contains("type=tv")
     }
 
-    private fun isAnimeUrl(url: String): Boolean {
-        return url.contains("category=animation", true)
-    }
+    private fun isAnimeUrl(url: String): Boolean = url.contains("category=animation", true)
 
-    private fun looksLikeSeriesPage(document: org.jsoup.nodes.Document): Boolean {
+    private fun looksLikeSeriesPage(document: Document): Boolean {
         val text = document.text().lowercase(Locale.ROOT)
         return text.contains("season") && text.contains("episode")
     }
 
     private fun isMediaUrl(url: String): Boolean {
-        val path = runCatching { URI(url).path.lowercase(Locale.ROOT) }.getOrElse { url.lowercase(Locale.ROOT) }
+        val path = runCatching { URI(url).path.lowercase(Locale.ROOT) }
+            .getOrElse { url.lowercase(Locale.ROOT) }
         return mediaExtensions.any { path.endsWith(it) }
+    }
+
+    private fun mediaPriority(url: String): Int {
+        val path = runCatching { URI(url).path.lowercase(Locale.ROOT) }
+            .getOrElse { url.lowercase(Locale.ROOT) }
+        return when {
+            path.endsWith(".m3u8") -> 0
+            path.endsWith(".mp4") -> 1
+            path.endsWith(".mkv") -> 2
+            path.endsWith(".webm") -> 3
+            path.endsWith(".mov") -> 4
+            path.endsWith(".m4v") -> 5
+            path.endsWith(".flv") -> 6
+            path.endsWith(".ts") -> 7
+            path.endsWith(".avi") -> 8
+            else -> 99
+        }
     }
 
     private suspend fun emitMediaLink(
@@ -674,13 +599,8 @@ class KhulnaPlex : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit
     ) {
+        val type = if (mediaUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val lower = mediaUrl.lowercase(Locale.ROOT)
-        val type = if (lower.contains(".m3u8")) {
-            ExtractorLinkType.M3U8
-        } else {
-            ExtractorLinkType.VIDEO
-        }
-
         val quality = when {
             "2160" in lower || "4k" in lower -> Qualities.P2160.value
             "1440" in lower -> Qualities.P1440.value
@@ -688,22 +608,17 @@ class KhulnaPlex : MainAPI() {
             "720" in lower -> Qualities.P720.value
             "480" in lower -> Qualities.P480.value
             "360" in lower -> Qualities.P360.value
-            "240" in lower -> Qualities.P240.value
             else -> Qualities.Unknown.value
         }
-
-        callback(
-            newExtractorLink(
-                source = name,
-                name = name,
-                url = mediaUrl,
-                type = type
-            ) {
-                this.referer = referer
-                this.quality = quality
-            }
-        )
+        callback(newExtractorLink(name, name, mediaUrl, type) {
+            this.referer = referer
+            this.quality = quality
+        })
     }
+
+    private fun extractContentUrl(raw: String): String? = Regex(
+        """(?i)(?:https?://[^"'\\s]+|(?:/|\\.\\.?/)?watch\\.php\\?[^"'\\s)]+)"""
+    ).find(raw)?.value?.trim(',', ')', '"', '\'')?.replace("&amp;", "&")
 
     private fun absoluteUrl(raw: String, base: String): String {
         val value = raw.trim()
@@ -715,31 +630,30 @@ class KhulnaPlex : MainAPI() {
         return runCatching { URI(base).resolve(value).toString() }.getOrElse { value }
     }
 
+    private fun extractPageTitle(document: Document): String {
+        for (selector in listOf("h1", "h2", ".movie-title", ".movie_name", ".title", "meta[property=og:title]")) {
+            val e = document.selectFirst(selector) ?: continue
+            val text = if (e.tagName() == "meta") e.attr("content") else e.text()
+            if (text.isNotBlank()) return cleanTitle(text)
+        }
+        return cleanTitle(document.title())
+    }
+
     private fun titleFromUrl(url: String): String {
-        val id = runCatching {
-            URI(url).query
-                ?.split('&')
-                ?.firstOrNull { it.startsWith("id=") }
-                ?.substringAfter('=')
-        }.getOrNull()
-
-        return id?.takeIf { it.isNotBlank() } ?: "KhulnaPlex"
+        return runCatching {
+            URI(url).query?.split('&')?.firstOrNull { it.startsWith("id=") }?.substringAfter('=')
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "Khulna Plex"
     }
 
-    private fun cleanTitle(value: String): String {
-        return value
-            .replace(Regex("\\s+"), " ")
-            .replace(Regex("(?i)\\s*[-|•]+\\s*(watch|download|play)\\s*$"), "")
-            .trim()
-    }
+    private fun cleanTitle(value: String): String = value
+        .replace(Regex("\\s+"), " ")
+        .replace(Regex("(?i)\\s*[-|•]+\\s*(watch|download|play)\\s*$"), "")
+        .trim()
 
-    private fun isNavigationTitle(value: String): Boolean {
-        val lower = value.lowercase(Locale.ROOT)
-        return lower in setOf(
-            "home", "movies", "tv shows", "tv series", "live tv",
-            "search", "genres", "software", "request", "next", "previous"
-        )
-    }
+    private fun isNavigationTitle(value: String): Boolean = value.lowercase(Locale.ROOT) in setOf(
+        "home", "movies", "tv shows", "tv series", "live tv", "search",
+        "genres", "software", "request", "next", "previous"
+    )
 
     private fun episodeNumber(anchor: Element, title: String, url: String): Int {
         val candidates = listOf(
@@ -751,4 +665,3 @@ class KhulnaPlex : MainAPI() {
         return candidates.firstNotNullOfOrNull { it?.toIntOrNull() } ?: 1
     }
 }
-
