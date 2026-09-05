@@ -2545,15 +2545,9 @@ class YouTubeKids : MainAPI() {
                             extractor
                         )
 
-                    if (
-                        emitProgressiveVideoStreams(
-                            info = info,
-                            callback = callback
-                        )
-                    ) {
-                        return true
-                    }
-
+                    // Resolve LIVE status first. For VOD, prefer the adaptive
+                    // DASH manifest below because YouTube's muxed progressive
+                    // streams are commonly limited to low resolutions.
                     val isLive =
                         info.streamType
                             ?.name
@@ -2601,7 +2595,12 @@ class YouTubeKids : MainAPI() {
                     }
 
                     /*
-                     * VOD -> DASH
+                     * VOD -> DASH FIRST
+                     *
+                     * The adaptive DASH manifest is the important path for
+                     * HD / Full HD / 2K / 4K / higher source resolutions.
+                     * Do not replace it with a fixed low-resolution muxed
+                     * stream when DASH is available.
                      */
                     val dash =
                         runCatching {
@@ -2669,6 +2668,18 @@ class YouTubeKids : MainAPI() {
                             }
                         )
 
+                        return true
+                    }
+
+                    // Last resort only: muxed progressive video. This path is
+                    // intentionally after DASH/HLS so it cannot downgrade an
+                    // HD-capable source to the low-resolution progressive stream.
+                    if (
+                        emitProgressiveVideoStreams(
+                            info = info,
+                            callback = callback
+                        )
+                    ) {
                         return true
                     }
 
@@ -2784,10 +2795,10 @@ class YouTubeKids : MainAPI() {
             return false
         }
 
+        // If this fallback is reached, still use the highest muxed
+        // progressive stream available; never deliberately choose 320p.
         val preferred =
-            candidates.firstOrNull {
-                it.resolution in 240..720
-            } ?: candidates.first()
+            candidates.first()
 
         callback(
             newExtractorLink(
