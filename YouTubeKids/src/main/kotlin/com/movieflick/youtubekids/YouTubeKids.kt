@@ -14,6 +14,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfo
@@ -72,12 +74,13 @@ class YouTubeKids : MainAPI() {
 
     private companion object {
         const val FAST_VISIBLE_COUNT = 6
-        const val FULL_CACHE_COUNT = 35
+        const val FULL_CACHE_COUNT = 40
 
         const val CACHE_TTL_MS = 15 * 60 * 1000L
         const val FAST_TOTAL_TIMEOUT_MS = 2_200L
         const val FAST_QUERY_TIMEOUT_MS = 1_700L
         const val BACKGROUND_QUERY_TIMEOUT_MS = 8_000L
+        const val BACKGROUND_SECTION_STAGGER_MS = 150L
 
         // Give CloudStream time to paint the first screen before the
         // all-category background worker starts.
@@ -138,24 +141,16 @@ class YouTubeKids : MainAPI() {
     private val refreshRunning =
         ConcurrentHashMap<String, Boolean>()
 
-    private val queryRunning =
-        ConcurrentHashMap<String, Boolean>()
-
     private val backgroundProgress =
         ConcurrentHashMap<String, Int>()
 
-    /*
-     * Global home ownership:
-     *
-     * A YouTube video id can belong to one home section at a time.
-     * This is what stops the same exact video from being sprayed
-     * across every category just because multiple YouTube searches
-     * return it.
-     */
-    private val homeVideoOwner =
-        ConcurrentHashMap<String, String>()
+    /* Per-section serialization prevents background and on-demand pagination
+     * from fetching the same query simultaneously. */
+    private val sectionLocks =
+        ConcurrentHashMap<String, Mutex>()
 
-    private val ownerLock = Any()
+    private fun sectionLock(section: String): Mutex =
+        sectionLocks.getOrPut(section) { Mutex() }
 
     /*
      * ============================================================
@@ -588,33 +583,48 @@ class YouTubeKids : MainAPI() {
         }
     }
 
-    private suspend fun runRoundRobinBackgroundFill() {
-        val maxQueries =
-            BACKGROUND_SECTION_ORDER
-                .maxOfOrNull {
-                    sectionQueries[it]?.size ?: 0
-                }
-                ?: 0
-
-        for (queryIndex in 0 until maxQueries) {
-            for (section in BACKGROUND_SECTION_ORDER) {
-                if (queryIndex >= (sectionQueries[section]?.size ?: 0)) {
-                    continue
-                }
-
+    private suspend fun runRoundRobinBackgroundFill() = coroutineScope {
+        /*
+         * Every category receives its own background worker. They start with
+         * a tiny stagger so startup does not create one giant HTTP burst, but
+         * after startup they progress independently toward FULL_CACHE_COUNT.
+         */
+        BACKGROUND_SECTION_ORDER.forEachIndexed { index, section ->
+            launch {
+                delay(index * BACKGROUND_SECTION_STAGGER_MS)
                 runCatching {
-                    backgroundFetchOneQuery(
+                    fillSectionToTarget(
                         section = section,
-                        queryIndex = queryIndex
+                        targetCount = FULL_CACHE_COUNT
                     )
                 }
-
-                /*
-                 * Give the runtime a scheduling point after every
-                 * individual category request.
-                 */
-                kotlinx.coroutines.yield()
             }
+        }
+    }
+
+    private suspend fun fillSectionToTarget(
+        section: String,
+        targetCount: Int
+    ) {
+        val queries =
+            sectionQueries[section] ?: return
+
+        while (
+            (cache[section]?.items?.size ?: 0) < targetCount
+        ) {
+            val queryIndex =
+                backgroundProgress[section] ?: 0
+
+            if (queryIndex >= queries.size) {
+                break
+            }
+
+            backgroundFetchOneQuery(
+                section = section,
+                queryIndex = queryIndex
+            )
+
+            kotlinx.coroutines.yield()
         }
     }
 
@@ -657,24 +667,6 @@ class YouTubeKids : MainAPI() {
                         CACHE_TTL_MS,
                 items = unique
             )
-    }
-
-    private fun clearExpiredSectionOwnership(section: String) {
-        val current =
-            cache[section]
-
-        if (
-            current == null ||
-            current.expiresAt <= System.currentTimeMillis()
-        ) {
-            synchronized(ownerLock) {
-                homeVideoOwner.entries
-                    .filter { it.value == section }
-                    .forEach {
-                        homeVideoOwner.remove(it.key, section)
-                    }
-            }
-        }
     }
 
     /*
@@ -760,36 +752,21 @@ class YouTubeKids : MainAPI() {
         section: String,
         queryIndex: Int
     ) {
-        val queries =
-            sectionQueries[section]
-                ?: return
+        sectionLock(section).withLock {
+            val queries =
+                sectionQueries[section] ?: return
 
-        if (queryIndex >= queries.size) {
-            return
-        }
+            if (queryIndex >= queries.size) {
+                return
+            }
 
-        val currentProgress =
-            backgroundProgress[section]
-                ?: 0
+            val currentProgress =
+                backgroundProgress[section] ?: 0
 
-        /*
-         * Fast category request may already have consumed query 0/1.
-         * Never redo those as background work.
-         */
-        if (queryIndex < currentProgress) {
-            return
-        }
+            if (queryIndex < currentProgress) {
+                return
+            }
 
-        if (
-            queryRunning.putIfAbsent(
-                section,
-                true
-            ) != null
-        ) {
-            return
-        }
-
-        try {
             val query =
                 queries[queryIndex]
 
@@ -801,29 +778,24 @@ class YouTubeKids : MainAPI() {
                 } ?: emptyList()
 
             val candidates =
-                fresh
-                    .filter {
-                        isSectionCandidate(
-                            item = it,
-                            section = section
-                        )
-                    }
+                fresh.filter {
+                    isSectionCandidate(
+                        item = it,
+                        section = section
+                    )
+                }
 
             mergeCandidatesIntoSection(
                 section = section,
                 candidates = candidates
             )
 
-            backgroundProgress.compute(
-                section
-            ) { _, old ->
+            backgroundProgress.compute(section) { _, old ->
                 maxOf(
                     old ?: 0,
                     queryIndex + 1
                 )
             }
-        } finally {
-            queryRunning.remove(section)
         }
     }
 
@@ -1456,37 +1428,6 @@ class YouTubeKids : MainAPI() {
      * ============================================================
      */
 
-    private fun reserveVideoIds(
-        section: String,
-        itemList: List<StreamInfoItem>
-    ): List<StreamInfoItem> {
-        synchronized(ownerLock) {
-            val output =
-                mutableListOf<StreamInfoItem>()
-
-            for (item in itemList) {
-                val id =
-                    videoIdFromUrl(item.url)
-                        ?: continue
-
-                val owner =
-                    homeVideoOwner[id]
-
-                if (
-                    owner != null &&
-                    owner != section
-                ) {
-                    continue
-                }
-
-                homeVideoOwner[id] = section
-                output.add(item)
-            }
-
-            return output
-        }
-    }
-
     private fun mergeCandidatesIntoSection(
         section: String,
         candidates: List<StreamInfoItem>
@@ -1508,9 +1449,10 @@ class YouTubeKids : MainAPI() {
                 .toSet()
 
         /*
-         * Do not let a video that is already owned by another section
-         * enter this section. Videos already owned by this same section
-         * are allowed to remain.
+         * De-duplicate inside the category only. A video appearing in one
+         * category must NOT consume that same video's slot in another category;
+         * otherwise overlapping YouTube search results can prevent entire rows
+         * from ever reaching the requested 40-item cache.
          */
         val available =
             candidates
@@ -1519,11 +1461,7 @@ class YouTubeKids : MainAPI() {
                         videoIdFromUrl(it.url)
 
                     id != null &&
-                        id !in existingIds &&
-                        (
-                            homeVideoOwner[id] == null ||
-                                homeVideoOwner[id] == section
-                            )
+                        id !in existingIds
                 }
                 .sortedByDescending {
                     scoreItem(
@@ -1536,12 +1474,6 @@ class YouTubeKids : MainAPI() {
             return
         }
 
-        /*
-         * Convert only the newly accepted items to SearchResponse.
-         * Existing SearchResponses are kept verbatim, so the cache really
-         * grows after each background query instead of being replaced by
-         * only the newest query.
-         */
         val newItems =
             available
                 .take(
@@ -1553,62 +1485,25 @@ class YouTubeKids : MainAPI() {
                 )
 
         val newResponses =
-            newItems
-                .mapNotNull {
-                    infoItemToSearchResponse(it)
-                }
+            newItems.mapNotNull {
+                infoItemToSearchResponse(it)
+            }
 
         if (newResponses.isEmpty()) {
             return
         }
 
-        /*
-         * Only reserve IDs that actually enter this section's cache.
-         * Merely seeing a search result must NOT block another category.
-         */
-        synchronized(ownerLock) {
-            for (response in newResponses) {
-                val id =
-                    videoIdFromUrl(response.url)
-                        ?: continue
-
-                val owner =
-                    homeVideoOwner[id]
-
-                if (
-                    owner == null ||
-                    owner == section
-                ) {
-                    homeVideoOwner[id] = section
-                }
-            }
-        }
-
         val merged =
-            existingResponses +
-                newResponses
+            existingResponses + newResponses
 
         val unique =
-            merged
-                .distinctBy {
-                    videoIdFromUrl(it.url) ?: it.url
-                }
-
-        /*
-         * Search-response objects do not contain the full StreamInfoItem
-         * score metadata, so the background cache preserves existing order
-         * and rotates only the tail. Newer background items are appended
-         * before the rotation pass.
-         */
-        val rotated =
-            rotateSearchResponses(
-                items = unique,
-                section = section
-            )
+            merged.distinctBy {
+                videoIdFromUrl(it.url) ?: it.url
+            }
 
         putCached(
             section = section,
-            items = rotated
+            items = unique
         )
     }
 
@@ -1664,8 +1559,6 @@ class YouTubeKids : MainAPI() {
             sectionQueries[section]
                 ?: return emptyHomePage()
 
-        clearExpiredSectionOwnership(section)
-
         val items =
             fetchSearchItemsFast(queries)
                 .filter {
@@ -1684,34 +1577,11 @@ class YouTubeKids : MainAPI() {
                     )
                 }
 
-        val available =
-            synchronized(ownerLock) {
-                items.filter { item ->
-                    val id =
-                        videoIdFromUrl(item.url)
-                            ?: return@filter false
-
-                    val owner =
-                        homeVideoOwner[id]
-
-                    owner == null ||
-                        owner == section
-                }
-            }
-
         val selected =
             rotateResults(
-                ranked = available,
+                ranked = items,
                 section = section
             ).take(FAST_VISIBLE_COUNT)
-
-        synchronized(ownerLock) {
-            selected.forEach { item ->
-                videoIdFromUrl(item.url)?.let { id ->
-                    homeVideoOwner[id] = section
-                }
-            }
-        }
 
         val results =
             selected.mapNotNull {
@@ -1796,37 +1666,76 @@ class YouTubeKids : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        if (page > 1) {
-            return emptyHomePage()
-        }
-
         val section =
             request.data
+
+        if (page <= 1) {
+            val cached =
+                getCached(section)
+
+            if (cached.isEmpty()) {
+                val fast =
+                    buildFastSection(section)
+
+                startSectionBackgroundRefresh(section)
+                return fast
+            }
+
+            startSectionBackgroundRefresh(section)
+
+            return newHomePageResponse(
+                request.name,
+                cached.take(FAST_VISIBLE_COUNT),
+                cached.size > FAST_VISIBLE_COUNT
+            )
+        }
+
+        /*
+         * Native CloudStream home pagination: page 2, 3, ... each returns the
+         * next six cached items. Background workers normally fill all 40 items
+         * before the user reaches them, while early scrolling can still trigger
+         * a small on-demand fill instead of showing an empty row.
+         */
+        val requiredCount =
+            page.coerceAtLeast(1) * FAST_VISIBLE_COUNT
+
+        if (
+            (cache[section]?.items?.size ?: 0) < requiredCount
+        ) {
+            runCatching {
+                fillSectionToTarget(
+                    section = section,
+                    targetCount = minOf(
+                        requiredCount,
+                        FULL_CACHE_COUNT
+                    )
+                )
+            }
+        }
 
         val cached =
             getCached(section)
 
-        if (cached.isNotEmpty()) {
-            startSectionBackgroundRefresh(section)
+        val startIndex =
+            (page - 1) * FAST_VISIBLE_COUNT
 
-            return newHomePageResponse(
-                listOf(
-                    HomePageList(
-                        sectionDisplayName(section),
-                        cached,
-                        false
-                    )
-                ),
-                false
-            )
-        }
-
-        val fast =
-            buildFastSection(section)
+        val pageItems =
+            cached
+                .drop(startIndex)
+                .take(FAST_VISIBLE_COUNT)
 
         startSectionBackgroundRefresh(section)
 
-        return fast
+        val hasMore =
+            cached.size > startIndex + pageItems.size ||
+                (backgroundProgress[section] ?: 0) <
+                    (sectionQueries[section]?.size ?: 0)
+
+        return newHomePageResponse(
+            request.name,
+            pageItems,
+            hasMore
+        )
     }
 
     private fun startSectionBackgroundRefresh(
@@ -1849,33 +1758,10 @@ class YouTubeKids : MainAPI() {
 
         backgroundScope.launch {
             try {
-                /*
-                 * Do not aggressively fetch everything again immediately.
-                 * The global round-robin startup worker handles long-lived
-                 * enrichment. This per-section worker is primarily for
-                 * sections opened by the user after startup or after cache
-                 * expiry.
-                 */
-                var index =
-                    backgroundProgress[section] ?: 2
-
-                val queries =
-                    sectionQueries[section]
-                        ?: emptyList()
-
-                while (
-                    index < queries.size
-                ) {
-                    backgroundFetchOneQuery(
-                        section = section,
-                        queryIndex = index
-                    )
-
-                    index++
-                    backgroundProgress[section] = index
-
-                    kotlinx.coroutines.yield()
-                }
+                fillSectionToTarget(
+                    section = section,
+                    targetCount = FULL_CACHE_COUNT
+                )
             } catch (_: Exception) {
                 // Background work must never break the visible UI.
             } finally {
