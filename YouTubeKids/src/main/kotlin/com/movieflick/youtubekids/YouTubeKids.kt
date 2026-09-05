@@ -23,7 +23,7 @@ class YouTubeKids : MainAPI() {
 
     override var mainUrl = "https://www.youtube.com"
     override var name = "YouTube Kids"
-    override var lang = "bn-IN"
+    override var lang = "bn"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -34,6 +34,12 @@ class YouTubeKids : MainAPI() {
     )
 
     private val service = ServiceList.YouTube
+
+    /*
+     * ============================================================
+     * HOME
+     * ============================================================
+     */
 
     override val mainPage = mainPageOf(
         "recommended" to "Recommended for Kids",
@@ -49,38 +55,88 @@ class YouTubeKids : MainAPI() {
         "explore" to "Explore"
     )
 
-    private companion object {
-        const val FAST_VISIBLE_COUNT = 6
-        const val FULL_CACHE_COUNT = 30
-        const val CACHE_TTL_MS = 15 * 60 * 1000L
-        const val FAST_TOTAL_TIMEOUT_MS = 2200L
-        const val FAST_QUERY_TIMEOUT_MS = 1700L
-        const val BACKGROUND_QUERY_TIMEOUT_MS = 8000L
+    /*
+     * ============================================================
+     * PERFORMANCE SETTINGS
+     * ============================================================
+     */
 
+    private companion object {
+
+        // First paint should stay small.
+        const val FAST_VISIBLE_COUNT = 6
+
+        // Full background snapshot.
+        const val HOME_CACHE_LIMIT = 40
+
+        // Cache freshness.
+        const val CACHE_TTL_MS = 15 * 60 * 1000L
+
+        // Prevent multiple background refreshes for same section.
+        const val BACKGROUND_REFRESH_COOLDOWN_MS = 15_000L
+
+        // First-load timeout.
+        const val FAST_TOTAL_TIMEOUT_MS = 1_650L
+
+        // Individual first-pass query timeout.
+        const val FAST_QUERY_TIMEOUT_MS = 1_350L
+
+        // Normal background query timeout.
+        const val NORMAL_QUERY_TIMEOUT_MS = 8_000L
+
+        // Prevent duplicate prewarm.
         val PREWARM_STARTED = AtomicBoolean(false)
     }
 
     private val backgroundScope =
-        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        CoroutineScope(
+            SupervisorJob() + Dispatchers.IO
+        )
 
-    private data class CachedSection(
+    private val refreshRunning =
+        ConcurrentHashMap<String, Boolean>()
+
+    private val refreshLastStarted =
+        ConcurrentHashMap<String, Long>()
+
+    private data class CachedResponses(
         val expiresAt: Long,
         val items: List<SearchResponse>
     )
 
-    private val cache = ConcurrentHashMap<String, CachedSection>()
-    private val refreshRunning = ConcurrentHashMap<String, Boolean>()
+    private val homeCache =
+        ConcurrentHashMap<String, CachedResponses>()
+
+    /*
+     * ============================================================
+     * BENGALI-FIRST KIDS CHANNELS
+     * ============================================================
+     *
+     * These are priority signals, not hardcoded video URLs.
+     * More channels can be added later without changing the
+     * underlying loading architecture.
+     */
 
     private val preferredBanglaChannels = listOf(
         "Shemaroo Bangla",
         "Sony AATH",
         "Green Gold",
+        "Motu Patlu Bangla",
         "ChuChu TV Bangla",
         "Kiddiestv Bangla",
         "Bangla Kids",
         "Bangla Rhymes",
-        "Bangla Nursery Rhymes"
+        "Bangla Nursery Rhymes",
+        "শিশুদের গান",
+        "শিশুদের ছড়া",
+        "বাংলা কার্টুন"
     )
+
+    /*
+     * ============================================================
+     * GENERAL TRUSTED KIDS CHANNEL SIGNALS
+     * ============================================================
+     */
 
     private val preferredKidsChannels = listOf(
         "Cocomelon",
@@ -96,9 +152,12 @@ class YouTubeKids : MainAPI() {
         "Pocoyo",
         "Numberblocks",
         "Alphablocks",
+        "Khan Academy Kids",
         "PBS Kids",
+        "Daniel Tiger",
         "Bluey",
         "Thomas & Friends",
+        "Thomas and Friends",
         "Gecko's Garage",
         "Gracie's Corner",
         "Ms Rachel",
@@ -111,33 +170,158 @@ class YouTubeKids : MainAPI() {
         "WildBrain Kids"
     )
 
-    private val unsafeSignals = listOf(
-        "18+", "adult", "nsfw", "violence", "violent", "weapon", "weapons",
-        "gun", "guns", "blood", "murder", "crime", "horror", "terror",
-        "terrorist", "war", "death", "kill", "killing", "drugs", "alcohol",
-        "beer", "casino", "gambling", "dating", "sexy", "sex", "xxx", "porn",
-        "politics", "breaking news", "true crime", "podcast", "reaction",
-        "roast", "shorts", "short video"
+    /*
+     * ============================================================
+     * AGE 3-6 SIGNALS
+     * ============================================================
+     */
+
+    private val ageFriendlyKeywords = listOf(
+        "kids",
+        "kid",
+        "children",
+        "child",
+        "toddler",
+        "preschool",
+        "preschoolers",
+        "nursery",
+        "rhymes",
+        "rhyme",
+        "abc",
+        "alphabet",
+        "phonics",
+        "numbers",
+        "counting",
+        "learn",
+        "learning",
+        "educational",
+        "education",
+        "colors",
+        "colours",
+        "shapes",
+        "animals",
+        "cars",
+        "trucks",
+        "vehicles",
+        "cartoon",
+        "cartoons",
+        "story",
+        "stories",
+        "bedtime",
+        "fairy tale",
+        "fairytale",
+        "music",
+        "song",
+        "songs",
+        "dance",
+        "play",
+        "pretend",
+        "drawing",
+        "craft",
+        "science for kids",
+        "bangla",
+        "bengali",
+        "বাংলা",
+        "শিশু",
+        "বাচ্চা",
+        "ছড়া",
+        "গান",
+        "কার্টুন",
+        "গল্প",
+        "শেখা"
     )
+
+    /*
+     * ============================================================
+     * CONTENT WE DO NOT WANT IN A 3-6 KIDS FEED
+     * ============================================================
+     */
+
+    private val unsafeOrAdultSignals = listOf(
+        "18+",
+        "adult",
+        "nsfw",
+        "violence",
+        "violent",
+        "fight",
+        "fighting",
+        "weapon",
+        "weapons",
+        "gun",
+        "guns",
+        "blood",
+        "murder",
+        "crime",
+        "horror",
+        "scary",
+        "scary movie",
+        "terror",
+        "terrorist",
+        "war",
+        "death",
+        "dead",
+        "kill",
+        "killing",
+        "drugs",
+        "alcohol",
+        "beer",
+        "casino",
+        "gambling",
+        "dating",
+        "sexy",
+        "sex",
+        "xxx",
+        "porn",
+        "prank",
+        "reaction",
+        "roast",
+        "politics",
+        "news",
+        "breaking news",
+        "true crime",
+        "podcast",
+        "vlog",
+        "live stream",
+        "shorts",
+        "short video"
+    )
+
+    /*
+     * ============================================================
+     * LOW QUALITY / NON-KIDS SIGNALS
+     * ============================================================
+     */
 
     private val lowQualitySignals = listOf(
-        "reupload", "re-upload", "fan made", "fanmade", "mega compilation",
-        "24/7", "movie explained", "episode explained", "reaction", "review",
-        "commentary", "clickbait"
+        "reupload",
+        "re-upload",
+        "fan made",
+        "fanmade",
+        "compilation",
+        "mega compilation",
+        "10 hours",
+        "24 hours",
+        "24/7",
+        "full movie",
+        "movie explained",
+        "episode explained",
+        "reaction",
+        "review",
+        "commentary",
+        "clickbait"
     )
 
-    private val ageSignals = listOf(
-        "kids", "kid", "children", "child", "toddler", "preschool",
-        "preschoolers", "nursery", "rhymes", "rhyme", "abc", "alphabet",
-        "phonics", "numbers", "counting", "learn", "learning", "educational",
-        "education", "colors", "colours", "shapes", "animals", "cars",
-        "trucks", "vehicles", "cartoon", "cartoons", "story", "stories",
-        "bedtime", "fairy tale", "fairytale", "music", "song", "songs",
-        "dance", "play", "drawing", "craft", "bangla", "bengali", "বাংলা",
-        "শিশু", "বাচ্চা", "ছড়া", "গান", "কার্টুন", "গল্প", "শেখা"
-    )
+    /*
+     * ============================================================
+     * SEARCH QUERIES
+     * ============================================================
+     *
+     * First two queries are the fast path.
+     * Remaining queries are background enrichment.
+     */
 
     private val sectionQueries = mapOf(
+
         "recommended" to listOf(
             "Bangla kids learning cartoons age 3 4 5 6",
             "Bangla kids nursery rhymes preschool",
@@ -147,6 +331,7 @@ class YouTubeKids : MainAPI() {
             "kids animals learning preschool",
             "kids cars trucks machines preschool"
         ),
+
         "bangla" to listOf(
             "Bangla kids cartoon",
             "Bangla nursery rhymes kids",
@@ -156,6 +341,7 @@ class YouTubeKids : MainAPI() {
             "বাংলা বাচ্চাদের কার্টুন",
             "বাংলা শিশুদের গল্প"
         ),
+
         "learning" to listOf(
             "kids learning ABC phonics age 3 4 5 6",
             "kids learning numbers counting colors shapes preschool",
@@ -164,6 +350,7 @@ class YouTubeKids : MainAPI() {
             "kids vocabulary learning English preschool",
             "Bangla kids learning ABC numbers"
         ),
+
         "rhymes" to listOf(
             "Bangla nursery rhymes kids",
             "Bangla baby rhymes",
@@ -173,6 +360,7 @@ class YouTubeKids : MainAPI() {
             "colors songs for kids",
             "animal songs for kids"
         ),
+
         "cartoons" to listOf(
             "Bangla kids cartoon",
             "safe cartoons for preschool kids",
@@ -182,6 +370,7 @@ class YouTubeKids : MainAPI() {
             "Bluey kids",
             "Masha and the Bear kids"
         ),
+
         "stories" to listOf(
             "Bangla kids stories",
             "Bangla bedtime stories for children",
@@ -190,6 +379,7 @@ class YouTubeKids : MainAPI() {
             "fairy tales for kids",
             "educational stories for children"
         ),
+
         "music" to listOf(
             "Bangla kids songs",
             "Bangla baby songs",
@@ -199,6 +389,7 @@ class YouTubeKids : MainAPI() {
             "Pinkfong kids songs",
             "Baby Shark kids"
         ),
+
         "animals" to listOf(
             "animals for kids preschool",
             "animal sounds for kids",
@@ -208,6 +399,7 @@ class YouTubeKids : MainAPI() {
             "ocean animals for kids",
             "dinosaur learning kids"
         ),
+
         "cars" to listOf(
             "cars trucks machines for kids",
             "construction vehicles for kids",
@@ -217,6 +409,7 @@ class YouTubeKids : MainAPI() {
             "Thomas and Friends kids",
             "vehicle learning preschool"
         ),
+
         "play" to listOf(
             "kids drawing craft preschool",
             "play and learn kids age 3 4 5 6",
@@ -225,6 +418,7 @@ class YouTubeKids : MainAPI() {
             "easy crafts for preschool kids",
             "kids coloring learning"
         ),
+
         "explore" to listOf(
             "kids science experiments preschool",
             "space for kids preschool",
@@ -235,202 +429,884 @@ class YouTubeKids : MainAPI() {
         )
     )
 
+    /*
+     * ============================================================
+     * PREWARM
+     * ============================================================
+     *
+     * Never blocks the first UI.
+     */
+
     init {
         if (PREWARM_STARTED.compareAndSet(false, true)) {
             backgroundScope.launch {
-                val sections = sectionQueries.keys.toList()
-                for (batch in sections.chunked(3)) {
-                    coroutineScope {
-                        batch.map { section ->
-                            async(Dispatchers.IO) {
-                                runCatching {
-                                    buildSection(section, false)
-                                }
+
+                coroutineScope {
+
+                    listOf(
+                        "recommended",
+                        "bangla",
+                        "learning"
+                    ).map { section ->
+
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                buildSection(
+                                    section = section,
+                                    fastMode = true,
+                                    forceRefresh = true
+                                )
                             }
-                        }.awaitAll()
-                    }
+                        }
+
+                    }.awaitAll()
                 }
             }
         }
     }
 
-    private fun containsAny(text: String, words: List<String>): Boolean {
-        val value = text.lowercase()
-        return words.any { value.contains(it.lowercase()) }
+    /*
+     * ============================================================
+     * CACHE
+     * ============================================================
+     */
+
+    private fun getCached(
+        section: String
+    ): List<SearchResponse> {
+
+        return homeCache[section]
+            ?.items
+            ?.take(HOME_CACHE_LIMIT)
+            ?: emptyList()
     }
 
-    private fun preferredBangla(uploader: String): Boolean {
-        return uploader.isNotBlank() && preferredBanglaChannels.any {
-            uploader.contains(it, ignoreCase = true)
+    private fun putCached(
+        section: String,
+        items: List<SearchResponse>
+    ) {
+
+        if (items.isEmpty()) return
+
+        homeCache[section] =
+            CachedResponses(
+                expiresAt =
+                    System.currentTimeMillis() +
+                        CACHE_TTL_MS,
+                items =
+                    items
+                        .distinctBy { it.url }
+                        .take(HOME_CACHE_LIMIT)
+            )
+    }
+
+    /*
+     * ============================================================
+     * BACKGROUND REFRESH
+     * ============================================================
+     */
+
+    private fun scheduleBackgroundRefresh(
+        section: String,
+        job: suspend () -> Unit
+    ) {
+
+        val now =
+            System.currentTimeMillis()
+
+        val last =
+            refreshLastStarted[section]
+                ?: 0L
+
+        if (
+            now - last <
+            BACKGROUND_REFRESH_COOLDOWN_MS
+        ) {
+            return
+        }
+
+        if (
+            refreshRunning.putIfAbsent(
+                section,
+                true
+            ) != null
+        ) {
+            return
+        }
+
+        refreshLastStarted[section] = now
+
+        backgroundScope.launch {
+
+            try {
+                job()
+            } catch (_: Exception) {
+                // Background refresh must never
+                // break the visible UI.
+            } finally {
+                refreshRunning.remove(section)
+            }
         }
     }
 
-    private fun preferredKids(uploader: String): Boolean {
-        return uploader.isNotBlank() && preferredKidsChannels.any {
-            uploader.contains(it, ignoreCase = true)
-        }
-    }
-
-    private fun isKidsCandidate(item: StreamInfoItem): Boolean {
-        if (item.streamType != StreamType.VIDEO_STREAM) return false
-        if (item.isShortFormContent) return false
-
-        val title = item.name?.trim().orEmpty()
-        val uploader = item.uploaderName?.trim().orEmpty()
-        if (title.isBlank()) return false
-
-        val combined = "$title $uploader".lowercase()
-
-        if (containsAny(combined, unsafeSignals)) return false
-        if (containsAny(combined, lowQualitySignals)) return false
-
-        val duration = item.duration
-        if (duration in 1L..25L) return false
-        if (duration > 60L * 60L) return false
-
-        return containsAny(combined, ageSignals) ||
-            preferredKids(uploader) ||
-            preferredBangla(uploader)
-    }
-
-    private fun score(item: StreamInfoItem, section: String): Int {
-        val title = item.name?.trim().orEmpty()
-        val uploader = item.uploaderName?.trim().orEmpty()
-        val combined = "$title $uploader".lowercase()
-
-        var score = 100
-
-        if (containsAny(combined, listOf("bangla", "bengali", "বাংলা"))) score += 160
-        if (preferredBangla(uploader)) score += 220
-        if (preferredKids(uploader)) score += 180
-
-        if (containsAny(combined, listOf(
-                "learning", "educational", "education", "learn", "abc",
-                "alphabet", "phonics", "numbers", "counting", "colors",
-                "colours", "shapes", "science"
-            ))) score += 90
-
-        if (containsAny(combined, listOf(
-                "preschool", "preschooler", "toddler", "3 year old",
-                "4 year old", "5 year old", "6 year old"
-            ))) score += 100
-
-        when (section) {
-            "bangla" -> if (containsAny(combined, listOf("bangla", "bengali", "বাংলা"))) score += 140
-            "learning" -> if (containsAny(combined, listOf("learn", "learning", "education", "abc", "numbers", "phonics"))) score += 100
-            "rhymes" -> if (containsAny(combined, listOf("rhyme", "rhymes", "nursery", "song"))) score += 100
-            "cartoons" -> if (containsAny(combined, listOf("cartoon", "cartoons", "animation", "animated"))) score += 100
-            "stories" -> if (containsAny(combined, listOf("story", "stories", "bedtime", "fairy tale", "fairytale"))) score += 100
-            "music" -> if (containsAny(combined, listOf("song", "songs", "music", "rhymes"))) score += 100
-            "animals" -> if (containsAny(combined, listOf("animal", "animals", "dinosaur", "farm", "ocean"))) score += 100
-            "cars" -> if (containsAny(combined, listOf("car", "cars", "truck", "trucks", "tractor", "excavator", "vehicle"))) score += 100
-            "play" -> if (containsAny(combined, listOf("play", "drawing", "craft", "coloring", "colouring", "toy"))) score += 100
-            "explore" -> if (containsAny(combined, listOf("science", "space", "nature", "dinosaur", "how things work"))) score += 100
-        }
-
-        if (item.duration in 60L..12L * 60L) score += 35
-        if (item.duration in 12L * 60L..30L * 60L) score += 20
-
-        return score
-    }
+    /*
+     * ============================================================
+     * FAST PARALLEL SEARCH
+     * ============================================================
+     */
 
     private suspend fun fetchSearchItems(
         queries: List<String>,
         fastMode: Boolean
-    ): List<StreamInfoItem> {
-        val clean = queries.map { it.trim() }.filter { it.isNotBlank() }.distinct()
-        if (clean.isEmpty()) return emptyList()
+    ): List<List<InfoItem>> {
 
-        val selectedQueries = if (fastMode) clean.take(2) else clean
+        val cleanQueries =
+            queries
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
 
-        val grouped: List<List<InfoItem>> =
-            if (fastMode) {
-                withTimeoutOrNull(FAST_TOTAL_TIMEOUT_MS) {
-                    coroutineScope {
-                        selectedQueries.map { query ->
+        if (cleanQueries.isEmpty()) {
+            return emptyList()
+        }
+
+        if (fastMode) {
+
+            val firstQueries =
+                cleanQueries.take(2)
+
+            return withTimeoutOrNull(
+                FAST_TOTAL_TIMEOUT_MS
+            ) {
+
+                coroutineScope {
+
+                    firstQueries
+                        .map { query ->
+
                             async(Dispatchers.IO) {
-                                withTimeoutOrNull(FAST_QUERY_TIMEOUT_MS) {
+
+                                withTimeoutOrNull(
+                                    FAST_QUERY_TIMEOUT_MS
+                                ) {
+
                                     runCatching {
-                                        val extractor = service.getSearchExtractor(query)
+
+                                        val extractor =
+                                            service.getSearchExtractor(
+                                                query
+                                            )
+
                                         extractor.fetchPage()
-                                        extractor.initialPage.items.toList()
-                                    }.getOrElse { emptyList() }
+
+                                        extractor
+                                            .initialPage
+                                            .items
+                                            .toList()
+
+                                    }.getOrElse {
+                                        emptyList()
+                                    }
+
                                 } ?: emptyList()
                             }
-                        }.awaitAll()
-                    }
-                } ?: emptyList()
-            } else {
-                val output = mutableListOf<List<InfoItem>>()
-                for (batch in selectedQueries.chunked(3)) {
-                    val result = coroutineScope {
-                        batch.map { query ->
-                            async(Dispatchers.IO) {
-                                withTimeoutOrNull(BACKGROUND_QUERY_TIMEOUT_MS) {
-                                    runCatching {
-                                        val extractor = service.getSearchExtractor(query)
-                                        extractor.fetchPage()
-                                        extractor.initialPage.items.toList()
-                                    }.getOrElse { emptyList() }
-                                } ?: emptyList()
-                            }
-                        }.awaitAll()
-                    }
-                    output.addAll(result)
+                        }
+                        .awaitAll()
                 }
-                output
+
+            } ?: emptyList()
+        }
+
+        val results =
+            mutableListOf<List<InfoItem>>()
+
+        for (
+            batch in cleanQueries.chunked(6)
+        ) {
+
+            val batchResults =
+                coroutineScope {
+
+                    batch.map { query ->
+
+                        async(Dispatchers.IO) {
+
+                            withTimeoutOrNull(
+                                NORMAL_QUERY_TIMEOUT_MS
+                            ) {
+
+                                runCatching {
+
+                                    val extractor =
+                                        service.getSearchExtractor(
+                                            query
+                                        )
+
+                                    extractor.fetchPage()
+
+                                    extractor
+                                        .initialPage
+                                        .items
+                                        .toList()
+
+                                }.getOrElse {
+                                    emptyList()
+                                }
+
+                            } ?: emptyList()
+                        }
+
+                    }.awaitAll()
+                }
+
+            results.addAll(batchResults)
+        }
+
+        return results
+    }
+
+    /*
+     * ============================================================
+     * CONTENT FILTER
+     * ============================================================
+     */
+
+    private fun isKidsCandidate(
+        item: StreamInfoItem
+    ): Boolean {
+
+        if (
+            item.streamType !=
+            StreamType.VIDEO_STREAM
+        ) {
+            return false
+        }
+
+        if (
+            item.isShortFormContent
+        ) {
+            return false
+        }
+
+        val title =
+            item.name
+                ?.trim()
+                .orEmpty()
+
+        val uploader =
+            item.uploaderName
+                ?.trim()
+                .orEmpty()
+
+        if (
+            title.isBlank()
+        ) {
+            return false
+        }
+
+        val combined =
+            "$title $uploader"
+                .lowercase()
+
+        /*
+         * Strong exclusion first.
+         */
+
+        if (
+            containsAny(
+                combined,
+                unsafeOrAdultSignals
+            )
+        ) {
+            return false
+        }
+
+        if (
+            containsAny(
+                combined,
+                lowQualitySignals
+            )
+        ) {
+            return false
+        }
+
+        /*
+         * Avoid very short clips.
+         */
+
+        val duration =
+            item.duration
+
+        if (
+            duration in 1L..25L
+        ) {
+            return false
+        }
+
+        /*
+         * Avoid extremely long videos.
+         * Long nursery/story videos can still pass.
+         */
+
+        if (
+            duration > 60L * 60L
+        ) {
+            return false
+        }
+
+        /*
+         * Must have at least one kids signal.
+         */
+
+        val kidsSignal =
+            containsAny(
+                combined,
+                ageFriendlyKeywords
+            ) ||
+                isPreferredKidsChannel(
+                    uploader
+                ) ||
+                isPreferredBanglaChannel(
+                    uploader
+                )
+
+        return kidsSignal
+    }
+
+    /*
+     * ============================================================
+     * SCORING
+     * ============================================================
+     */
+
+    private fun scoreKidsItem(
+        item: StreamInfoItem,
+        section: String
+    ): Int {
+
+        val title =
+            item.name
+                ?.trim()
+                .orEmpty()
+
+        val uploader =
+            item.uploaderName
+                ?.trim()
+                .orEmpty()
+
+        val combined =
+            "$title $uploader"
+                .lowercase()
+
+        var score = 100
+
+        /*
+         * Bengali gets strongest priority.
+         */
+
+        if (
+            containsAny(
+                combined,
+                listOf(
+                    "bangla",
+                    "bengali",
+                    "বাংলা"
+                )
+            )
+        ) {
+            score += 160
+        }
+
+        if (
+            isPreferredBanglaChannel(
+                uploader
+            )
+        ) {
+            score += 220
+        }
+
+        /*
+         * Trusted kids channels.
+         */
+
+        if (
+            isPreferredKidsChannel(
+                uploader
+            )
+        ) {
+            score += 180
+        }
+
+        /*
+         * Educational content.
+         */
+
+        if (
+            containsAny(
+                combined,
+                listOf(
+                    "learning",
+                    "educational",
+                    "education",
+                    "learn",
+                    "abc",
+                    "alphabet",
+                    "phonics",
+                    "numbers",
+                    "counting",
+                    "colors",
+                    "colours",
+                    "shapes",
+                    "science"
+                )
+            )
+        ) {
+            score += 90
+        }
+
+        /*
+         * Age range signals.
+         */
+
+        if (
+            containsAny(
+                combined,
+                listOf(
+                    "preschool",
+                    "preschooler",
+                    "toddler",
+                    "3 year old",
+                    "4 year old",
+                    "5 year old",
+                    "6 year old",
+                    "ages 3",
+                    "ages 4",
+                    "ages 5",
+                    "ages 6"
+                )
+            )
+        ) {
+            score += 100
+        }
+
+        /*
+         * Section relevance.
+         */
+
+        when (section) {
+
+            "bangla" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "bangla",
+                            "bengali",
+                            "বাংলা"
+                        )
+                    )
+                ) {
+                    score += 140
+                }
             }
 
-        return grouped
-            .flatten()
-            .filterIsInstance<StreamInfoItem>()
-            .distinctBy { it.url }
+            "learning" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "learn",
+                            "learning",
+                            "education",
+                            "abc",
+                            "numbers",
+                            "phonics"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "rhymes" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "rhyme",
+                            "rhymes",
+                            "nursery",
+                            "song"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "cartoons" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "cartoon",
+                            "cartoons",
+                            "animation",
+                            "animated"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "stories" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "story",
+                            "stories",
+                            "bedtime",
+                            "fairy tale",
+                            "fairytale"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "music" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "song",
+                            "songs",
+                            "music",
+                            "rhymes"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "animals" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "animal",
+                            "animals",
+                            "dinosaur",
+                            "farm",
+                            "ocean",
+                            "wildlife"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "cars" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "car",
+                            "cars",
+                            "truck",
+                            "trucks",
+                            "tractor",
+                            "excavator",
+                            "construction",
+                            "vehicle"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "play" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "play",
+                            "drawing",
+                            "craft",
+                            "coloring",
+                            "colouring",
+                            "toy"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+
+            "explore" -> {
+                if (
+                    containsAny(
+                        combined,
+                        listOf(
+                            "science",
+                            "space",
+                            "nature",
+                            "dinosaur",
+                            "how things work"
+                        )
+                    )
+                ) {
+                    score += 100
+                }
+            }
+        }
+
+        /*
+         * Prefer normal educational/video lengths.
+         */
+
+        val duration =
+            item.duration
+
+        if (
+            duration in 60L..12L * 60L
+        ) {
+            score += 35
+        }
+
+        if (
+            duration in 12L * 60L..30L * 60L
+        ) {
+            score += 20
+        }
+
+        /*
+         * Recent/new wording is only a weak signal.
+         * We intentionally do not use DateWrapper/uploadDate.
+         */
+
+        if (
+            combined.contains("new")
+        ) {
+            score += 10
+        }
+
+        if (
+            combined.contains("latest")
+        ) {
+            score += 10
+        }
+
+        /*
+         * Small penalty for suspicious upload signals.
+         */
+
+        if (
+            containsAny(
+                combined,
+                listOf(
+                    "reupload",
+                    "fan made",
+                    "fanmade"
+                )
+            )
+        ) {
+            score -= 150
+        }
+
+        return score
     }
+
+    /*
+     * ============================================================
+     * SECTION BUILDER
+     * ============================================================
+     */
 
     private suspend fun buildSection(
         section: String,
-        fastMode: Boolean
+        fastMode: Boolean,
+        forceRefresh: Boolean
     ): HomePageResponse {
-        val queries = sectionQueries[section] ?: sectionQueries["recommended"].orEmpty()
-        val items = fetchSearchItems(queries, fastMode)
 
-        val ranked = items
-            .filter { isKidsCandidate(it) }
-            .distinctBy { it.url }
-            .map { score(it, section) to it }
-            .sortedByDescending { it.first }
+        val queries =
+            sectionQueries[section]
+                ?: sectionQueries["recommended"]
+                ?: emptyList()
 
-        val stableCount = minOf(4, ranked.size)
-        val stable = ranked.take(stableCount)
-        val rotating = ranked.drop(stableCount).toMutableList()
+        val allItems =
+            fetchSearchItems(
+                queries = queries,
+                fastMode = fastMode
+            )
+                .flatten()
+                .filterIsInstance<StreamInfoItem>()
 
-        val bucket = System.currentTimeMillis() / (10 * 60 * 1000L)
-        rotating.shuffle(Random(section.hashCode().toLong() xor bucket))
+        val candidates =
+            mutableListOf<Pair<Int, StreamInfoItem>>()
 
-        val limit = if (fastMode) FAST_VISIBLE_COUNT else FULL_CACHE_COUNT
-        val selected = (stable + rotating).take(limit)
+        val seenUrls =
+            mutableSetOf<String>()
 
-        val results = selected.mapNotNull { (_, item) ->
-            val title = item.name?.trim().orEmpty()
-            val url = item.url?.trim().orEmpty()
-            if (title.isBlank() || url.isBlank()) return@mapNotNull null
+        for (
+            item in allItems
+        ) {
 
-            newMovieSearchResponse(title, url, TvType.Others) {
-                posterUrl = item.thumbnails.lastOrNull()?.url
+            if (
+                !isKidsCandidate(item)
+            ) {
+                continue
             }
-        }
 
-        if (results.isNotEmpty()) {
-            cache[section] = CachedSection(
-                System.currentTimeMillis() + CACHE_TTL_MS,
-                results.distinctBy { it.url }.take(FULL_CACHE_COUNT)
+            val url =
+                item.url
+                    ?.trim()
+                    ?: continue
+
+            if (
+                url.isBlank()
+            ) {
+                continue
+            }
+
+            if (
+                !seenUrls.add(url)
+            ) {
+                continue
+            }
+
+            candidates.add(
+                scoreKidsItem(
+                    item,
+                    section
+                ) to item
             )
         }
+
+        /*
+         * Highest quality first.
+         */
+
+        val ranked =
+            candidates
+                .sortedByDescending {
+                    it.first
+                }
+
+        val limit =
+            if (fastMode) {
+                FAST_VISIBLE_COUNT
+            } else {
+                HOME_CACHE_LIMIT
+            }
+
+        /*
+         * ========================================================
+         * ROTATION
+         * ========================================================
+         *
+         * We deliberately do not return exactly the same ordering
+         * on every refresh.
+         *
+         * Top results remain quality-oriented.
+         * The remainder gets shuffled using a time bucket.
+         */
+
+        val stableCount =
+            minOf(
+                4,
+                ranked.size
+            )
+
+        val stable =
+            ranked.take(
+                stableCount
+            )
+
+        val rotating =
+            ranked
+                .drop(stableCount)
+                .toMutableList()
+
+        val rotationBucket =
+            System.currentTimeMillis() /
+                (10 * 60 * 1000L)
+
+        rotating.shuffle(
+            Random(
+                (
+                    section.hashCode()
+                        .toLong() shl 32
+                ) xor rotationBucket
+            )
+        )
+
+        val selected =
+            (
+                stable + rotating
+            ).take(limit)
+
+        val results =
+            selected.mapNotNull {
+                (_, item) ->
+
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: return@mapNotNull null
+
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: return@mapNotNull null
+
+                if (
+                    title.isBlank() ||
+                    url.isBlank()
+                ) {
+                    return@mapNotNull null
+                }
+
+                newMovieSearchResponse(
+                    title,
+                    canonicalYouTubeVideoUrl(url),
+                    TvType.Others
+                ) {
+
+                    posterUrl =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
+                }
+            }
+
+        if (
+            results.isNotEmpty()
+        ) {
+            putCached(
+                section,
+                results
+            )
+        }
+
+        val sectionName =
+            sectionDisplayName(
+                section
+            )
 
         return newHomePageResponse(
             listOf(
                 HomePageList(
-                    sectionDisplayName(section),
+                    sectionName,
                     results,
                     false
                 )
@@ -439,180 +1315,551 @@ class YouTubeKids : MainAPI() {
         )
     }
 
+    /*
+     * ============================================================
+     * HOME PAGE
+     * ============================================================
+     */
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        if (page > 1) {
-            return newHomePageResponse(emptyList(), false)
-        }
 
-        val section = request.data
-        val cached = cache[section]
-            ?.takeIf { it.expiresAt > System.currentTimeMillis() }
-            ?.items
-            ?.take(FULL_CACHE_COUNT)
-            .orEmpty()
-
-        if (cached.isNotEmpty()) {
-            scheduleRefresh(section)
+        if (
+            page > 1
+        ) {
             return newHomePageResponse(
-                listOf(HomePageList(sectionDisplayName(section), cached, false)),
+                emptyList(),
                 false
             )
         }
 
-        val fast = buildSection(section, true)
-        scheduleRefresh(section)
+        val section =
+            request.data
+
+        /*
+         * CACHE FIRST.
+         *
+         * UI gets something immediately.
+         * Network refresh happens separately.
+         */
+
+        val cached =
+            getCached(
+                section
+            )
+
+        if (
+            cached.isNotEmpty()
+        ) {
+
+            scheduleBackgroundRefresh(
+                section
+            ) {
+
+                buildSection(
+                    section = section,
+                    fastMode = false,
+                    forceRefresh = true
+                )
+            }
+
+            return newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        sectionDisplayName(section),
+                        cached,
+                        false
+                    )
+                ),
+                false
+            )
+        }
+
+        /*
+         * No cache:
+         *
+         * Small fast network request.
+         */
+
+        val fast =
+            buildSection(
+                section = section,
+                fastMode = true,
+                forceRefresh = true
+            )
+
+        /*
+         * Immediately start a full background refresh.
+         */
+
+        scheduleBackgroundRefresh(
+            section
+        ) {
+
+            buildSection(
+                section = section,
+                fastMode = false,
+                forceRefresh = true
+            )
+        }
+
         return fast
     }
 
-    private fun scheduleRefresh(section: String) {
-        if (refreshRunning.putIfAbsent(section, true) != null) return
+    /*
+     * ============================================================
+     * SEARCH
+     * ============================================================
+     */
 
-        backgroundScope.launch {
-            try {
-                buildSection(section, false)
-            } catch (_: Exception) {
-            } finally {
-                refreshRunning.remove(section)
-            }
-        }
-    }
+    private val searchPageCache =
+        ConcurrentHashMap<String, org.schabi.newpipe.extractor.Page?>()
 
     override suspend fun search(
         query: String,
         page: Int
     ): SearchResponseList {
-        val clean = query.trim()
-        if (clean.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        val extractor = try {
-            service.getSearchExtractor(clean)
-        } catch (_: Exception) {
-            return newSearchResponseList(emptyList(), false)
+        val cleanQuery =
+            query.trim()
+
+        if (
+            cleanQuery.isBlank()
+        ) {
+            return newSearchResponseList(
+                emptyList(),
+                false
+            )
         }
 
-        val pageData = try {
-            extractor.fetchPage()
-            extractor.initialPage
-        } catch (_: Exception) {
-            return newSearchResponseList(emptyList(), false)
-        }
+        val cacheKey =
+            cleanQuery.lowercase()
 
-        val results = pageData.items
-            .filterIsInstance<StreamInfoItem>()
-            .filter { isKidsCandidate(it) }
-            .mapNotNull { item ->
-                val title = item.name?.trim().orEmpty()
-                val url = item.url?.trim().orEmpty()
-                if (title.isBlank() || url.isBlank()) null
-                else newMovieSearchResponse(title, url, TvType.Others) {
-                    posterUrl = item.thumbnails.lastOrNull()?.url
-                }
+        val extractor =
+            try {
+                service.getSearchExtractor(
+                    cleanQuery
+                )
+            } catch (_: Exception) {
+                return newSearchResponseList(
+                    emptyList(),
+                    false
+                )
             }
 
-        return newSearchResponseList(results, pageData.hasNextPage())
+        val pageData =
+            try {
+
+                if (
+                    page == 1 ||
+                    !searchPageCache.containsKey(
+                        cacheKey
+                    )
+                ) {
+
+                    extractor.fetchPage()
+
+                    extractor
+                        .initialPage
+                        .also {
+
+                            searchPageCache[
+                                cacheKey
+                            ] =
+                                it.nextPage
+                        }
+
+                } else {
+
+                    val next =
+                        searchPageCache[
+                            cacheKey
+                        ]
+                            ?: return newSearchResponseList(
+                                emptyList(),
+                                false
+                            )
+
+                    extractor
+                        .getPage(next)
+                        .also {
+
+                            searchPageCache[
+                                cacheKey
+                            ] =
+                                it.nextPage
+                        }
+                }
+
+            } catch (_: Exception) {
+
+                return newSearchResponseList(
+                    emptyList(),
+                    false
+                )
+            }
+
+        /*
+         * Search results are also filtered for kids safety.
+         */
+
+        val results =
+            pageData.items
+                .filterIsInstance<StreamInfoItem>()
+                .filter {
+                    isKidsCandidate(it)
+                }
+                .mapNotNull {
+                    infoItemToSearchResponse(
+                        it
+                    )
+                }
+
+        return newSearchResponseList(
+            results,
+            pageData.hasNextPage()
+        )
     }
 
-    override suspend fun quickSearch(query: String): List<SearchResponse> {
-        return search(query, 1).items
+    /*
+     * ============================================================
+     * QUICK SEARCH
+     * ============================================================
+     */
+
+    override suspend fun quickSearch(
+        query: String
+    ): List<SearchResponse> {
+
+        return search(
+            query,
+            1
+        ).items
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        return when {
-            isVideoUrl(url) -> loadVideo(url)
-            isChannelUrl(url) -> loadChannel(url)
-            isPlaylistUrl(url) -> loadPlaylist(url)
-            else -> throw RuntimeException("Unsupported YouTube Kids URL")
+    /*
+     * ============================================================
+     * INFO ITEM -> SEARCH RESPONSE
+     * ============================================================
+     */
+
+    private fun infoItemToSearchResponse(
+        item: StreamInfoItem
+    ): SearchResponse? {
+
+        val title =
+            item.name
+                ?.trim()
+                ?: return null
+
+        val url =
+            item.url
+                ?.trim()
+                ?: return null
+
+        if (
+            title.isBlank() ||
+            url.isBlank()
+        ) {
+            return null
+        }
+
+        return newMovieSearchResponse(
+            title,
+            canonicalYouTubeVideoUrl(url),
+            TvType.Others
+        ) {
+
+            posterUrl =
+                item.thumbnails
+                    .lastOrNull()
+                    ?.url
         }
     }
 
-    private fun isVideoUrl(url: String): Boolean {
-        val value = url.lowercase()
-        return value.contains("/watch?v=") ||
-            value.contains("youtu.be/") ||
-            value.contains("/shorts/")
+    /*
+     * ============================================================
+     * LOAD
+     * ============================================================
+     */
+
+    override suspend fun load(
+        url: String
+    ): LoadResponse {
+
+        return when {
+
+            isVideoUrl(url) ->
+                loadVideo(url)
+
+            isChannelUrl(url) ->
+                loadChannel(url)
+
+            isPlaylistUrl(url) ->
+                loadPlaylist(url)
+
+            else ->
+                throw RuntimeException(
+                    "Unsupported YouTube Kids URL"
+                )
+        }
     }
 
-    private fun isChannelUrl(url: String): Boolean {
-        val value = url.lowercase()
-        return value.contains("/channel/") ||
-            value.contains("/@") ||
-            value.contains("/c/") ||
-            value.contains("/user/")
+    /*
+     * ============================================================
+     * URL TYPE
+     * ============================================================
+     */
+
+    private fun isVideoUrl(
+        url: String
+    ): Boolean {
+
+        val value =
+            url.lowercase()
+
+        return value.contains(
+            "/watch?v="
+        ) ||
+            value.contains(
+                "youtu.be/"
+            ) ||
+            value.contains(
+                "/shorts/"
+            )
     }
 
-    private fun isPlaylistUrl(url: String): Boolean {
-        return url.lowercase().contains("/playlist?list=")
+    private fun isChannelUrl(
+        url: String
+    ): Boolean {
+
+        val value =
+            url.lowercase()
+
+        return value.contains(
+            "/channel/"
+        ) ||
+            value.contains(
+                "/@"
+            ) ||
+            value.contains(
+                "/c/"
+            ) ||
+            value.contains(
+                "/user/"
+            )
     }
 
-    private suspend fun loadVideo(url: String): LoadResponse {
-        val extractor = service.getStreamExtractor(url)
+    private fun isPlaylistUrl(
+        url: String
+    ): Boolean {
+
+        return url
+            .lowercase()
+            .contains(
+                "/playlist?list="
+            )
+    }
+
+    /*
+     * ============================================================
+     * VIDEO LOAD
+     * ============================================================
+     */
+
+    private suspend fun loadVideo(
+        url: String
+    ): LoadResponse {
+
+        val videoUrl = canonicalYouTubeVideoUrl(url)
+
+        val extractor =
+            service.getStreamExtractor(
+                videoUrl
+            )
+
         extractor.fetchPage()
-        val info = StreamInfo.getInfo(extractor)
-        val isLive = info.streamType?.name?.contains("LIVE") == true
+
+        val info =
+            StreamInfo.getInfo(
+                extractor
+            )
+
+        val isLive =
+            info.streamType
+                ?.name
+                ?.contains(
+                    "LIVE"
+                ) == true
 
         return newMovieLoadResponse(
             info.name,
-            url,
-            if (isLive) TvType.Live else TvType.Others,
+            videoUrl,
+            if (isLive) {
+                TvType.Live
+            } else {
+                TvType.Others
+            },
             url
         ) {
-            plot = info.description.content.toString()
-            posterUrl = info.thumbnails.lastOrNull()?.url
-            if (info.duration > 0) duration = info.duration.toInt()
-            info.uploaderName?.takeIf { it.isNotBlank() }?.let { uploader ->
-                actors = listOf(
-                    ActorData(
-                        Actor(
-                            uploader,
-                            info.uploaderAvatars.lastOrNull()?.url ?: ""
-                        )
-                    )
-                )
+
+            plot =
+                info.description
+                    .content
+                    .toString()
+
+            posterUrl =
+                info.thumbnails
+                    .lastOrNull()
+                    ?.url
+
+            if (
+                info.duration > 0
+            ) {
+
+                duration =
+                    info.duration
+                        .toInt()
             }
-            tags = listOf("Kids", "Age 3-6")
+
+            info.uploaderName
+                ?.takeIf {
+                    it.isNotBlank()
+                }
+                ?.let { uploader ->
+
+                    actors =
+                        listOf(
+                            ActorData(
+                                Actor(
+                                    uploader,
+                                    info.uploaderAvatars
+                                        .lastOrNull()
+                                        ?.url
+                                        ?: ""
+                                )
+                            )
+                        )
+                }
+
+            tags =
+                listOf(
+                    "Kids",
+                    "Age 3-6"
+                )
         }
     }
 
-    private suspend fun loadChannel(url: String): LoadResponse {
-        val extractor = service.getChannelExtractor(url)
+    /*
+     * ============================================================
+     * CHANNEL LOAD
+     * ============================================================
+     */
+
+    private suspend fun loadChannel(
+        url: String
+    ): LoadResponse {
+
+        val extractor =
+            service.getChannelExtractor(
+                url
+            )
+
         extractor.fetchPage()
 
-        val channelName = extractor.name
-        val description = extractor.description
-        val avatar = extractor.avatars.lastOrNull()?.url
-        val banner = extractor.banners.lastOrNull()?.url
+        val channelName =
+            extractor.name
 
-        val videosTab = extractor.tabs.firstOrNull {
-            it.url.contains("/videos")
-        } ?: extractor.tabs.firstOrNull()
-            ?: throw RuntimeException("No videos tab found")
+        val description =
+            extractor.description
 
-        val videosExtractor = service.getChannelTabExtractor(videosTab)
-        val episodes = mutableListOf<Episode>()
+        val avatar =
+            extractor.avatars
+                .lastOrNull()
+                ?.url
 
-        var pageData = videosExtractor.initialPage
-        var pages = 0
+        val banner =
+            extractor.banners
+                .lastOrNull()
+                ?.url
 
-        while (pages < 5) {
-            pageData.items
+        val tabs =
+            extractor.tabs
+
+        val videosTab =
+            tabs.firstOrNull {
+                it.url.contains(
+                    "/videos"
+                )
+            }
+                ?: tabs.firstOrNull()
+                ?: throw RuntimeException(
+                    "No videos tab found"
+                )
+
+        val videosExtractor =
+            service.getChannelTabExtractor(
+                videosTab
+            )
+
+        val episodes =
+            mutableListOf<Episode>()
+
+        var page =
+            videosExtractor.initialPage
+
+        var pagesLoaded =
+            0
+
+        val maxPages =
+            5
+
+        while (
+            pagesLoaded < maxPages
+        ) {
+
+            page.items
                 .filterIsInstance<StreamInfoItem>()
-                .filter { isKidsCandidate(it) }
+                .filter {
+                    isKidsCandidate(it)
+                }
                 .forEach { item ->
-                    val itemUrl = item.url?.trim().orEmpty()
-                    if (itemUrl.isNotBlank()) {
-                        episodes.add(newEpisode(itemUrl) {
-                            name = item.name
-                            posterUrl = item.thumbnails.lastOrNull()?.url
-                        })
-                    }
+
+                    val itemUrl =
+                        item.url
+                            ?.trim()
+                            ?: return@forEach
+
+                    episodes.add(
+                        newEpisode(
+                            itemUrl
+                        ) {
+
+                            name =
+                                item.name
+
+                            posterUrl =
+                                item.thumbnails
+                                    .lastOrNull()
+                                    ?.url
+                        }
+                    )
                 }
 
-            if (!pageData.hasNextPage()) break
-            pageData = videosExtractor.getPage(pageData.nextPage)
-            pages++
+            if (
+                !page.hasNextPage()
+            ) {
+                break
+            }
+
+            page =
+                videosExtractor.getPage(
+                    page.nextPage
+                )
+
+            pagesLoaded++
         }
 
         return newTvSeriesLoadResponse(
@@ -621,48 +1868,124 @@ class YouTubeKids : MainAPI() {
             TvType.TvSeries,
             episodes
         ) {
-            plot = description
-            posterUrl = banner ?: avatar
-            backgroundPosterUrl = banner
-            tags = listOf("Kids", "Age 3-6", "Channel")
-            actors = listOf(
-                ActorData(
-                    Actor(channelName, avatar ?: "")
+
+            plot =
+                description
+
+            posterUrl =
+                banner
+
+            backgroundPosterUrl =
+                banner
+
+            tags =
+                listOf(
+                    "Kids",
+                    "Age 3-6",
+                    "Channel"
                 )
-            )
+
+            actors =
+                listOf(
+                    ActorData(
+                        Actor(
+                            channelName,
+                            avatar ?: ""
+                        )
+                    )
+                )
         }
     }
 
-    private suspend fun loadPlaylist(url: String): LoadResponse {
-        val extractor = service.getPlaylistExtractor(url)
+    /*
+     * ============================================================
+     * PLAYLIST LOAD
+     * ============================================================
+     */
+
+    private suspend fun loadPlaylist(
+        url: String
+    ): LoadResponse {
+
+        val extractor =
+            service.getPlaylistExtractor(
+                url
+            )
+
         extractor.fetchPage()
 
-        val playlistName = extractor.name
-        val description = extractor.description.content.toString()
-        val thumbnail = extractor.thumbnails.lastOrNull()?.url
-        val uploader = extractor.uploaderName
+        val playlistName =
+            extractor.name
 
-        val episodes = mutableListOf<Episode>()
-        var pageData = extractor.getInitialPage()
-        var pages = 0
+        val description =
+            extractor.description
+                .content
+                .toString()
 
-        while (pages < 10) {
-            pageData.items
+        val thumbnail =
+            extractor.thumbnails
+                .lastOrNull()
+                ?.url
+
+        val uploader =
+            extractor.uploaderName
+
+        val episodes =
+            mutableListOf<Episode>()
+
+        var page =
+            extractor.getInitialPage()
+
+        var pagesLoaded =
+            0
+
+        val maxPages =
+            10
+
+        while (
+            pagesLoaded < maxPages
+        ) {
+
+            page.items
                 .filterIsInstance<StreamInfoItem>()
-                .filter { isKidsCandidate(it) }
+                .filter {
+                    isKidsCandidate(it)
+                }
                 .forEach { item ->
-                    val itemUrl = item.url?.trim().orEmpty()
-                    if (itemUrl.isNotBlank()) {
-                        episodes.add(newEpisode(itemUrl) {
-                            name = item.name
-                            posterUrl = item.thumbnails.lastOrNull()?.url
-                        })
-                    }
+
+                    val itemUrl =
+                        item.url
+                            ?.trim()
+                            ?: return@forEach
+
+                    episodes.add(
+                        newEpisode(
+                            itemUrl
+                        ) {
+
+                            name =
+                                item.name
+
+                            posterUrl =
+                                item.thumbnails
+                                    .lastOrNull()
+                                    ?.url
+                        }
+                    )
                 }
 
-            if (!pageData.hasNextPage()) break
-            pageData = extractor.getPage(pageData.nextPage)
-            pages++
+            if (
+                !page.hasNextPage()
+            ) {
+                break
+            }
+
+            page =
+                extractor.getPage(
+                    page.nextPage
+                )
+
+            pagesLoaded++
         }
 
         return newTvSeriesLoadResponse(
@@ -671,21 +1994,53 @@ class YouTubeKids : MainAPI() {
             TvType.TvSeries,
             episodes
         ) {
-            plot = description
-            posterUrl = thumbnail
-            tags = listOf("Kids", "Age 3-6", "Playlist")
-            if (uploader.isNotBlank()) {
-                actors = listOf(
-                    ActorData(
-                        Actor(
-                            uploader,
-                            extractor.uploaderAvatars.lastOrNull()?.url ?: ""
+
+            plot =
+                description
+
+            posterUrl =
+                thumbnail
+
+            tags =
+                listOf(
+                    "Kids",
+                    "Age 3-6"
+                )
+
+            if (
+                uploader.isNotBlank()
+            ) {
+
+                actors =
+                    listOf(
+                        ActorData(
+                            Actor(
+                                uploader,
+                                extractor
+                                    .uploaderAvatars
+                                    .lastOrNull()
+                                    ?.url
+                                    ?: ""
+                            )
                         )
                     )
-                )
             }
         }
     }
+
+    /*
+     * ============================================================
+     * PLAYBACK
+     * ============================================================
+     *
+     * Same direct playback philosophy as the working YouTube
+     * provider:
+     *
+     * VOD  -> DASH
+     * LIVE -> HLS
+     *
+     * No proxy.
+     */
 
     override suspend fun loadLinks(
         data: String,
@@ -693,25 +2048,53 @@ class YouTubeKids : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+
         if (data.isBlank()) return false
 
-        val cleanUrl = canonicalYouTubeUrl(data)
+        /*
+         * IMPORTANT:
+         * Search results may contain youtube.com, youtu.be or shorts
+         * URLs.  Always turn a video into a clean watch URL before
+         * giving it to NewPipe.  Do NOT cache a signed media URL here;
+         * YouTube stream URLs are temporary and must be resolved when
+         * the user presses Play.
+         */
+        val videoUrl = canonicalYouTubeVideoUrl(data)
+
+        /*
+         * First use the same NewPipe path as the working main YouTube
+         * provider.  This resolves a fresh DASH/HLS URL at playback
+         * time rather than trying to reuse an expired media URL.
+         */
+        val extractor = try {
+            service.getStreamExtractor(videoUrl)
+        } catch (_: Exception) {
+            return loadExtractor(
+                videoUrl,
+                subtitleCallback,
+                callback
+            )
+        }
 
         try {
-            val extractor = service.getStreamExtractor(cleanUrl)
             extractor.fetchPage()
 
             val info = StreamInfo.getInfo(extractor)
-            val live = info.streamType?.name?.contains("LIVE") == true
 
-            if (live) {
-                val hls = runCatching { info.hlsUrl }.getOrNull()
-                if (!hls.isNullOrBlank()) {
+            val isLive = info.streamType
+                ?.name
+                ?.contains("LIVE") == true
+
+            /* LIVE -> HLS */
+            if (isLive) {
+                val liveHls = runCatching { info.hlsUrl }.getOrNull()
+
+                if (!liveHls.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
                             source = name,
                             name = "$name Live",
-                            url = hls,
+                            url = liveHls,
                             type = ExtractorLinkType.M3U8
                         ) {
                             referer = "https://www.youtube.com/"
@@ -722,7 +2105,9 @@ class YouTubeKids : MainAPI() {
                 }
             }
 
+            /* VOD -> DASH (preferred) */
             val dash = runCatching { info.dashMpdUrl }.getOrNull()
+
             if (!dash.isNullOrBlank()) {
                 callback(
                     newExtractorLink(
@@ -738,7 +2123,9 @@ class YouTubeKids : MainAPI() {
                 return true
             }
 
+            /* HLS fallback */
             val hls = runCatching { info.hlsUrl }.getOrNull()
+
             if (!hls.isNullOrBlank()) {
                 callback(
                     newExtractorLink(
@@ -754,73 +2141,167 @@ class YouTubeKids : MainAPI() {
                 return true
             }
         } catch (_: Exception) {
+            /* Try CloudStream's YouTube extractor below. */
         }
 
-        return runCatching {
-            loadExtractor(cleanUrl, subtitleCallback, callback)
-        }.getOrDefault(false)
+        /*
+         * Final fallback: let CloudStream resolve the YouTube URL.
+         * This is deliberately the last step so a provider failure does
+         * not turn into "Link not found" when the built-in extractor can
+         * still resolve the video.
+         */
+        return loadExtractor(
+            videoUrl,
+            subtitleCallback,
+            callback
+        )
     }
 
-    private fun canonicalYouTubeUrl(url: String): String {
+    /*
+     * Convert every supported YouTube video URL to one canonical URL.
+     * The stream extractor receives the clean watch URL, while channel
+     * and playlist URLs are returned unchanged.
+     */
+    private fun canonicalYouTubeVideoUrl(url: String): String {
         val value = url.trim()
 
-        val watchIndex = value.indexOf("v=")
-        if (watchIndex >= 0) {
-            val id = value.substring(watchIndex + 2)
-                .substringBefore("&")
-                .substringBefore("#")
-                .trim()
+        if (value.isBlank()) return value
 
-            if (id.length >= 6) {
-                return "https://www.youtube.com/watch?v=$id"
+        val videoId = when {
+            value.contains("youtu.be/", ignoreCase = true) -> {
+                value.substringAfter("youtu.be/", "")
+                    .substringBefore('?')
+                    .substringBefore('&')
+                    .substringBefore('/')
             }
+
+            value.contains("/shorts/", ignoreCase = true) -> {
+                value.substringAfter("/shorts/", "")
+                    .substringBefore('?')
+                    .substringBefore('&')
+                    .substringBefore('/')
+            }
+
+            value.contains("/watch?v=", ignoreCase = true) -> {
+                value.substringAfter("/watch?v=", "")
+                    .substringBefore('&')
+                    .substringBefore('#')
+            }
+
+            else -> ""
         }
 
-        val shortPrefix = "youtu.be/"
-        val shortIndex = value.indexOf(shortPrefix, ignoreCase = true)
-        if (shortIndex >= 0) {
-            val id = value.substring(shortIndex + shortPrefix.length)
-                .substringBefore("?")
-                .substringBefore("&")
-                .substringBefore("#")
-                .trim()
+        if (videoId.isBlank()) return value
 
-            if (id.length >= 6) {
-                return "https://www.youtube.com/watch?v=$id"
-            }
-        }
-
-        val shortsPrefix = "/shorts/"
-        val shortsIndex = value.indexOf(shortsPrefix, ignoreCase = true)
-        if (shortsIndex >= 0) {
-            val id = value.substring(shortsIndex + shortsPrefix.length)
-                .substringBefore("?")
-                .substringBefore("&")
-                .substringBefore("#")
-                .trim()
-
-            if (id.length >= 6) {
-                return "https://www.youtube.com/watch?v=$id"
-            }
-        }
-
-        return value
+        return "https://www.youtube.com/watch?v=$videoId"
     }
 
-    private fun sectionDisplayName(section: String): String {
+    /*
+     * ============================================================
+     * HELPERS
+     * ============================================================
+     */
+
+    private fun containsAny(
+        text: String,
+        keywords: List<String>
+    ): Boolean {
+
+        val lower =
+            text.lowercase()
+
+        return keywords.any {
+            lower.contains(
+                it.lowercase()
+            )
+        }
+    }
+
+    private fun isPreferredBanglaChannel(
+        uploader: String
+    ): Boolean {
+
+        if (
+            uploader.isBlank()
+        ) {
+            return false
+        }
+
+        return preferredBanglaChannels.any {
+            uploader.equals(
+                it,
+                ignoreCase = true
+            ) ||
+                uploader.contains(
+                    it,
+                    ignoreCase = true
+                )
+        }
+    }
+
+    private fun isPreferredKidsChannel(
+        uploader: String
+    ): Boolean {
+
+        if (
+            uploader.isBlank()
+        ) {
+            return false
+        }
+
+        return preferredKidsChannels.any {
+            uploader.equals(
+                it,
+                ignoreCase = true
+            ) ||
+                uploader.contains(
+                    it,
+                    ignoreCase = true
+                )
+        }
+    }
+
+    private fun sectionDisplayName(
+        section: String
+    ): String {
+
         return when (section) {
-            "recommended" -> "Recommended for Kids"
-            "bangla" -> "বাংলা Kids"
-            "learning" -> "Learning"
-            "rhymes" -> "Nursery Rhymes"
-            "cartoons" -> "Cartoons"
-            "stories" -> "Stories"
-            "music" -> "Kids Music"
-            "animals" -> "Animals & Nature"
-            "cars" -> "Cars, Trucks & Machines"
-            "play" -> "Play & Create"
-            "explore" -> "Explore"
-            else -> section
+
+            "recommended" ->
+                "Recommended for Kids"
+
+            "bangla" ->
+                "বাংলা Kids"
+
+            "learning" ->
+                "Learning"
+
+            "rhymes" ->
+                "Nursery Rhymes"
+
+            "cartoons" ->
+                "Cartoons"
+
+            "stories" ->
+                "Stories"
+
+            "music" ->
+                "Kids Music"
+
+            "animals" ->
+                "Animals & Nature"
+
+            "cars" ->
+                "Cars, Trucks & Machines"
+
+            "play" ->
+                "Play & Create"
+
+            "explore" ->
+                "Explore"
+
+            else ->
+                section
         }
     }
 }
