@@ -14,6 +14,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
+import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
+import java.net.URLDecoder
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 class YouTube : MainAPI() {
@@ -860,47 +867,62 @@ class YouTube : MainAPI() {
 
     private suspend fun fetchSearchItemsInBatches(
         queries: List<String>,
-        batchSize: Int = 6
+        batchSize: Int = 6,
+        fastMode: Boolean = false
     ): List<List<InfoItem>> {
 
         val cleanQueries =
             queries
-                .map {
-                    it.trim()
-                }
-                .filter {
-                    it.isNotBlank()
-                }
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
                 .distinct()
+
+        if (cleanQueries.isEmpty()) return emptyList()
+
+        /*
+         * FAST MODE:
+         * Only the first two high-value queries are used and both are
+         * requested in parallel. The whole operation is bounded so the
+         * first paint is never held hostage by a slow query.
+         */
+        if (fastMode) {
+            val fastQueries = cleanQueries.take(2)
+
+            return withTimeoutOrNull(2_400L) {
+                coroutineScope {
+                    fastQueries.map { query ->
+                        async(Dispatchers.IO) {
+                            withTimeoutOrNull(2_000L) {
+                                runCatching {
+                                    val extractor =
+                                        service.getSearchExtractor(query)
+
+                                    extractor.fetchPage()
+
+                                    extractor
+                                        .initialPage
+                                        .items
+                                        .toList()
+                                }.getOrElse { emptyList() }
+                            } ?: emptyList()
+                        }
+                    }.awaitAll()
+                }
+            } ?: emptyList()
+        }
 
         val results =
             mutableListOf<List<InfoItem>>()
 
-        for (
-            batch in cleanQueries.chunked(
-                batchSize
-            )
-        ) {
-
+        for (batch in cleanQueries.chunked(batchSize)) {
             val batchResults =
                 coroutineScope {
-
                     batch.map { query ->
-
-                        async(
-                            Dispatchers.IO
-                        ) {
-
-                            withTimeoutOrNull(
-                                8_000L
-                            ) {
-
+                        async(Dispatchers.IO) {
+                            withTimeoutOrNull(8_000L) {
                                 try {
-
                                     val extractor =
-                                        service.getSearchExtractor(
-                                            query
-                                        )
+                                        service.getSearchExtractor(query)
 
                                     extractor.fetchPage()
 
@@ -909,23 +931,15 @@ class YouTube : MainAPI() {
                                         .items
                                         .toList()
 
-                                } catch (
-                                    _: Exception
-                                ) {
-
+                                } catch (_: Exception) {
                                     emptyList()
-
                                 }
-
                             } ?: emptyList()
                         }
-
                     }.awaitAll()
                 }
 
-            results.addAll(
-                batchResults
-            )
+            results.addAll(batchResults)
         }
 
         return results
@@ -972,6 +986,28 @@ class YouTube : MainAPI() {
 
         val key =
             request.data
+
+        if (page == 1) {
+            val cacheSection = "generic_" + key
+            val cached = cachedResponses(cacheSection, "generic")
+
+            if (cached.isNotEmpty()) {
+                scheduleBackgroundRefresh(cacheSection) {
+                    refreshGenericKioskHome(request.data, request.name, cacheSection)
+                }
+
+                return newHomePageResponse(
+                    listOf(HomePageList(request.name, cached, false)),
+                    false
+                )
+            }
+
+            val fast = buildGenericKioskFast(request.data, request.name, cacheSection)
+            scheduleBackgroundRefresh(cacheSection) {
+                refreshGenericKioskHome(request.data, request.name, cacheSection)
+            }
+            return fast
+        }
 
         if (page == 1) {
             pageCache.remove(
@@ -1077,8 +1113,282 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getIndianMusicPage(
-        page: Int
+    /*
+     * --------------------------------------------------
+     * FAST HOME + STALE-WHILE-REVALIDATE CACHE
+     * --------------------------------------------------
+     *
+     * CloudStream's getMainPage() returns a snapshot; it has no reliable
+     * public API for a plugin to append items to the already-rendered UI
+     * after returning. Therefore:
+     *
+     * 1) Show a small fast snapshot (6 items) on the first ever open.
+     * 2) Refresh the complete row in the background.
+     * 3) Persist the refreshed row so the next open is immediate.
+     * 4) Keep recent older items in the cache so a newly changing feed does
+     *    not erase everything at once.
+     */
+    private companion object {
+        const val FAST_VISIBLE_COUNT = 6
+        const val HOME_CACHE_LIMIT = 50
+        const val CACHE_RETENTION_MS = 14L * 24L * 60L * 60L * 1000L
+        const val BACKGROUND_REFRESH_COOLDOWN_MS = 30_000L
+        const val PERSISTENT_CACHE_PREFIX = "movieflick.youtube.home.v3."
+    }
+
+    private data class PersistentHomeItem(
+        val title: String,
+        val url: String,
+        val poster: String?,
+        val lastSeen: Long
+    )
+
+    private val backgroundRefreshScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val refreshRunning =
+        ConcurrentHashMap<String, Boolean>()
+
+    private val refreshLastStarted =
+        ConcurrentHashMap<String, Long>()
+
+    private fun cacheKey(section: String): String =
+        PERSISTENT_CACHE_PREFIX + section
+
+    private fun encodeCacheField(value: String): String =
+        URLEncoder.encode(value, "UTF-8")
+
+    private fun decodeCacheField(value: String): String? =
+        runCatching {
+            URLDecoder.decode(value, "UTF-8")
+        }.getOrNull()
+
+    private fun readPersistentHomeCache(
+        section: String
+    ): List<PersistentHomeItem> {
+        val raw =
+            runCatching {
+                getKey<String>(cacheKey(section))
+            }.getOrNull()
+                ?: return emptyList()
+
+        val now = System.currentTimeMillis()
+
+        return raw
+            .lineSequence()
+            .mapNotNull { line ->
+                val parts = line.split('\t')
+                if (parts.size < 4) return@mapNotNull null
+
+                val lastSeen =
+                    parts[0].toLongOrNull()
+                        ?: return@mapNotNull null
+
+                val title =
+                    decodeCacheField(parts[1])
+                        ?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+
+                val url =
+                    decodeCacheField(parts[2])
+                        ?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+
+                val poster =
+                    decodeCacheField(parts[3])
+                        ?.takeIf { it.isNotBlank() }
+
+                if (now - lastSeen > CACHE_RETENTION_MS) {
+                    return@mapNotNull null
+                }
+
+                PersistentHomeItem(
+                    title = title,
+                    url = url,
+                    poster = poster,
+                    lastSeen = lastSeen
+                )
+            }
+            .distinctBy { it.url }
+            .take(HOME_CACHE_LIMIT)
+            .toList()
+    }
+
+    private fun writePersistentHomeCache(
+        section: String,
+        fresh: List<SearchResponse>
+    ) {
+        if (fresh.isEmpty()) return
+
+        val now = System.currentTimeMillis()
+        val old = readPersistentHomeCache(section)
+
+        val merged = mutableListOf<PersistentHomeItem>()
+        val seen = mutableSetOf<String>()
+
+        fresh.forEach { response ->
+            val url = response.url.trim()
+            val title = response.name.trim()
+
+            if (url.isBlank() || title.isBlank() || !seen.add(url)) return@forEach
+
+            merged.add(
+                PersistentHomeItem(
+                    title = title,
+                    url = url,
+                    poster = response.posterUrl,
+                    lastSeen = now
+                )
+            )
+        }
+
+        old.forEach { item ->
+            if (seen.add(item.url)) {
+                merged.add(item)
+            }
+        }
+
+        val payload =
+            merged
+                .take(HOME_CACHE_LIMIT)
+                .joinToString("\n") { item ->
+                    listOf(
+                        item.lastSeen.toString(),
+                        encodeCacheField(item.title),
+                        encodeCacheField(item.url),
+                        encodeCacheField(item.poster.orEmpty())
+                    ).joinToString("\t")
+                }
+
+        runCatching {
+            setKey(
+                cacheKey(section),
+                payload
+            )
+        }
+    }
+
+    private fun cachedResponses(
+        section: String,
+        kind: String,
+        limit: Int = HOME_CACHE_LIMIT
+    ): List<SearchResponse> {
+        return readPersistentHomeCache(section)
+            .take(limit)
+            .mapNotNull { item ->
+                when (kind) {
+                    "religion" ->
+                        newTvSeriesSearchResponse(
+                            item.title,
+                            item.url,
+                            TvType.TvSeries
+                        ) {
+                            posterUrl = item.poster
+                        }
+
+                    "live" ->
+                        newMovieSearchResponse(
+                            item.title,
+                            item.url,
+                            TvType.Live
+                        ) {
+                            posterUrl = item.poster
+                        }
+
+                    "generic" ->
+                        newMovieSearchResponse(
+                            item.title,
+                            item.url,
+                            TvType.Others
+                        ) {
+                            posterUrl = item.poster
+                        }
+
+                    else ->
+                        newMovieSearchResponse(
+                            item.title,
+                            item.url,
+                            TvType.Movie
+                        ) {
+                            posterUrl = item.poster
+                        }
+                }
+            }
+    }
+
+    private fun scheduleBackgroundRefresh(
+        section: String,
+        job: suspend () -> Unit
+    ) {
+        val now = System.currentTimeMillis()
+        val last = refreshLastStarted[section] ?: 0L
+
+        if (now - last < BACKGROUND_REFRESH_COOLDOWN_MS) return
+        if (refreshRunning.putIfAbsent(section, true) != null) return
+
+        refreshLastStarted[section] = now
+
+        backgroundRefreshScope.launch {
+            try {
+                job()
+            } catch (_: Exception) {
+                // Background refresh must never break the visible home page.
+            } finally {
+                refreshRunning.remove(section)
+            }
+        }
+    }
+
+    private suspend fun getIndianMusicPage(page: Int): HomePageResponse {
+        if (page > 1) {
+            return newHomePageResponse(emptyList(), false)
+        }
+
+        val cached =
+            cachedResponses("music", "movie")
+
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh("music") {
+                buildIndianMusicPageFull(
+                    1,
+                    fastMode = false,
+                    forceRefresh = true
+                )
+            }
+            return newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Trending Music Videos",
+                        cached.take(HOME_CACHE_LIMIT),
+                        false
+                    )
+                ),
+                false
+            )
+        }
+
+        val fast =
+            buildIndianMusicPageFull(
+                1,
+                fastMode = true,
+                forceRefresh = true
+            )
+
+        scheduleBackgroundRefresh("music") {
+            buildIndianMusicPageFull(
+                1,
+                fastMode = false,
+                forceRefresh = true
+            )
+        }
+
+        return fast
+    }
+
+    private suspend fun buildIndianMusicPageFull(
+        page: Int,
+        fastMode: Boolean = false,
+        forceRefresh: Boolean = false
     ): HomePageResponse {
 
         if (page > 1) {
@@ -1089,15 +1399,19 @@ class YouTube : MainAPI() {
             )
         }
 
-        getCachedHomePage(
-            musicHomeCache,
-            "music"
-        )?.let {
-            return it
+        if (!fastMode && !forceRefresh) {
+            getCachedHomePage(
+                musicHomeCache,
+                "music"
+            )?.let {
+                return it
+            }
         }
 
         val results =
             mutableListOf<SearchResponse>()
+
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
 
         val seenUrls =
             mutableSetOf<String>()
@@ -1105,17 +1419,18 @@ class YouTube : MainAPI() {
         for (
             items in fetchSearchItemsInBatches(
                 indianMusicQueries,
-                6
+                6,
+                fastMode
             )
         ) {
 
-            if (results.size >= 40) {
+            if (results.size >= resultLimit) {
                 break
             }
 
             for (item in items) {
 
-                if (results.size >= 40) {
+                if (results.size >= resultLimit) {
                     break
                 }
 
@@ -1240,6 +1555,8 @@ class YouTube : MainAPI() {
             10 * 60 * 1000L
         )
 
+        writePersistentHomeCache("music", results)
+
         return response
     }
 
@@ -1249,8 +1566,32 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getMoviesPage(
-        page: Int
+
+    private suspend fun getMoviesPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+
+        val cached = cachedResponses("movies", "movie")
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh("movies") {
+                buildMoviesPageFull(1, fastMode = false, forceRefresh = true)
+            }
+            return newHomePageResponse(
+                listOf(HomePageList("Movies", cached, false)),
+                false
+            )
+        }
+
+        val fast = buildMoviesPageFull(1, fastMode = true, forceRefresh = true)
+        scheduleBackgroundRefresh("movies") {
+            buildMoviesPageFull(1, fastMode = false, forceRefresh = true)
+        }
+        return fast
+    }
+
+    private suspend fun buildMoviesPageFull(
+        page: Int,
+        fastMode: Boolean = false,
+        forceRefresh: Boolean = false
     ): HomePageResponse {
 
         if (page > 1) {
@@ -1261,15 +1602,19 @@ class YouTube : MainAPI() {
             )
         }
 
-        getCachedHomePage(
-            movieHomeCache,
-            "movies"
-        )?.let {
-            return it
+        if (!fastMode && !forceRefresh) {
+            getCachedHomePage(
+                movieHomeCache,
+                "movies"
+            )?.let {
+                return it
+            }
         }
 
         val results =
             mutableListOf<SearchResponse>()
+
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
 
         val seenUrls =
             mutableSetOf<String>()
@@ -1277,17 +1622,18 @@ class YouTube : MainAPI() {
         for (
             items in fetchSearchItemsInBatches(
                 movieQueries,
-                5
+                5,
+                fastMode
             )
         ) {
 
-            if (results.size >= 40) {
+            if (results.size >= resultLimit) {
                 break
             }
 
             for (item in items) {
 
-                if (results.size >= 40) {
+                if (results.size >= resultLimit) {
                     break
                 }
 
@@ -1393,6 +1739,8 @@ class YouTube : MainAPI() {
             response,
             20 * 60 * 1000L
         )
+
+        writePersistentHomeCache("movies", results)
 
         return response
     }
@@ -1547,8 +1895,32 @@ class YouTube : MainAPI() {
         return score
     }
 
-    private suspend fun getHindiMoviesPage(
-        page: Int
+
+    private suspend fun getHindiMoviesPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+
+        val cached = cachedResponses("hindi_movies", "movie")
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh("hindi_movies") {
+                buildHindiMoviesPageFull(1, fastMode = false, forceRefresh = true)
+            }
+            return newHomePageResponse(
+                listOf(HomePageList("Hindi Movies", cached, false)),
+                false
+            )
+        }
+
+        val fast = buildHindiMoviesPageFull(1, fastMode = true, forceRefresh = true)
+        scheduleBackgroundRefresh("hindi_movies") {
+            buildHindiMoviesPageFull(1, fastMode = false, forceRefresh = true)
+        }
+        return fast
+    }
+
+    private suspend fun buildHindiMoviesPageFull(
+        page: Int,
+        fastMode: Boolean = false,
+        forceRefresh: Boolean = false
     ): HomePageResponse {
 
         if (page > 1) {
@@ -1559,11 +1931,13 @@ class YouTube : MainAPI() {
             )
         }
 
-        getCachedHomePage(
-            movieHomeCache,
-            "hindi_movies"
-        )?.let {
-            return it
+        if (!fastMode && !forceRefresh) {
+            getCachedHomePage(
+                movieHomeCache,
+                "hindi_movies"
+            )?.let {
+                return it
+            }
         }
 
         val candidates =
@@ -1578,7 +1952,8 @@ class YouTube : MainAPI() {
         for (
             items in fetchSearchItemsInBatches(
                 hindiMovieQueries,
-                6
+                6,
+                fastMode
             )
         ) {
 
@@ -1725,7 +2100,7 @@ class YouTube : MainAPI() {
         val finalResults =
             (
                 fixed + rotating
-                ).take(40)
+                ).take(resultLimit)
 
         val response =
             newHomePageResponse(
@@ -1746,6 +2121,8 @@ class YouTube : MainAPI() {
             15 * 60 * 1000L
         )
 
+        writePersistentHomeCache("hindi_movies", results)
+
         return response
     }
 
@@ -1755,8 +2132,82 @@ class YouTube : MainAPI() {
      * --------------------------------------------------
      */
 
-    private suspend fun getCuratedLivePage(
-        page: Int
+
+    private suspend fun getCuratedLivePage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+
+        val cached = cachedResponses("live", "live")
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh("live") {
+                buildCuratedLivePageFull(1, fastMode = false, forceRefresh = true)
+            }
+            return newHomePageResponse(
+                listOf(HomePageList("Live", cached, false)),
+                false
+            )
+        }
+
+        val fast = getCuratedLiveFastPage()
+        scheduleBackgroundRefresh("live") {
+            buildCuratedLivePageFull(1, fastMode = false, forceRefresh = true)
+        }
+        return fast
+    }
+
+    private suspend fun getCuratedLiveFastPage(): HomePageResponse {
+        val results = mutableListOf<SearchResponse>()
+        val seen = mutableSetOf<String>()
+
+        val found =
+            withTimeoutOrNull(2_400L) {
+                coroutineScope {
+                    allowedLiveChannels
+                        .take(12)
+                        .map { channel ->
+                            async(Dispatchers.IO) {
+                                withTimeoutOrNull(2_000L) {
+                                    runCatching {
+                                        val extractor =
+                                            service.getSearchExtractor("$channel live")
+
+                                        extractor.fetchPage()
+
+                                        selectOldestLiveForChannel(
+                                            channel,
+                                            extractor.initialPage.items.toList()
+                                        )
+                                    }.getOrNull()
+                                }
+                            }
+                        }
+                        .awaitAll()
+                }
+            } ?: emptyList()
+
+        found.filterNotNull().forEach { selected ->
+            val url = selected.url?.trim() ?: return@forEach
+            val title = selected.name?.trim() ?: return@forEach
+            if (url.isBlank() || title.isBlank() || !seen.add(url)) return@forEach
+
+            results.add(
+                newMovieSearchResponse(title, url, TvType.Live) {
+                    posterUrl = selected.thumbnails.lastOrNull()?.url
+                }
+            )
+
+            if (results.size >= FAST_VISIBLE_COUNT) return@forEach
+        }
+
+        return newHomePageResponse(
+            listOf(HomePageList("Live", results.take(FAST_VISIBLE_COUNT), false)),
+            false
+        )
+    }
+
+    private suspend fun buildCuratedLivePageFull(
+        page: Int,
+        fastMode: Boolean = false,
+        forceRefresh: Boolean = false
     ): HomePageResponse {
 
         if (page > 1) {
@@ -1767,11 +2218,13 @@ class YouTube : MainAPI() {
             )
         }
 
-        getCachedHomePage(
-            liveHomeCache,
-            "live"
-        )?.let {
-            return it
+        if (!fastMode && !forceRefresh) {
+            getCachedHomePage(
+                liveHomeCache,
+                "live"
+            )?.let {
+                return it
+            }
         }
 
         val results =
@@ -1900,6 +2353,8 @@ class YouTube : MainAPI() {
             60 * 1000L
         )
 
+        writePersistentHomeCache("live", results)
+
         return response
     }
 
@@ -2022,8 +2477,124 @@ class YouTube : MainAPI() {
         }
     }
 
-    private suspend fun getReligionPage(
-        page: Int
+
+    private suspend fun getReligionPage(page: Int): HomePageResponse {
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+
+        val cached = cachedResponses("religion", "religion")
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh("religion") {
+                buildReligionPageFull(1, fastMode = false, forceRefresh = true)
+            }
+            return newHomePageResponse(
+                listOf(HomePageList("Religion", cached, false)),
+                false
+            )
+        }
+
+        val fast = getReligionFastPage()
+        scheduleBackgroundRefresh("religion") {
+            buildReligionPageFull(1, fastMode = false, forceRefresh = true)
+        }
+        return fast
+    }
+
+    private suspend fun getReligionFastPage(): HomePageResponse {
+        val results = mutableListOf<SearchResponse>()
+        val seenKeys = mutableSetOf<String>()
+
+        suspend fun findFastBengali(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
+            val queries = show.bengaliNames.take(1).map { "$it playlist" }
+            val items = fetchSearchItemsInBatches(queries, 1, fastMode = true).flatten()
+
+            return items.asSequence()
+                .filterIsInstance<PlaylistInfoItem>()
+                .mapNotNull { item ->
+                    val title = item.name?.trim().orEmpty()
+                    val url = item.url?.trim().orEmpty()
+                    val uploader = item.uploaderName?.trim().orEmpty()
+                    if (title.isBlank() || url.isBlank() || !url.contains("playlist?list=", true)) null
+                    else if (!isValidBengaliDubbedPlaylist(title, uploader, show)) null
+                    else ReligionPlaylistCandidate(
+                        title,
+                        url,
+                        item.thumbnails.lastOrNull()?.url,
+                        uploader,
+                        ReligionLanguage.BENGALI,
+                        show.key,
+                        calculateBengaliPlaylistScore(title, uploader, show)
+                    )
+                }
+                .maxByOrNull { it.score }
+        }
+
+        suspend fun findFastHindi(show: BengaliDubbedShow): ReligionPlaylistCandidate? {
+            val queries = show.hindiNames.take(1).map { "$it playlist" }
+            val items = fetchSearchItemsInBatches(queries, 1, fastMode = true).flatten()
+
+            return items.asSequence()
+                .filterIsInstance<PlaylistInfoItem>()
+                .mapNotNull { item ->
+                    val title = item.name?.trim().orEmpty()
+                    val url = item.url?.trim().orEmpty()
+                    val uploader = item.uploaderName?.trim().orEmpty()
+                    if (title.isBlank() || url.isBlank() || !url.contains("playlist?list=", true)) null
+                    else if (!isValidHindiPlaylist(title, uploader, show)) null
+                    else ReligionPlaylistCandidate(
+                        title,
+                        url,
+                        item.thumbnails.lastOrNull()?.url,
+                        uploader,
+                        ReligionLanguage.HINDI,
+                        show.key,
+                        calculateHindiPlaylistScore(title, uploader, show)
+                    )
+                }
+                .maxByOrNull { it.score }
+        }
+
+        val bengali =
+            withTimeoutOrNull(2_400L) {
+                coroutineScope {
+                    bengaliDubbedShows
+                        .take(3)
+                        .map { show -> async { findFastBengali(show) } }
+                        .awaitAll()
+                        .filterNotNull()
+                }
+            } ?: emptyList()
+
+        val hindi =
+            withTimeoutOrNull(2_400L) {
+                coroutineScope {
+                    bengaliDubbedShows
+                        .take(3)
+                        .map { show -> async { findFastHindi(show) } }
+                        .awaitAll()
+                        .filterNotNull()
+                }
+            } ?: emptyList()
+
+        (bengali + hindi).forEach { candidate ->
+            if (!seenKeys.add(candidate.seriesKey)) {
+                // Keep Bengali and Hindi entries separately in the cache/UI.
+                // Use the full URL as the uniqueness key when language differs.
+                if (candidate.language == ReligionLanguage.BENGALI) return@forEach
+            }
+
+            results.add(religionCandidateToSearchResponse(candidate))
+        }
+
+        return newHomePageResponse(
+            listOf(HomePageList("Religion", results.take(FAST_VISIBLE_COUNT), false)),
+            false
+        )
+    }
+
+    private suspend fun buildReligionPageFull(
+        page: Int,
+        fastMode: Boolean = false,
+        forceRefresh: Boolean = false
     ): HomePageResponse {
 
         if (page > 1) {
@@ -2034,11 +2605,13 @@ class YouTube : MainAPI() {
             )
         }
 
-        getCachedHomePage(
-            religionHomeCache,
-            "religion"
-        )?.let {
-            return it
+        if (!fastMode && !forceRefresh) {
+            getCachedHomePage(
+                religionHomeCache,
+                "religion"
+            )?.let {
+                return it
+            }
         }
 
         val bengaliResults =
@@ -2230,6 +2803,8 @@ class YouTube : MainAPI() {
             response,
             30 * 60 * 1000L
         )
+
+        writePersistentHomeCache("religion", finalResults)
 
         return response
     }
@@ -3337,6 +3912,73 @@ class YouTube : MainAPI() {
      * NORMAL SEARCH
      * --------------------------------------------------
      */
+
+    private suspend fun buildGenericKioskFast(
+        kioskId: String,
+        sectionName: String,
+        cacheSection: String
+    ): HomePageResponse {
+        val pageData =
+            try {
+                val extractor = getKioskExtractor(kioskId)
+
+                withTimeoutOrNull(2_400L) {
+                    extractor.fetchPage()
+                    extractor.initialPage
+                }
+            } catch (_: Exception) {
+                null
+            }
+
+        if (pageData != null) {
+            pageCache[kioskId] = pageData.nextPage
+        }
+
+        val results =
+            pageData
+                ?.items
+                ?.map { it.toSearchResponse() }
+                ?.take(FAST_VISIBLE_COUNT)
+                ?: emptyList()
+
+        if (results.isNotEmpty()) {
+            writePersistentHomeCache(cacheSection, results)
+        }
+
+        return newHomePageResponse(
+            listOf(
+                HomePageList(
+                    sectionName,
+                    results,
+                    true
+                )
+            ),
+            pageData?.hasNextPage() == true
+        )
+    }
+
+    private suspend fun refreshGenericKioskHome(
+        kioskId: String,
+        sectionName: String,
+        cacheSection: String
+    ) {
+        val fresh =
+            try {
+                val extractor = getKioskExtractor(kioskId)
+                withTimeoutOrNull(8_000L) {
+                    extractor.fetchPage()
+                    extractor.initialPage.items
+                        .map { it.toSearchResponse() }
+                        .take(40)
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+
+        if (fresh.isEmpty()) return
+
+        writePersistentHomeCache(cacheSection, fresh)
+    }
 
     override suspend fun search(
         query: String,
