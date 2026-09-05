@@ -119,15 +119,169 @@ class YouTube : MainAPI() {
      */
 
     private val indianMusicQueries = listOf(
-        "Hindi trending songs India",
-        "Indian Hindi trending music",
-        "Hindi new songs trending India",
-        "Hindi songs trending India",
-        "Kolkata Bengali trending songs",
-        "Indian Bengali trending songs",
-        "Bengali new songs India",
-        "Bengali songs trending Kolkata"
+        // Fast path: only two high-value official-label searches run first.
+        "T-Series latest Hindi official music video 2026",
+        "Zee Music Company latest Hindi official music video 2026",
+
+        // Background searches add variety without delaying the first paint.
+        "Sony Music India latest Hindi official music video 2026",
+        "Tips Official latest Hindi official music video 2026",
+        "Saregama Music latest Hindi official music video 2026",
+        "Times Music latest Hindi official music video 2026",
+        "Universal Music India latest Hindi official music video 2026",
+        "Panorama Music latest Hindi official music video 2026",
+        "9XM Hindi latest music video 2026",
+        "Mastiii latest Hindi music video 2026",
+        "latest Hindi movie song official video 2026",
+        "latest Bengali official music video India 2026",
+        "Bengali bhakti official music video 2026"
     )
+
+    private val preferredMusicChannels = listOf(
+        "T-Series",
+        "Zee Music Company",
+        "Sony Music India",
+        "Sony Music South",
+        "Tips Official",
+        "Tips Music",
+        "Saregama Music",
+        "Times Music",
+        "Universal Music India",
+        "Panorama Music",
+        "Ishtar Music",
+        "Desi Music Factory",
+        "Play DM Official",
+        "9XM",
+        "9XM Music",
+        "Mastiii",
+        "B4U Music",
+        "Venus Music"
+    )
+
+    private val musicNonVideoKeywords = listOf(
+        "audio",
+        "official audio",
+        "lyrical",
+        "lyric video",
+        "jukebox",
+        "mix",
+        "mashup",
+        "medley",
+        "nonstop",
+        "full album",
+        "album songs",
+        "all songs",
+        "collection",
+        "playlist",
+        "radio",
+        "24/7",
+        "lofi",
+        "slowed",
+        "reverb",
+        "8d",
+        "karaoke",
+        "instrumental",
+        "cover version",
+        "remix",
+        "dj mix",
+        "bass boosted",
+        "only audio",
+        "audio song"
+    )
+
+    private val musicVideoKeywords = listOf(
+        "official video",
+        "official music video",
+        "video song",
+        "music video",
+        "full video",
+        "official mv",
+        "mv |",
+        "| official video",
+        "song video"
+    )
+
+    private fun isPreferredMusicChannel(name: String): Boolean {
+        if (name.isBlank()) return false
+        return preferredMusicChannels.any { preferred ->
+            isSameChannel(name, preferred) ||
+                name.contains(preferred, ignoreCase = true)
+        }
+    }
+
+    private fun isMusicVideoCandidate(item: StreamInfoItem): Boolean {
+        if (item.streamType != StreamType.VIDEO_STREAM) return false
+        if (item.isShortFormContent) return false
+
+        val title = item.name?.trim().orEmpty()
+        val uploader = item.uploaderName?.trim().orEmpty()
+        if (title.isBlank()) return false
+
+        if (containsAny(title, bangladeshKeywords)) return false
+        if (containsAny(title, pakistanMusicKeywords)) return false
+        if (containsAny(uploader, bangladeshKeywords)) return false
+        if (containsAny(uploader, pakistanMusicKeywords)) return false
+        if (containsAny(title, musicNonVideoKeywords)) return false
+
+        // Real music videos are normally short VOD items. Reject long
+        // jukebox/compilation-style uploads and tiny audio snippets.
+        val duration = item.duration
+        if (duration > 12 * 60L) return false
+        if (duration in 1L..89L) return false
+
+        val hasVideoSignal = containsAny(title, musicVideoKeywords)
+        val isOfficialChannel =
+            isPreferredMusicChannel(uploader) || item.isUploaderVerified
+
+        return hasVideoSignal || isOfficialChannel
+    }
+
+    private fun musicVideoScore(item: StreamInfoItem): Int {
+        val title = item.name?.trim().orEmpty()
+        val uploader = item.uploaderName?.trim().orEmpty()
+        val combined = "$title $uploader".lowercase()
+
+        var score = 0
+
+        if (isPreferredMusicChannel(uploader)) score += 300
+        if (item.isUploaderVerified) score += 80
+        if (containsAny(title, musicVideoKeywords)) score += 120
+        if (combined.contains("2026")) score += 50
+        if (combined.contains("new song")) score += 40
+        if (combined.contains("latest")) score += 35
+        if (combined.contains("from the movie")) score += 35
+        if (combined.contains("full video")) score += 25
+
+        // Popularity helps keep genuine hit songs above low-engagement uploads.
+        when {
+            item.viewCount >= 50_000_000L -> score += 80
+            item.viewCount >= 10_000_000L -> score += 60
+            item.viewCount >= 2_000_000L -> score += 40
+            item.viewCount >= 500_000L -> score += 20
+        }
+
+        // Give a modest boost to genuinely recent uploads.
+        val uploadedAt = item.uploadDate
+            ?.instant
+            ?.toEpochMilli()
+            ?: 0L
+        if (uploadedAt > 0L) {
+            val ageDays = (System.currentTimeMillis() - uploadedAt)
+                .coerceAtLeast(0L) / (24L * 60L * 60L * 1000L)
+            when {
+                ageDays <= 30L -> score += 60
+                ageDays <= 90L -> score += 40
+                ageDays <= 180L -> score += 25
+                ageDays <= 365L -> score += 10
+            }
+        }
+
+        val duration = item.duration
+        if (duration in 150L..480L) score += 20
+        if (duration in 481L..720L) score += 5
+
+        return score
+    }
 
     /*
      * --------------------------------------------------
@@ -884,11 +1038,11 @@ class YouTube : MainAPI() {
         if (fastMode) {
             val fastQueries = cleanQueries.take(2)
 
-            return withTimeoutOrNull(2_400L) {
+            return withTimeoutOrNull(1_650L) {
                 coroutineScope {
                     fastQueries.map { query ->
                         async(Dispatchers.IO) {
-                            withTimeoutOrNull(2_000L) {
+                            withTimeoutOrNull(1_350L) {
                                 runCatching {
                                     val extractor =
                                         service.getSearchExtractor(query)
@@ -1127,11 +1281,41 @@ class YouTube : MainAPI() {
     private companion object {
         const val FAST_VISIBLE_COUNT = 6
         const val HOME_CACHE_LIMIT = 50
-        const val BACKGROUND_REFRESH_COOLDOWN_MS = 30_000L
+        const val BACKGROUND_REFRESH_COOLDOWN_MS = 45_000L
     }
 
     private val backgroundRefreshScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /*
+     * Prewarm the three most-used dynamic sections as soon as this provider
+     * instance is created. This runs completely off the UI path, so it does
+     * not block CloudStream while the provider opens. Any results discovered
+     * here become immediately reusable through the in-memory cache.
+     */
+    init {
+        backgroundRefreshScope.launch {
+            coroutineScope {
+                listOf(
+                    async(Dispatchers.IO) {
+                        runCatching {
+                            buildIndianMusicPageFull(1, fastMode = true, forceRefresh = false)
+                        }
+                    },
+                    async(Dispatchers.IO) {
+                        runCatching {
+                            buildMoviesPageFull(1, fastMode = true, forceRefresh = false)
+                        }
+                    },
+                    async(Dispatchers.IO) {
+                        runCatching {
+                            buildHindiMoviesPageFull(1, fastMode = true, forceRefresh = false)
+                        }
+                    }
+                ).awaitAll()
+            }
+        }
+    }
 
     private val refreshRunning =
         ConcurrentHashMap<String, Boolean>()
@@ -1159,10 +1343,6 @@ class YouTube : MainAPI() {
         limit: Int = HOME_CACHE_LIMIT
     ): List<SearchResponse> {
         val cached = fastContentCache[section] ?: return emptyList()
-        if (cached.expiresAt <= System.currentTimeMillis()) {
-            fastContentCache.remove(section, cached)
-            return emptyList()
-        }
         return cached.items.take(limit)
     }
 
@@ -1202,13 +1382,9 @@ class YouTube : MainAPI() {
     }
 
     private suspend fun getIndianMusicPage(page: Int): HomePageResponse {
-        if (page > 1) {
-            return newHomePageResponse(emptyList(), false)
-        }
+        if (page > 1) return newHomePageResponse(emptyList(), false)
 
-        val cached =
-            cachedResponses("music", "movie")
-
+        val cached = cachedResponses("music", "movie")
         if (cached.isNotEmpty()) {
             scheduleBackgroundRefresh("music") {
                 buildIndianMusicPageFull(
@@ -1217,6 +1393,7 @@ class YouTube : MainAPI() {
                     forceRefresh = true
                 )
             }
+
             return newHomePageResponse(
                 listOf(
                     HomePageList(
@@ -1229,12 +1406,12 @@ class YouTube : MainAPI() {
             )
         }
 
-        val fast =
-            buildIndianMusicPageFull(
-                1,
-                fastMode = true,
-                forceRefresh = true
-            )
+        // Keep the existing fast first-paint behaviour.
+        val fast = buildIndianMusicPageFull(
+            1,
+            fastMode = true,
+            forceRefresh = true
+        )
 
         scheduleBackgroundRefresh("music") {
             buildIndianMusicPageFull(
@@ -1252,172 +1429,84 @@ class YouTube : MainAPI() {
         fastMode: Boolean = false,
         forceRefresh: Boolean = false
     ): HomePageResponse {
-
-        if (page > 1) {
-
-            return newHomePageResponse(
-                emptyList(),
-                false
-            )
-        }
+        if (page > 1) return newHomePageResponse(emptyList(), false)
 
         if (!fastMode && !forceRefresh) {
-            getCachedHomePage(
-                musicHomeCache,
-                "music"
-            )?.let {
+            getCachedHomePage(musicHomeCache, "music")?.let {
                 return it
             }
         }
 
-        val results =
-            mutableListOf<SearchResponse>()
+        val candidates = mutableListOf<Pair<Int, StreamInfoItem>>()
+        val seenUrls = mutableSetOf<String>()
 
-        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
-
-        val seenUrls =
-            mutableSetOf<String>()
-
-        for (
-            items in fetchSearchItemsInBatches(
-                indianMusicQueries,
-                6,
-                fastMode
-            )
-        ) {
-
-            if (results.size >= resultLimit) {
-                break
-            }
-
+        for (items in fetchSearchItemsInBatches(
+            indianMusicQueries,
+            6,
+            fastMode
+        )) {
             for (item in items) {
+                if (item !is StreamInfoItem) continue
+                if (!isMusicVideoCandidate(item)) continue
 
-                if (results.size >= resultLimit) {
-                    break
-                }
+                val url = item.url?.trim() ?: continue
+                if (url.isBlank() || !seenUrls.add(url)) continue
 
-                if (
-                    item !is StreamInfoItem
-                ) {
-                    continue
-                }
-
-                if (
-                    item.streamType !=
-                    StreamType.VIDEO_STREAM
-                ) {
-                    continue
-                }
-
-                if (
-                    item.isShortFormContent
-                ) {
-                    continue
-                }
-
-                val url =
-                    item.url
-                        ?.trim()
-                        ?: continue
-
-                if (
-                    url.isBlank() ||
-                    !seenUrls.add(url)
-                ) {
-                    continue
-                }
-
-                val title =
-                    item.name
-                        ?.trim()
-                        ?: continue
-
-                if (
-                    title.isBlank()
-                ) {
-                    continue
-                }
-
-                if (
-                    containsAny(
-                        title,
-                        bangladeshKeywords
-                    )
-                ) {
-                    continue
-                }
-
-                if (
-                    containsAny(
-                        title,
-                        pakistanMusicKeywords
-                    )
-                ) {
-                    continue
-                }
-
-                val uploader =
-                    item.uploaderName
-                        ?.trim()
-                        ?: ""
-
-                if (
-                    containsAny(
-                        uploader,
-                        bangladeshKeywords
-                    )
-                ) {
-                    continue
-                }
-
-                if (
-                    containsAny(
-                        uploader,
-                        pakistanMusicKeywords
-                    )
-                ) {
-                    continue
-                }
-
-                results.add(
-                    newMovieSearchResponse(
-                        title,
-                        url,
-                        TvType.Movie
-                    ) {
-
-                        posterUrl =
-                            item.thumbnails
-                                .lastOrNull()
-                                ?.url
-                                ?.takeIf {
-                                    it.isNotBlank()
-                                }
-                    }
+                candidates.add(
+                    musicVideoScore(item) to item
                 )
             }
         }
 
-        val response =
-            newHomePageResponse(
-                listOf(
-                    HomePageList(
-                        "Trending Music Videos",
-                        results,
-                        false
-                    )
-                ),
-                false
-            )
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
 
+        // Prefer official/verified music videos while keeping recency from
+        // YouTube search order as the secondary tie-breaker.
+        val selected = candidates
+            .sortedByDescending { it.first }
+            .take(resultLimit)
+
+        val results = selected.mapNotNull { (_, item) ->
+            val title = item.name?.trim() ?: return@mapNotNull null
+            val url = item.url?.trim() ?: return@mapNotNull null
+            if (title.isBlank() || url.isBlank()) return@mapNotNull null
+
+            newMovieSearchResponse(
+                title,
+                url,
+                TvType.Movie
+            ) {
+                posterUrl = item.thumbnails
+                    .lastOrNull()
+                    ?.url
+                    ?.takeIf { it.isNotBlank() }
+            }
+        }
+
+        val response = newHomePageResponse(
+            listOf(
+                HomePageList(
+                    "Trending Music Videos",
+                    results,
+                    false
+                )
+            ),
+            false
+        )
+
+        // Keep the current cache strategy and TTL so loading speed is not
+        // compromised by this content-quality change.
         putCachedHomePage(
             musicHomeCache,
             "music",
             response,
             10 * 60 * 1000L
         )
-
-        putCachedResponses("music", results, 10 * 60 * 1000L)
+        putCachedResponses(
+            "music",
+            results,
+            10 * 60 * 1000L
+        )
 
         return response
     }
