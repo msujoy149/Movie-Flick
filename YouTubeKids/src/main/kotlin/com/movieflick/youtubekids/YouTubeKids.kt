@@ -2524,8 +2524,6 @@ class YouTubeKids : MainAPI() {
          * only when Play is pressed.
          */
 
-         * ----------------------------------------------------------
-         */
         val directUrls =
             linkedSetOf(
                 canonical,
