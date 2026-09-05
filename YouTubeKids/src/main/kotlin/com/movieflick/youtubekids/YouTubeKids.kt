@@ -23,7 +23,7 @@ class YouTubeKids : MainAPI() {
 
     override var mainUrl = "https://www.youtube.com"
     override var name = "YouTube Kids"
-    override var lang = "bn"
+    override var lang = "bn-IN"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -440,13 +440,54 @@ class YouTubeKids : MainAPI() {
     init {
         if (PREWARM_STARTED.compareAndSet(false, true)) {
             backgroundScope.launch {
+                // Prime only a few sections first so the first screen
+                // remains responsive.
+                coroutineScope {
+                    listOf(
+                        "recommended",
+                        "bangla",
+                        "learning"
+                    ).map { section ->
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                buildSection(
+                                    section = section,
+                                    fastMode = true,
+                                    forceRefresh = true
+                                )
+                            }
+                        }
+                    }.awaitAll()
+                }
 
-                val sections =
-                    sectionQueries.keys.toList()
+                // Enrich every remaining category in small background
+                // batches. This fills the 30-item cache without making
+                // the first UI wait for all network work.
+                val remaining = sectionQueries.keys
+                    .filterNot { it in setOf("recommended", "bangla", "learning") }
 
-                // Prepare the full 30-item cache in small background batches.
-                // This never blocks the first UI paint.
-                for (batch in sections.chunked(3)) {
+                for (batch in remaining.chunked(2)) {
+                    coroutineScope {
+                        batch.map { section ->
+                            async(Dispatchers.IO) {
+                                runCatching {
+                                    buildSection(
+                                        section = section,
+                                        fastMode = false,
+                                        forceRefresh = true
+                                    )
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+
+                // Finally upgrade the first three sections from the
+                // initial six-item snapshot to the full cache.
+                for (batch in listOf(
+                    listOf("recommended", "bangla"),
+                    listOf("learning")
+                )) {
                     coroutineScope {
                         batch.map { section ->
                             async(Dispatchers.IO) {
@@ -1146,7 +1187,6 @@ class YouTubeKids : MainAPI() {
                 fastMode = fastMode
             )
                 .flatten()
-                .filterIsInstance<StreamInfoItem>()
 
         val candidates =
             mutableListOf<Pair<Int, StreamInfoItem>>()
@@ -1555,9 +1595,11 @@ class YouTubeKids : MainAPI() {
                 ?: return null
 
         val url =
-            item.url
-                ?.trim()
-                ?: return null
+            canonicalYouTubeUrl(
+                item.url
+                    ?.trim()
+                    ?: return null
+            )
 
         if (
             title.isBlank() ||
@@ -1589,10 +1631,13 @@ class YouTubeKids : MainAPI() {
         url: String
     ): LoadResponse {
 
+        val normalizedUrl =
+            canonicalYouTubeUrl(url)
+
         return when {
 
-            isVideoUrl(url) ->
-                loadVideo(url)
+            isVideoUrl(normalizedUrl) ->
+                loadVideo(normalizedUrl)
 
             isChannelUrl(url) ->
                 loadChannel(url)
@@ -2047,182 +2092,105 @@ class YouTubeKids : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
 
-        if (data.isBlank()) {
-            return false
-        }
+        if (data.isBlank()) return false
 
-        val cleanData = data.trim()
+        val canonical = canonicalYouTubeUrl(data)
 
-        /*
-         * First use the same direct NewPipe playback path as the
-         * working YouTube provider.
-         */
-        try {
-            val extractor =
-                service.getStreamExtractor(cleanData)
+        // 1) Use the same NewPipe path as the working YouTube provider.
+        // This gives DASH/HLS directly when NewPipe can extract the stream.
+        val directUrls = linkedSetOf(
+            canonical,
+            data.trim()
+        )
 
-            extractor.fetchPage()
+        for (videoUrl in directUrls) {
+            val directResult = runCatching {
+                val extractor = service.getStreamExtractor(videoUrl)
+                extractor.fetchPage()
+                val info = StreamInfo.getInfo(extractor)
 
-            val info =
-                StreamInfo.getInfo(extractor)
+                val isLive = info.streamType?.name
+                    ?.contains("LIVE", ignoreCase = true) == true
 
-            val isLive =
-                info.streamType
-                    ?.name
-                    ?.contains("LIVE") == true
+                if (isLive) {
+                    val hls = runCatching { info.hlsUrl }.getOrNull()
+                    if (!hls.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name Live",
+                                url = hls,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                referer = "https://www.youtube.com/"
+                                quality = Qualities.Unknown.value
+                            }
+                        )
+                        return@runCatching true
+                    }
+                }
 
-            if (isLive) {
-                val hlsUrl =
-                    runCatching { info.hlsUrl }.getOrNull()
-
-                if (!hlsUrl.isNullOrBlank()) {
+                val dash = runCatching { info.dashMpdUrl }.getOrNull()
+                if (!dash.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = "$name Live",
-                            url = hlsUrl,
+                            name = "$name Adaptive",
+                            url = dash,
+                            type = ExtractorLinkType.DASH
+                        ) {
+                            referer = "https://www.youtube.com/"
+                            quality = Qualities.Unknown.value
+                        }
+                    )
+                    return@runCatching true
+                }
+
+                val hls = runCatching { info.hlsUrl }.getOrNull()
+                if (!hls.isNullOrBlank()) {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name HLS",
+                            url = hls,
                             type = ExtractorLinkType.M3U8
                         ) {
                             referer = "https://www.youtube.com/"
                             quality = Qualities.Unknown.value
                         }
                     )
-                    return true
+                    return@runCatching true
                 }
-            }
 
-            val dashUrl =
-                runCatching { info.dashMpdUrl }.getOrNull()
+                false
+            }.getOrElse { false }
 
-            if (!dashUrl.isNullOrBlank()) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name Adaptive",
-                        url = dashUrl,
-                        type = ExtractorLinkType.DASH
-                    ) {
-                        referer = "https://www.youtube.com/"
-                        quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-
-            val hlsUrl =
-                runCatching { info.hlsUrl }.getOrNull()
-
-            if (!hlsUrl.isNullOrBlank()) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name HLS",
-                        url = hlsUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        referer = "https://www.youtube.com/"
-                        quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-        } catch (_: Exception) {
-            // Continue to CloudStream's extractor fallback.
+            if (directResult) return true
         }
 
-        /*
-         * CloudStream's extractor is the second playback path.
-         * This is important because YouTube can change the direct
-         * stream response independently of the search result.
-         */
-        try {
-            if (loadExtractor(cleanData, subtitleCallback, callback)) {
-                return true
-            }
-        } catch (_: Exception) {
-            // Try a canonical YouTube watch URL below.
-        }
+        // 2) If direct NewPipe extraction does not expose a playable URL,
+        // hand the canonical URL to CloudStream's registered YouTube
+        // extractors. This is important because CloudStream currently
+        // ships multiple YouTube extractor variants.
+        val fallbackUrls = linkedSetOf(
+            canonical,
+            mobileYouTubeUrl(canonical),
+            noCookieYouTubeUrl(canonical)
+        )
 
-        /*
-         * Some YouTube links contain extra parameters. Rebuild a
-         * canonical watch URL when a video id can be extracted.
-         */
-        val canonicalUrl =
-            canonicalYouTubeWatchUrl(cleanData)
+        for (videoUrl in fallbackUrls) {
+            val loaded = runCatching {
+                loadExtractor(
+                    videoUrl,
+                    subtitleCallback,
+                    callback
+                )
+            }.getOrElse { false }
 
-        if (canonicalUrl != null && canonicalUrl != cleanData) {
-            try {
-                if (loadExtractor(canonicalUrl, subtitleCallback, callback)) {
-                    return true
-                }
-            } catch (_: Exception) {
-                // No more playback fallbacks available.
-            }
+            if (loaded) return true
         }
 
         return false
-    }
-
-    private fun canonicalYouTubeWatchUrl(
-        url: String
-    ): String? {
-        val value = url.trim()
-
-        val watchIndex =
-            value.indexOf("/watch?v=", ignoreCase = true)
-
-        if (watchIndex >= 0) {
-            val idStart = watchIndex + "/watch?v=".length
-            val id =
-                value.substring(idStart)
-                    .substringBefore('&')
-                    .substringBefore('#')
-                    .trim()
-
-            if (id.isNotBlank()) {
-                return "https://www.youtube.com/watch?v=$id"
-            }
-        }
-
-        val shortMarker =
-            "youtu.be/"
-
-        val shortIndex =
-            value.indexOf(shortMarker, ignoreCase = true)
-
-        if (shortIndex >= 0) {
-            val id =
-                value.substring(shortIndex + shortMarker.length)
-                    .substringBefore('?')
-                    .substringBefore('&')
-                    .substringBefore('#')
-                    .trim()
-
-            if (id.isNotBlank()) {
-                return "https://www.youtube.com/watch?v=$id"
-            }
-        }
-
-        val shortsMarker =
-            "/shorts/"
-
-        val shortsIndex =
-            value.indexOf(shortsMarker, ignoreCase = true)
-
-        if (shortsIndex >= 0) {
-            val id =
-                value.substring(shortsIndex + shortsMarker.length)
-                    .substringBefore('?')
-                    .substringBefore('&')
-                    .substringBefore('#')
-                    .trim()
-
-            if (id.isNotBlank()) {
-                return "https://www.youtube.com/watch?v=$id"
-            }
-        }
-
-        return null
     }
 
     /*
@@ -2230,6 +2198,42 @@ class YouTubeKids : MainAPI() {
      * HELPERS
      * ============================================================
      */
+
+    private fun canonicalYouTubeUrl(url: String): String {
+        val value = url.trim()
+        if (value.isBlank()) return value
+
+        val id = Regex("(?:v=|youtu\\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})")
+            .find(value)
+            ?.groupValues
+            ?.getOrNull(1)
+
+        return if (!id.isNullOrBlank()) {
+            "https://www.youtube.com/watch?v=$id"
+        } else {
+            value
+        }
+    }
+
+    private fun mobileYouTubeUrl(url: String): String {
+        return url.replace(
+            "https://www.youtube.com/",
+            "https://m.youtube.com/"
+        )
+    }
+
+    private fun noCookieYouTubeUrl(url: String): String {
+        val id = Regex("[?&]v=([A-Za-z0-9_-]{6,})")
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+
+        return if (!id.isNullOrBlank()) {
+            "https://www.youtube-nocookie.com/embed/$id"
+        } else {
+            url
+        }
+    }
 
     private fun containsAny(
         text: String,
