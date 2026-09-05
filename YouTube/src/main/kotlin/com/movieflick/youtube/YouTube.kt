@@ -260,21 +260,15 @@ class YouTube : MainAPI() {
             item.viewCount >= 500_000L -> score += 20
         }
 
-        // Give a modest boost to genuinely recent uploads.
-        val uploadedAt = item.uploadDate
-            ?.instant
-            ?.toEpochMilli()
-            ?: 0L
-        if (uploadedAt > 0L) {
-            val ageDays = (System.currentTimeMillis() - uploadedAt)
-                .coerceAtLeast(0L) / (24L * 60L * 60L * 1000L)
-            when {
-                ageDays <= 30L -> score += 60
-                ageDays <= 90L -> score += 40
-                ageDays <= 180L -> score += 25
-                ageDays <= 365L -> score += 10
-            }
-        }
+        // Do not access StreamInfoItem.uploadDate here.
+        //
+        // CloudStream can run plugins with a different NewPipeExtractor
+        // version already bundled inside the host app. Accessing the newer
+        // DateWrapper Instant API can therefore cause a runtime
+        // NoSuchMethodError even when the plugin compiles successfully.
+        //
+        // Recency is intentionally left to YouTube's own search ranking so
+        // this provider stays binary-compatible with the host runtime.
 
         val duration = item.duration
         if (duration in 150L..480L) score += 20
@@ -2375,15 +2369,14 @@ class YouTube : MainAPI() {
             return null
         }
 
-        return candidates.minWithOrNull(
-            compareBy<StreamInfoItem> {
-
-                it.uploadDate
-                    ?.instant
-                    ?.toEpochMilli()
-                    ?: Long.MAX_VALUE
-            }
-        )
+        // Keep the first matching live result instead of touching
+        // StreamInfoItem.uploadDate / DateWrapper. The host CloudStream app
+        // may expose an older DateWrapper ABI at runtime, which can otherwise
+        // trigger NoSuchMethodError when the plugin is loaded.
+        //
+        // YouTube search already ranks currently-active results, so the first
+        // accepted live stream is the safest compatibility-first choice.
+        return candidates.firstOrNull()
     }
 
     /*
