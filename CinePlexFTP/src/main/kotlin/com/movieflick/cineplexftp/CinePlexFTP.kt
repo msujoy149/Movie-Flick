@@ -738,9 +738,76 @@ class CinePlexFTP : MainAPI() {
         if (input.isBlank()) return false
 
         if (isMediaUrl(input)) {
-            if (!isCinePlexFullMediaUrl(input)) return false
-            emitMediaLink(input, callback)
-            return true
+            if (isCinePlexTvMediaUrl(input) || isCinePlexFullMediaUrl(input)) {
+                emitMediaLink(input, callback)
+                return true
+            }
+            return false
+        }
+
+        /*
+         * TV SERIES ONLY:
+         * Cine Plex episode links use watch.php?id=...&season=...&ep=... .
+         * The real episode source is an HLS master.m3u8 under /hls/tr/.
+         * Handle that exact player flow before the movie player logic below.
+         */
+        if (input.contains("watch.php", true)) {
+            val tvPage = runCatching {
+                app.get(
+                    input,
+                    headers = pageHeaders(input) + mapOf(
+                        "Cache-Control" to "no-cache, no-store, max-age=0",
+                        "Pragma" to "no-cache"
+                    )
+                )
+            }.getOrNull() ?: return false
+
+            val tvSources = extractMediaUrls(
+                tvPage.document,
+                tvPage.text,
+                input
+            )
+                .filter { isCinePlexTvMediaUrl(it) }
+                .sortedWith(
+                    compareByDescending<String> {
+                        val lower = it.lowercase(Locale.ROOT)
+                        when {
+                            "master.m3u8" in lower -> 1000
+                            "/hls/tr/" in lower -> 900
+                            ".m3u8" in lower -> 800
+                            else -> 0
+                        }
+                    }.thenByDescending { it.length }
+                )
+
+            val tvSource = tvSources.firstOrNull()
+            if (tvSource != null) {
+                emitMediaLink(tvSource, callback)
+                return true
+            }
+
+            /* Final TV-only fallback: extract the website's /hls/tr/.../master.m3u8 directly. */
+            val cleanedHtml = tvPage.text
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+
+            val tvHlsRegex = Regex(
+                """(?i)(?:https?://[^\"'<>\s]+|/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?)"""
+            )
+
+            val rawTvSource = tvHlsRegex.findAll(cleanedHtml)
+                .map { it.value.trim() }
+                .map { absoluteUrl(it, input) }
+                .filter { isCinePlexTvMediaUrl(it) }
+                .firstOrNull()
+
+            if (rawTvSource != null) {
+                emitMediaLink(rawTvSource, callback)
+                return true
+            }
+
+            return false
         }
 
         /*
@@ -921,6 +988,31 @@ class CinePlexFTP : MainAPI() {
         }
 
         return found.toList()
+    }
+
+    /*
+     * Cine Plex TV episode media uses HLS manifests under /hls/tr/.
+     * This is intentionally TV-only and does not change movie media rules.
+     */
+    private fun isCinePlexTvMediaUrl(url: String): Boolean {
+        val cleaned = cleanUrl(url)
+        if (!isMediaUrl(cleaned)) return false
+
+        val uri = runCatching { URI(cleaned) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
+        val path = uri.path?.lowercase(Locale.ROOT).orEmpty()
+
+        if (host == "youtube.com" ||
+            host.endsWith(".youtube.com") ||
+            host == "youtu.be" ||
+            host.endsWith(".youtu.be")) {
+            return false
+        }
+
+        val cineplexHost = host == "cineplexbd.net" ||
+            host.endsWith(".cineplexbd.net")
+
+        return cineplexHost && path.startsWith("/hls/tr/") && path.endsWith(".m3u8")
     }
 
     private fun isCinePlexFullMediaUrl(url: String): Boolean {
