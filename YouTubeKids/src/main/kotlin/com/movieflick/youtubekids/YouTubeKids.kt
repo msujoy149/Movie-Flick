@@ -2,6 +2,9 @@ package com.movieflick.youtubekids
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.nicehttp.RequestBodyTypes
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -15,7 +18,6 @@ import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
-import org.schabi.newpipe.extractor.stream.VideoStream
 import org.schabi.newpipe.extractor.stream.StreamType
 import java.net.URLDecoder
 import java.util.concurrent.ConcurrentHashMap
@@ -80,6 +82,15 @@ class YouTubeKids : MainAPI() {
         // Give CloudStream time to paint the first screen before the
         // all-category background worker starts.
         const val BACKGROUND_START_DELAY_MS = 1_200L
+
+        const val WEB_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/131.0.0.0 Safari/537.36"
+
+        const val TVHTML5_USER_AGENT =
+            "Mozilla/5.0 (ChromiumStylePlatform) " +
+                "Cobalt/Version"
 
         val PREWARM_STARTED = AtomicBoolean(false)
 
@@ -2496,6 +2507,83 @@ class YouTubeKids : MainAPI() {
      * No signed media URL is stored in the home cache.
      */
 
+    /*
+     * ============================================================
+     * YOUTUBE HIGH-QUALITY PLAYBACK
+     * ============================================================
+     *
+     * The important part of this implementation is that it does NOT
+     * depend on NewPipe's current YouTube stream lists for high quality.
+     *
+     * YouTube has been moving more playback traffic to SABR / client-
+     * specific responses. In that situation an extractor can appear to
+     * work perfectly while exposing only the legacy 360p muxed stream.
+     *
+     * We therefore ask YouTube's InnerTube player endpoint directly with
+     * several compatible clients, collect every direct video/audio format
+     * that is actually returned, and publish one CloudStream source per
+     * video height.
+     *
+     * Result:
+     *   source contains 360p/480p/720p/1080p/1440p/2160p/4320p
+     *   only when that exact resolution exists for this video.
+     *
+     * Adaptive video-only formats receive CloudStream AudioFile tracks,
+     * so HD/4K/8K video can keep normal sound.
+     */
+
+    private data class InnerTubeClient(
+        val name: String,
+        val version: String,
+        val userAgent: String,
+        val isEmbedded: Boolean = false
+    )
+
+    private data class InnerTubeVideoCandidate(
+        val url: String,
+        val height: Int,
+        val bitrate: Int,
+        val hasAudio: Boolean,
+        val userAgent: String,
+        val clientName: String
+    )
+
+    private data class InnerTubeAudioCandidate(
+        val url: String,
+        val bitrate: Int,
+        val userAgent: String
+    )
+
+    private data class InnerTubeResult(
+        val videoCandidates: List<InnerTubeVideoCandidate>,
+        val audioCandidates: List<InnerTubeAudioCandidate>,
+        val dashManifestUrl: String?,
+        val hadResponse: Boolean
+    )
+
+    /*
+     * These models intentionally contain only the InnerTube fields used by
+     * the provider. CloudStream's parsedSafe() ignores the large number of
+     * unrelated player-response fields returned by YouTube.
+     */
+    private data class InnerTubePlayerResponse(
+        val streamingData: InnerTubeStreamingData? = null
+    )
+
+    private data class InnerTubeStreamingData(
+        val formats: List<InnerTubeFormat>? = null,
+        val adaptiveFormats: List<InnerTubeFormat>? = null,
+        val dashManifestUrl: String? = null
+    )
+
+    private data class InnerTubeFormat(
+        val url: String? = null,
+        val mimeType: String? = null,
+        val width: Int? = null,
+        val height: Int? = null,
+        val bitrate: Int? = null
+    )
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -2506,21 +2594,94 @@ class YouTubeKids : MainAPI() {
             return false
         }
 
-        val original = data.trim()
-        val canonical = canonicalYouTubeUrl(original)
-        val directUrls = linkedSetOf(canonical, original)
+        val original =
+            data.trim()
+
+        val canonical =
+            canonicalYouTubeUrl(
+                original
+            )
+
+        val videoId =
+            videoIdFromUrl(
+                canonical
+            )
+
+        /*
+         * ------------------------------------------------------------
+         * PATH 1: DIRECT INNERTUBE
+         * ------------------------------------------------------------
+         *
+         * This is deliberately before the old NewPipe / CloudStream
+         * fallback. If YouTube gives us 1080p/2K/4K/8K, those direct
+         * sources must be the sources CloudStream sees first.
+         */
+        if (!videoId.isNullOrBlank()) {
+            val innerTube =
+                runCatching {
+                    extractInnerTubeFormats(
+                        videoId = videoId
+                    )
+                }.getOrNull()
+
+            if (innerTube != null) {
+                val emitted =
+                    emitInnerTubeResolutionSources(
+                        result = innerTube,
+                        callback = callback
+                    )
+
+                if (emitted) {
+                    return true
+                }
+            }
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * PATH 2: EXISTING NEWPIPE PATH
+         * ------------------------------------------------------------
+         *
+         * Kept as a compatibility path. This can still provide DASH/HLS
+         * on hosts where the bundled NewPipeExtractor is healthy.
+         */
+        val directUrls =
+            linkedSetOf(
+                canonical,
+                original
+            )
 
         for (videoUrl in directUrls) {
             try {
-                val extractor = service.getStreamExtractor(videoUrl)
+                val extractor =
+                    service.getStreamExtractor(
+                        videoUrl
+                    )
+
                 extractor.fetchPage()
 
-                val info = StreamInfo.getInfo(extractor)
-                val isLive = info.streamType?.name?.contains("LIVE", ignoreCase = true) == true
+                val info =
+                    StreamInfo.getInfo(
+                        extractor
+                    )
 
-                /* LIVE -> HLS */
+                val isLive =
+                    info.streamType
+                        ?.name
+                        ?.contains(
+                            "LIVE",
+                            ignoreCase = true
+                        ) == true
+
+                /*
+                 * LIVE -> HLS
+                 */
                 if (isLive) {
-                    val hls = runCatching { info.hlsUrl }.getOrNull()
+                    val hls =
+                        runCatching {
+                            info.hlsUrl
+                        }.getOrNull()
+
                     if (!hls.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
@@ -2529,30 +2690,35 @@ class YouTubeKids : MainAPI() {
                                 url = hls,
                                 type = ExtractorLinkType.M3U8
                             ) {
-                                referer = "https://www.youtube.com/"
-                                headers = mapOf("User-Agent" to USER_AGENT)
-                                quality = Qualities.Unknown.value
+                                referer =
+                                    "https://www.youtube.com/"
+
+                                headers =
+                                    mapOf(
+                                        "User-Agent" to
+                                            USER_AGENT
+                                    )
+
+                                quality =
+                                    Qualities.Unknown.value
                             }
                         )
+
                         return true
                     }
                 }
 
                 /*
-                 * VOD -> DASH FIRST
+                 * VOD -> DASH
                  *
-                 * This is the critical part of the fix. The old code returned
-                 * as soon as it found the normal 360p muxed stream. That meant
-                 * the adaptive YouTube DASH manifest was never offered when a
-                 * low-resolution progressive stream existed.
-                 *
-                 * We now expose DASH first and do NOT return before the direct
-                 * resolution extraction has also had a chance to publish every
-                 * higher-resolution stream that NewPipe actually exposes.
+                 * This remains a useful adaptive fallback when the
+                 * host's NewPipeExtractor can still obtain the manifest.
                  */
-                var hasAnyLink = false
+                val dash =
+                    runCatching {
+                        info.dashMpdUrl
+                    }.getOrNull()
 
-                val dash = runCatching { info.dashMpdUrl }.getOrNull()
                 if (!dash.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
@@ -2561,32 +2727,31 @@ class YouTubeKids : MainAPI() {
                             url = dash,
                             type = ExtractorLinkType.DASH
                         ) {
-                            referer = "https://www.youtube.com/"
-                            headers = mapOf("User-Agent" to USER_AGENT)
-                            quality = Qualities.Unknown.value
+                            referer =
+                                "https://www.youtube.com/"
+
+                            headers =
+                                mapOf(
+                                    "User-Agent" to
+                                        USER_AGENT
+                                )
+
+                            quality =
+                                Qualities.Unknown.value
                         }
                     )
-                    hasAnyLink = true
-                }
 
-                /*
-                 * Expose individually selectable direct resolutions as well.
-                 * When DASH exists we suppress only the low 360p fallback so it
-                 * cannot mask the adaptive source on a TV/phone source picker.
-                 */
-                val directEmitted = emitYouTubeResolutionStreams(
-                    info = info,
-                    callback = callback,
-                    minimumResolution = if (dash.isNullOrBlank()) 1 else 361
-                )
-                hasAnyLink = hasAnyLink || directEmitted
-
-                if (hasAnyLink) {
                     return true
                 }
 
-                /* VOD -> HLS fallback */
-                val hls = runCatching { info.hlsUrl }.getOrNull()
+                /*
+                 * VOD -> HLS fallback.
+                 */
+                val hls =
+                    runCatching {
+                        info.hlsUrl
+                    }.getOrNull()
+
                 if (!hls.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
@@ -2595,40 +2760,57 @@ class YouTubeKids : MainAPI() {
                             url = hls,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            referer = "https://www.youtube.com/"
-                            headers = mapOf("User-Agent" to USER_AGENT)
-                            quality = Qualities.Unknown.value
+                            referer =
+                                "https://www.youtube.com/"
+
+                            headers =
+                                mapOf(
+                                    "User-Agent" to
+                                        USER_AGENT
+                                )
+
+                            quality =
+                                Qualities.Unknown.value
                         }
                     )
+
                     return true
                 }
             } catch (_: Exception) {
-                /* Try the next URL form or registered CloudStream extractor. */
+                /*
+                 * Continue to the next compatibility path.
+                 */
             }
         }
 
-        /* Final compatibility fallback through CloudStream extractors. */
-        val fallbackUrls = linkedSetOf(
-            canonical,
-            mobileYouTubeUrl(canonical),
-            noCookieYouTubeUrl(canonical),
-            original
-        )
+        /*
+         * ------------------------------------------------------------
+         * PATH 3: REGISTERED CLOUDSTREAM EXTRACTORS
+         * ------------------------------------------------------------
+         */
+        val fallbackUrls =
+            linkedSetOf(
+                canonical,
+                mobileYouTubeUrl(canonical),
+                noCookieYouTubeUrl(canonical),
+                original
+            )
 
         for (videoUrl in fallbackUrls) {
-            var fallbackLinkFound = false
+            var found =
+                false
 
             runCatching {
                 loadExtractor(
                     videoUrl,
                     subtitleCallback
                 ) { link ->
-                    fallbackLinkFound = true
+                    found = true
                     callback(link)
                 }
             }
 
-            if (fallbackLinkFound) {
+            if (found) {
                 return true
             }
         }
@@ -2638,243 +2820,508 @@ class YouTubeKids : MainAPI() {
 
     /*
      * ============================================================
-     * YOUTUBE RESOLUTION / AUDIO TRACK EXTRACTION
+     * INNER TUBE CONFIGURATION
      * ============================================================
-     *
-     * NewPipe separates YouTube's adaptive video streams from audio.
-     *
-     * A video-only VideoStream has no audio. CloudStream, however,
-     * supports attaching separate AudioFile objects to an ExtractorLink.
-     * Therefore each available YouTube video resolution can be exposed
-     * directly while retaining sound.
-     *
-     * Result:
-     *   360p  -> 360p source when available
-     *   480p  -> 480p source when available
-     *   720p  -> 720p source when available
-     *   1080p -> 1080p source when available
-     *   1440p -> 1440p / 2K source when available
-     *   2160p -> 2160p / 4K source when available
-     *   4320p -> 4320p / 8K source when available
-     *
-     * The helper does NOT invent a quality. It only exposes resolutions
-     * that NewPipe actually returned for this specific YouTube video.
      */
 
-    private suspend fun emitYouTubeResolutionStreams(
-        info: StreamInfo,
-        callback: (ExtractorLink) -> Unit,
-        minimumResolution: Int = 1
-    ): Boolean {
+    private suspend fun extractInnerTubeFormats(
+        videoId: String
+    ): InnerTubeResult? {
         /*
-         * NewPipe keeps muxed/progressive video streams and adaptive
-         * video-only streams separately. The old implementation looked
-         * only at videoStreams, which is why CloudStream was seeing the
-         * low-resolution 360p muxed source even when YouTube had
-         * 720p/1080p/1440p/2160p/4320p adaptive variants.
+         * Read the watch page only to obtain the current public InnerTube
+         * key/client version/visitor data. If the page request fails, the
+         * player requests still continue with a keyless/default context.
          */
-        val streams: List<VideoStream> =
-            (
-                runCatching {
-                    info.videoStreams
-                }.getOrDefault(emptyList()) +
-                    runCatching {
-                        info.videoOnlyStreams
-                    }.getOrDefault(emptyList())
+        val page =
+            runCatching {
+                app.get(
+                    "https://www.youtube.com/watch?v=$videoId",
+                    headers =
+                        mapOf(
+                            "User-Agent" to
+                                WEB_USER_AGENT,
+                            "Accept-Language" to
+                                "en-US,en;q=0.9"
+                        )
+                ).text
+            }.getOrNull()
+
+        val apiKey =
+            page?.let {
+                extractQuotedPageValue(
+                    html = it,
+                    key = "INNERTUBE_API_KEY"
+                )
+            }
+
+        val webVersion =
+            page?.let {
+                extractQuotedPageValue(
+                    html = it,
+                    key = "INNERTUBE_CLIENT_VERSION"
+                )
+            }
+                ?: "2.20260101.00.00"
+
+        val visitorData =
+            page?.let {
+                extractQuotedPageValue(
+                    html = it,
+                    key = "VISITOR_DATA"
+                )
+            }
+
+
+        val clients =
+            listOf(
+                InnerTubeClient(
+                    name = "WEB_EMBEDDED_PLAYER",
+                    version = webVersion,
+                    userAgent = WEB_USER_AGENT,
+                    isEmbedded = true
+                ),
+                InnerTubeClient(
+                    name = "TVHTML5",
+                    version = "7.20250129.15.00",
+                    userAgent = TVHTML5_USER_AGENT
+                ),
+                InnerTubeClient(
+                    name = "WEB",
+                    version = webVersion,
+                    userAgent = WEB_USER_AGENT
+                ),
+                InnerTubeClient(
+                    name = "ANDROID",
+                    version = "21.08.266",
+                    userAgent =
+                        "com.google.android.youtube/21.08.266 " +
+                            "(Linux; U; Android 11) gzip"
+                )
             )
-                .distinctBy { stream ->
-                    Triple(
-                        stream.content.trim(),
-                        stream.resolution,
-                        runCatching {
-                            stream.isVideoOnly
-                        }.getOrDefault(false)
+
+        val videoCandidates =
+            mutableListOf<InnerTubeVideoCandidate>()
+
+        val audioCandidates =
+            mutableListOf<InnerTubeAudioCandidate>()
+
+        var dashManifestUrl:
+            String? = null
+
+        var hadResponse =
+            false
+
+        for (client in clients) {
+            val result =
+                runCatching {
+                    requestInnerTubePlayer(
+                        videoId = videoId,
+                        apiKey = apiKey,
+                        visitorData = visitorData,
+                        client = client
+                    )
+                }.getOrNull()
+                    ?: continue
+
+            hadResponse =
+                hadResponse || result.hadResponse
+
+            videoCandidates.addAll(
+                result.videoCandidates
+            )
+
+            audioCandidates.addAll(
+                result.audioCandidates
+            )
+
+            if (
+                dashManifestUrl.isNullOrBlank() &&
+                !result.dashManifestUrl.isNullOrBlank()
+            ) {
+                dashManifestUrl =
+                    result.dashManifestUrl
+            }
+
+            /*
+             * Do not stop after 1080p. Different InnerTube clients can
+             * expose different adaptive representations. All client
+             * responses are therefore merged before publishing sources.
+             */
+        }
+
+        if (
+            !hadResponse &&
+            videoCandidates.isEmpty() &&
+            audioCandidates.isEmpty()
+        ) {
+            return null
+        }
+
+        return InnerTubeResult(
+            videoCandidates =
+                videoCandidates
+                    .distinctBy {
+                        Triple(
+                            it.url,
+                            it.height,
+                            it.hasAudio
+                        )
+                    },
+            audioCandidates =
+                audioCandidates
+                    .distinctBy {
+                        it.url
+                    },
+            dashManifestUrl =
+                dashManifestUrl,
+            hadResponse =
+                hadResponse
+        )
+    }
+
+    private suspend fun requestInnerTubePlayer(
+        videoId: String,
+        apiKey: String?,
+        visitorData: String?,
+        client: InnerTubeClient
+    ): InnerTubeResult {
+        val endpoint =
+            buildString {
+                append(
+                    "https://www.youtube.com/youtubei/v1/player"
+                )
+                append(
+                    "?prettyPrint=false"
+                )
+
+                if (!apiKey.isNullOrBlank()) {
+                    append(
+                        "&key="
+                    )
+                    append(
+                        java.net.URLEncoder.encode(
+                            apiKey,
+                            "UTF-8"
+                        )
                     )
                 }
+            }
 
-        if (streams.isEmpty()) {
+        val visitorPart =
+            if (!visitorData.isNullOrBlank()) {
+                ",\"visitorData\":\"${escapeJson(visitorData)}\""
+            } else {
+                ""
+            }
+
+        val embeddedPart =
+            if (client.isEmbedded) {
+                ",\"clientScreen\":\"EMBED\""
+            } else {
+                ""
+            }
+
+        val thirdPartyPart =
+            if (client.isEmbedded) {
+                ",\"thirdParty\":{\"embedUrl\":\"https://www.youtube.com/embed/$videoId\"}"
+            } else {
+                ""
+            }
+
+        val payload =
+            """
+            {
+              "context": {
+                "client": {
+                  "hl": "en",
+                  "gl": "IN",
+                  "clientName": "${escapeJson(client.name)}",
+                  "clientVersion": "${escapeJson(client.version)}"$embeddedPart$visitorPart
+                }$thirdPartyPart
+              },
+              "videoId": "${escapeJson(videoId)}",
+              "contentCheckOk": true,
+              "racyCheckOk": true,
+              "playbackContext": {
+                "contentPlaybackContext": {
+                  "html5Preference": "HTML5_PREF_WANTS"
+                }
+              }
+            }
+            """.trimIndent()
+
+        val body =
+            payload.toRequestBody(
+                RequestBodyTypes.JSON
+                    .toMediaTypeOrNull()
+            )
+
+        val response =
+            app.post(
+                endpoint,
+                requestBody = body,
+                headers =
+                    mapOf(
+                        "Content-Type" to
+                            "application/json",
+                        "User-Agent" to
+                            client.userAgent,
+                        "Accept-Language" to
+                            "en-US,en;q=0.9",
+                        "Origin" to
+                            "https://www.youtube.com",
+                        "Referer" to
+                            "https://www.youtube.com/"
+                    )
+            )
+
+        val parsed =
+            runCatching {
+                response.parsedSafe<InnerTubePlayerResponse>()
+            }.getOrNull()
+
+        val streamingData =
+            parsed?.streamingData
+                ?: return InnerTubeResult(
+                    videoCandidates = emptyList(),
+                    audioCandidates = emptyList(),
+                    dashManifestUrl = null,
+                    hadResponse = true
+                )
+
+        val videoCandidates =
+            mutableListOf<InnerTubeVideoCandidate>()
+
+        val audioCandidates =
+            mutableListOf<InnerTubeAudioCandidate>()
+
+        fun consumeFormats(
+            formats: List<InnerTubeFormat>?
+        ) {
+            for (item in formats.orEmpty()) {
+                val url =
+                    item.url
+                        ?.trim()
+                        .orEmpty()
+
+                if (
+                    url.isBlank() ||
+                    !url.startsWith(
+                        "http",
+                        ignoreCase = true
+                    )
+                ) {
+                    continue
+                }
+
+                val mimeType =
+                    item.mimeType
+                        ?.trim()
+                        .orEmpty()
+
+                val bitrate =
+                    item.bitrate
+                        ?: 0
+
+                val height =
+                    item.height
+                        ?: 0
+
+                if (
+                    mimeType.startsWith(
+                        "audio/",
+                        ignoreCase = true
+                    )
+                ) {
+                    audioCandidates.add(
+                        InnerTubeAudioCandidate(
+                            url = url,
+                            bitrate = bitrate,
+                            userAgent =
+                                client.userAgent
+                        )
+                    )
+                    continue
+                }
+
+                if (
+                    !mimeType.startsWith(
+                        "video/",
+                        ignoreCase = true
+                    ) ||
+                    height <= 0
+                ) {
+                    continue
+                }
+
+                val codecs =
+                    mimeType
+                        .substringAfter(
+                            "codecs=",
+                            ""
+                        )
+                        .lowercase()
+
+                val hasAudio =
+                    codecs.contains(
+                        "mp4a"
+                    ) ||
+                        codecs.contains(
+                            "opus"
+                        ) ||
+                        codecs.contains(
+                            "vorbis"
+                        )
+
+                videoCandidates.add(
+                    InnerTubeVideoCandidate(
+                        url = url,
+                        height = height,
+                        bitrate = bitrate,
+                        hasAudio = hasAudio,
+                        userAgent =
+                            client.userAgent,
+                        clientName =
+                            client.name
+                    )
+                )
+            }
+        }
+
+        consumeFormats(
+            streamingData.formats
+        )
+
+        consumeFormats(
+            streamingData.adaptiveFormats
+        )
+
+        return InnerTubeResult(
+            videoCandidates =
+                videoCandidates,
+            audioCandidates =
+                audioCandidates,
+            dashManifestUrl =
+                streamingData.dashManifestUrl
+                    ?.trim()
+                    ?.ifBlank {
+                        null
+                    },
+            hadResponse =
+                true
+        )
+    }
+
+    /*
+     * ============================================================
+     * PUBLISH INNER TUBE SOURCES
+     * ============================================================
+     */
+
+    private suspend fun emitInnerTubeResolutionSources(
+        result: InnerTubeResult,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (
+            result.videoCandidates.isEmpty() &&
+            result.dashManifestUrl.isNullOrBlank()
+        ) {
             return false
         }
 
-        data class ResolutionCandidate(
-            val stream: VideoStream,
-            val resolution: Int,
-            val hasAudio: Boolean,
-            val bitrate: Int
-        )
-
         /*
-         * Build the separate audio track list once.
-         *
-         * newAudioFile(url) is enough for CloudStream to know how to
-         * load the audio source. We deliberately avoid adding optional
-         * metadata here so this stays compatible with the broadest
-         * range of CloudStream AudioFile implementations.
+         * Build audio tracks once, preferring the highest bitrate URL
+         * per exact URL and limiting duplicates.
          */
-        val audioTracks = mutableListOf<AudioFile>()
+        val audioFiles =
+            result.audioCandidates
+                .asSequence()
+                .sortedByDescending {
+                    it.bitrate
+                }
+                .distinctBy {
+                    it.url
+                }
+                .mapNotNull {
+                    runCatching {
+                        newAudioFile(
+                            it.url
+                        )
+                    }.getOrNull()
+                }
+                .toList()
 
-        for (audio in runCatching { info.audioStreams }.getOrDefault(emptyList())) {
-            val url =
-                runCatching {
-                    if (audio.isUrl) audio.content else ""
-                }.getOrNull()
-                    ?.trim()
-                    .orEmpty()
+        val bestPerHeight =
+            result.videoCandidates
+                .asSequence()
+                .filter {
+                    it.height > 0
+                }
+                .groupBy {
+                    it.height
+                }
+                .mapNotNull { (height, sameHeight) ->
+                    sameHeight
+                        .sortedWith(
+                            compareByDescending<InnerTubeVideoCandidate> {
+                                it.hasAudio
+                            }
+                                .thenByDescending {
+                                    it.bitrate
+                                }
+                        )
+                        .firstOrNull()
+                        ?.let {
+                            height to it
+                        }
+                }
+                .sortedBy {
+                    it.first
+                }
+                .toList()
 
+        var emitted =
+            false
+
+        for ((height, candidate) in bestPerHeight) {
+            /*
+             * A video-only format must have a usable audio stream.
+             * Muxed formats work without one.
+             */
             if (
-                url.isBlank() ||
-                !url.startsWith(
-                    "http",
-                    ignoreCase = true
-                )
+                !candidate.hasAudio &&
+                audioFiles.isEmpty()
             ) {
                 continue
             }
 
-            try {
-                val audioFile = newAudioFile(url)
-                if (audioTracks.none { it.url == audioFile.url }) {
-                    audioTracks.add(audioFile)
+            val label =
+                when {
+                    height >= 4320 ->
+                        "8K (${height}p)"
+
+                    height >= 2160 ->
+                        "4K (${height}p)"
+
+                    height >= 1440 ->
+                        "2K (${height}p)"
+
+                    else ->
+                        "${height}p"
                 }
-            } catch (_: Exception) {
-                // Ignore an invalid audio variant and keep the remaining ones.
-            }
-        }
 
-        val candidates =
-            streams
-                .asSequence()
-                .mapNotNull { stream ->
-                    val url =
-                        runCatching {
-                            stream.content
-                        }.getOrNull()
-                            ?.trim()
-                            .orEmpty()
-
-                    if (
-                        !stream.isUrl ||
-                        url.isBlank() ||
-                        !url.startsWith(
-                            "http",
-                            ignoreCase = true
-                        )
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val height =
-                        runCatching {
-                            stream.height
-                        }.getOrDefault(0)
-
-                    val resolution =
-                        if (height > 0) {
-                            height
-                        } else {
-                            parseResolution(
-                                stream.resolution
-                            )
-                        }
-
-                    if (resolution < minimumResolution || resolution <= 0) {
-                        return@mapNotNull null
-                    }
-
-                    val isVideoOnly =
-                        runCatching {
-                            stream.isVideoOnly
-                        }.getOrDefault(false)
-
-                    /*
-                     * A video-only stream is useful only when we have at
-                     * least one separate audio source to merge into it.
-                     */
-                    if (
-                        isVideoOnly &&
-                        audioTracks.isEmpty()
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val bitrate =
-                        runCatching {
-                            stream.bitrate
-                        }.getOrDefault(0)
-
-                    ResolutionCandidate(
-                        stream = stream,
-                        resolution = resolution,
-                        hasAudio = !isVideoOnly,
-                        bitrate = bitrate
-                    )
+            val fullName =
+                if (candidate.hasAudio) {
+                    "$name $label"
+                } else {
+                    "$name $label Adaptive"
                 }
-                .distinctBy { candidate ->
-                    Triple(
-                        candidate.resolution,
-                        candidate.hasAudio,
-                        candidate.stream.content.trim()
-                    )
-                }
-                .groupBy {
-                    it.resolution
-                }
-                .mapNotNull { (resolution, sameResolution) ->
-                    /*
-                     * Prefer a muxed stream when it exists at the same
-                     * resolution because it needs no audio merge.
-                     *
-                     * Otherwise choose the highest-bitrate video-only
-                     * stream. This is especially important for 1080p,
-                     * 1440p, 2160p and 4320p where YouTube commonly
-                     * provides adaptive video-only variants.
-                     */
-                    sameResolution
-                        .sortedWith(
-                            compareByDescending<ResolutionCandidate> {
-                                it.hasAudio
-                            }.thenByDescending {
-                                it.bitrate
-                            }
-                        )
-                        .firstOrNull()
-                }
-                .sortedByDescending {
-                    it.resolution
-                }
-                .toList()
-
-        if (candidates.isEmpty()) {
-            return false
-        }
-
-        var emittedCount = 0
-
-        for (candidate in candidates) {
-            val stream =
-                candidate.stream
-
-            val resolution =
-                candidate.resolution
-
-            val url =
-                stream.content
-                    .trim()
-
-            val isVideoOnly =
-                !candidate.hasAudio
-
-            val linkName =
-                buildYouTubeQualityName(
-                    resolution = resolution,
-                    isVideoOnly = isVideoOnly
-                )
 
             callback(
                 newExtractorLink(
                     source = name,
-                    name = "$name $linkName",
-                    url = url,
+                    name = fullName,
+                    url = candidate.url,
                     type = ExtractorLinkType.VIDEO
                 ) {
                     referer =
@@ -2883,159 +3330,117 @@ class YouTubeKids : MainAPI() {
                     headers =
                         mapOf(
                             "User-Agent" to
-                                USER_AGENT
+                                candidate.userAgent
                         )
 
                     quality =
-                        resolution
+                        height
 
-                    if (isVideoOnly) {
+                    if (!candidate.hasAudio) {
                         this.audioTracks =
-                            audioTracks
+                            audioFiles
                     }
                 }
             )
 
-            emittedCount++
+            emitted =
+                true
         }
 
-        return emittedCount > 0
-    }
-
-    private fun buildYouTubeQualityName(
-        resolution: Int,
-        isVideoOnly: Boolean
-    ): String {
-        val label =
-            when {
-                resolution >= 4320 -> "8K (${resolution}p)"
-                resolution >= 2160 -> "4K (${resolution}p)"
-                resolution >= 1440 -> "2K (${resolution}p)"
-                else -> "${resolution}p"
-            }
-
-        return if (isVideoOnly) {
-            "$label Adaptive"
-        } else {
-            label
-        }
-    }
-
         /*
-     * ============================================================
-     * PROGRESSIVE / MUXED VIDEO STREAM EXTRACTION
-     * ============================================================
-     *
-     * NewPipe's VideoStream model exposes the media URL/content,
-     * resolution and video-only flag directly. This implementation
-     * uses the typed API instead of reflection, so Kotlin nullability
-     * inference cannot degrade the stream object to Any?.
-     *
-     * A muxed progressive stream already contains audio + video and
-     * is therefore the simplest possible input for ExoPlayer.
-     */
-
-    private suspend fun emitProgressiveVideoStreams(
-        info: StreamInfo,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        /*
-         * NewPipe exposes normal video streams through getVideoStreams().
-         * VideoStream entries marked video-only are skipped because a
-         * single VIDEO link must already contain the audio track.
+         * If InnerTube supplied a valid adaptive manifest but direct URLs
+         * were not exposed, keep the DASH source as a final adaptive path.
          */
-        val streams: List<VideoStream> =
-            runCatching {
-                info.videoStreams
-            }.getOrDefault(emptyList())
+        if (
+            !emitted &&
+            !result.dashManifestUrl.isNullOrBlank()
+        ) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "$name Adaptive (YouTube)",
+                    url =
+                        result.dashManifestUrl,
+                    type = ExtractorLinkType.DASH
+                ) {
+                    referer =
+                        "https://www.youtube.com/"
 
-        if (streams.isEmpty()) {
-            return false
-        }
-
-        data class Candidate(
-            val url: String,
-            val resolution: Int
-        )
-
-        val candidates =
-            streams
-                .asSequence()
-                .filter { stream ->
-                    stream.isUrl &&
-                        !stream.isVideoOnly &&
-                        stream.content.isNotBlank() &&
-                        stream.content.startsWith(
-                            "http",
-                            ignoreCase = true
+                    headers =
+                        mapOf(
+                            "User-Agent" to
+                                WEB_USER_AGENT
                         )
-                }
-                .map { stream ->
-                    Candidate(
-                        url = stream.content.trim(),
-                        resolution = parseResolution(
-                            stream.resolution
-                        )
-                    )
-                }
-                .distinctBy { it.url }
-                .sortedByDescending { it.resolution }
-                .toList()
 
-        if (candidates.isEmpty()) {
-            return false
-        }
-
-        // If this fallback is reached, still use the highest muxed
-        // progressive stream available; never deliberately choose 320p.
-        val preferred =
-            candidates.first()
-
-        callback(
-            newExtractorLink(
-                source = name,
-                name =
-                    if (preferred.resolution > 0) {
-                        "$name ${preferred.resolution}p"
-                    } else {
-                        "$name Direct"
-                    },
-                url = preferred.url,
-                type = ExtractorLinkType.VIDEO
-            ) {
-                referer =
-                    "https://www.youtube.com/"
-
-                headers =
-                    mapOf(
-                        "User-Agent" to USER_AGENT
-                    )
-
-                quality =
-                    if (preferred.resolution > 0) {
-                        preferred.resolution
-                    } else {
+                    quality =
                         Qualities.Unknown.value
-                    }
-            }
-        )
+                }
+            )
 
-        return true
+            emitted =
+                true
+        }
+
+        return emitted
     }
 
-    private fun parseResolution(
+    private fun escapeJson(
         value: String
-    ): Int {
-        val match =
-            Regex(
-                "(\\d{3,4})"
-            ).find(value)
+    ): String {
+        return buildString {
+            for (char in value) {
+                when (char) {
+                    '\\' ->
+                        append("\\\\")
+                    '"' ->
+                        append("\\\"")
+                    '\n' ->
+                        append("\\n")
+                    '\r' ->
+                        append("\\r")
+                    '\t' ->
+                        append("\\t")
+                    else ->
+                        append(char)
+                }
+            }
+        }
+    }
 
-        return match
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
-            ?: 0
+    private fun extractQuotedPageValue(
+        html: String,
+        key: String
+    ): String? {
+        val patterns =
+            listOf(
+                Regex(
+                    "\"$key\"\\s*:\\s*\"([^\"]+)\""
+                ),
+                Regex(
+                    "\\\"$key\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+                ),
+                Regex(
+                    "$key\\s*:\\s*\"([^\"]+)\""
+                )
+            )
+
+        for (pattern in patterns) {
+            val value =
+                pattern
+                    .find(html)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.trim()
+                    ?.takeIf {
+                        it.isNotBlank()
+                    }
+
+            if (value != null) {
+                return value
+            }
+        }
+
+        return null
     }
 
     /*
