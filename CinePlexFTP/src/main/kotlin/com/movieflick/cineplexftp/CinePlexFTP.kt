@@ -494,30 +494,30 @@ class CinePlexFTP : MainAPI() {
             )
         }
 
-        val document = getDocument(url)
+        val detailUrl = normalizeContentUrl(url)
+        val document = getDocument(detailUrl)
 
         if (document == null) {
             return newMovieLoadResponse(
                 titleFromUrl(url),
-                url,
-                TvType.Movie,
-                url
+                detailUrl,
+                if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
+                detailUrl
             )
         }
 
         val title = extractPageTitle(document)
             .ifBlank { titleFromUrl(url) }
 
-        val poster = extractPoster(document, url)
+        val poster = extractPoster(document, detailUrl)
         val series = isSeriesUrl(url) || looksLikeSeriesPage(document)
 
         if (series) {
-            val episodes = parseEpisodes(document, url)
-
+            val episodes = parseEpisodes(document, detailUrl)
             if (episodes.isNotEmpty()) {
                 return newTvSeriesLoadResponse(
                     title,
-                    url,
+                    detailUrl,
                     TvType.TvSeries,
                     episodes
                 ) {
@@ -527,17 +527,19 @@ class CinePlexFTP : MainAPI() {
         }
 
         /*
-         * Keep the watch page as the canonical data.
-         *
-         * Playback is resolved at Play time by loadLinks(), which fetches
-         * the same page and extracts the exact media URL currently published
-         * inside <source src="..."> / <video> / player metadata.
+         * IMPORTANT:
+         * A Cine Plex All Movies card normally points to view.php?id=...
+         * The actual full movie player is player.php?id=... .
+         * Keep the detail page for metadata, but hand the player page to
+         * loadLinks() as the canonical playback data.
          */
+        val playbackUrl = toPlayerUrl(detailUrl) ?: detailUrl
+
         return newMovieLoadResponse(
             title,
-            url,
+            detailUrl,
             if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
-            url
+            playbackUrl
         ) {
             posterUrl = poster
         }
@@ -553,124 +555,156 @@ class CinePlexFTP : MainAPI() {
         if (input.isBlank()) return false
 
         if (isMediaUrl(input)) {
+            if (!isCinePlexFullMediaUrl(input)) return false
             emitMediaLink(input, callback)
             return true
         }
 
         /*
-         * The Cine Plex player does not permanently expose the final movie
-         * file in the page URL. It generates a signed videoSrc URL containing
-         * md5 + expires. We therefore resolve it only when Play is pressed.
-         *
-         * We try twice so a stale/cached player response can immediately be
-         * replaced by a fresh token.
+         * ALWAYS resolve through the real Cine Plex player page.
+         * This is critical for All Movies because those cards commonly use
+         * view.php?id=..., while the full movie source lives in player.php.
          */
-        var resolvedPlayerUrl: String? = null
-
-        for (attempt in 0 until 2) {
-            val response = runCatching {
-                app.get(
-                    input,
-                    headers = pageHeaders(input) + mapOf(
-                        "Cache-Control" to "no-cache, no-store, max-age=0",
-                        "Pragma" to "no-cache"
-                    )
+        val playerUrl = toPlayerUrl(input) ?: input
+        val response = runCatching {
+            app.get(
+                playerUrl,
+                headers = pageHeaders(playerUrl) + mapOf(
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache"
                 )
-            }.getOrNull()
-
-            if (response != null) {
-                val playerSources = extractPlayerVideoSrcCandidates(
-                    response.text,
-                    input
-                )
-
-                val bestPlayer = playerSources
-                    .filter { isMediaUrl(it) }
-                    .maxByOrNull { playerMediaScore(it) }
-
-                if (bestPlayer != null) {
-                    resolvedPlayerUrl = bestPlayer
-                    break
-                }
-
-                /*
-                 * Fallback only after checking videoSrc. This prevents a
-                 * generic preview/clip <video> source from winning over the
-                 * site's real movie source.
-                 */
-                val direct = extractMediaUrls(
-                    response.document,
-                    response.text,
-                    input
-                )
-                    .distinct()
-                    .maxByOrNull { playerMediaScore(it) }
-
-                if (direct != null) {
-                    resolvedPlayerUrl = direct
-                    break
-                }
-            }
-
-            /*
-             * Give the next attempt a fresh HTTP request. The page itself
-             * controls md5/expires, so the provider never invents a token.
-             */
-            if (attempt == 0) continue
-        }
-
-        if (resolvedPlayerUrl != null) {
-            emitMediaLink(
-                resolvedPlayerUrl!!,
-                callback
             )
+        }.getOrNull() ?: return false
+
+        /*
+         * PRIMARY SOURCE ONLY:
+         * Cine Plex exposes the complete movie as `const videoSrc = ...`
+         * on its own player page. We take that exact URL, including md5 and
+         * expires. A fresh request is made on every Play, so a changed token
+         * is automatically picked up.
+         */
+        val playerCandidates = extractPlayerVideoSrcCandidates(
+            response.text,
+            playerUrl
+        )
+            .filter { isCinePlexFullMediaUrl(it) }
+            .sortedByDescending { playerMediaScore(it) }
+
+        val bestPlayerSource = playerCandidates.firstOrNull()
+        if (bestPlayerSource != null) {
+            emitMediaLink(bestPlayerSource, callback)
             return true
         }
 
         /*
-         * External iframe fallback.
+         * SECONDARY SOURCE:
+         * Some Cine Plex player revisions place the same full source directly
+         * in <video>/<source> or player metadata. Only Cine Plex /v/m/ or
+         * Cine Plex VOD media is accepted. YouTube, trailers, previews and
+         * unrelated embeds are deliberately rejected.
          */
-        val iframeResponse = runCatching {
+        val directSources = extractMediaUrls(
+            response.document,
+            response.text,
+            playerUrl
+        )
+            .filter { isCinePlexFullMediaUrl(it) }
+            .sortedByDescending { playerMediaScore(it) }
+
+        val bestDirectSource = directSources.firstOrNull()
+        if (bestDirectSource != null) {
+            emitMediaLink(bestDirectSource, callback)
+            return true
+        }
+
+        /*
+         * One forced fresh reload. This handles cases where the first response
+         * was cached upstream or returned an already-expired signed token.
+         */
+        val retryResponse = runCatching {
             app.get(
-                input,
-                headers = pageHeaders(input)
+                playerUrl,
+                headers = pageHeaders(playerUrl) + mapOf(
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache",
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
             )
         }.getOrNull() ?: return false
 
-        val iframes = iframeResponse.document
-            .select("iframe[src], iframe[data-src]")
-            .mapNotNull { iframe ->
-                iframe.attr("src")
-                    .ifBlank { iframe.attr("data-src") }
-                    .trim()
-                    .takeIf { it.isNotBlank() }
-                    ?.let { absoluteUrl(it, input) }
-            }
-            .distinct()
+        val retrySource = extractPlayerVideoSrcCandidates(
+            retryResponse.text,
+            playerUrl
+        )
+            .filter { isCinePlexFullMediaUrl(it) }
+            .sortedByDescending { playerMediaScore(it) }
+            .firstOrNull()
 
-        for (iframe in iframes) {
-            val extracted = runCatching {
-                loadExtractor(
-                    iframe,
-                    subtitleCallback,
-                    callback
-                )
-            }.getOrDefault(false)
-
-            if (extracted) return true
+        if (retrySource != null) {
+            emitMediaLink(retrySource, callback)
+            return true
         }
 
+        /*
+         * DO NOT fall back to external iframes here.
+         * Cine Plex pages may contain YouTube trailers, and CloudStream
+         * extractors would otherwise expose those trailers as playable links.
+         */
         return false
+    }
+
+    private fun normalizeContentUrl(url: String): String {
+        val cleaned = cleanUrl(url)
+        if (cleaned.isBlank()) return cleaned
+        return if (
+            cleaned.contains("view.php?id=", true) ||
+            cleaned.contains("details.php?id=", true) ||
+            cleaned.contains("movie.php?id=", true)
+        ) {
+            cleaned
+        } else {
+            cleaned
+        }
+    }
+
+    private fun toPlayerUrl(url: String): String? {
+        val cleaned = cleanUrl(url)
+        if (cleaned.isBlank()) return null
+        if (cleaned.contains("player.php", true)) return cleaned
+
+        val uri = runCatching { URI(cleaned) }.getOrNull() ?: return null
+        val query = uri.rawQuery.orEmpty()
+        if (query.isBlank()) return null
+
+        val id = query.split('&')
+            .firstOrNull {
+                it.substringBefore('=').equals("id", true)
+            }
+            ?.substringAfter('=', "")
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        val h = query.split('&')
+            .firstOrNull {
+                it.substringBefore('=').equals("h", true)
+            }
+            ?.substringAfter('=', "")
+            ?.takeIf { it.isNotBlank() }
+
+        val scheme = uri.scheme?.takeIf { it.isNotBlank() } ?: "http"
+        val host = uri.host?.takeIf { it.isNotBlank() } ?: URI(mainUrl).host
+        val base = "$scheme://$host"
+
+        return "$base/player.php?id=$id" + if (h != null) "&h=$h" else ""
     }
 
     private fun extractPlayerVideoSrc(
         html: String,
         baseUrl: String
     ): String? {
-        return extractPlayerVideoSrcCandidates(
-            html,
-            baseUrl
-        ).maxByOrNull { playerMediaScore(it) }
+        return extractPlayerVideoSrcCandidates(html, baseUrl)
+            .filter { isCinePlexFullMediaUrl(it) }
+            .maxByOrNull { playerMediaScore(it) }
     }
 
     private fun extractPlayerVideoSrcCandidates(
@@ -678,30 +712,25 @@ class CinePlexFTP : MainAPI() {
         baseUrl: String
     ): List<String> {
         val cleaned = html
-            .replace("\\/","/")
+            .replace("\\/", "/")
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
 
-        val patterns = listOf(
-            Regex("""(?is)\\b(?:const|let|var)?\\s*videoSrc\\s*=\\s*["']([^"']+)["']"""),
-            Regex("""(?is)["']videoSrc["']?\\s*[:=]\\s*["']([^"']+)["']"""),
-            Regex("""(?is)\\bvideoSrc\\s*\\+=\\s*["']([^"']+)["']""")
-        )
-
         val found = linkedSetOf<String>()
+
+        val patterns = listOf(
+            Regex("""(?is)\b(?:const|let|var)?\s*videoSrc\s*=\s*[\"']([^\"']+)[\"']"""),
+            Regex("""(?is)[\"']videoSrc[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']"""),
+            Regex("""(?is)\bvideoSrc\s*\+=\s*[\"']([^\"']+)[\"']""")
+        )
 
         for (pattern in patterns) {
             pattern.findAll(cleaned).forEach { match ->
-                val raw = match.groupValues
-                    .getOrNull(1)
-                    ?.trim()
-                    .orEmpty()
-
+                val raw = match.groupValues.getOrNull(1)?.trim().orEmpty()
                 if (raw.isBlank()) return@forEach
 
                 val resolved = absoluteUrl(raw, baseUrl)
-
-                if (isMediaUrl(resolved)) {
+                if (isCinePlexFullMediaUrl(resolved)) {
                     found.add(resolved)
                 }
             }
@@ -710,103 +739,54 @@ class CinePlexFTP : MainAPI() {
         return found.toList()
     }
 
+    private fun isCinePlexFullMediaUrl(url: String): Boolean {
+        val cleaned = cleanUrl(url)
+        if (!isMediaUrl(cleaned)) return false
+
+        val uri = runCatching { URI(cleaned) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
+        val path = uri.path?.lowercase(Locale.ROOT).orEmpty()
+
+        if (host == "youtube.com" ||
+            host.endsWith(".youtube.com") ||
+            host == "youtu.be" ||
+            host.endsWith(".youtu.be")) {
+            return false
+        }
+
+        val cineplexHost = host == "cineplexbd.net" ||
+            host.endsWith(".cineplexbd.net")
+
+        if (!cineplexHost) return false
+
+        /* The verified full-movie player path is /v/m/. */
+        return path.startsWith("/v/m/") ||
+            host == "vod.cineplexbd.net"
+    }
+
     private fun playerMediaScore(url: String): Int {
         val lower = url.lowercase(Locale.ROOT)
         var score = 0
 
-        /*
-         * Prefer complete movie sources over preview/clip-like URLs.
-         */
-        if ("preview" in lower) score -= 100
-        if ("trailer" in lower) score -= 100
-        if ("sample" in lower) score -= 80
-        if ("clip" in lower) score -= 80
-        if ("teaser" in lower) score -= 80
+        if ("preview" in lower) score -= 1000
+        if ("trailer" in lower) score -= 1000
+        if ("sample" in lower) score -= 900
+        if ("clip" in lower) score -= 900
+        if ("teaser" in lower) score -= 900
 
-        /*
-         * The Cine Plex player uses /v/m/ for its actual movie stream.
-         */
-        if ("/v/m/" in lower) score += 200
+        if ("/v/m/" in lower) score += 1000
+        if ("/movies/" in lower) score += 250
+        if ("md5=" in lower) score += 100
+        if ("expires=" in lower) score += 100
 
-        /*
-         * Preserve a real signed URL. Do not remove md5/expires parameters.
-         */
-        if ("md5=" in lower) score += 40
-        if ("expires=" in lower) score += 40
-
-        if (lower.contains("1080")) score += 20
-        else if (lower.contains("720")) score += 15
+        if (lower.contains("2160") || lower.contains("4k")) score += 40
+        else if (lower.contains("1440")) score += 35
+        else if (lower.contains("1080")) score += 30
+        else if (lower.contains("720")) score += 20
         else if (lower.contains("480")) score += 10
 
-        /*
-         * A longer file path generally represents the complete named source
-         * rather than a tiny preview asset.
-         */
-        score += minOf(url.length / 25, 20)
-
+        score += minOf(url.length / 20, 30)
         return score
-    }
-
-    /*
-     * Emits a native CloudStream media source.
-     *
-     * No forced HTTP->HTTPS rewrite.
-     * No artificial Range header.
-     * No CORS/Sec-Fetch headers.
-     *
-     * The player itself handles the HTTP media request and byte-range
-     * negotiation.
-     */
-    private suspend fun emitMediaLink(
-        mediaUrl: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val type = when {
-            mediaUrl.contains(".m3u8", true) ->
-                ExtractorLinkType.M3U8
-
-            mediaUrl.contains(".mpd", true) ->
-                ExtractorLinkType.DASH
-
-            else ->
-                ExtractorLinkType.VIDEO
-        }
-
-        val lower = mediaUrl.lowercase(Locale.ROOT)
-
-        val quality = when {
-            "2160" in lower || "4k" in lower ->
-                Qualities.P2160.value
-
-            "1440" in lower ->
-                Qualities.P1440.value
-
-            "1080" in lower ->
-                Qualities.P1080.value
-
-            "720" in lower ->
-                Qualities.P720.value
-
-            "480" in lower ->
-                Qualities.P480.value
-
-            "360" in lower ->
-                Qualities.P360.value
-
-            else ->
-                Qualities.Unknown.value
-        }
-
-        callback(
-            newExtractorLink(
-                source = name,
-                name = "Cine Plex Direct",
-                url = mediaUrl,
-                type = type
-            ) {
-                this.quality = quality
-            }
-        )
     }
 
     private fun extractDirectMediaFromDownloads(
@@ -929,7 +909,7 @@ class CinePlexFTP : MainAPI() {
              */
             val fixed = absoluteUrl(value, baseUrl)
 
-            if (isMediaUrl(fixed)) {
+            if (isCinePlexFullMediaUrl(fixed)) {
                 found.add(fixed)
             }
         }
