@@ -23,7 +23,7 @@ class YouTubeKids : MainAPI() {
 
     override var mainUrl = "https://www.youtube.com"
     override var name = "YouTube Kids"
-    override var lang = "bn"
+    override var lang = "bn-IN"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -67,7 +67,7 @@ class YouTubeKids : MainAPI() {
         const val FAST_VISIBLE_COUNT = 6
 
         // Full background snapshot.
-        const val HOME_CACHE_LIMIT = 40
+        const val HOME_CACHE_LIMIT = 35
 
         // Cache freshness.
         const val CACHE_TTL_MS = 15 * 60 * 1000L
@@ -440,26 +440,30 @@ class YouTubeKids : MainAPI() {
     init {
         if (PREWARM_STARTED.compareAndSet(false, true)) {
             backgroundScope.launch {
+                val sections = sectionQueries.keys.toList()
 
-                coroutineScope {
-
-                    listOf(
-                        "recommended",
-                        "bangla",
-                        "learning"
-                    ).map { section ->
-
-                        async(Dispatchers.IO) {
-                            runCatching {
-                                buildSection(
-                                    section = section,
-                                    fastMode = true,
-                                    forceRefresh = true
-                                )
+                /*
+                 * Prewarm every section in small background batches.
+                 * The first visible screen is NOT blocked by this work.
+                 */
+                for (batch in sections.chunked(2)) {
+                    coroutineScope {
+                        batch.map { section ->
+                            async(Dispatchers.IO) {
+                                runCatching {
+                                    buildSection(
+                                        section = section,
+                                        fastMode = false,
+                                        forceRefresh = true
+                                    )
+                                }
                             }
-                        }
+                        }.awaitAll()
+                    }
 
-                    }.awaitAll()
+                    // Yield between batches so background work does not
+                    // monopolize the IO dispatcher.
+                    kotlinx.coroutines.yield()
                 }
             }
         }
@@ -570,78 +574,27 @@ class YouTubeKids : MainAPI() {
             return emptyList()
         }
 
+        /*
+         * FAST PATH:
+         * Only two queries are launched in parallel.
+         * The caller limits the visible result set to six items.
+         */
         if (fastMode) {
-
             val firstQueries =
                 cleanQueries.take(2)
 
             return withTimeoutOrNull(
                 FAST_TOTAL_TIMEOUT_MS
             ) {
-
                 coroutineScope {
-
-                    firstQueries
-                        .map { query ->
-
-                            async(Dispatchers.IO) {
-
-                                withTimeoutOrNull(
-                                    FAST_QUERY_TIMEOUT_MS
-                                ) {
-
-                                    runCatching {
-
-                                        val extractor =
-                                            service.getSearchExtractor(
-                                                query
-                                            )
-
-                                        extractor.fetchPage()
-
-                                        extractor
-                                            .initialPage
-                                            .items
-                                            .filterIsInstance<StreamInfoItem>()
-                                            .toList()
-
-                                    }.getOrElse {
-                                        emptyList()
-                                    }
-
-                                } ?: emptyList()
-                            }
-                        }
-                        .awaitAll()
-                }
-
-            } ?: emptyList()
-        }
-
-        val results =
-            mutableListOf<List<StreamInfoItem>>()
-
-        for (
-            batch in cleanQueries.chunked(6)
-        ) {
-
-            val batchResults =
-                coroutineScope {
-
-                    batch.map { query ->
-
+                    firstQueries.map { query ->
                         async(Dispatchers.IO) {
-
                             withTimeoutOrNull(
-                                NORMAL_QUERY_TIMEOUT_MS
+                                FAST_QUERY_TIMEOUT_MS
                             ) {
-
                                 runCatching {
-
                                     val extractor =
-                                        service.getSearchExtractor(
-                                            query
-                                        )
+                                        service.getSearchExtractor(query)
 
                                     extractor.fetchPage()
 
@@ -650,18 +603,56 @@ class YouTubeKids : MainAPI() {
                                         .items
                                         .filterIsInstance<StreamInfoItem>()
                                         .toList()
-
                                 }.getOrElse {
                                     emptyList()
                                 }
-
                             } ?: emptyList()
                         }
+                    }.awaitAll()
+                }
+            } ?: emptyList()
+        }
 
+        /*
+         * BACKGROUND PATH:
+         * Fetch all enrichment queries in small parallel batches.
+         * This fills the full 35-item section cache without blocking
+         * the first paint.
+         */
+        val results =
+            mutableListOf<List<StreamInfoItem>>()
+
+        for (batch in cleanQueries.chunked(3)) {
+            val batchResults =
+                coroutineScope {
+                    batch.map { query ->
+                        async(Dispatchers.IO) {
+                            withTimeoutOrNull(
+                                NORMAL_QUERY_TIMEOUT_MS
+                            ) {
+                                runCatching {
+                                    val extractor =
+                                        service.getSearchExtractor(query)
+
+                                    extractor.fetchPage()
+
+                                    extractor
+                                        .initialPage
+                                        .items
+                                        .filterIsInstance<StreamInfoItem>()
+                                        .toList()
+                                }.getOrElse {
+                                    emptyList()
+                                }
+                            } ?: emptyList()
+                        }
                     }.awaitAll()
                 }
 
             results.addAll(batchResults)
+
+            // Yield after every small batch so UI work remains responsive.
+            kotlinx.coroutines.yield()
         }
 
         return results
@@ -1148,6 +1139,7 @@ class YouTubeKids : MainAPI() {
                 fastMode = fastMode
             )
                 .flatten()
+                .distinctBy { it.url }
 
         val candidates =
             mutableListOf<Pair<Int, StreamInfoItem>>()
@@ -1155,32 +1147,16 @@ class YouTubeKids : MainAPI() {
         val seenUrls =
             mutableSetOf<String>()
 
-        for (
-            item in allItems
-        ) {
-
-            if (
-                !isKidsCandidate(item)
-            ) {
-                continue
-            }
+        for (item in allItems) {
+            if (!isKidsCandidate(item)) continue
 
             val url =
                 item.url
                     ?.trim()
                     ?: continue
 
-            if (
-                url.isBlank()
-            ) {
-                continue
-            }
-
-            if (
-                !seenUrls.add(url)
-            ) {
-                continue
-            }
+            if (url.isBlank()) continue
+            if (!seenUrls.add(url)) continue
 
             candidates.add(
                 scoreKidsItem(
@@ -1190,34 +1166,11 @@ class YouTubeKids : MainAPI() {
             )
         }
 
-        /*
-         * Highest quality first.
-         */
-
         val ranked =
             candidates
                 .sortedByDescending {
                     it.first
                 }
-
-        val limit =
-            if (fastMode) {
-                FAST_VISIBLE_COUNT
-            } else {
-                HOME_CACHE_LIMIT
-            }
-
-        /*
-         * ========================================================
-         * ROTATION
-         * ========================================================
-         *
-         * We deliberately do not return exactly the same ordering
-         * on every refresh.
-         *
-         * Top results remain quality-oriented.
-         * The remainder gets shuffled using a time bucket.
-         */
 
         val stableCount =
             minOf(
@@ -1235,6 +1188,10 @@ class YouTubeKids : MainAPI() {
                 .drop(stableCount)
                 .toMutableList()
 
+        /*
+         * Change the rotating portion every ten minutes.
+         * The best few items remain stable; the rest rotate naturally.
+         */
         val rotationBucket =
             System.currentTimeMillis() /
                 (10 * 60 * 1000L)
@@ -1251,7 +1208,13 @@ class YouTubeKids : MainAPI() {
         val selected =
             (
                 stable + rotating
-            ).take(limit)
+            ).take(
+                if (fastMode) {
+                    FAST_VISIBLE_COUNT
+                } else {
+                    HOME_CACHE_LIMIT
+                }
+            )
 
         val results =
             selected.mapNotNull {
@@ -1279,35 +1242,24 @@ class YouTubeKids : MainAPI() {
                     url,
                     TvType.Others
                 ) {
-
                     posterUrl =
                         item.thumbnails
                             .lastOrNull()
                             ?.url
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
                 }
             }
 
-        if (
-            results.isNotEmpty()
-        ) {
+        if (results.isNotEmpty()) {
             putCached(
                 section,
                 results
             )
         }
 
-        val sectionName =
-            sectionDisplayName(
-                section
-            )
-
         return newHomePageResponse(
             listOf(
                 HomePageList(
-                    sectionName,
+                    sectionDisplayName(section),
                     results,
                     false
                 )
@@ -2048,29 +2000,34 @@ class YouTubeKids : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
 
-        if (
-            data.isBlank()
-        ) {
+        if (data.isBlank()) {
             return false
         }
 
-        val extractor =
-            try {
+        val cleanData =
+            data.trim()
 
-                service.getStreamExtractor(
-                    data
-                )
+        /*
+         * Search cards may contain a short/parameterized YouTube URL.
+         * Rebuild a canonical watch URL before asking the extractor.
+         */
+        val canonicalUrl =
+            canonicalYouTubeWatchUrl(cleanData)
+                ?: cleanData
 
-            } catch (_: Exception) {
-
-                return loadExtractor(
-                    data,
-                    subtitleCallback,
-                    callback
-                )
-            }
-
+        /*
+         * PATH 1:
+         * Same direct NewPipe flow used by the working YouTube provider.
+         *
+         * IMPORTANT:
+         * Stream URLs are resolved at click time, not cached with the
+         * home page, so temporary/signed media URLs stay fresh.
+         */
         try {
+            val extractor =
+                service.getStreamExtractor(
+                    canonicalUrl
+                )
 
             extractor.fetchPage()
 
@@ -2089,20 +2046,13 @@ class YouTubeKids : MainAPI() {
             /*
              * LIVE -> HLS
              */
-
-            if (
-                isLive
-            ) {
-
+            if (isLive) {
                 val hlsUrl =
                     runCatching {
                         info.hlsUrl
                     }.getOrNull()
 
-                if (
-                    !hlsUrl.isNullOrBlank()
-                ) {
-
+                if (!hlsUrl.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
                             source = name,
@@ -2110,17 +2060,12 @@ class YouTubeKids : MainAPI() {
                             url = hlsUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
-
                             referer =
                                 "https://www.youtube.com/"
-
                             quality =
-                                Qualities
-                                    .Unknown
-                                    .value
+                                Qualities.Unknown.value
                         }
                     )
-
                     return true
                 }
             }
@@ -2128,16 +2073,12 @@ class YouTubeKids : MainAPI() {
             /*
              * VOD -> DASH
              */
-
             val dashUrl =
                 runCatching {
                     info.dashMpdUrl
                 }.getOrNull()
 
-            if (
-                !dashUrl.isNullOrBlank()
-            ) {
-
+            if (!dashUrl.isNullOrBlank()) {
                 callback(
                     newExtractorLink(
                         source = name,
@@ -2145,33 +2086,24 @@ class YouTubeKids : MainAPI() {
                         url = dashUrl,
                         type = ExtractorLinkType.DASH
                     ) {
-
                         referer =
                             "https://www.youtube.com/"
-
                         quality =
-                            Qualities
-                                .Unknown
-                                .value
+                            Qualities.Unknown.value
                     }
                 )
-
                 return true
             }
 
             /*
-             * HLS fallback.
+             * VOD fallback -> HLS
              */
-
             val hlsUrl =
                 runCatching {
                     info.hlsUrl
                 }.getOrNull()
 
-            if (
-                !hlsUrl.isNullOrBlank()
-            ) {
-
+            if (!hlsUrl.isNullOrBlank()) {
                 callback(
                     newExtractorLink(
                         source = name,
@@ -2179,29 +2111,141 @@ class YouTubeKids : MainAPI() {
                         url = hlsUrl,
                         type = ExtractorLinkType.M3U8
                     ) {
-
                         referer =
                             "https://www.youtube.com/"
-
                         quality =
-                            Qualities
-                                .Unknown
-                                .value
+                            Qualities.Unknown.value
                     }
                 )
-
                 return true
             }
 
         } catch (_: Exception) {
-            // Fall through to CloudStream extractor.
+            // Continue to CloudStream extractor fallback.
         }
 
-        return loadExtractor(
-            data,
-            subtitleCallback,
-            callback
-        )
+        /*
+         * PATH 2:
+         * CloudStream's registered extractor chain.
+         */
+        try {
+            if (
+                loadExtractor(
+                    canonicalUrl,
+                    subtitleCallback,
+                    callback
+                )
+            ) {
+                return true
+            }
+        } catch (_: Exception) {
+        }
+
+        /*
+         * PATH 3:
+         * If canonicalization changed the URL, also try the exact
+         * original URL for compatibility with provider-specific links.
+         */
+        if (canonicalUrl != cleanData) {
+            try {
+                if (
+                    loadExtractor(
+                        cleanData,
+                        subtitleCallback,
+                        callback
+                    )
+                ) {
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return false
+    }
+
+    private fun canonicalYouTubeWatchUrl(
+        url: String
+    ): String? {
+        val value =
+            url.trim()
+
+        val watchIndex =
+            value.indexOf(
+                "/watch?v=",
+                ignoreCase = true
+            )
+
+        if (watchIndex >= 0) {
+            val idStart =
+                watchIndex +
+                    "/watch?v=".length
+
+            val id =
+                value
+                    .substring(idStart)
+                    .substringBefore('&')
+                    .substringBefore('#')
+                    .trim()
+
+            if (id.isNotBlank()) {
+                return "https://www.youtube.com/watch?v=$id"
+            }
+        }
+
+        val shortMarker =
+            "youtu.be/"
+
+        val shortIndex =
+            value.indexOf(
+                shortMarker,
+                ignoreCase = true
+            )
+
+        if (shortIndex >= 0) {
+            val id =
+                value
+                    .substring(
+                        shortIndex +
+                            shortMarker.length
+                    )
+                    .substringBefore('?')
+                    .substringBefore('&')
+                    .substringBefore('#')
+                    .trim()
+
+            if (id.isNotBlank()) {
+                return "https://www.youtube.com/watch?v=$id"
+            }
+        }
+
+        val shortsMarker =
+            "/shorts/"
+
+        val shortsIndex =
+            value.indexOf(
+                shortsMarker,
+                ignoreCase = true
+            )
+
+        if (shortsIndex >= 0) {
+            val id =
+                value
+                    .substring(
+                        shortsIndex +
+                            shortsMarker.length
+                    )
+                    .substringBefore('?')
+                    .substringBefore('&')
+                    .substringBefore('#')
+                    .trim()
+
+            if (id.isNotBlank()) {
+                return "https://www.youtube.com/watch?v=$id"
+            }
+        }
+
+        return null
     }
 
     /*
