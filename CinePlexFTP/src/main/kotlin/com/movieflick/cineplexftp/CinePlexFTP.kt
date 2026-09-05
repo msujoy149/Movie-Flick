@@ -756,10 +756,20 @@ class CinePlexFTP : MainAPI() {
          * Handle that exact player flow before the movie player logic below.
          */
         if (input.contains("watch.php", true)) {
-            val tvPage = runCatching {
+            /*
+             * TV SERIES ONLY.
+             *
+             * 1) Open the exact Cine Plex episode page.
+             * 2) Crawl the returned HTML for the site's own /hls/tr/.../master.m3u8.
+             * 3) Send that exact M3U8 URL to CloudStream as an M3U8 ExtractorLink.
+             *
+             * No movie/player.php logic is involved here.
+             */
+            val tvResponse = runCatching {
                 app.get(
                     input,
                     headers = pageHeaders(input) + mapOf(
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Cache-Control" to "no-cache, no-store, max-age=0",
                         "Pragma" to "no-cache"
                     )
@@ -767,51 +777,74 @@ class CinePlexFTP : MainAPI() {
             }.getOrNull() ?: return false
 
             val tvSources = extractTvHlsSources(
-                tvPage.document,
-                tvPage.text,
+                tvResponse.document,
+                tvResponse.text,
                 input
             )
+
+            /*
+             * Also scan raw HTML independently. This catches the source even if
+             * Jsoup normalizes part of the <source> tag differently.
+             */
+            val cleanedHtml = tvResponse.text
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .replace("\\u003A", ":")
+
+            val tvHlsRegex = Regex(
+                """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?)"""
+            )
+
+            val rawSources = tvHlsRegex.findAll(cleanedHtml)
+                .map { it.value.trim() }
+                .map { it.trim('"', '\'', '`', ',', ';', ')', ']', '}') }
+                .map { absoluteUrl(it, input) }
+                .filter { isCinePlexTvMediaUrl(it) }
+                .toList()
+
+            val allTvSources = (tvSources + rawSources)
+                .distinct()
                 .sortedWith(
                     compareByDescending<String> {
-                        val lower = it.lowercase(Locale.ROOT)
                         when {
-                            "master.m3u8" in lower -> 1000
-                            "/hls/tr/" in lower -> 900
+                            "master.m3u8" in it.lowercase(Locale.ROOT) -> 1000
+                            "/hls/tr/" in it.lowercase(Locale.ROOT) -> 900
                             else -> 0
                         }
                     }.thenByDescending { it.length }
                 )
 
-            val tvSource = tvSources.firstOrNull()
-            if (tvSource != null) {
-                emitTvMediaLink(tvSource, callback, input)
-                return true
-            }
+            if (allTvSources.isEmpty()) return false
 
-            /* Final TV-only fallback: extract the website's /hls/tr/.../master.m3u8 directly. */
-            val cleanedHtml = tvPage.text
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
+            /*
+             * Give CloudStream the exact manifest URL.
+             *
+             * The TV player on Cine Plex is same-origin. Use the episode page
+             * as Referer, but do NOT inject a synthetic Origin header.
+             *
+             * Also provide a root-Referer fallback link because some hotlink
+             * rules accept only the site's root while others accept the exact
+             * watch page. Both links point to the SAME M3U8 manifest.
+             */
+            val primarySource = allTvSources.first()
 
-            val tvHlsRegex = Regex(
-                """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?)"""
+            emitTvMediaLink(
+                mediaUrl = primarySource,
+                callback = callback,
+                referer = input
             )
 
-            val rawTvSource = tvHlsRegex.findAll(cleanedHtml)
-                .map { it.value.trim() }
-                .map { it.trim('"', '\'', '`', ',', ';', ')', ']', '}') }
-                .map { absoluteUrl(it, input) }
-                .filter { isCinePlexTvMediaUrl(it) }
-                .distinct()
-                .firstOrNull()
-
-            if (rawTvSource != null) {
-                emitTvMediaLink(rawTvSource, callback, input)
-                return true
+            val rootReferer = "$mainUrl/"
+            if (!rootReferer.equals(input, ignoreCase = true)) {
+                emitTvMediaLink(
+                    mediaUrl = primarySource,
+                    callback = callback,
+                    referer = rootReferer
+                )
             }
 
-            return false
+            return true
         }
 
         /*
@@ -1155,7 +1188,10 @@ class CinePlexFTP : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         referer: String
     ) {
-        val lower = mediaUrl.lowercase(Locale.ROOT)
+        val cleanMediaUrl = cleanUrl(mediaUrl).trim()
+        if (!isCinePlexTvMediaUrl(cleanMediaUrl)) return
+
+        val lower = cleanMediaUrl.lowercase(Locale.ROOT)
 
         val quality = when {
             "2160" in lower || "4k" in lower ->
@@ -1180,28 +1216,29 @@ class CinePlexFTP : MainAPI() {
                 Qualities.Unknown.value
         }
 
-        val hlsHeaders = mapOf(
+        /*
+         * Keep the request as close as possible to the website's actual
+         * same-origin HLS GET. In particular, do not add an Origin header.
+         */
+        val headers = mapOf(
             "User-Agent" to
                 "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-            "Accept" to
-                "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+            "Accept" to "*/*",
             "Accept-Language" to "en-US,en;q=0.9",
             "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache",
-            "Origin" to mainUrl,
-            "Referer" to referer
+            "Pragma" to "no-cache"
         )
 
         callback(
             newExtractorLink(
                 source = name,
                 name = "Cine Plex TV HLS",
-                url = mediaUrl,
+                url = cleanMediaUrl,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.referer = referer
-                this.headers = hlsHeaders
+                this.headers = headers
                 this.quality = quality
             }
         )
