@@ -2543,9 +2543,9 @@ class YouTubeKids : MainAPI() {
                                 quality = Qualities.Unknown.value
                             }
                         )
-\                        emittedLive = true
+                        emittedLive = true
                     }
-\                    // Do not try VOD adaptive handling for a live stream.
+                    // Do not try VOD adaptive handling for a live stream.
                     continue
                 }
 
@@ -2578,7 +2578,7 @@ class YouTubeKids : MainAPI() {
                             quality = Qualities.Unknown.value
                         }
                     )
-\                    emittedAdaptive = true
+                    emittedAdaptive = true
                 }
 
                 /*
