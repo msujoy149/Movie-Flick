@@ -6,6 +6,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -254,96 +255,77 @@ class KhulnaPlex : MainAPI() {
         if (input.isBlank()) return false
 
         /*
-         * Case 1:
-         * CloudStream received the exact media URL directly.
-         *
-         * Do not rewrite HTTP -> HTTPS.
-         * Do not probe it with HEAD.
-         * Do not turn it into download.php.
-         *
-         * The user's verified Android Chrome test proves the raw HTTP MP4
-         * itself is playable, so pass the exact source through.
+         * Direct media URL:
+         * pass the exact URL straight to the native player.
          */
         if (isMediaUrl(input)) {
             emitMediaLink(
                 mediaUrl = input,
-                referer = null,
                 callback = callback
             )
             return true
         }
 
         /*
-         * Case 2:
-         * Normal Khulna Plex watch.php URL.
-         *
-         * Fetch the watch page fresh at Play time.
+         * Normal Khulna Plex watch page:
+         * fetch it and resolve the REAL media file published by the site.
          */
-        val pageResponse = runCatching {
+        val response = runCatching {
             app.get(
                 input,
                 headers = pageHeaders(input)
             )
         }.getOrNull() ?: return false
 
-        val document = pageResponse.document
-        val html = pageResponse.text
+        val document = response.document
+        val html = response.text
 
         /*
-         * IMPORTANT:
-         * Use the actual direct media source from the website first.
+         * 1) Prefer the real <video>/<source> file.
+         * 2) If no source exists, use the "Download Video" URL only to
+         *    recover its `file=` path and rebuild the DIRECT media URL.
          *
-         * Example verified by the user:
-         * http://khulnaplex.com/uploads/videos/1788517057_Neru_2023.mp4
+         * We do NOT play download.php itself because it may be served as
+         * Content-Disposition: attachment. The actual /uploads/videos/...mp4
+         * file is what Chrome plays directly on Android.
          */
-        val mediaSources = extractMediaUrls(
+        val directSources = extractMediaUrls(
             document = document,
             html = html,
             baseUrl = input
-        )
-
-        val directSources = mediaSources.filter { media ->
-            !media.contains(".m3u8", true) &&
-                !media.contains(".mpd", true)
-        }
+        ).distinct()
 
         if (directSources.isNotEmpty()) {
-            for (source in directSources.distinct()) {
+            directSources.forEach { source ->
                 emitMediaLink(
                     mediaUrl = source,
-                    referer = null,
                     callback = callback
                 )
             }
-
-            // Do not emit download.php or invent a second scheme after
-            // the actual media source has been found.
             return true
         }
 
         /*
-         * Manifest fallback:
-         * Some titles may use HLS or DASH rather than progressive MP4/MKV.
+         * Recover direct media paths from download.php links.
          */
-        val manifests = mediaSources.filter {
-            it.contains(".m3u8", true) ||
-                it.contains(".mpd", true)
-        }
+        val recoveredSources = extractDirectMediaFromDownloads(
+            document = document,
+            html = html,
+            baseUrl = input
+        ).distinct()
 
-        if (manifests.isNotEmpty()) {
-            for (manifest in manifests.distinct()) {
+        if (recoveredSources.isNotEmpty()) {
+            recoveredSources.forEach { source ->
                 emitMediaLink(
-                    mediaUrl = manifest,
-                    referer = null,
+                    mediaUrl = source,
                     callback = callback
                 )
             }
-
             return true
         }
 
         /*
-         * Embedded player fallback.
+         * Last fallback for externally embedded players.
          */
         val iframes = document.select(
             "iframe[src], iframe[data-src]"
@@ -365,9 +347,7 @@ class KhulnaPlex : MainAPI() {
                 )
             }.getOrDefault(false)
 
-            if (extracted) {
-                return true
-            }
+            if (extracted) return true
         }
 
         return false
@@ -385,7 +365,6 @@ class KhulnaPlex : MainAPI() {
      */
     private suspend fun emitMediaLink(
         mediaUrl: String,
-        referer: String?,
         callback: (ExtractorLink) -> Unit
     ) {
         val type = when {
@@ -431,13 +410,93 @@ class KhulnaPlex : MainAPI() {
                 url = mediaUrl,
                 type = type
             ) {
-                if (!referer.isNullOrBlank()) {
-                    this.referer = referer
-                }
-
                 this.quality = quality
             }
         )
+    }
+
+    private fun extractDirectMediaFromDownloads(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        fun addDownload(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val cleaned = cleanUrl(raw)
+
+            if (!cleaned.contains("download.php", true)) return
+
+            val query = runCatching {
+                URI(absoluteUrl(cleaned, baseUrl)).rawQuery.orEmpty()
+            }.getOrDefault("")
+
+            val fileValue = query
+                .split('&')
+                .firstOrNull {
+                    it.substringBefore('=')
+                        .equals("file", ignoreCase = true)
+                }
+                ?.substringAfter('=', "")
+
+            if (fileValue.isNullOrBlank()) return
+
+            val decoded = runCatching {
+                URLDecoder.decode(
+                    fileValue,
+                    StandardCharsets.UTF_8.toString()
+                )
+            }.getOrNull()?.trim().orEmpty()
+
+            if (decoded.isBlank()) return
+
+            /*
+             * Only recover a real media file path.
+             * Example:
+             * uploads/videos/1788517057_Neru_2023.mp4
+             */
+            if (!isMediaUrl("http://example.com/$decoded")) return
+
+            val direct = if (
+                decoded.startsWith("http://", true) ||
+                decoded.startsWith("https://", true)
+            ) {
+                decoded
+            } else {
+                absoluteUrl(
+                    if (decoded.startsWith("/")) decoded else "/$decoded",
+                    baseUrl
+                )
+            }
+
+            if (isMediaUrl(direct)) {
+                found.add(direct)
+            }
+        }
+
+        document.select(
+            "a[href*='download.php'], " +
+                "a.download-btn"
+        ).forEach { anchor ->
+            addDownload(anchor.attr("href"))
+        }
+
+        val cleanedHtml = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val regex = Regex(
+            """(?i)(?:https?://[^"'<>\s]+|(?:/|\.\.?/)?download\.php\?[^"'<>\s)]+)"""
+        )
+
+        regex.findAll(cleanedHtml).forEach { match ->
+            addDownload(match.value)
+        }
+
+        return found.toList()
     }
 
     /*
@@ -462,19 +521,22 @@ class KhulnaPlex : MainAPI() {
 
             val value = cleanUrl(raw)
                 .replace("\\x2F", "/")
+                .trim()
 
-            if (value.startsWith("http://") ||
-                value.startsWith("https://") ||
-                value.startsWith("//") ||
-                value.startsWith("/") ||
-                value.startsWith("../") ||
-                value.startsWith("./")
-            ) {
-                val fixed = absoluteUrl(value, baseUrl)
+            if (value.isBlank() || value.startsWith("data:", true) || value.startsWith("javascript:", true)) {
+                return
+            }
 
-                if (isMediaUrl(fixed)) {
-                    found.add(fixed)
-                }
+            /*
+             * IMPORTANT: KhulnaPlex uses plain relative paths such as
+             * `uploads/videos/1788517057_Neru_2023.mp4` without a leading `/`.
+             * Always resolve relative URLs against the watch-page URL instead
+             * of requiring the path to begin with '/', './' or '../'.
+             */
+            val fixed = absoluteUrl(value, baseUrl)
+
+            if (isMediaUrl(fixed)) {
+                found.add(fixed)
             }
         }
 
@@ -494,7 +556,9 @@ class KhulnaPlex : MainAPI() {
                 "[data-source], " +
                 "[data-stream], " +
                 "[data-file-url], " +
-                "[data-video-url]"
+                "[data-video-url], " +
+                "[data-playlist], " +
+                "[data-manifest]"
         ).forEach { element ->
             add(element.attr("src"))
             add(element.attr("data-src"))
@@ -505,6 +569,9 @@ class KhulnaPlex : MainAPI() {
             add(element.attr("data-stream"))
             add(element.attr("data-file-url"))
             add(element.attr("data-video-url"))
+            add(element.attr("data-playlist"))
+            add(element.attr("data-manifest"))
+            add(element.attr("href"))
         }
 
         val cleanedHtml = html
@@ -517,7 +584,7 @@ class KhulnaPlex : MainAPI() {
          * Direct media URL regex.
          */
         val directRegex = Regex(
-            """(?i)(?:(?:https?:)?//|/|\.\.?/)[^"'<>\s\\]+?\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
+            """(?i)(?:https?://[^"'<>\s\\]+|(?<![A-Za-z0-9_./-])(?:uploads/|videos/|media/|files/)[^"'<>\s\\]+)\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
         )
 
         directRegex.findAll(cleanedHtml).forEach {
