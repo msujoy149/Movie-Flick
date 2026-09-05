@@ -3233,7 +3233,16 @@ class YouTubeKids : MainAPI() {
          * Build audio tracks once, preferring the highest bitrate URL
          * per exact URL and limiting duplicates.
          */
+        /*
+         * IMPORTANT: newAudioFile() is a suspend function. Do not call it
+         * from a collection transformation lambda. Build the list inside
+         * this suspend function instead so Kotlin can keep the coroutine
+         * context correctly.
+         */
         val audioFiles =
+            mutableListOf<AudioFile>()
+
+        val audioCandidates =
             result.audioCandidates
                 .asSequence()
                 .sortedByDescending {
@@ -3242,14 +3251,24 @@ class YouTubeKids : MainAPI() {
                 .distinctBy {
                     it.url
                 }
-                .mapNotNull {
-                    runCatching {
-                        newAudioFile(
-                            it.url
-                        )
-                    }.getOrNull()
-                }
                 .toList()
+
+        for (audio in audioCandidates) {
+            try {
+                val audioFile =
+                    newAudioFile(
+                        audio.url
+                    )
+
+                if (audioFiles.none {
+                        it.url == audioFile.url
+                    }) {
+                    audioFiles.add(audioFile)
+                }
+            } catch (_: Exception) {
+                // Ignore a bad audio variant and keep all valid variants.
+            }
+        }
 
         val bestPerHeight =
             result.videoCandidates
