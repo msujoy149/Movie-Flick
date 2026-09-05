@@ -186,11 +186,24 @@ class CTGFTP : MainAPI() {
             else -> Unit
         }
 
+        /*
+         * CTG detail pages contain the real Play URL:
+         *   /watch/<id>?type=movie
+         *
+         * CloudStream must receive that watch URL as its playback data.
+         * The old implementation passed /movies/<slug>, which is only a
+         * metadata page and does not contain the actual FTP media source.
+         */
+        val playbackUrl = extractPlaybackPageUrl(
+            document = document,
+            baseUrl = clean
+        ) ?: clean
+
         return newMovieLoadResponse(
             title,
             clean,
             typeFromUrl(clean),
-            clean
+            playbackUrl
         ) {
             posterUrl = poster
             this.plot = plot
@@ -208,7 +221,9 @@ class CTGFTP : MainAPI() {
         if (input.isBlank()) return false
 
         /*
-         * Direct media URLs are sent straight to CloudStream's native player.
+         * Direct media:
+         * The CTG FTP files are normal MP4/MKV/M3U8/MPD resources. Give the
+         * exact media URL directly to CloudStream's player.
          */
         if (isMediaUrl(input)) {
             emitMediaLink(
@@ -219,6 +234,14 @@ class CTGFTP : MainAPI() {
             return true
         }
 
+        /*
+         * CTG flow:
+         * Movie page -> /watch/<id>?type=movie -> real FTP source.
+         *
+         * The watch page is intentionally fetched here, at Play time, so the
+         * provider always resolves the current source rather than caching an
+         * old FTP URL.
+         */
         val response = runCatching {
             app.get(
                 input,
@@ -230,18 +253,18 @@ class CTGFTP : MainAPI() {
         val html = response.text
 
         /*
-         * 1. Exact video/source/media attributes.
+         * Priority 1: explicit video/source/data-* values and direct FTP URLs.
          */
-        val directSources = extractMediaUrls(
+        val sources = extractMediaUrls(
             document = document,
             html = html,
             baseUrl = input
         ).distinct()
 
-        if (directSources.isNotEmpty()) {
-            directSources.forEach { media ->
+        if (sources.isNotEmpty()) {
+            sources.forEach { source ->
                 emitMediaLink(
-                    mediaUrl = media,
+                    mediaUrl = source,
                     referer = input,
                     callback = callback
                 )
@@ -250,20 +273,19 @@ class CTGFTP : MainAPI() {
         }
 
         /*
-         * 2. Some FTP sites put the actual file behind a download endpoint.
-         * Recover only the real media URL and never hand download.php itself
-         * to the player.
+         * Priority 2: links such as Download/Server buttons whose query or
+         * encoded value points to the actual media file.
          */
-        val recovered = recoverDownloadUrls(
+        val recovered = recoverPlayableUrls(
             document = document,
             html = html,
             baseUrl = input
         ).distinct()
 
         if (recovered.isNotEmpty()) {
-            recovered.forEach { media ->
+            recovered.forEach { source ->
                 emitMediaLink(
-                    mediaUrl = media,
+                    mediaUrl = source,
                     referer = input,
                     callback = callback
                 )
@@ -272,9 +294,10 @@ class CTGFTP : MainAPI() {
         }
 
         /*
-         * 3. External embedded player fallback.
+         * Priority 3: embedded player fallback.
          */
-        val iframes = document.select("iframe[src], iframe[data-src]")
+        val iframes = document
+            .select("iframe[src], iframe[data-src]")
             .mapNotNull { iframe ->
                 val raw = iframe.attr("src")
                     .ifBlank { iframe.attr("data-src") }
@@ -448,6 +471,91 @@ class CTGFTP : MainAPI() {
                 posterUrl = poster
             }
         }
+    }
+
+    /*
+     * Find CTG's actual playback page from a movie/series/anime detail page.
+     *
+     * The supplied CTG source shows the Movie Play button using:
+     *   href="/watch/<id>?type=movie"
+     *
+     * We use the DOM link instead of a giant regex.
+     */
+    private fun extractPlaybackPageUrl(
+        document: Document,
+        baseUrl: String
+    ): String? {
+        val elements = document.select(
+            "a[href], [data-href], [data-url]"
+        )
+
+        /*
+         * Prefer an explicit Play/Watch link.
+         */
+        for (element in elements) {
+            val raw = sequenceOf(
+                element.attr("href"),
+                element.attr("data-href"),
+                element.attr("data-url")
+            ).firstOrNull { it.isNotBlank() } ?: continue
+
+            val absolute = absoluteUrl(
+                cleanUrl(raw),
+                baseUrl
+            )
+
+            val path = runCatching {
+                URI(absolute).path.orEmpty().lowercase(Locale.ROOT)
+            }.getOrElse {
+                absolute.lowercase(Locale.ROOT)
+            }
+
+            val label = element.text()
+                .trim()
+                .lowercase(Locale.ROOT)
+
+            if (
+                path.startsWith("/watch/") &&
+                (
+                    label.contains("play") ||
+                    label.contains("watch") ||
+                    absolute.contains("type=movie", true) ||
+                    absolute.contains("type=series", true) ||
+                    absolute.contains("type=tv", true) ||
+                    absolute.contains("type=anime", true)
+                )
+            ) {
+                return absolute
+            }
+        }
+
+        /*
+         * Fallback for buttons/links whose visible label is rendered by JS.
+         */
+        for (element in elements) {
+            val raw = sequenceOf(
+                element.attr("href"),
+                element.attr("data-href"),
+                element.attr("data-url")
+            ).firstOrNull { it.isNotBlank() } ?: continue
+
+            val absolute = absoluteUrl(
+                cleanUrl(raw),
+                baseUrl
+            )
+
+            val path = runCatching {
+                URI(absolute).path.orEmpty().lowercase(Locale.ROOT)
+            }.getOrElse {
+                absolute.lowercase(Locale.ROOT)
+            }
+
+            if (path.startsWith("/watch/")) {
+                return absolute
+            }
+        }
+
+        return null
     }
 
     private fun parseEpisodes(
@@ -696,7 +804,7 @@ class CTGFTP : MainAPI() {
          * optional groups like the broken CTG implementation.
          */
         val mediaRegex = Regex(
-            """(?i)https?://[^"'<>\\s]+\\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\\?[^"'<>\\s]*)?"""
+            """(?i)https?://[^"'<>\s]+\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s]*)?"""
         )
 
         mediaRegex.findAll(
@@ -821,6 +929,134 @@ class CTGFTP : MainAPI() {
         }
 
         return null
+    }
+
+    /*
+     * Recover actual media URLs from CTG's server/download controls.
+     *
+     * This handles:
+     * - direct FTP URLs
+     * - percent-encoded FTP URLs
+     * - file/url/src/video/stream query parameters
+     * - href/data-* attributes
+     *
+     * It deliberately does not require a specific server name.
+     */
+    private fun recoverPlayableUrls(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        fun addCandidate(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            var value = cleanUrl(raw)
+
+            repeat(2) {
+                value = runCatching {
+                    URLDecoder.decode(
+                        value,
+                        StandardCharsets.UTF_8.toString()
+                    )
+                }.getOrElse {
+                    value
+                }
+            }
+
+            val absolute = absoluteUrl(
+                value,
+                baseUrl
+            )
+
+            if (isMediaUrl(absolute)) {
+                found.add(absolute)
+            }
+        }
+
+        document.select(
+            "a[href], " +
+            "[data-url], " +
+            "[data-href], " +
+            "[data-file], " +
+            "[data-src], " +
+            "[data-video], " +
+            "[data-video-url], " +
+            "[data-file-url], " +
+            "[data-stream]"
+        ).forEach { element ->
+            addCandidate(element.attr("href"))
+            addCandidate(element.attr("data-url"))
+            addCandidate(element.attr("data-href"))
+            addCandidate(element.attr("data-file"))
+            addCandidate(element.attr("data-src"))
+            addCandidate(element.attr("data-video"))
+            addCandidate(element.attr("data-video-url"))
+            addCandidate(element.attr("data-file-url"))
+            addCandidate(element.attr("data-stream"))
+
+            val rawHref = element.attr("href")
+            if (rawHref.contains("download", true) ||
+                rawHref.contains("stream", true)
+            ) {
+                recoverQueryMedia(
+                    rawHref,
+                    baseUrl
+                )?.let(found::add)
+            }
+        }
+
+        /*
+         * Search the raw HTML for ftp.ctgfun.com first. This is the actual
+         * storage host shown by the supplied working browser URL.
+         */
+        val ftpRegex = Regex(
+            """(?i)https?://ftp\.ctgfun\.com/[^"'<>\s\\]+"""
+        )
+
+        ftpRegex.findAll(
+            html
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+        ).forEach { match ->
+            addCandidate(match.value)
+        }
+
+        /*
+         * Decode any percent-encoded FTP URL embedded in the page.
+         */
+        val encodedFtpRegex = Regex(
+            """(?i)(?:https?%3A%2F%2F|https?%253A%252F%252F)ftp%\.ctgfun\.com%2F[^"'<>\s]+"""
+        )
+
+        encodedFtpRegex.findAll(
+            html
+                .replace("\\/", "/")
+                .replace("&amp;", "&")
+        ).forEach { match ->
+            addCandidate(match.value)
+        }
+
+        /*
+         * Finally inspect common query parameters.
+         */
+        html
+            .replace("\\/", "/")
+            .replace("&amp;", "&")
+            .split(
+                '"', '\'', ' ', '\n', '\r', '\t',
+                '<', '>', '(', ')'
+            )
+            .forEach { token ->
+                recoverQueryMedia(
+                    token,
+                    baseUrl
+                )?.let(found::add)
+            }
+
+        return found.toList()
     }
 
     private fun extractPoster(
@@ -992,7 +1228,10 @@ class CTGFTP : MainAPI() {
 
         return mediaExtensions.any {
             path.endsWith(it)
-        }
+        } || path.contains(".mp4") ||
+            path.contains(".mkv") ||
+            path.contains(".m3u8") ||
+            path.contains(".mpd")
     }
 
     private fun qualityFromUrl(
