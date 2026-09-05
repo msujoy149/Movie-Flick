@@ -1,5 +1,30 @@
 [
     {
+        "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
+        "jarFileSize": 124760,
+        "fileHash": "sha256-2959c1322b583529982b738908024edceea0bb4e244d57b59c3bbefceffc40bb",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 36737,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime"
+        ],
+        "version": 1,
+        "internalName": "CinePlexFTP",
+        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.jar",
+        "description": "Cine Plex FTP provider for Movie-Flick",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.cs3",
+        "name": "CinePlexFTP",
+        "jarHash": "sha256-ba11de4f806a95c3e2415522d4281bbd44ed9ea5e07205fc8d3a7601d7141e3d"
+    },
+    {
         "iconUrl": "https://flagcdn.com/w320/bd.png",
         "jarFileSize": 151926,
         "fileHash": "sha256-4d346e037b098bb18ed270cf0a12e918194bf84a04cb25a06185387465b4f866",
