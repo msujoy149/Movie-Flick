@@ -12,7 +12,7 @@ android {
     }
 }
 
-version = 2
+version = 11
 
 cloudstream {
     description = "Bengali India YouTube Kids provider for Movie-Flick"
