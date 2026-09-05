@@ -69,11 +69,11 @@
         "jarHash": "sha256-efaf3611a572fc41205d99a39bfffc42128c897d746d33b6acb83a33f9a61516"
     },
     {
-        "jarFileSize": 254861,
-        "fileHash": "sha256-44767629544bfd5e2b295b6433f9f33861d89883b1c33f1a8733847e7431d4f3",
+        "jarFileSize": 444528,
+        "fileHash": "sha256-dc69463d4da579dc0702c30800014ac0f50f64ce6b006b02cee86fa3cbfd43fc",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 47617,
+        "fileSize": 66160,
         "status": 1,
         "language": "en",
         "authors": [
@@ -90,6 +90,6 @@
         "description": "YouTube provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
         "name": "YouTube",
-        "jarHash": "sha256-1a2b98f737de89d5fbe8890f146552e6881583d781f4aec4f31f5fbadacca559"
+        "jarHash": "sha256-d3f51ff4f88ef35262254001be5a19dcb87d85fa271fdc784026cee8e44afbee"
     }
 ]
