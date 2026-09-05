@@ -87,11 +87,15 @@ class CinePlexFTP : MainAPI() {
 
     /*
      * Verified from Cine Plex's own All Movies page JavaScript:
-     * the first 24 cards are rendered in the page and the next request
-     * starts at offset=24.
+     * the first 24 cards are rendered in the page; after that Cine Plex's
+     * JavaScript requests 12 more cards at offsets 24, 36, 48, ...
      */
     private companion object {
-        const val ALL_MOVIES_BATCH_SIZE = 24
+        const val ALL_MOVIES_FIRST_BATCH_SIZE = 24
+        const val ALL_MOVIES_LAZY_BATCH_SIZE = 12
+        const val SEARCH_ALL_MOVIES_PAGES = 6
+        const val SEARCH_CATEGORY_PAGES = 2
+        const val SEARCH_TV_PAGES = 3
     }
 
     /*
@@ -149,18 +153,9 @@ class CinePlexFTP : MainAPI() {
     ): HomePageResponse {
         return when (request.data) {
             "cineplex://movies" -> {
-                getMergedHomePage(
+                getAllMoviesHomePage(
                     request = request,
-                    page = page,
-                    sources = listOf(
-                        "$mainUrl/category.php",
-                        "$mainUrl/category.php?category=Indian+Bangla",
-                        "$mainUrl/category.php?category=Korean",
-                        "$mainUrl/category.php?category=3D+Movies",
-                        "$mainUrl/category.php?category=Bangla+Dubbed",
-                        "$mainUrl/category.php?category=Bangla+Movies",
-                        "$mainUrl/category.php?category=English"
-                    )
+                    page = page
                 )
             }
 
@@ -231,6 +226,25 @@ class CinePlexFTP : MainAPI() {
         }
     }
 
+    private suspend fun getAllMoviesHomePage(
+        request: MainPageRequest,
+        page: Int
+    ): HomePageResponse {
+        val items = getAllMoviesItems(page, request.name)
+
+        return newHomePageResponse(
+            request,
+            items
+                .take(maxHomeItems)
+                .map { it.toSearchResponse() },
+            if (page <= 1) {
+                items.size >= ALL_MOVIES_FIRST_BATCH_SIZE
+            } else {
+                items.size >= ALL_MOVIES_LAZY_BATCH_SIZE
+            }
+        )
+    }
+
     private suspend fun getMergedHomePage(
         request: MainPageRequest,
         page: Int,
@@ -259,7 +273,7 @@ class CinePlexFTP : MainAPI() {
                  * All Movies uses the site's lazy endpoint. If this page
                  * returned a full 24-item batch, another batch may exist.
                  */
-                if (items.size >= ALL_MOVIES_BATCH_SIZE) {
+                if (items.size >= ALL_MOVIES_LAZY_BATCH_SIZE) {
                     anySourceHasNext = true
                 }
             } else {
@@ -307,15 +321,29 @@ class CinePlexFTP : MainAPI() {
             val url = "$mainUrl/category.php"
             val document = getDocument(url) ?: return emptyList()
 
+            /*
+             * CRITICAL: category.php contains several sections, including
+             * Weekly Top 20 Trending. The real All Movies list is ONLY the
+             * #movieGrid element. Parsing the entire document mixes those
+             * trending cards into the Movies section.
+             */
+            val movieGrid = document.selectFirst("#movieGrid") ?: return emptyList()
+            val gridDocument = org.jsoup.Jsoup.parse(
+                "<html><body></body></html>",
+                "$mainUrl/"
+            )
+            gridDocument.body().appendChild(movieGrid.clone())
+
             return parseItems(
-                document = document,
+                document = gridDocument,
                 sourceUrl = url,
                 sectionName = sectionName,
                 page = 1
-            ).take(ALL_MOVIES_BATCH_SIZE)
+            ).take(ALL_MOVIES_FIRST_BATCH_SIZE)
         }
 
-        val offset = (pageNumber - 1) * ALL_MOVIES_BATCH_SIZE
+        val offset = ALL_MOVIES_FIRST_BATCH_SIZE +
+            ((pageNumber - 2) * ALL_MOVIES_LAZY_BATCH_SIZE)
         val endpoint = "$mainUrl/load_more_movies.php?offset=$offset"
 
         val response = runCatching {
@@ -328,10 +356,6 @@ class CinePlexFTP : MainAPI() {
         val html = response.text.trim()
         if (html.isBlank()) return emptyList()
 
-        /*
-         * load_more_movies.php returns the same movie-card HTML fragment
-         * that the site's JavaScript appends to #movieGrid.
-         */
         val document = org.jsoup.Jsoup.parse(
             "<html><body>$html</body></html>",
             "$mainUrl/"
@@ -342,7 +366,7 @@ class CinePlexFTP : MainAPI() {
             sourceUrl = "$mainUrl/category.php",
             sectionName = sectionName,
             page = pageNumber
-        ).take(ALL_MOVIES_BATCH_SIZE)
+        ).take(ALL_MOVIES_LAZY_BATCH_SIZE)
     }
 
     override suspend fun search(
@@ -352,33 +376,59 @@ class CinePlexFTP : MainAPI() {
         val q = query.trim()
         if (q.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        val native = linkedSetOf<SiteItem>()
-        val encoded = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
-        val candidates = listOf(
-            "$mainUrl/search.php?q=$encoded${if (page > 1) "&page=$page" else ""}",
-            "$mainUrl/search.php?query=$encoded${if (page > 1) "&page=$page" else ""}",
-            "$mainUrl/search.php?search=$encoded${if (page > 1) "&page=$page" else ""}"
-        )
+        val normalized = normalizeSearchText(q)
+        val compact = compactSearchText(q)
+        val variants = linkedSetOf<String>().apply {
+            add(q)
+            if (normalized.isNotBlank()) add(normalized)
+            if (compact.isNotBlank()) add(compact)
+        }
 
-        for (url in candidates) {
-            val document = getDocument(url) ?: continue
-            native += parseItems(document, url, "Search", page)
+        /* First try Cine Plex's native search with equivalent query forms. */
+        val native = linkedMapOf<String, SiteItem>()
+        for (variant in variants) {
+            val encoded = URLEncoder.encode(variant, StandardCharsets.UTF_8.toString())
+            val candidates = listOf(
+                "$mainUrl/search.php?q=$encoded${if (page > 1) "&page=$page" else ""}",
+                "$mainUrl/search.php?query=$encoded${if (page > 1) "&page=$page" else ""}",
+                "$mainUrl/search.php?search=$encoded${if (page > 1) "&page=$page" else ""}"
+            )
+
+            for (url in candidates) {
+                val document = getDocument(url) ?: continue
+                parseItems(document, url, "Search", page).forEach { item ->
+                    native.putIfAbsent(item.url, item)
+                }
+            }
         }
 
         if (native.isNotEmpty()) {
-            val ranked = rankSearchResults(q, native.toList())
-            return newSearchResponseList(
-                ranked.take(maxHomeItems).map { it.toSearchResponse() },
-                false
-            )
+            val ranked = rankSearchResults(q, native.values.toList())
+            val strongest = ranked.firstOrNull()?.let { searchScore(q, it.title) } ?: 0.0
+
+            if (strongest >= 0.72) {
+                return newSearchResponseList(
+                    ranked.take(maxHomeItems).map { it.toSearchResponse() },
+                    false
+                )
+            }
         }
 
-        // Advanced fallback: scan the site's public category pages and rank
-        // fuzzy/partial matches locally. This handles punctuation, spacing,
-        // spelling differences and partial titles when search.php is strict.
+        /*
+         * Local fallback for strict/limited site-search behavior.
+         * Search is punctuation/space-insensitive and scans enough of the
+         * real All Movies stream plus TV pages to find titles that the native
+         * search misses.
+         */
         val fallback = linkedMapOf<String, SiteItem>()
-        val sources = listOf(
-            "$mainUrl/category.php",
+
+        for (scanPage in 1..SEARCH_ALL_MOVIES_PAGES) {
+            getAllMoviesItems(scanPage, "Search").forEach { item ->
+                fallback.putIfAbsent(item.url, item)
+            }
+        }
+
+        val movieSources = listOf(
             "$mainUrl/category.php?category=Indian+Bangla",
             "$mainUrl/category.php?category=Korean",
             "$mainUrl/category.php?category=3D+Movies",
@@ -388,31 +438,46 @@ class CinePlexFTP : MainAPI() {
             "$mainUrl/category.php?category=Dual+Audio",
             "$mainUrl/category.php?category=Hindi+Dubbed",
             "$mainUrl/category.php?category=Hindi",
-            "$mainUrl/tvs.php",
             "$mainUrl/category.php?category=Anime",
             "$mainUrl/category.php?category=Animation"
         )
 
-        sources.forEach { url ->
-            getDocument(url)?.let { doc ->
-                parseItems(doc, url, "Search", 1).forEach { item ->
+        for (source in movieSources) {
+            for (scanPage in 1..SEARCH_CATEGORY_PAGES) {
+                val url = pageUrl(source, scanPage)
+                val document = getDocument(url) ?: continue
+                parseItems(document, url, "Search", scanPage).forEach { item ->
                     fallback.putIfAbsent(item.url, item)
                 }
             }
         }
 
+        for (scanPage in 1..SEARCH_TV_PAGES) {
+            val url = pageUrl("$mainUrl/tvs.php", scanPage)
+            val document = getDocument(url) ?: continue
+            parseItems(document, url, "TV Shows", scanPage).forEach { item ->
+                fallback.putIfAbsent(item.url, item.copy(isSeries = true))
+            }
+        }
+
         val ranked = rankSearchResults(q, fallback.values.toList())
+        val start = (page - 1).coerceAtLeast(0) * maxHomeItems
+
         return newSearchResponseList(
-            ranked.take(maxHomeItems).map { it.toSearchResponse() },
+            ranked
+                .drop(start)
+                .take(maxHomeItems)
+                .map { it.toSearchResponse() },
             false
         )
     }
 
     private fun normalizeSearchText(value: String): String {
-        return value
+        return java.text.Normalizer
+            .normalize(value, java.text.Normalizer.Form.NFKC)
             .lowercase(Locale.ROOT)
             .replace("&", " and ")
-            .replace("\u00B7", " ")
+            .replace(Regex("[\u2010-\u2015\u2212\u2043\u30A0\u30FC]"), "-")
             .replace(Regex("[^a-z0-9\\p{L}]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
@@ -459,20 +524,38 @@ class CinePlexFTP : MainAPI() {
         val tn = normalizeSearchText(title)
         if (qn.isBlank() || tn.isBlank()) return 0.0
         if (qn == tn) return 1.0
-        if (tn.contains(qn)) return 0.97
 
         val qc = compactSearchText(query)
         val tc = compactSearchText(title)
-        var score = similarity(qc, tc) * 0.55
+        if (qc.isNotBlank() && qc == tc) return 0.995
+
+        var score = 0.0
+
+        if (tn.contains(qn)) {
+            score = maxOf(score, 0.97)
+        }
+
+        if (qc.isNotBlank() && tc.contains(qc)) {
+            val ratio = qc.length.toDouble() / tc.length.coerceAtLeast(1).toDouble()
+            score = maxOf(score, 0.86 + (ratio * 0.11))
+        }
 
         val qTokens = qn.split(' ').filter { it.length >= 2 }
         val tTokens = tn.split(' ').filter { it.length >= 2 }
         if (qTokens.isNotEmpty() && tTokens.isNotEmpty()) {
             val tokenScore = qTokens.map { qt ->
-                tTokens.maxOfOrNull { tt -> similarity(qt, tt) } ?: 0.0
+                tTokens.maxOfOrNull { tt ->
+                    when {
+                        tt == qt -> 1.0
+                        tt.startsWith(qt) || qt.startsWith(tt) -> 0.92
+                        else -> similarity(qt, tt)
+                    }
+                } ?: 0.0
             }.average()
-            score += tokenScore * 0.45
+            score = maxOf(score, tokenScore)
         }
+
+        score = maxOf(score, similarity(qc, tc))
         return score.coerceIn(0.0, 1.0)
     }
 
@@ -510,7 +593,7 @@ class CinePlexFTP : MainAPI() {
             .ifBlank { titleFromUrl(url) }
 
         val poster = extractPoster(document, detailUrl)
-        val series = isSeriesUrl(url) || looksLikeSeriesPage(document)
+        val series = isSeriesUrl(url) || looksLikeSeriesPage(document) || detailUrl.contains("watch.php?id=", true)
 
         if (series) {
             val episodes = parseEpisodes(document, detailUrl)
@@ -671,6 +754,7 @@ class CinePlexFTP : MainAPI() {
         val cleaned = cleanUrl(url)
         if (cleaned.isBlank()) return null
         if (cleaned.contains("player.php", true)) return cleaned
+        if (cleaned.contains("watch.php", true)) return null
 
         val uri = runCatching { URI(cleaned) }.getOrNull() ?: return null
         val query = uri.rawQuery.orEmpty()
@@ -1242,45 +1326,97 @@ class CinePlexFTP : MainAPI() {
     ): List<Episode> {
         val result = linkedMapOf<String, Episode>()
 
-        document.select("a[href]").forEach { anchor ->
-            val href = anchor.attr("href").trim()
-
-            if (!looksLikeEpisodeLink(href)) {
-                return@forEach
-            }
+        document.select(
+            "a[href], [data-href], [data-url], [data-link]"
+        ).forEach { element ->
+            val raw = sequenceOf(
+                element.attr("href"),
+                element.attr("data-href"),
+                element.attr("data-url"),
+                element.attr("data-link")
+            ).firstOrNull { it.isNotBlank() } ?: return@forEach
 
             val absolute = absoluteUrl(
-                href,
+                cleanUrl(raw),
                 baseUrl
             )
 
-            if (absolute == baseUrl) {
+            if (absolute == baseUrl || !looksLikeContentLink(absolute)) {
                 return@forEach
             }
 
-            val title = cleanTitle(
-                anchor.text().ifBlank {
-                    "Episode"
-                }
+            val label = cleanTitle(
+                sequenceOf(
+                    element.text(),
+                    element.attr("aria-label"),
+                    element.attr("title")
+                ).firstOrNull { it.isNotBlank() } ?: "Episode"
             )
 
-            result[absolute] = newEpisode(
-                absolute
-            ) {
-                name = title
-                season = 1
-                episode = episodeNumber(
-                    anchor,
-                    title,
-                    absolute
-                )
+            val lower = absolute.lowercase(Locale.ROOT)
+            val explicitEpisode =
+                lower.contains("episode") ||
+                    lower.contains("ep=") ||
+                    lower.contains("episode=") ||
+                    lower.contains("season=") ||
+                    lower.contains("type=episode")
+
+            val labelLooksEpisode = Regex(
+                "(?i)\\b(?:episode|ep|e)\\s*[-._ ]?\\d+"
+            ).containsMatchIn(label)
+
+            val hasEpisodeData =
+                element.attr("data-episode").isNotBlank() ||
+                    element.attr("data-ep").isNotBlank()
+
+            if (explicitEpisode || labelLooksEpisode || hasEpisodeData) {
+                val season = seasonNumberFrom(element, label, absolute)
+                val episode = episodeNumberFrom(element, label, absolute)
+
+                result[absolute] = newEpisode(absolute) {
+                    name = label.ifBlank { "Episode $episode" }
+                    this.season = season
+                    this.episode = episode
+                }
             }
         }
 
         /*
-         * If the series page itself exposes one direct file,
-         * expose it as Episode 1.
+         * Cine Plex TV pages can also expose plain watch.php episode cards
+         * without textual "Episode" labels. When no explicit episode was
+         * detected, use those watch.php cards in page order and number them.
          */
+        if (result.isEmpty()) {
+            val watchLinks = document.select("a[href*='watch.php?id=']")
+            var sequential = 1
+
+            for (anchor in watchLinks) {
+                val absolute = absoluteUrl(
+                    cleanUrl(anchor.attr("href")),
+                    baseUrl
+                )
+
+                if (absolute == baseUrl || !isCinePlexPageUrl(absolute)) continue
+
+                val label = cleanTitle(
+                    sequenceOf(
+                        anchor.text(),
+                        anchor.attr("aria-label"),
+                        anchor.attr("title")
+                    ).firstOrNull { it.isNotBlank() } ?: "Episode $sequential"
+                )
+
+                result.putIfAbsent(absolute, newEpisode(absolute) {
+                    name = label
+                    season = 1
+                    episode = sequential
+                })
+
+                sequential++
+            }
+        }
+
+        /* Single-file TV page fallback. */
         if (result.isEmpty()) {
             val direct = extractMediaUrls(
                 document,
@@ -1289,9 +1425,7 @@ class CinePlexFTP : MainAPI() {
             ).firstOrNull()
 
             if (direct != null) {
-                result[direct] = newEpisode(
-                    direct
-                ) {
+                result[direct] = newEpisode(direct) {
                     name = "Episode 1"
                     season = 1
                     episode = 1
@@ -1299,9 +1433,54 @@ class CinePlexFTP : MainAPI() {
             }
         }
 
-        return result.values.sortedBy {
-            it.episode ?: Int.MAX_VALUE
-        }
+        return result.values.sortedWith(
+            compareBy<Episode> { it.season ?: 1 }
+                .thenBy { it.episode ?: Int.MAX_VALUE }
+        )
+    }
+
+    private fun seasonNumberFrom(
+        element: Element,
+        title: String,
+        url: String
+    ): Int {
+        val candidates = listOf(
+            element.attr("data-season"),
+            Regex("(?i)\\bseason\\s*([0-9]+)").find(title)?.groupValues?.getOrNull(1),
+            Regex("(?i)\\bs\\s*([0-9]+)").find(title)?.groupValues?.getOrNull(1),
+            Regex("(?i)(?:season|s)=([0-9]+)").find(url)?.groupValues?.getOrNull(1)
+        )
+
+        return candidates
+            .firstNotNullOfOrNull { it.toIntOrNull() }
+            ?: 1
+    }
+
+    private fun episodeNumberFrom(
+        element: Element,
+        title: String,
+        url: String
+    ): Int {
+        val candidates = listOf(
+            element.attr("data-episode"),
+            element.attr("data-ep"),
+            Regex("(?i)\\bepisode\\s*[-._ ]?([0-9]+)").find(title)?.groupValues?.getOrNull(1),
+            Regex("(?i)\\bep\\s*[-._ ]?([0-9]+)").find(title)?.groupValues?.getOrNull(1),
+            Regex("(?i)\\be\\s*[-._ ]?([0-9]+)").find(title)?.groupValues?.getOrNull(1),
+            Regex("(?i)(?:episode|ep|e)=([0-9]+)").find(url)?.groupValues?.getOrNull(1)
+        )
+
+        return candidates
+            .firstNotNullOfOrNull { it.toIntOrNull() }
+            ?: 1
+    }
+
+    private fun isCinePlexPageUrl(url: String): Boolean {
+        val host = runCatching {
+            URI(url).host?.lowercase(Locale.ROOT).orEmpty()
+        }.getOrDefault("")
+
+        return host == "cineplexbd.net" || host.endsWith(".cineplexbd.net")
     }
 
     private fun findCard(
@@ -1513,6 +1692,7 @@ class CinePlexFTP : MainAPI() {
         }
 
         return lower.contains("view.php?id=") ||
+            lower.contains("watch.php?id=") ||
             lower.contains("player.php?id=") ||
             lower.contains("movie.php") ||
             lower.contains("series.php") ||
@@ -1589,6 +1769,7 @@ class CinePlexFTP : MainAPI() {
         val lower = url.lowercase(Locale.ROOT)
 
         return lower.contains("tvs.php") ||
+            lower.contains("watch.php") ||
             lower.contains("series.php") ||
             lower.contains("show.php") ||
             lower.contains("type=series") ||
