@@ -2486,10 +2486,10 @@ class YouTubeKids : MainAPI() {
      *
      *   1) Delegate to the already-working main YouTube provider.
      *   2) Direct NewPipe extraction in this provider.
-     *      - progressive/muxed VIDEO stream first
      *      - LIVE HLS
-     *      - DASH
-     *      - HLS
+     *      - DASH first for VOD
+     *      - direct per-resolution VIDEO links
+     *      - HLS fallback
      *   3) CloudStream's registered YouTube extractors.
      *
      * Stream URLs are always resolved when the user clicks Play.
@@ -2506,235 +2506,117 @@ class YouTubeKids : MainAPI() {
             return false
         }
 
-        val original =
-            data.trim()
-
-        val canonical =
-            canonicalYouTubeUrl(
-                original
-            )
-
-        /*
-         * ----------------------------------------------------------
-         * PATH 1: DIRECT NEWPIPE
-         * ----------------------------------------------------------
-         *
-         * The important part of this path is that we expose every
-         * usable YouTube video resolution that NewPipe gives us.
-         *
-         * YouTube HD+ streams are commonly video-only adaptive
-         * streams, so those streams are emitted as VIDEO links with
-         * CloudStream audioTracks attached. This lets CloudStream
-         * show 360p / 480p / 720p / 1080p / 1440p / 2160p / 4320p
-         * when the source actually provides them.
-         *
-         * Signed media URLs are still resolved only when Play is
-         * pressed. No signed media URL is stored in the home cache.
-         */
-
-        val directUrls =
-            linkedSetOf(
-                canonical,
-                original
-            )
+        val original = data.trim()
+        val canonical = canonicalYouTubeUrl(original)
+        val directUrls = linkedSetOf(canonical, original)
 
         for (videoUrl in directUrls) {
-            val emitted =
-                runCatching {
-                    val extractor =
-                        service.getStreamExtractor(
-                            videoUrl
-                        )
+            try {
+                val extractor = service.getStreamExtractor(videoUrl)
+                extractor.fetchPage()
 
-                    extractor.fetchPage()
+                val info = StreamInfo.getInfo(extractor)
+                val isLive = info.streamType?.name?.contains("LIVE", ignoreCase = true) == true
 
-                    val info =
-                        StreamInfo.getInfo(
-                            extractor
-                        )
-
-                    val isLive =
-                        info.streamType
-                            ?.name
-                            ?.contains(
-                                "LIVE",
-                                ignoreCase = true
-                            ) == true
-
-                    /*
-                     * LIVE -> HLS
-                     *
-                     * Live handling is intentionally left separate from
-                     * the VOD resolution system.
-                     */
-                    if (isLive) {
-                        val hls =
-                            runCatching {
-                                info.hlsUrl
-                            }.getOrNull()
-
-                        if (!hls.isNullOrBlank()) {
-                            callback(
-                                newExtractorLink(
-                                    source = name,
-                                    name = "$name Live",
-                                    url = hls,
-                                    type =
-                                        ExtractorLinkType.M3U8
-                                ) {
-                                    referer =
-                                        "https://www.youtube.com/"
-
-                                    headers =
-                                        mapOf(
-                                            "User-Agent" to
-                                                USER_AGENT
-                                        )
-
-                                    quality =
-                                        Qualities.Unknown.value
-                                }
-                            )
-
-                            return true
-                        }
-                    }
-
-                    /*
-                     * VOD -> ALL AVAILABLE DIRECT RESOLUTIONS FIRST
-                     *
-                     * This is the actual HD/4K/8K fix.
-                     *
-                     * The helper emits one CloudStream source for each
-                     * distinct resolution available from YouTube. For
-                     * video-only streams it attaches NewPipe audio streams
-                     * through CloudStream's audioTracks support.
-                     */
-                    if (
-                        emitYouTubeResolutionStreams(
-                            info = info,
-                            callback = callback
-                        )
-                    ) {
-                        return true
-                    }
-
-                    /*
-                     * If NewPipe did not expose direct video streams,
-                     * retain the adaptive DASH fallback.
-                     */
-                    val dash =
-                        runCatching {
-                            info.dashMpdUrl
-                        }.getOrNull()
-
-                    if (
-                        !dash.isNullOrBlank()
-                    ) {
+                /* LIVE -> HLS */
+                if (isLive) {
+                    val hls = runCatching { info.hlsUrl }.getOrNull()
+                    if (!hls.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
                                 source = name,
-                                name = "$name Adaptive",
-                                url = dash,
-                                type =
-                                    ExtractorLinkType.DASH
-                            ) {
-                                referer =
-                                    "https://www.youtube.com/"
-
-                                headers =
-                                    mapOf(
-                                        "User-Agent" to
-                                            USER_AGENT
-                                    )
-
-                                quality =
-                                    Qualities.Unknown.value
-                            }
-                        )
-
-                        return true
-                    }
-
-                    /*
-                     * HLS fallback
-                     */
-                    val hls =
-                        runCatching {
-                            info.hlsUrl
-                        }.getOrNull()
-
-                    if (
-                        !hls.isNullOrBlank()
-                    ) {
-                        callback(
-                            newExtractorLink(
-                                source = name,
-                                name = "$name HLS",
+                                name = "$name Live",
                                 url = hls,
-                                type =
-                                    ExtractorLinkType.M3U8
+                                type = ExtractorLinkType.M3U8
                             ) {
-                                referer =
-                                    "https://www.youtube.com/"
-
-                                headers =
-                                    mapOf(
-                                        "User-Agent" to
-                                            USER_AGENT
-                                    )
-
-                                quality =
-                                    Qualities.Unknown.value
+                                referer = "https://www.youtube.com/"
+                                headers = mapOf("User-Agent" to USER_AGENT)
+                                quality = Qualities.Unknown.value
                             }
                         )
-
                         return true
                     }
+                }
 
-                    /*
-                     * Absolute last resort: a single muxed progressive
-                     * stream. This remains only for cases where NewPipe
-                     * cannot expose the normal adaptive/direct stream set.
-                     */
-                    if (
-                        emitProgressiveVideoStreams(
-                            info = info,
-                            callback = callback
-                        )
-                    ) {
-                        return true
-                    }
+                /*
+                 * VOD -> DASH FIRST
+                 *
+                 * This is the critical part of the fix. The old code returned
+                 * as soon as it found the normal 360p muxed stream. That meant
+                 * the adaptive YouTube DASH manifest was never offered when a
+                 * low-resolution progressive stream existed.
+                 *
+                 * We now expose DASH first and do NOT return before the direct
+                 * resolution extraction has also had a chance to publish every
+                 * higher-resolution stream that NewPipe actually exposes.
+                 */
+                var hasAnyLink = false
 
-                    false
-                }.getOrDefault(false)
+                val dash = runCatching { info.dashMpdUrl }.getOrNull()
+                if (!dash.isNullOrBlank()) {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name Adaptive (YouTube)",
+                            url = dash,
+                            type = ExtractorLinkType.DASH
+                        ) {
+                            referer = "https://www.youtube.com/"
+                            headers = mapOf("User-Agent" to USER_AGENT)
+                            quality = Qualities.Unknown.value
+                        }
+                    )
+                    hasAnyLink = true
+                }
 
-            if (emitted) {
-                return true
+                /*
+                 * Expose individually selectable direct resolutions as well.
+                 * When DASH exists we suppress only the low 360p fallback so it
+                 * cannot mask the adaptive source on a TV/phone source picker.
+                 */
+                val directEmitted = emitYouTubeResolutionStreams(
+                    info = info,
+                    callback = callback,
+                    minimumResolution = if (dash.isNullOrBlank()) 1 else 361
+                )
+                hasAnyLink = hasAnyLink || directEmitted
+
+                if (hasAnyLink) {
+                    return true
+                }
+
+                /* VOD -> HLS fallback */
+                val hls = runCatching { info.hlsUrl }.getOrNull()
+                if (!hls.isNullOrBlank()) {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name HLS",
+                            url = hls,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            referer = "https://www.youtube.com/"
+                            headers = mapOf("User-Agent" to USER_AGENT)
+                            quality = Qualities.Unknown.value
+                        }
+                    )
+                    return true
+                }
+            } catch (_: Exception) {
+                /* Try the next URL form or registered CloudStream extractor. */
             }
         }
 
-        /*
-         * ----------------------------------------------------------
-         * PATH 3: REGISTERED CLOUDSTREAM EXTRACTORS
-         * ----------------------------------------------------------
-         *
-         * We intentionally try multiple YouTube URL forms because
-         * CloudStream can have more than one compatible extractor
-         * installed.
-         */
-
-        val fallbackUrls =
-            linkedSetOf(
-                canonical,
-                mobileYouTubeUrl(canonical),
-                noCookieYouTubeUrl(canonical),
-                original
-            )
+        /* Final compatibility fallback through CloudStream extractors. */
+        val fallbackUrls = linkedSetOf(
+            canonical,
+            mobileYouTubeUrl(canonical),
+            noCookieYouTubeUrl(canonical),
+            original
+        )
 
         for (videoUrl in fallbackUrls) {
-            var fallbackLinkFound =
-                false
+            var fallbackLinkFound = false
 
             runCatching {
                 loadExtractor(
@@ -2781,7 +2663,8 @@ class YouTubeKids : MainAPI() {
 
     private suspend fun emitYouTubeResolutionStreams(
         info: StreamInfo,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        minimumResolution: Int = 1
     ): Boolean {
         /*
          * NewPipe keeps muxed/progressive video streams and adaptive
@@ -2894,7 +2777,7 @@ class YouTubeKids : MainAPI() {
                             )
                         }
 
-                    if (resolution <= 0) {
+                    if (resolution < minimumResolution || resolution <= 0) {
                         return@mapNotNull null
                     }
 
