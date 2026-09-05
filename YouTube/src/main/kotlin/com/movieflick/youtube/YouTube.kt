@@ -17,10 +17,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
-import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
-import java.net.URLDecoder
-import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 class YouTube : MainAPI() {
@@ -1131,17 +1127,8 @@ class YouTube : MainAPI() {
     private companion object {
         const val FAST_VISIBLE_COUNT = 6
         const val HOME_CACHE_LIMIT = 50
-        const val CACHE_RETENTION_MS = 14L * 24L * 60L * 60L * 1000L
         const val BACKGROUND_REFRESH_COOLDOWN_MS = 30_000L
-        const val PERSISTENT_CACHE_PREFIX = "movieflick.youtube.home.v3."
     }
-
-    private data class PersistentHomeItem(
-        val title: String,
-        val url: String,
-        val poster: String?,
-        val lastSeen: Long
-    )
 
     private val backgroundRefreshScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -1152,168 +1139,43 @@ class YouTube : MainAPI() {
     private val refreshLastStarted =
         ConcurrentHashMap<String, Long>()
 
-    private fun cacheKey(section: String): String =
-        PERSISTENT_CACHE_PREFIX + section
+    /*
+     * Fast in-memory cache for repeated navigation.
+     * App-level storage helpers from the host application are not part of the
+     * plugin compile classpath, so this extension intentionally stays on the
+     * library-safe in-memory cache path.
+     */
+    private data class CachedResponses(
+        val expiresAt: Long,
+        val items: List<SearchResponse>
+    )
 
-    private fun encodeCacheField(value: String): String =
-        URLEncoder.encode(value, "UTF-8")
-
-    private fun decodeCacheField(value: String): String? =
-        runCatching {
-            URLDecoder.decode(value, "UTF-8")
-        }.getOrNull()
-
-    private fun readPersistentHomeCache(
-        section: String
-    ): List<PersistentHomeItem> {
-        val raw =
-            runCatching {
-                getKey<String>(cacheKey(section))
-            }.getOrNull()
-                ?: return emptyList()
-
-        val now = System.currentTimeMillis()
-
-        return raw
-            .lineSequence()
-            .mapNotNull { line ->
-                val parts = line.split('\t')
-                if (parts.size < 4) return@mapNotNull null
-
-                val lastSeen =
-                    parts[0].toLongOrNull()
-                        ?: return@mapNotNull null
-
-                val title =
-                    decodeCacheField(parts[1])
-                        ?.takeIf { it.isNotBlank() }
-                        ?: return@mapNotNull null
-
-                val url =
-                    decodeCacheField(parts[2])
-                        ?.takeIf { it.isNotBlank() }
-                        ?: return@mapNotNull null
-
-                val poster =
-                    decodeCacheField(parts[3])
-                        ?.takeIf { it.isNotBlank() }
-
-                if (now - lastSeen > CACHE_RETENTION_MS) {
-                    return@mapNotNull null
-                }
-
-                PersistentHomeItem(
-                    title = title,
-                    url = url,
-                    poster = poster,
-                    lastSeen = lastSeen
-                )
-            }
-            .distinctBy { it.url }
-            .take(HOME_CACHE_LIMIT)
-            .toList()
-    }
-
-    private fun writePersistentHomeCache(
-        section: String,
-        fresh: List<SearchResponse>
-    ) {
-        if (fresh.isEmpty()) return
-
-        val now = System.currentTimeMillis()
-        val old = readPersistentHomeCache(section)
-
-        val merged = mutableListOf<PersistentHomeItem>()
-        val seen = mutableSetOf<String>()
-
-        fresh.forEach { response ->
-            val url = response.url.trim()
-            val title = response.name.trim()
-
-            if (url.isBlank() || title.isBlank() || !seen.add(url)) return@forEach
-
-            merged.add(
-                PersistentHomeItem(
-                    title = title,
-                    url = url,
-                    poster = response.posterUrl,
-                    lastSeen = now
-                )
-            )
-        }
-
-        old.forEach { item ->
-            if (seen.add(item.url)) {
-                merged.add(item)
-            }
-        }
-
-        val payload =
-            merged
-                .take(HOME_CACHE_LIMIT)
-                .joinToString("\n") { item ->
-                    listOf(
-                        item.lastSeen.toString(),
-                        encodeCacheField(item.title),
-                        encodeCacheField(item.url),
-                        encodeCacheField(item.poster.orEmpty())
-                    ).joinToString("\t")
-                }
-
-        runCatching {
-            setKey(
-                cacheKey(section),
-                payload
-            )
-        }
-    }
+    private val fastContentCache =
+        ConcurrentHashMap<String, CachedResponses>()
 
     private fun cachedResponses(
         section: String,
         kind: String,
         limit: Int = HOME_CACHE_LIMIT
     ): List<SearchResponse> {
-        return readPersistentHomeCache(section)
-            .take(limit)
-            .mapNotNull { item ->
-                when (kind) {
-                    "religion" ->
-                        newTvSeriesSearchResponse(
-                            item.title,
-                            item.url,
-                            TvType.TvSeries
-                        ) {
-                            posterUrl = item.poster
-                        }
+        val cached = fastContentCache[section] ?: return emptyList()
+        if (cached.expiresAt <= System.currentTimeMillis()) {
+            fastContentCache.remove(section, cached)
+            return emptyList()
+        }
+        return cached.items.take(limit)
+    }
 
-                    "live" ->
-                        newMovieSearchResponse(
-                            item.title,
-                            item.url,
-                            TvType.Live
-                        ) {
-                            posterUrl = item.poster
-                        }
-
-                    "generic" ->
-                        newMovieSearchResponse(
-                            item.title,
-                            item.url,
-                            TvType.Others
-                        ) {
-                            posterUrl = item.poster
-                        }
-
-                    else ->
-                        newMovieSearchResponse(
-                            item.title,
-                            item.url,
-                            TvType.Movie
-                        ) {
-                            posterUrl = item.poster
-                        }
-                }
-            }
+    private fun putCachedResponses(
+        section: String,
+        items: List<SearchResponse>,
+        ttlMs: Long
+    ) {
+        if (items.isEmpty()) return
+        fastContentCache[section] = CachedResponses(
+            expiresAt = System.currentTimeMillis() + ttlMs,
+            items = items.distinctBy { it.url }.take(HOME_CACHE_LIMIT)
+        )
     }
 
     private fun scheduleBackgroundRefresh(
@@ -1555,7 +1417,7 @@ class YouTube : MainAPI() {
             10 * 60 * 1000L
         )
 
-        writePersistentHomeCache("music", results)
+        putCachedResponses("music", results, 10 * 60 * 1000L)
 
         return response
     }
@@ -1740,7 +1602,7 @@ class YouTube : MainAPI() {
             20 * 60 * 1000L
         )
 
-        writePersistentHomeCache("movies", results)
+        putCachedResponses("movies", results, 20 * 60 * 1000L)
 
         return response
     }
@@ -1943,6 +1805,8 @@ class YouTube : MainAPI() {
         val candidates =
             mutableListOf<SearchResponse>()
 
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
+
         val scores =
             mutableMapOf<String, Int>()
 
@@ -2121,7 +1985,7 @@ class YouTube : MainAPI() {
             15 * 60 * 1000L
         )
 
-        writePersistentHomeCache("hindi_movies", results)
+        putCachedResponses("hindi_movies", candidates, 15 * 60 * 1000L)
 
         return response
     }
@@ -2353,7 +2217,7 @@ class YouTube : MainAPI() {
             60 * 1000L
         )
 
-        writePersistentHomeCache("live", results)
+        putCachedResponses("live", results, 60 * 1000L)
 
         return response
     }
@@ -2804,7 +2668,7 @@ class YouTube : MainAPI() {
             30 * 60 * 1000L
         )
 
-        writePersistentHomeCache("religion", finalResults)
+        putCachedResponses("religion", finalResults, 30 * 60 * 1000L)
 
         return response
     }
@@ -3942,7 +3806,7 @@ class YouTube : MainAPI() {
                 ?: emptyList()
 
         if (results.isNotEmpty()) {
-            writePersistentHomeCache(cacheSection, results)
+            putCachedResponses(cacheSection, results, 15 * 60 * 1000L)
         }
 
         return newHomePageResponse(
@@ -3977,7 +3841,7 @@ class YouTube : MainAPI() {
 
         if (fresh.isEmpty()) return
 
-        writePersistentHomeCache(cacheSection, fresh)
+        putCachedResponses(cacheSection, fresh, 15 * 60 * 1000L)
     }
 
     override suspend fun search(
