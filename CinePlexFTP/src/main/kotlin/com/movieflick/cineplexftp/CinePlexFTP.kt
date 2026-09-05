@@ -10,6 +10,7 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Locale
+import org.json.JSONArray
 
 class CinePlexFTP : MainAPI() {
 
@@ -96,6 +97,8 @@ class CinePlexFTP : MainAPI() {
         const val SEARCH_ALL_MOVIES_PAGES = 6
         const val SEARCH_CATEGORY_PAGES = 2
         const val SEARCH_TV_PAGES = 3
+        const val ALL_TV_FIRST_BATCH_SIZE = 24
+        const val ALL_TV_LAZY_BATCH_SIZE = 24
     }
 
     /*
@@ -181,12 +184,9 @@ class CinePlexFTP : MainAPI() {
             }
 
             "cineplex://tv" -> {
-                getMergedHomePage(
+                getAllTvSeriesHomePage(
                     request = request,
-                    page = page,
-                    sources = listOf(
-                        "$mainUrl/tvs.php"
-                    )
+                    page = page
                 )
             }
 
@@ -243,6 +243,103 @@ class CinePlexFTP : MainAPI() {
                 items.size >= ALL_MOVIES_LAZY_BATCH_SIZE
             }
         )
+    }
+
+    private suspend fun getAllTvSeriesHomePage(
+        request: MainPageRequest,
+        page: Int
+    ): HomePageResponse {
+        val items = getAllTvSeriesItems(page)
+        val pageNumber = page.coerceAtLeast(1)
+
+        return newHomePageResponse(
+            request,
+            items.take(maxHomeItems).map {
+                it.copy(isSeries = true).toSearchResponse()
+            },
+            if (pageNumber == 1) {
+                items.size >= ALL_TV_FIRST_BATCH_SIZE
+            } else {
+                items.size >= ALL_TV_LAZY_BATCH_SIZE
+            }
+        )
+    }
+
+    private suspend fun getAllTvSeriesItems(page: Int): List<SiteItem> {
+        val pageNumber = page.coerceAtLeast(1)
+
+        if (pageNumber == 1) {
+            val url = "$mainUrl/tvs.php"
+            val document = getDocument(url) ?: return emptyList()
+            val tvGrid = document.selectFirst("#tvGrid") ?: return emptyList()
+
+            val gridDocument = org.jsoup.Jsoup.parse(
+                "<html><body></body></html>",
+                "$mainUrl/"
+            )
+            gridDocument.body().appendChild(tvGrid.clone())
+
+            return parseItems(
+                document = gridDocument,
+                sourceUrl = url,
+                sectionName = "TV Shows",
+                page = 1
+            ).map { it.copy(isSeries = true) }
+                .take(ALL_TV_FIRST_BATCH_SIZE)
+        }
+
+        val offset = ALL_TV_FIRST_BATCH_SIZE +
+            ((pageNumber - 2) * ALL_TV_LAZY_BATCH_SIZE)
+        val endpoint = "$mainUrl/tvs_more.php?offset=$offset&limit=$ALL_TV_LAZY_BATCH_SIZE"
+
+        val response = runCatching {
+            app.get(
+                endpoint,
+                headers = pageHeaders("$mainUrl/tvs.php") + mapOf(
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache"
+                )
+            )
+        }.getOrNull() ?: return emptyList()
+
+        val raw = response.text.trim()
+        if (raw.isBlank()) return emptyList()
+
+        val array = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
+        val result = linkedMapOf<String, SiteItem>()
+
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val id = item.optString("id").trim()
+            val title = cleanTitle(item.optString("title").trim())
+            if (id.isBlank() || title.isBlank()) continue
+
+            val encodedId = URLEncoder.encode(id, StandardCharsets.UTF_8.toString())
+            val absolute = "$mainUrl/watch.php?series_id=$encodedId&autoplay=1"
+            val posterRaw = item.optString("poster").trim()
+            val poster = posterRaw.takeIf { it.isNotBlank() }?.let {
+                absoluteUrl(it, "$mainUrl/tvs.php")
+            }
+
+            result.putIfAbsent(absolute, SiteItem(
+                title = title,
+                url = absolute,
+                poster = poster,
+                isSeries = true,
+                sortTime = parseJsonTimestamp(item.optString("created_at").trim()),
+                discoveryOrder = pageNumber.toLong() * 1_000_000L + index
+            ))
+        }
+
+        return result.values.toList().take(ALL_TV_LAZY_BATCH_SIZE)
+    }
+
+    private fun parseJsonTimestamp(value: String): Long {
+        if (value.isBlank()) return 0L
+        value.toLongOrNull()?.let { number ->
+            return if (number < 10_000_000_000L) number * 1000L else number
+        }
+        return parseDate(value) ?: 0L
     }
 
     private suspend fun getMergedHomePage(
@@ -453,9 +550,7 @@ class CinePlexFTP : MainAPI() {
         }
 
         for (scanPage in 1..SEARCH_TV_PAGES) {
-            val url = pageUrl("$mainUrl/tvs.php", scanPage)
-            val document = getDocument(url) ?: continue
-            parseItems(document, url, "TV Shows", scanPage).forEach { item ->
+            getAllTvSeriesItems(scanPage).forEach { item ->
                 fallback.putIfAbsent(item.url, item.copy(isSeries = true))
             }
         }
@@ -593,7 +688,12 @@ class CinePlexFTP : MainAPI() {
             .ifBlank { titleFromUrl(url) }
 
         val poster = extractPoster(document, detailUrl)
-        val series = isSeriesUrl(url) || looksLikeSeriesPage(document) || detailUrl.contains("watch.php?id=", true)
+        val series =
+            isSeriesUrl(url) ||
+                looksLikeSeriesPage(document) ||
+                detailUrl.contains("watch.php?id=", true) ||
+                detailUrl.contains("watch.php?series_id=", true) ||
+                detailUrl.contains("watch.php?series-id=", true)
 
         if (series) {
             val episodes = parseEpisodes(document, detailUrl)
@@ -1452,7 +1552,7 @@ class CinePlexFTP : MainAPI() {
         )
 
         return candidates
-            .firstNotNullOfOrNull { it.toIntOrNull() }
+            .firstNotNullOfOrNull { it?.toIntOrNull() }
             ?: 1
     }
 
@@ -1471,7 +1571,7 @@ class CinePlexFTP : MainAPI() {
         )
 
         return candidates
-            .firstNotNullOfOrNull { it.toIntOrNull() }
+            .firstNotNullOfOrNull { it?.toIntOrNull() }
             ?: 1
     }
 
@@ -1693,6 +1793,8 @@ class CinePlexFTP : MainAPI() {
 
         return lower.contains("view.php?id=") ||
             lower.contains("watch.php?id=") ||
+            lower.contains("watch.php?series_id=") ||
+            lower.contains("watch.php?series-id=") ||
             lower.contains("player.php?id=") ||
             lower.contains("movie.php") ||
             lower.contains("series.php") ||
@@ -1894,6 +1996,7 @@ class CinePlexFTP : MainAPI() {
         val patterns = listOf(
             Regex("""(?i)https?://[^"'<>\s)]+"""),
             Regex("""(?i)(?:/|\.\.?/)?(?:view|player)\.php\?[^"'<>\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?watch\.php\?[^"'<>\s)]+"""),
             Regex("""(?i)(?:/|\.\.?/)?(?:movie|series|show|details)\.php\?[^"'<>\s)]+""")
         )
 
