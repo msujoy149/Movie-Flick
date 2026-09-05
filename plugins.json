@@ -91,5 +91,27 @@
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
         "name": "YouTube",
         "jarHash": "sha256-e564c112a7c590f269bfd0234c0df1f369de9999af784fafad957b21b9212e9b"
+    },
+    {
+        "jarFileSize": 174051,
+        "fileHash": "sha256-fbb088302eda53e66bb2bd76072ea51ad0dfb86107b831c7aef7f23d803c999a",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 34239,
+        "status": 1,
+        "language": "bn",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Other"
+        ],
+        "version": 1,
+        "internalName": "YouTubeKids",
+        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.jar",
+        "description": "YouTube Kids provider for Movie-Flick",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.cs3",
+        "name": "YouTubeKids",
+        "jarHash": "sha256-daa6d6f31a51a582dbcbfb94f3ea1b58002a9f59aaa155de09f41aac23837ce0"
     }
 ]
