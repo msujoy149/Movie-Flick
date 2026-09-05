@@ -5,23 +5,19 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
-import java.net.URLDecoder
 import java.net.URLEncoder
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
 import java.util.Locale
-import kotlin.math.max
-import kotlin.math.min
 
 class CinePlexFTP : MainAPI() {
 
     override var mainUrl = "http://cineplexbd.net"
-
     override var name = "Cine Plex FTP"
-
     override var lang = "bn"
 
     override val hasMainPage = true
-
     override val hasQuickSearch = true
 
     override val supportedTypes = setOf(
@@ -30,102 +26,20 @@ class CinePlexFTP : MainAPI() {
         TvType.Anime
     )
 
-    /*
-     * ============================================================
-     * HOME MENU
-     * ============================================================
-     *
-     * CloudStream will show only:
-     *
-     * Movies
-     * Dual Audio
-     * Hindi
-     * TV Shows
-     * Anime
-     *
-     * The website categories inside each section are merged.
-     */
-
     override val mainPage = mainPageOf(
-
-        /*
-         * MOVIES
-         *
-         * Main Movies
-         * Indian Bangla
-         * Korean
-         * 3D Movies
-         * Bangla Dubbed
-         * Bangla Movies
-         * English
-         */
         "$mainUrl/movies" to "Movies",
-
-        /*
-         * DUAL AUDIO
-         *
-         * Dual Audio
-         * Hindi Dubbed
-         */
+        "$mainUrl/category.php?category=Indian+Bangla" to "Movies",
+        "$mainUrl/category.php?category=Korean" to "Movies",
+        "$mainUrl/category.php?category=3D+Movies" to "Movies",
+        "$mainUrl/category.php?category=Bangla+Dubbed" to "Movies",
+        "$mainUrl/category.php?category=Bangla+Movies" to "Movies",
+        "$mainUrl/category.php?category=English" to "Movies",
         "$mainUrl/category.php?category=Dual+Audio" to "Dual Audio",
-
-        /*
-         * HINDI
-         */
+        "$mainUrl/category.php?category=Hindi+Dubbed" to "Dual Audio",
         "$mainUrl/category.php?category=Hindi" to "Hindi",
-
-        /*
-         * TV SHOWS
-         */
         "$mainUrl/tvs.php" to "TV Shows",
-
-        /*
-         * ANIME
-         *
-         * Anime + Animation are merged.
-         *
-         * The special "anime" data marker is handled in
-         * getMainPage().
-         */
-        "cineplex://anime" to "Anime"
-    )
-
-    /*
-     * ============================================================
-     * MERGED MOVIE CATEGORY SOURCES
-     * ============================================================
-     */
-
-    private val movieSources = listOf(
-        "$mainUrl/movies",
-        "$mainUrl/category.php?category=Indian+Bangla",
-        "$mainUrl/category.php?category=Korean",
-        "$mainUrl/category.php?category=3D+Movies",
-        "$mainUrl/category.php?category=Bangla+Dubbed",
-        "$mainUrl/category.php?category=Bangla+Movies",
-        "$mainUrl/category.php?category=English"
-    )
-
-    /*
-     * ============================================================
-     * MERGED DUAL AUDIO SOURCES
-     * ============================================================
-     */
-
-    private val dualAudioSources = listOf(
-        "$mainUrl/category.php?category=Dual+Audio",
-        "$mainUrl/category.php?category=Hindi+Dubbed"
-    )
-
-    /*
-     * ============================================================
-     * MERGED ANIME SOURCES
-     * ============================================================
-     */
-
-    private val animeSources = listOf(
-        "$mainUrl/category.php?category=Anime",
-        "$mainUrl/category.php?category=Animation"
+        "$mainUrl/category.php?category=Anime" to "Anime",
+        "$mainUrl/category.php?category=Animation" to "Anime"
     )
 
     private data class SiteItem(
@@ -133,115 +47,74 @@ class CinePlexFTP : MainAPI() {
         val url: String,
         val poster: String?,
         val isSeries: Boolean,
-        val category: String = ""
+        val sortTime: Long,
+        val discoveryOrder: Long
     )
 
-    /*
-     * ============================================================
-     * SEARCH RESPONSE
-     * ============================================================
-     */
-
     private fun SiteItem.toSearchResponse(): SearchResponse {
-
         return if (isSeries) {
-
-            newTvSeriesSearchResponse(
-                title,
-                url,
-                TvType.TvSeries
-            ) {
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
                 posterUrl = poster
             }
-
         } else {
-
-            newMovieSearchResponse(
-                title,
-                url,
-                TvType.Movie
-            ) {
+            newMovieSearchResponse(title, url, TvType.Movie) {
                 posterUrl = poster
             }
         }
     }
 
-    /*
-     * ============================================================
-     * PAGE HEADERS
-     * ============================================================
-     */
+    private val mediaExtensions = setOf(
+        ".m3u8",
+        ".mpd",
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".mov",
+        ".m4v",
+        ".avi",
+        ".flv",
+        ".ts"
+    )
 
-    private fun pageHeaders(
-        referer: String = "$mainUrl/"
-    ): Map<String, String> {
-
-        return mapOf(
-            "User-Agent" to
-                "Mozilla/5.0 (Linux; Android 13; Mobile) " +
-                    "AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) " +
-                    "Chrome/131.0.0.0 Mobile Safari/537.36",
-
-            "Accept" to
-                "text/html,application/xhtml+xml," +
-                    "application/xml;q=0.9,*/*;q=0.8",
-
-            "Accept-Language" to
-                "en-US,en;q=0.9",
-
-            "Referer" to referer
-        )
-    }
+    private val maxHomeItems = 25
 
     /*
-     * ============================================================
-     * DOCUMENT LOADER
-     * ============================================================
+     * Page requests use normal browser headers.
+     *
+     * IMPORTANT:
+     * Media playback intentionally does NOT reuse this full header set.
+     * The verified Cine Plex MP4 URL plays directly in Android Chrome,
+     * so the safest CloudStream playback request is the exact source URL
+     * with minimal metadata rather than an invented browser/CORS profile.
      */
+    private fun pageHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
+        "User-Agent" to
+            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "Accept" to
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to referer
+    )
 
-    private suspend fun getDocument(
-        url: String
-    ): Document? {
-
+    private suspend fun getDocument(url: String): Document? {
         val normalized = url.trim()
-
-        if (normalized.isBlank()) {
-            return null
-        }
+        if (normalized.isBlank()) return null
 
         val candidates = linkedSetOf<String>()
-
         candidates.add(normalized)
 
-        /*
-         * Cine Plex currently uses HTTP.
-         * HTTPS is kept only as a fallback for page loading.
-         */
+        // Only use the alternate scheme for Cine Plex page loading.
+        // We do NOT change the scheme of discovered media URLs.
         if (normalized.startsWith("http://", true)) {
-
-            candidates.add(
-                "https://" +
-                    normalized.removePrefix("http://")
-            )
-
+            candidates.add("https://" + normalized.removePrefix("http://"))
         } else if (normalized.startsWith("https://", true)) {
-
-            candidates.add(
-                "http://" +
-                    normalized.removePrefix("https://")
-            )
+            candidates.add("http://" + normalized.removePrefix("https://"))
         }
 
         for (candidate in candidates) {
-
             val document = runCatching {
-
-                app.get(
-                    candidate,
-                    headers = pageHeaders(candidate)
-                ).document
-
+                app.get(candidate, headers = pageHeaders(candidate)).document
             }.getOrNull()
 
             if (document != null) {
@@ -252,390 +125,205 @@ class CinePlexFTP : MainAPI() {
         return null
     }
 
-    /*
-     * ============================================================
-     * MAIN PAGE
-     * ============================================================
-     */
-
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-
-        val source = request.data
-
-        /*
-         * Anime is a special merged section.
-         */
-        if (source == "cineplex://anime") {
-
-            val merged = collectSources(
-                animeSources,
-                page
-            )
-
-            return newHomePageResponse(
-                request,
-                merged
-                    .distinctBy { it.url }
-                    .take(MAX_HOME_ITEMS)
-                    .map { it.toSearchResponse() },
-                false
-            )
-        }
-
-        /*
-         * Movies section.
-         */
-        if (source == "$mainUrl/movies") {
-
-            val merged = collectSources(
-                movieSources,
-                page
-            )
-
-            return newHomePageResponse(
-                request,
-                merged
-                    .distinctBy { it.url }
-                    .take(MAX_HOME_ITEMS)
-                    .map { it.toSearchResponse() },
-                false
-            )
-        }
-
-        /*
-         * Dual Audio section.
-         */
-        if (source == "$mainUrl/category.php?category=Dual+Audio") {
-
-            val merged = collectSources(
-                dualAudioSources,
-                page
-            )
-
-            return newHomePageResponse(
-                request,
-                merged
-                    .distinctBy { it.url }
-                    .take(MAX_HOME_ITEMS)
-                    .map { it.toSearchResponse() },
-                false
-            )
-        }
-
-        /*
-         * Normal category / TV page.
-         */
-
-        val url = pageUrl(
-            source,
-            page
-        )
-
+        val url = pageUrl(request.data, page)
         val document = getDocument(url)
-            ?: return newHomePageResponse(
-                request,
-                emptyList(),
-                false
-            )
+            ?: return newHomePageResponse(request, emptyList(), false)
 
+        /*
+         * Cine Plex puts many cards on one listing page.
+         * Keep the home request fast: parse only the current page.
+         */
         val items = parseItems(
             document = document,
             sourceUrl = url,
-            sectionName = request.name
-        )
+            sectionName = request.name,
+            page = page
+        ).take(maxHomeItems)
 
         return newHomePageResponse(
             request,
-            items
-                .take(MAX_HOME_ITEMS)
-                .map { it.toSearchResponse() },
-            false
+            items.map { it.toSearchResponse() },
+            hasNextPage(document, page)
         )
     }
-
-    /*
-     * ============================================================
-     * COLLECT MULTIPLE CATEGORY SOURCES
-     * ============================================================
-     */
-
-    private suspend fun collectSources(
-        sources: List<String>,
-        page: Int
-    ): List<SiteItem> {
-
-        val result = linkedMapOf<String, SiteItem>()
-
-        for (source in sources) {
-
-            /*
-             * To prevent an unnecessarily heavy request,
-             * only the requested page is fetched for each source.
-             */
-            val url = pageUrl(
-                source,
-                page
-            )
-
-            val document = getDocument(url)
-                ?: continue
-
-            val items = parseItems(
-                document = document,
-                sourceUrl = url,
-                sectionName = ""
-            )
-
-            for (item in items) {
-
-                if (!result.containsKey(item.url)) {
-
-                    result[item.url] =
-                        item
-                }
-            }
-        }
-
-        return result.values.toList()
-    }
-
-    /*
-     * ============================================================
-     * ADVANCED SEARCH
-     * ============================================================
-     *
-     * Search is designed in layers:
-     *
-     * 1. Cine Plex native search
-     * 2. alternate search parameter fallback
-     * 3. fuzzy scoring
-     * 4. duplicate removal
-     *
-     * Matching tolerates:
-     *
-     * - case difference
-     * - punctuation difference
-     * - extra/missing spaces
-     * - partial words
-     * - token overlap
-     * - character similarity
-     * - typo-like variations
-     */
 
     override suspend fun search(
         query: String,
         page: Int
     ): SearchResponseList {
+        val q = query.trim()
+        if (q.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        val cleanQuery = query.trim()
+        val native = linkedSetOf<SiteItem>()
+        val encoded = URLEncoder.encode(q, StandardCharsets.UTF_8.toString())
+        val candidates = listOf(
+            "$mainUrl/search.php?q=$encoded${if (page > 1) "&page=$page" else ""}",
+            "$mainUrl/search.php?query=$encoded${if (page > 1) "&page=$page" else ""}",
+            "$mainUrl/search.php?search=$encoded${if (page > 1) "&page=$page" else ""}"
+        )
 
-        if (cleanQuery.isBlank()) {
+        for (url in candidates) {
+            val document = getDocument(url) ?: continue
+            native += parseItems(document, url, "Search", page)
+        }
+
+        if (native.isNotEmpty()) {
+            val ranked = rankSearchResults(q, native.toList())
             return newSearchResponseList(
-                emptyList(),
+                ranked.take(maxHomeItems).map { it.toSearchResponse() },
                 false
             )
         }
 
-        /*
-         * Page > 1 currently uses the same search endpoint
-         * because the provided Cine Plex source does not expose
-         * a confirmed search pagination parameter.
-         */
-        if (page > 1) {
-            return newSearchResponseList(
-                emptyList(),
-                false
-            )
-        }
-
-        val encoded = URLEncoder.encode(
-            cleanQuery,
-            StandardCharsets.UTF_8.toString()
+        // Advanced fallback: scan the site's public category pages and rank
+        // fuzzy/partial matches locally. This handles punctuation, spacing,
+        // spelling differences and partial titles when search.php is strict.
+        val fallback = linkedMapOf<String, SiteItem>()
+        val sources = listOf(
+            "$mainUrl/movies",
+            "$mainUrl/category.php?category=Indian+Bangla",
+            "$mainUrl/category.php?category=Korean",
+            "$mainUrl/category.php?category=3D+Movies",
+            "$mainUrl/category.php?category=Bangla+Dubbed",
+            "$mainUrl/category.php?category=Bangla+Movies",
+            "$mainUrl/category.php?category=English",
+            "$mainUrl/category.php?category=Dual+Audio",
+            "$mainUrl/category.php?category=Hindi+Dubbed",
+            "$mainUrl/category.php?category=Hindi",
+            "$mainUrl/tvs.php",
+            "$mainUrl/category.php?category=Anime",
+            "$mainUrl/category.php?category=Animation"
         )
 
-        val searchUrls = listOf(
-            "$mainUrl/search.php?q=$encoded",
-            "$mainUrl/search.php?query=$encoded",
-            "$mainUrl/search.php?search=$encoded"
-        )
-
-        val candidates = linkedMapOf<String, SiteItem>()
-
-        for (searchUrl in searchUrls) {
-
-            val document = getDocument(searchUrl)
-                ?: continue
-
-            val items = parseItems(
-                document = document,
-                sourceUrl = searchUrl,
-                sectionName = "Search"
-            )
-
-            for (item in items) {
-
-                if (!candidates.containsKey(item.url)) {
-
-                    candidates[item.url] = item
-                }
-            }
-
-            /*
-             * One successful search endpoint is enough.
-             */
-            if (items.isNotEmpty()) {
-                break
-            }
-        }
-
-        /*
-         * If native search produces nothing, do a lightweight
-         * cross-category fallback.
-         */
-        if (candidates.isEmpty()) {
-
-            val fallbackSources =
-                (
-                    movieSources +
-                        dualAudioSources +
-                        listOf("$mainUrl/category.php?category=Hindi") +
-                        animeSources +
-                        listOf("$mainUrl/tvs.php")
-                    ).distinct()
-
-            for (source in fallbackSources) {
-
-                val document = getDocument(source)
-                    ?: continue
-
-                val items = parseItems(
-                    document = document,
-                    sourceUrl = source,
-                    sectionName = ""
-                )
-
-                for (item in items) {
-
-                    if (!candidates.containsKey(item.url)) {
-                        candidates[item.url] = item
-                    }
+        sources.forEach { url ->
+            getDocument(url)?.let { doc ->
+                parseItems(doc, url, "Search", 1).forEach { item ->
+                    fallback.putIfAbsent(item.url, item)
                 }
             }
         }
 
-        /*
-         * Advanced fuzzy ranking.
-         */
-        val ranked = candidates
-            .values
-            .map { item ->
-
-                val score = fuzzyScore(
-                    cleanQuery,
-                    item.title
-                )
-
-                item to score
-            }
-            .filter {
-                it.second >= SEARCH_MIN_SCORE
-            }
-            .sortedByDescending {
-                it.second
-            }
-            .map {
-                it.first
-            }
-            .take(MAX_SEARCH_RESULTS)
-
+        val ranked = rankSearchResults(q, fallback.values.toList())
         return newSearchResponseList(
-            ranked.map {
-                it.toSearchResponse()
-            },
+            ranked.take(maxHomeItems).map { it.toSearchResponse() },
             false
         )
     }
 
-    /*
-     * ============================================================
-     * LOAD
-     * ============================================================
-     */
+    private fun normalizeSearchText(value: String): String {
+        return value
+            .lowercase(Locale.ROOT)
+            .replace("&", " and ")
+            .replace("\u00B7", " ")
+            .replace(Regex("[^a-z0-9\\p{L}]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
 
-    override suspend fun load(
-        url: String
-    ): LoadResponse {
+    private fun compactSearchText(value: String): String =
+        normalizeSearchText(value).replace(" ", "")
 
-        val input = url.trim()
+    private fun levenshtein(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+        var prev = IntArray(b.length + 1) { it }
+        var curr = IntArray(b.length + 1)
+        for (i in a.indices) {
+            curr[0] = i + 1
+            for (j in b.indices) {
+                val cost = if (a[i] == b[j]) 0 else 1
+                curr[j + 1] = minOf(
+                    curr[j] + 1,
+                    prev[j + 1] + 1,
+                    prev[j] + cost
+                )
+            }
+            val tmp = prev; prev = curr; curr = tmp
+        }
+        return prev[b.length]
+    }
 
-        if (input.isBlank()) {
+    private fun similarity(a: String, b: String): Double {
+        if (a == b) return 1.0
+        if (a.isBlank() || b.isBlank()) return 0.0
+        if (a.contains(b) || b.contains(a)) {
+            val minLen = minOf(a.length, b.length).toDouble()
+            val maxLen = maxOf(a.length, b.length).toDouble()
+            return 0.80 + 0.20 * (minLen / maxLen)
+        }
+        val distance = levenshtein(a, b)
+        return 1.0 - distance.toDouble() / maxOf(a.length, b.length)
+    }
 
+    private fun searchScore(query: String, title: String): Double {
+        val qn = normalizeSearchText(query)
+        val tn = normalizeSearchText(title)
+        if (qn.isBlank() || tn.isBlank()) return 0.0
+        if (qn == tn) return 1.0
+        if (tn.contains(qn)) return 0.97
+
+        val qc = compactSearchText(query)
+        val tc = compactSearchText(title)
+        var score = similarity(qc, tc) * 0.55
+
+        val qTokens = qn.split(' ').filter { it.length >= 2 }
+        val tTokens = tn.split(' ').filter { it.length >= 2 }
+        if (qTokens.isNotEmpty() && tTokens.isNotEmpty()) {
+            val tokenScore = qTokens.map { qt ->
+                tTokens.maxOfOrNull { tt -> similarity(qt, tt) } ?: 0.0
+            }.average()
+            score += tokenScore * 0.45
+        }
+        return score.coerceIn(0.0, 1.0)
+    }
+
+    private fun rankSearchResults(query: String, items: List<SiteItem>): List<SiteItem> {
+        return items
+            .map { it to searchScore(query, it.title) }
+            .filter { it.second >= 0.34 }
+            .sortedWith(compareByDescending<Pair<SiteItem, Double>> { it.second }.thenBy { it.first.title })
+            .map { it.first }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        if (isMediaUrl(url)) {
             return newMovieLoadResponse(
-                "Cine Plex",
-                input,
-                TvType.Movie,
-                input
+                titleFromUrl(url),
+                url,
+                if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
+                url
             )
         }
 
-        /*
-         * Direct video URL.
-         */
-        if (isMediaUrl(input)) {
-
-            return newMovieLoadResponse(
-                titleFromMediaUrl(input),
-                input,
-                TvType.Movie,
-                input
-            )
-        }
-
-        val document = getDocument(input)
+        val document = getDocument(url)
 
         if (document == null) {
-
             return newMovieLoadResponse(
-                titleFromUrl(input),
-                input,
+                titleFromUrl(url),
+                url,
                 TvType.Movie,
-                input
+                url
             )
         }
 
-        val title =
-            extractPageTitle(document)
-                .ifBlank {
-                    titleFromUrl(input)
-                }
+        val title = extractPageTitle(document)
+            .ifBlank { titleFromUrl(url) }
 
-        val poster =
-            extractPoster(
-                document,
-                input
-            )
+        val poster = extractPoster(document, url)
+        val series = isSeriesUrl(url) || looksLikeSeriesPage(document)
 
-        /*
-         * TV series.
-         */
-        if (isSeriesUrl(input) ||
-            looksLikeSeriesPage(document)
-        ) {
-
-            val episodes =
-                parseEpisodes(
-                    document,
-                    input
-                )
+        if (series) {
+            val episodes = parseEpisodes(document, url)
 
             if (episodes.isNotEmpty()) {
-
                 return newTvSeriesLoadResponse(
                     title,
-                    input,
+                    url,
                     TvType.TvSeries,
                     episodes
                 ) {
@@ -645,44 +333,21 @@ class CinePlexFTP : MainAPI() {
         }
 
         /*
-         * Movie.
+         * Keep the watch page as the canonical data.
          *
-         * IMPORTANT:
-         * The player page itself remains the canonical playback
-         * page. loadLinks() will fetch it again at Play time.
-         *
-         * Therefore a temporary md5/expires URL is NOT cached here.
+         * Playback is resolved at Play time by loadLinks(), which fetches
+         * the same page and extracts the exact media URL currently published
+         * inside <source src="..."> / <video> / player metadata.
          */
         return newMovieLoadResponse(
             title,
-            input,
-            if (isAnimeUrl(input)) {
-                TvType.Anime
-            } else {
-                TvType.Movie
-            },
-            input
+            url,
+            if (isAnimeUrl(url)) TvType.Anime else TvType.Movie,
+            url
         ) {
             posterUrl = poster
         }
     }
-
-    /*
-     * ============================================================
-     * LOAD LINKS
-     * ============================================================
-     *
-     * This is the most important Cine Plex part.
-     *
-     * The website generates a fresh:
-     *
-     * /v/m/...mp4?md5=XXXX&expires=XXXX
-     *
-     * inside the player page JavaScript.
-     *
-     * We fetch the player page NOW and extract the current
-     * videoSrc instead of storing an old token.
-     */
 
     override suspend fun loadLinks(
         data: String,
@@ -690,547 +355,130 @@ class CinePlexFTP : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-
         val input = data.trim()
+        if (input.isBlank()) return false
 
-        if (input.isBlank()) {
-            return false
-        }
-
-        /*
-         * Direct media URL.
-         */
         if (isMediaUrl(input)) {
-
-            emitMediaLink(
-                input,
-                input,
-                callback
-            )
-
+            emitMediaLink(input, callback)
             return true
         }
 
-        /*
-         * Fetch player page at Play time.
-         */
         val response = runCatching {
-
-            app.get(
-                input,
-                headers = pageHeaders(input)
-            )
-
+            app.get(input, headers = pageHeaders(input))
         }.getOrNull() ?: return false
 
+        val document = response.document
         val html = response.text
 
-        /*
-         * Primary Cine Plex extraction:
-         *
-         * const videoSrc = "/v/m/...mp4?md5=...&expires=...";
-         */
-        val freshSources =
-            extractCinePlexVideoSources(
-                html = html,
-                baseUrl = input
-            )
-
-        if (freshSources.isNotEmpty()) {
-
-            freshSources
-                .distinct()
-                .forEach { mediaUrl ->
-
-                    emitMediaLink(
-                        mediaUrl = mediaUrl,
-                        referer = input,
-                        callback = callback
-                    )
-                }
-
-            /*
-             * Subtitles from the player page.
-             */
-            extractSubtitles(
-                response.document,
-                input
-            ).forEach { subtitle ->
-
-                subtitleCallback(
-                    subtitle
-                )
-            }
+        // Cine Plex player.php publishes the actual temporary/signed MP4 URL
+        // in JavaScript as: const videoSrc = "...mp4?md5=...&expires=..."
+        // Resolve it at play time so expired URLs are never cached.
+        val playerSource = extractPlayerVideoSrc(html, input)
+        if (playerSource != null) {
+            emitMediaLink(playerSource, callback)
 
             return true
         }
 
-        /*
-         * Secondary generic extraction.
-         *
-         * Useful if Cine Plex changes the JS variable name in
-         * the future but still exposes the source via video/source.
-         */
-        val fallbackSources =
-            extractMediaUrls(
-                document = response.document,
-                html = html,
-                baseUrl = input
-            )
-                .distinct()
-
-        if (fallbackSources.isNotEmpty()) {
-
-            fallbackSources.forEach { mediaUrl ->
-
-                emitMediaLink(
-                    mediaUrl = mediaUrl,
-                    referer = input,
-                    callback = callback
-                )
+        // Generic fallback for any direct source exposed in the DOM/JS.
+        val directSources = extractMediaUrls(document, html, input).distinct()
+        if (directSources.isNotEmpty()) {
+            directSources.take(6).forEach { source ->
+                emitMediaLink(source, callback)
             }
-
-            extractSubtitles(
-                response.document,
-                input
-            ).forEach { subtitle ->
-
-                subtitleCallback(
-                    subtitle
-                )
-            }
-
             return true
         }
 
-        /*
-         * Final iframe fallback.
-         */
-        val iframes =
-            response.document
-                .select(
-                    "iframe[src], iframe[data-src]"
-                )
-                .mapNotNull { iframe ->
-
-                    val raw =
-                        iframe.attr("src")
-                            .ifBlank {
-                                iframe.attr("data-src")
-                            }
-                            .trim()
-
-                    if (raw.isBlank()) {
-                        null
-                    } else {
-                        absoluteUrl(
-                            raw,
-                            input
-                        )
-                    }
-                }
-                .distinct()
+        val iframes = document.select("iframe[src], iframe[data-src]")
+            .mapNotNull { iframe ->
+                iframe.attr("src")
+                    .ifBlank { iframe.attr("data-src") }
+                    .trim()
+                    .takeIf { it.isNotBlank() }
+                    ?.let { absoluteUrl(it, input) }
+            }
+            .distinct()
 
         for (iframe in iframes) {
-
-            val extracted =
-                runCatching {
-
-                    loadExtractor(
-                        iframe,
-                        subtitleCallback,
-                        callback
-                    )
-
-                }.getOrDefault(false)
-
-            if (extracted) {
-                return true
-            }
+            val extracted = runCatching {
+                loadExtractor(iframe, subtitleCallback, callback)
+            }.getOrDefault(false)
+            if (extracted) return true
         }
 
         return false
     }
 
-    /*
-     * ============================================================
-     * CINE PLEX VIDEO SOURCE EXTRACTION
-     * ============================================================
-     *
-     * Current confirmed source:
-     *
-     * const videoSrc = "/v/m/...mp4?md5=...&expires=...";
-     *
-     * We intentionally capture the WHOLE URL including query.
-     *
-     * That is critical because md5/expires are part of the
-     * temporary playable URL.
-     */
+    private fun extractPlayerVideoSrc(html: String, baseUrl: String): String? {
+        val cleaned = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
 
-    private fun extractCinePlexVideoSources(
-        html: String,
-        baseUrl: String
-    ): List<String> {
+        val patterns = listOf(
+            Regex("""(?is)\bvideoSrc\s*=\s*[\"']([^\"']+)[\"']"""),
+            Regex("""(?is)[\"']videoSrc[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']""")
+        )
 
-        val found =
-            linkedSetOf<String>()
-
-        val cleaned =
-            cleanHtml(
-                html
-            )
-
-        /*
-         * Exact current Cine Plex variable.
-         */
-        val videoSrcRegex =
-            Regex(
-                """(?is)\bvideoSrc\s*=\s*["']([^"']+)["']"""
-            )
-
-        videoSrcRegex
-            .findAll(cleaned)
-            .forEach { match ->
-
-                val raw =
-                    match.groupValues
-                        .getOrNull(1)
-                        .orEmpty()
-
-                val absolute =
-                    absoluteUrl(
-                        decodeJsUrl(raw),
-                        baseUrl
-                    )
-
-                if (isMediaUrl(absolute)) {
-
-                    found.add(
-                        absolute
-                    )
-                }
-            }
-
-        /*
-         * HTML/JS escaped alternative.
-         */
-        if (found.isEmpty()) {
-
-            val genericVideoSrcRegex =
-                Regex(
-                    """(?is)\b(?:videoSrc|video_url|videoUrl|mediaUrl|fileUrl)\s*[:=]\s*["']([^"']+)["']"""
-                )
-
-            genericVideoSrcRegex
-                .findAll(cleaned)
-                .forEach { match ->
-
-                    val raw =
-                        match.groupValues
-                            .getOrNull(1)
-                            .orEmpty()
-
-                    val absolute =
-                        absoluteUrl(
-                            decodeJsUrl(raw),
-                            baseUrl
-                        )
-
-                    if (isMediaUrl(absolute)) {
-
-                        found.add(
-                            absolute
-                        )
-                    }
-                }
+        for (pattern in patterns) {
+            val raw = pattern.find(cleaned)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+            if (raw.isBlank()) continue
+            val resolved = absoluteUrl(raw, baseUrl)
+            if (isMediaUrl(resolved)) return resolved
         }
 
-        return found.toList()
+        return null
     }
 
     /*
-     * ============================================================
-     * GENERIC MEDIA URL EXTRACTION
-     * ============================================================
+     * Emits a native CloudStream media source.
+     *
+     * No forced HTTP->HTTPS rewrite.
+     * No artificial Range header.
+     * No CORS/Sec-Fetch headers.
+     *
+     * The player itself handles the HTTP media request and byte-range
+     * negotiation.
      */
-
-    private fun extractMediaUrls(
-        document: Document,
-        html: String,
-        baseUrl: String
-    ): List<String> {
-
-        val found =
-            linkedSetOf<String>()
-
-        fun addCandidate(
-            raw: String?
-        ) {
-
-            if (raw.isNullOrBlank()) {
-                return
-            }
-
-            val cleaned =
-                decodeJsUrl(
-                    cleanUrl(raw)
-                )
-
-            if (
-                cleaned.startsWith(
-                    "data:",
-                    true
-                ) ||
-                cleaned.startsWith(
-                    "javascript:",
-                    true
-                )
-            ) {
-                return
-            }
-
-            val absolute =
-                absoluteUrl(
-                    cleaned,
-                    baseUrl
-                )
-
-            if (isMediaUrl(absolute)) {
-
-                found.add(
-                    absolute
-                )
-            }
-        }
-
-        /*
-         * DOM sources first.
-         */
-        document
-            .select(
-                "video[src], " +
-                    "video source[src], " +
-                    "source[src], " +
-                    "[data-src], " +
-                    "[data-video], " +
-                    "[data-file], " +
-                    "[data-url], " +
-                    "[data-source], " +
-                    "[data-stream], " +
-                    "[data-file-url], " +
-                    "[data-video-url], " +
-                    "[data-playlist], " +
-                    "[data-manifest]"
-            )
-            .forEach { element ->
-
-                addCandidate(
-                    element.attr("src")
-                )
-
-                addCandidate(
-                    element.attr("data-src")
-                )
-
-                addCandidate(
-                    element.attr("data-video")
-                )
-
-                addCandidate(
-                    element.attr("data-file")
-                )
-
-                addCandidate(
-                    element.attr("data-url")
-                )
-
-                addCandidate(
-                    element.attr("data-source")
-                )
-
-                addCandidate(
-                    element.attr("data-stream")
-                )
-
-                addCandidate(
-                    element.attr("data-file-url")
-                )
-
-                addCandidate(
-                    element.attr("data-video-url")
-                )
-
-                addCandidate(
-                    element.attr("data-playlist")
-                )
-
-                addCandidate(
-                    element.attr("data-manifest")
-                )
-            }
-
-        val cleanedHtml =
-            cleanHtml(html)
-
-        /*
-         * Direct media URL fallback.
-         *
-         * Includes query strings such as:
-         *
-         * ?md5=XXXX&expires=XXXX
-         */
-        val directRegex =
-            Regex(
-                """(?i)(?:https?://|/|\.{0,2}/)(?:[^"'<>\s\\]+)\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
-            )
-
-        directRegex
-            .findAll(cleanedHtml)
-            .forEach { match ->
-
-                addCandidate(
-                    match.value
-                )
-            }
-
-        /*
-         * JavaScript player object fallback.
-         */
-        val keyRegex =
-            Regex(
-                """(?is)\b(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl)\s*[:=]\s*["']([^"']+)["']"""
-            )
-
-        keyRegex
-            .findAll(cleanedHtml)
-            .forEach { match ->
-
-                addCandidate(
-                    match.groupValues[1]
-                )
-            }
-
-        return found.toList()
-    }
-
-    /*
-     * ============================================================
-     * SUBTITLE EXTRACTION
-     * ============================================================
-     */
-
-    private fun extractSubtitles(
-        document: Document,
-        baseUrl: String
-    ): List<SubtitleFile> {
-
-        val result =
-            mutableListOf<SubtitleFile>()
-
-        document
-            .select(
-                "track[src], track[data-src]"
-            )
-            .forEach { track ->
-
-                val raw =
-                    track.attr("src")
-                        .ifBlank {
-                            track.attr("data-src")
-                        }
-                        .trim()
-
-                if (raw.isBlank()) {
-                    return@forEach
-                }
-
-                val url =
-                    absoluteUrl(
-                        raw,
-                        baseUrl
-                    )
-
-                val label =
-                    track.attr("label")
-                        .ifBlank {
-                            track.attr("srclang")
-                        }
-                        .ifBlank {
-                            "English"
-                        }
-
-                result.add(
-                    SubtitleFile(
-                        label,
-                        url
-                    )
-                )
-            }
-
-        return result
-    }
-
-    /*
-     * ============================================================
-     * MEDIA LINK EMITTER
-     * ============================================================
-     */
-
-    private fun emitMediaLink(
+    private suspend fun emitMediaLink(
         mediaUrl: String,
-        referer: String,
         callback: (ExtractorLink) -> Unit
     ) {
+        val type = when {
+            mediaUrl.contains(".m3u8", true) ->
+                ExtractorLinkType.M3U8
 
-        val type =
-            when {
+            mediaUrl.contains(".mpd", true) ->
+                ExtractorLinkType.DASH
 
-                mediaUrl.contains(
-                    ".m3u8",
-                    true
-                ) ->
-                    ExtractorLinkType.M3U8
+            else ->
+                ExtractorLinkType.VIDEO
+        }
 
-                mediaUrl.contains(
-                    ".mpd",
-                    true
-                ) ->
-                    ExtractorLinkType.DASH
+        val lower = mediaUrl.lowercase(Locale.ROOT)
 
-                else ->
-                    ExtractorLinkType.VIDEO
-            }
+        val quality = when {
+            "2160" in lower || "4k" in lower ->
+                Qualities.P2160.value
 
-        val lower =
-            mediaUrl.lowercase(
-                Locale.ROOT
-            )
+            "1440" in lower ->
+                Qualities.P1440.value
 
-        val quality =
-            when {
+            "1080" in lower ->
+                Qualities.P1080.value
 
-                lower.contains("2160") ||
-                    lower.contains("4k") ->
-                    Qualities.P2160.value
+            "720" in lower ->
+                Qualities.P720.value
 
-                lower.contains("1440") ->
-                    Qualities.P1440.value
+            "480" in lower ->
+                Qualities.P480.value
 
-                lower.contains("1080") ->
-                    Qualities.P1080.value
+            "360" in lower ->
+                Qualities.P360.value
 
-                lower.contains("720") ->
-                    Qualities.P720.value
-
-                lower.contains("480") ->
-                    Qualities.P480.value
-
-                lower.contains("360") ->
-                    Qualities.P360.value
-
-                else ->
-                    Qualities.Unknown.value
-            }
+            else ->
+                Qualities.Unknown.value
+        }
 
         callback(
             newExtractorLink(
@@ -1239,301 +487,535 @@ class CinePlexFTP : MainAPI() {
                 url = mediaUrl,
                 type = type
             ) {
-
-                this.referer = referer
-
-                this.quality =
-                    quality
+                this.quality = quality
             }
         )
     }
 
-    /*
-     * ============================================================
-     * PARSE LISTING ITEMS
-     * ============================================================
-     *
-     * Current Cine Plex cards use patterns such as:
-     *
-     * player.php?id=77031&h=
-     * view.php?id=77414&h=
-     *
-     * and poster:
-     *
-     * /uploads/....
-     *
-     * title:
-     *
-     * img alt="Babu Shona"
-     *
-     * The source provided confirms this structure.
-     */
-
-    private fun parseItems(
+    private fun extractDirectMediaFromDownloads(
         document: Document,
-        sourceUrl: String,
-        sectionName: String
-    ): List<SiteItem> {
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
 
-        val result =
-            linkedMapOf<String, SiteItem>()
+        fun addDownload(raw: String?) {
+            if (raw.isNullOrBlank()) return
 
-        val anchors =
-            document.select(
-                "a[href]"
-            )
+            val cleaned = cleanUrl(raw)
 
-        for (anchor in anchors) {
+            if (!cleaned.contains("download.php", true)) return
 
-            val href =
-                anchor.attr(
-                    "href"
-                ).trim()
+            val query = runCatching {
+                URI(absoluteUrl(cleaned, baseUrl)).rawQuery.orEmpty()
+            }.getOrDefault("")
 
-            if (href.isBlank()) {
-                continue
-            }
-
-            /*
-             * Ignore menus and external links.
-             */
-            if (
-                !looksLikeContentLink(
-                    href
-                )
-            ) {
-                continue
-            }
-
-            val absolute =
-                absoluteUrl(
-                    cleanUrl(href),
-                    sourceUrl
-                )
-
-            val card =
-                findCard(anchor)
-
-            val title =
-                cleanTitle(
-                    extractCardTitle(
-                        anchor,
-                        card
-                    )
-                )
-
-            if (
-                title.isBlank() ||
-                isNavigationTitle(title)
-            ) {
-                continue
-            }
-
-            val poster =
-                extractPosterFromElement(
-                    card,
-                    sourceUrl
-                )
-
-            /*
-             * IMPORTANT:
-             *
-             * The player page is a better canonical playback
-             * target than a temporary /v/m URL.
-             *
-             * Therefore, whenever a player.php link exists,
-             * use that as the CloudStream data URL.
-             */
-            val playbackUrl =
-                when {
-
-                    absolute.contains(
-                        "player.php",
-                        true
-                    ) ->
-                        absolute
-
-                    else -> {
-
-                        val player =
-                            extractPlayerIdUrl(
-                                card,
-                                sourceUrl
-                            )
-
-                        player ?: absolute
-                    }
+            val fileValue = query
+                .split('&')
+                .firstOrNull {
+                    it.substringBefore('=')
+                        .equals("file", ignoreCase = true)
                 }
+                ?.substringAfter('=', "")
 
-            val series =
-                isSeriesUrl(
-                    playbackUrl
-                ) ||
-                    sectionName.contains(
-                        "TV",
-                        true
-                    ) ||
-                    sectionName.contains(
-                        "Series",
-                        true
-                    ) ||
-                    sourceUrl.contains(
-                        "tvs.php",
-                        true
-                    ) ||
-                    sourceUrl.contains(
-                        "tcategory.php",
-                        true
-                    )
+            if (fileValue.isNullOrBlank()) return
 
-            if (
-                !result.containsKey(
-                    playbackUrl
+            val decoded = runCatching {
+                URLDecoder.decode(
+                    fileValue,
+                    StandardCharsets.UTF_8.toString()
                 )
-            ) {
+            }.getOrNull()?.trim().orEmpty()
 
-                result[playbackUrl] =
-                    SiteItem(
-                        title = title,
-                        url = playbackUrl,
-                        poster = poster,
-                        isSeries = series,
-                        category = sectionName
-                    )
+            if (decoded.isBlank()) return
+
+            /*
+             * Only recover a real media file path.
+             * Example:
+             * uploads/videos/1788517057_Neru_2023.mp4
+             */
+            if (!isMediaUrl("http://example.com/$decoded")) return
+
+            val direct = if (
+                decoded.startsWith("http://", true) ||
+                decoded.startsWith("https://", true)
+            ) {
+                decoded
+            } else {
+                absoluteUrl(
+                    if (decoded.startsWith("/")) decoded else "/$decoded",
+                    baseUrl
+                )
+            }
+
+            if (isMediaUrl(direct)) {
+                found.add(direct)
             }
         }
 
-        return result.values.toList()
+        document.select(
+            "a[href*='download.php'], " +
+                "a.download-btn"
+        ).forEach { anchor ->
+            addDownload(anchor.attr("href"))
+        }
+
+        val cleanedHtml = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val regex = Regex(
+            """(?i)(?:https?://[^"'<>\s]+|(?:/|\.\.?/)?download\.php\?[^"'<>\s)]+)"""
+        )
+
+        regex.findAll(cleanedHtml).forEach { match ->
+            addDownload(match.value)
+        }
+
+        return found.toList()
     }
 
     /*
-     * ============================================================
-     * FIND PLAYER URL FROM CARD
-     * ============================================================
+     * Extract every real media URL exposed by the watch page.
+     *
+     * Supports:
+     * - <video src>
+     * - <source src>
+     * - data-video / data-src / data-file / ...
+     * - URLs embedded in JavaScript player objects
+     * - direct media files such as .mp4, .mkv, .webm, .m3u8, and .mpd
      */
-
-    private fun extractPlayerIdUrl(
-        card: Element,
+    private fun extractMediaUrls(
+        document: Document,
+        html: String,
         baseUrl: String
-    ): String? {
+    ): List<String> {
+        val found = linkedSetOf<String>()
 
-        val player =
-            card
-                .select("a[href*='player.php']")
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val value = cleanUrl(raw)
+                .replace("\\x2F", "/")
+                .trim()
+
+            if (value.isBlank() || value.startsWith("data:", true) || value.startsWith("javascript:", true)) {
+                return
+            }
+
+            /*
+             * IMPORTANT: Cine Plex uses plain relative paths such as
+             * `uploads/videos/1788517057_Neru_2023.mp4` without a leading `/`.
+             * Always resolve relative URLs against the watch-page URL instead
+             * of requiring the path to begin with '/', './' or '../'.
+             */
+            val fixed = absoluteUrl(value, baseUrl)
+
+            if (isMediaUrl(fixed)) {
+                found.add(fixed)
+            }
+        }
+
+        /*
+         * DOM first: this is the most trustworthy source because it matches
+         * the website's actual <video>/<source> element.
+         */
+        document.select(
+            "video[src], " +
+                "video source[src], " +
+                "source[src], " +
+                "[src], " +
+                "[data-src], " +
+                "[data-video], " +
+                "[data-file], " +
+                "[data-url], " +
+                "[data-source], " +
+                "[data-stream], " +
+                "[data-file-url], " +
+                "[data-video-url], " +
+                "[data-playlist], " +
+                "[data-manifest]"
+        ).forEach { element ->
+            add(element.attr("src"))
+            add(element.attr("data-src"))
+            add(element.attr("data-video"))
+            add(element.attr("data-file"))
+            add(element.attr("data-url"))
+            add(element.attr("data-source"))
+            add(element.attr("data-stream"))
+            add(element.attr("data-file-url"))
+            add(element.attr("data-video-url"))
+            add(element.attr("data-playlist"))
+            add(element.attr("data-manifest"))
+            add(element.attr("href"))
+        }
+
+        val cleanedHtml = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003A", ":")
+            .replace("&amp;", "&")
+
+        /*
+         * Direct media URL regex.
+         */
+        val directRegex = Regex(
+            """(?i)(?:https?://[^"'<>\s\\]+|(?<![A-Za-z0-9_./-])(?:uploads/|videos/|media/|files/)[^"'<>\s\\]+)\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s\\]*)?"""
+        )
+
+        directRegex.findAll(cleanedHtml).forEach {
+            add(it.value)
+        }
+
+        /*
+         * Player object / JavaScript variable fallback.
+         */
+        val keyRegex = Regex(
+            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl)\s*[:=]\s*["']([^"']+)["']"""
+        )
+
+        keyRegex.findAll(cleanedHtml).forEach {
+            add(it.groupValues[1])
+        }
+
+        return found.toList()
+    }
+
+    /*
+     * Parse Cine Plex cards.
+     *
+     * The site uses:
+     *   <div class="movie-card" onclick="openMovie(994)">
+     *   <div class="movie-card" onclick="openSeries(99)">
+     *
+     * Titles come from the card's visible title / heading / image alt,
+     * and the poster comes from the card's image.
+     */
+    private fun parseItems(
+        document: Document,
+        sourceUrl: String,
+        sectionName: String,
+        page: Int
+    ): List<SiteItem> {
+        val result = linkedMapOf<String, SiteItem>()
+
+        var order = page.toLong() * 1_000_000L
+
+        val elements = document.select(
+            ".movie-card, " +
+                ".movie-grid .movie-card, " +
+                "a[href], " +
+                "[data-href], " +
+                "[data-url], " +
+                "[data-link], " +
+                "[onclick]"
+        )
+
+        elements.forEach { element ->
+            val rawCandidates = listOf(
+                element.attr("href"),
+                element.attr("data-href"),
+                element.attr("data-url"),
+                element.attr("data-link"),
+                element.attr("onclick")
+            ).filter { it.isNotBlank() }
+
+            val href = rawCandidates.asSequence()
+                .mapNotNull { extractContentUrl(it) }
                 .firstOrNull()
-                ?.attr("href")
-                ?.trim()
+                ?: return@forEach
 
-        if (!player.isNullOrBlank()) {
+            val absolute = absoluteUrl(href, sourceUrl)
 
-            return absoluteUrl(
-                cleanUrl(player),
-                baseUrl
+            if (!looksLikeContentLink(absolute)) {
+                return@forEach
+            }
+
+            val card = findCard(element)
+
+            val title = cleanTitle(
+                extractCardTitle(element, card)
+                    .ifBlank { titleFromUrl(absolute) }
             )
+
+            if (title.isBlank() || isNavigationTitle(title)) {
+                return@forEach
+            }
+
+            val series =
+                isSeriesUrl(absolute) ||
+                    sectionName.contains("TV", true) ||
+                    absolute.contains("type=series", true) ||
+                    absolute.contains("type=tv", true)
+
+            if (!result.containsKey(absolute)) {
+                result[absolute] = SiteItem(
+                    title = title,
+                    url = absolute,
+                    poster = extractPosterFromElement(
+                        card,
+                        sourceUrl
+                    ),
+                    isSeries = series,
+                    sortTime = extractSortTime(
+                        card,
+                        element
+                    ),
+                    discoveryOrder = order++
+                )
+            }
+        }
+
+        val values = result.values.toList()
+
+        /*
+         * Preserve Cine Plex's own listing order.
+         *
+         * If the site exposes a real upload/created timestamp, use it.
+         * Never treat a plain "2026" release year as upload time.
+         */
+        val hasRealTimestamp = values.any {
+            it.sortTime > 0L
+        }
+
+        return if (hasRealTimestamp) {
+            values.sortedWith(
+                compareByDescending<SiteItem> { it.sortTime }
+                    .thenBy { it.discoveryOrder }
+            )
+        } else {
+            values.sortedBy {
+                it.discoveryOrder
+            }
+        }
+    }
+
+    private fun extractSortTime(
+        card: Element,
+        anchor: Element
+    ): Long {
+        val values = listOf(
+            card.attr("data-created"),
+            card.attr("data-uploaded"),
+            card.attr("data-upload-date"),
+            card.attr("data-created-at"),
+            card.attr("data-uploaded-at"),
+            card.attr("data-published"),
+            card.attr("data-published-at"),
+            card.attr("datetime"),
+
+            anchor.attr("data-created"),
+            anchor.attr("data-uploaded"),
+            anchor.attr("data-upload-date"),
+            anchor.attr("data-created-at"),
+            anchor.attr("data-uploaded-at"),
+            anchor.attr("data-published"),
+            anchor.attr("data-published-at"),
+            anchor.attr("datetime"),
+
+            card.selectFirst("time[datetime]")
+                ?.attr("datetime")
+        )
+            .filterNotNull()
+            .filter { it.isNotBlank() }
+
+        for (value in values) {
+            val clean = value.trim()
+
+            if (Regex("""^\d{4}$""").matches(clean)) {
+                continue
+            }
+
+            clean.toLongOrNull()?.let { number ->
+                return if (number < 10_000_000_000L) {
+                    number * 1000L
+                } else {
+                    number
+                }
+            }
+
+            parseDate(clean)?.let {
+                return it
+            }
+        }
+
+        return 0L
+    }
+
+    private fun parseDate(
+        value: String
+    ): Long? {
+        val patterns = listOf(
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+            "yyyy-MM-dd",
+
+            "dd-MM-yyyy HH:mm:ss",
+            "dd-MM-yyyy HH:mm",
+            "dd-MM-yyyy",
+
+            "dd/MM/yyyy HH:mm:ss",
+            "dd/MM/yyyy HH:mm",
+            "dd/MM/yyyy",
+
+            "MMM dd, yyyy HH:mm:ss",
+            "MMM dd, yyyy HH:mm",
+            "MMM dd, yyyy"
+        )
+
+        for (pattern in patterns) {
+            val parsed = runCatching {
+                SimpleDateFormat(
+                    pattern,
+                    Locale.ENGLISH
+                ).parse(value)?.time
+            }.getOrNull()
+
+            if (parsed != null) {
+                return parsed
+            }
         }
 
         return null
     }
 
-    /*
-     * ============================================================
-     * FIND CARD CONTAINER
-     * ============================================================
-     */
+    private fun parseEpisodes(
+        document: Document,
+        baseUrl: String
+    ): List<Episode> {
+        val result = linkedMapOf<String, Episode>()
+
+        document.select("a[href]").forEach { anchor ->
+            val href = anchor.attr("href").trim()
+
+            if (!looksLikeEpisodeLink(href)) {
+                return@forEach
+            }
+
+            val absolute = absoluteUrl(
+                href,
+                baseUrl
+            )
+
+            if (absolute == baseUrl) {
+                return@forEach
+            }
+
+            val title = cleanTitle(
+                anchor.text().ifBlank {
+                    "Episode"
+                }
+            )
+
+            result[absolute] = newEpisode(
+                absolute
+            ) {
+                name = title
+                season = 1
+                episode = episodeNumber(
+                    anchor,
+                    title,
+                    absolute
+                )
+            }
+        }
+
+        /*
+         * If the series page itself exposes one direct file,
+         * expose it as Episode 1.
+         */
+        if (result.isEmpty()) {
+            val direct = extractMediaUrls(
+                document,
+                document.html(),
+                baseUrl
+            ).firstOrNull()
+
+            if (direct != null) {
+                result[direct] = newEpisode(
+                    direct
+                ) {
+                    name = "Episode 1"
+                    season = 1
+                    episode = 1
+                }
+            }
+        }
+
+        return result.values.sortedBy {
+            it.episode ?: Int.MAX_VALUE
+        }
+    }
 
     private fun findCard(
         anchor: Element
     ): Element {
-
-        var current:
-            Element? = anchor
+        var current: Element? = anchor
 
         repeat(8) {
+            val element = current ?: return@repeat
 
-            val element =
-                current
-                    ?: return@repeat
-
-            val className =
-                element
-                    .className()
-                    .lowercase(
-                        Locale.ROOT
-                    )
+            val cls = element
+                .className()
+                .lowercase(Locale.ROOT)
 
             if (
-                element.select("img")
-                    .isNotEmpty() ||
-                className.contains("card") ||
-                className.contains("movie") ||
-                className.contains("item") ||
-                className.contains("poster")
+                element.select("img").isNotEmpty() ||
+                cls.contains("card") ||
+                cls.contains("movie") ||
+                cls.contains("item") ||
+                cls.contains("poster")
             ) {
-
                 return element
             }
 
-            current =
-                element.parent()
+            current = element.parent()
         }
 
         return anchor
     }
 
-    /*
-     * ============================================================
-     * EXTRACT TITLE
-     * ============================================================
-     */
-
     private fun extractCardTitle(
         anchor: Element,
         card: Element
     ): String {
-
-        val selectors =
-            listOf(
-                ".title",
-                ".movie-title",
-                ".movie_name",
-                ".name",
-                "h1",
-                "h2",
-                "h3",
-                "h4",
-                "strong"
-            )
+        val selectors = listOf(
+            ".title",
+            ".movie-title",
+            ".movie_name",
+            ".name",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "strong"
+        )
 
         for (selector in selectors) {
+            val text = card
+                .selectFirst(selector)
+                ?.text()
+                ?.trim()
+                .orEmpty()
 
-            val value =
-                card
-                    .selectFirst(
-                        selector
-                    )
-                    ?.text()
-                    ?.trim()
-                    .orEmpty()
-
-            if (value.isNotBlank()) {
-                return value
+            if (text.isNotBlank()) {
+                return text
             }
         }
 
-        val aria =
-            anchor
-                .attr("aria-label")
-                .trim()
+        val aria = anchor
+            .attr("aria-label")
+            .trim()
 
         if (aria.isNotBlank()) {
             return aria
         }
 
-        val alt =
-            card
-                .selectFirst("img")
-                ?.attr("alt")
-                ?.trim()
+        val alt = card
+            .selectFirst("img")
+            ?.attr("alt")
+            ?.trim()
 
         if (!alt.isNullOrBlank()) {
             return alt
@@ -1542,17 +1024,10 @@ class CinePlexFTP : MainAPI() {
         return anchor.text().trim()
     }
 
-    /*
-     * ============================================================
-     * POSTER
-     * ============================================================
-     */
-
     private fun extractPoster(
         document: Document,
         pageUrl: String
     ): String? {
-
         return extractPosterFromElement(
             document,
             pageUrl
@@ -1563,93 +1038,92 @@ class CinePlexFTP : MainAPI() {
         element: Element,
         pageUrl: String
     ): String? {
-
-        /*
-         * OG image.
-         */
-        val meta =
-            element
-                .selectFirst(
-                    "meta[property=og:image], " +
-                        "meta[name=twitter:image]"
+        val videoPoster = element
+            .select("video[poster], video[data-poster]")
+            .asSequence()
+            .mapNotNull {
+                it.attr("poster")
+                    .ifBlank {
+                        it.attr("data-poster")
+                    }
+                    .takeIf(String::isNotBlank)
+            }
+            .map {
+                absoluteUrl(
+                    it,
+                    pageUrl
                 )
-                ?.attr("content")
-                ?.trim()
+            }
+            .firstOrNull()
+
+        if (!videoPoster.isNullOrBlank()) {
+            return videoPoster
+        }
+
+        val meta = element
+            .selectFirst(
+                "meta[property=og:image], " +
+                    "meta[name=twitter:image]"
+            )
+            ?.attr("content")
+            ?.trim()
 
         if (!meta.isNullOrBlank()) {
-
             return absoluteUrl(
                 meta,
                 pageUrl
             )
         }
 
-        /*
-         * Standard Cine Plex poster.
-         */
-        val image =
-            element
-                .select(
-                    "img[src], " +
-                        "img[data-src], " +
-                        "img[data-lazy-src], " +
-                        "img[data-original], " +
-                        "img[data-poster]"
-                )
-                .firstOrNull()
+        val images = element.select(
+            "img[src], " +
+                "img[data-src], " +
+                "img[data-lazy-src], " +
+                "img[data-original], " +
+                "img[data-poster]"
+        )
 
-        if (image != null) {
+        val preferred = images.firstOrNull { image ->
+            val all =
+                "${imageSource(image)} " +
+                    "${image.attr("alt")} " +
+                    "${image.className()}"
+                    .lowercase(Locale.ROOT)
 
-            val source =
-                imageSource(
-                    image
-                )
+            all.contains("poster") ||
+                all.contains("cover") ||
+                all.contains("thumb") ||
+                all.contains("movie")
+        } ?: images.firstOrNull()
 
-            if (!source.isNullOrBlank()) {
-
+        if (preferred != null) {
+            imageSource(preferred)?.let {
                 return absoluteUrl(
-                    source,
+                    it,
                     pageUrl
                 )
             }
         }
 
-        /*
-         * Background image fallback.
-         */
-        val style =
-            element
-                .select("[style*=background]")
-                .map {
-                    it.attr("style")
-                }
-                .firstOrNull {
-                    it.contains(
-                        "url(",
-                        true
-                    )
-                }
+        val style = element
+            .select("[style*=background]")
+            .map { it.attr("style") }
+            .firstOrNull {
+                it.contains("url(", true)
+            }
 
         if (!style.isNullOrBlank()) {
-
-            val match =
-                Regex(
-                    """(?i)url\(\s*['"]?([^'")]+)['"]?\s*\)"""
-                )
-                    .find(style)
-
-            val value =
-                match
-                    ?.groupValues
-                    ?.getOrNull(1)
-
-            if (!value.isNullOrBlank()) {
-
-                return absoluteUrl(
-                    value,
-                    pageUrl
-                )
-            }
+            Regex(
+                """(?i)url\(\s*['"]?([^'")]+)['"]?\s*\)"""
+            ).find(style)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.let {
+                    return absoluteUrl(
+                        it,
+                        pageUrl
+                    )
+                }
         }
 
         return null
@@ -1658,817 +1132,183 @@ class CinePlexFTP : MainAPI() {
     private fun imageSource(
         image: Element
     ): String? {
-
         return sequenceOf(
-
-            image.attr(
-                "data-poster"
-            ),
-
-            image.attr(
-                "data-src"
-            ),
-
-            image.attr(
-                "data-lazy-src"
-            ),
-
-            image.attr(
-                "data-original"
-            ),
-
-            image.attr(
-                "src"
-            )
-
+            image.attr("data-poster"),
+            image.attr("data-src"),
+            image.attr("data-lazy-src"),
+            image.attr("data-original"),
+            image.attr("src")
         ).firstOrNull {
             it.isNotBlank()
         }
     }
 
-    /*
-     * ============================================================
-     * CONTENT LINK DETECTION
-     * ============================================================
-     */
-
     private fun looksLikeContentLink(
         href: String
     ): Boolean {
-
-        val lower =
-            href.lowercase(
-                Locale.ROOT
-            )
+        val lower = href.lowercase(Locale.ROOT)
 
         if (
             lower.isBlank() ||
             lower.startsWith("#") ||
-            lower.startsWith(
-                "javascript:"
-            ) ||
-            lower.startsWith(
-                "mailto:"
-            )
+            lower.startsWith("javascript:")
         ) {
             return false
         }
 
-        return lower.contains(
-            "player.php"
-        ) ||
-            lower.contains(
-                "view.php"
-            ) ||
-            lower.contains(
-                "movie.php"
-            ) ||
-            lower.contains(
-                "series.php"
-            ) ||
-            lower.contains(
-                "show.php"
-            ) ||
-            lower.contains(
-                "watch.php"
-            ) ||
-            lower.contains(
-                "details.php"
-            ) ||
-            lower.contains(
-                "type=movie"
-            ) ||
-            lower.contains(
-                "type=series"
-            ) ||
-            lower.contains(
-                "type=tv"
-            )
-    }
-
-    /*
-     * ============================================================
-     * EPISODES
-     * ============================================================
-     */
-
-    private fun parseEpisodes(
-        document: Document,
-        baseUrl: String
-    ): List<Episode> {
-
-        val result =
-            linkedMapOf<String, Episode>()
-
-        document
-            .select("a[href]")
-            .forEach { anchor ->
-
-                val href =
-                    anchor.attr(
-                        "href"
-                    )
-                        .trim()
-
-                if (href.isBlank()) {
-                    return@forEach
-                }
-
-                if (
-                    !looksLikeEpisodeLink(
-                        href
-                    )
-                ) {
-                    return@forEach
-                }
-
-                val absolute =
-                    absoluteUrl(
-                        href,
-                        baseUrl
-                    )
-
-                val title =
-                    cleanTitle(
-                        anchor.text()
-                            .ifBlank {
-                                "Episode"
-                            }
-                    )
-
-                result[absolute] =
-                    newEpisode(
-                        absolute
-                    ) {
-
-                        name = title
-
-                        season = extractSeasonNumber(
-                            anchor,
-                            title,
-                            absolute
-                        )
-
-                        episode =
-                            extractEpisodeNumber(
-                                anchor,
-                                title,
-                                absolute
-                            )
-                    }
-            }
-
-        /*
-         * Some simple series pages may expose player links
-         * without explicit episode text.
-         */
-        if (result.isEmpty()) {
-
-            document
-                .select(
-                    "a[href*='player.php'], " +
-                        "a[href*='view.php']"
-                )
-                .forEach { anchor ->
-
-                    val href =
-                        anchor.attr("href")
-                            .trim()
-
-                    if (href.isBlank()) {
-                        return@forEach
-                    }
-
-                    val absolute =
-                        absoluteUrl(
-                            href,
-                            baseUrl
-                        )
-
-                    val title =
-                        cleanTitle(
-                            anchor.text()
-                                .ifBlank {
-                                    "Episode"
-                                }
-                        )
-
-                    result[absolute] =
-                        newEpisode(
-                            absolute
-                        ) {
-
-                            name = title
-
-                            season = 1
-
-                            episode =
-                                extractEpisodeNumber(
-                                    anchor,
-                                    title,
-                                    absolute
-                                )
-                        }
-                }
-        }
-
-        return result.values
-            .sortedWith(
-                compareBy<Episode> {
-                    it.season ?: 1
-                }.thenBy {
-                    it.episode ?: Int.MAX_VALUE
-                }
-            )
+        return lower.contains("view.php?id=") ||
+            lower.contains("player.php?id=") ||
+            lower.contains("movie.php") ||
+            lower.contains("series.php") ||
+            lower.contains("show.php") ||
+            lower.contains("details.php") ||
+            lower.contains("movie?id=") ||
+            lower.contains("type=movie") ||
+            lower.contains("type=series") ||
+            lower.contains("type=tv")
     }
 
     private fun looksLikeEpisodeLink(
         href: String
     ): Boolean {
+        val lower = href.lowercase(Locale.ROOT)
 
-        val lower =
-            href.lowercase(
-                Locale.ROOT
+        return looksLikeContentLink(href) && (
+            lower.contains("episode") ||
+                lower.contains("ep=") ||
+                lower.contains("episode=") ||
+                lower.contains("season=") ||
+                lower.contains("type=episode")
             )
-
-        return looksLikeContentLink(href) &&
-            (
-                lower.contains(
-                    "episode"
-                ) ||
-                    lower.contains(
-                        "ep="
-                    ) ||
-                    lower.contains(
-                        "episode="
-                    ) ||
-                    lower.contains(
-                        "season="
-                    ) ||
-                    lower.contains(
-                        "type=episode"
-                    )
-                )
     }
 
-    private fun extractSeasonNumber(
-        anchor: Element,
-        title: String,
-        url: String
-    ): Int {
+    private fun hasNextPage(
+        document: Document,
+        currentPage: Int
+    ): Boolean {
+        return document
+            .select("a[href]")
+            .any { anchor ->
+                val text = anchor
+                    .text()
+                    .trim()
+                    .lowercase(Locale.ROOT)
 
-        val candidates =
-            listOf(
+                val rel = anchor
+                    .attr("rel")
+                    .lowercase(Locale.ROOT)
 
-                Regex(
-                    """(?i)\bseason\s*([0-9]+)"""
-                )
-                    .find(title)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                Regex(
-                    """(?i)\bs\s*([0-9]+)\b"""
-                )
-                    .find(title)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                Regex(
-                    """(?i)\bseason\s*([0-9]+)"""
-                )
-                    .find(url)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                anchor.attr(
-                    "data-season"
-                )
-                    .takeIf {
-                        it.isNotBlank()
-                    }
-            )
-
-        return candidates
-            .firstNotNullOfOrNull {
-                it?.toIntOrNull()
-            }
-            ?: 1
-    }
-
-    private fun extractEpisodeNumber(
-        anchor: Element,
-        title: String,
-        url: String
-    ): Int {
-
-        val candidates =
-            listOf(
-
-                Regex(
-                    """(?i)\bepisode\s*([0-9]+)"""
-                )
-                    .find(title)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                Regex(
-                    """(?i)\bep\s*([0-9]+)"""
-                )
-                    .find(title)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                Regex(
-                    """(?i)\be\s*([0-9]+)\b"""
-                )
-                    .find(title)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                Regex(
-                    """(?i)(?:episode|ep)=([0-9]+)"""
-                )
-                    .find(url)
-                    ?.groupValues
-                    ?.getOrNull(1),
-
-                anchor.attr(
-                    "data-episode"
-                )
-                    .takeIf {
-                        it.isNotBlank()
-                    }
-            )
-
-        return candidates
-            .firstNotNullOfOrNull {
-                it?.toIntOrNull()
-            }
-            ?: 1
-    }
-
-    /*
-     * ============================================================
-     * PAGE TITLE
-     * ============================================================
-     */
-
-    private fun extractPageTitle(
-        document: Document
-    ): String {
-
-        val selectors =
-            listOf(
-                "h1",
-                "h2",
-                ".movie-title",
-                ".movie_name",
-                ".title",
-                "meta[property=og:title]"
-            )
-
-        for (selector in selectors) {
-
-            val element =
-                document.selectFirst(
-                    selector
-                )
-                    ?: continue
-
-            val text =
-                if (
-                    element.tagName()
-                        .equals(
-                            "meta",
-                            true
+                text == "next" ||
+                    text.contains("next") ||
+                    rel == "next" ||
+                    anchor
+                        .attr("aria-label")
+                        .contains("next", true) ||
+                    anchor
+                        .attr("href")
+                        .contains(
+                            "page=${currentPage + 1}"
                         )
-                ) {
-                    element.attr(
-                        "content"
-                    )
-                } else {
-                    element.text()
-                }
-
-            if (text.isNotBlank()) {
-
-                return cleanTitle(
-                    text
-                )
             }
-        }
-
-        return cleanTitle(
-            document.title()
-        )
-    }
-
-    /*
-     * ============================================================
-     * URL HELPERS
-     * ============================================================
-     */
-
-    private fun absoluteUrl(
-        raw: String,
-        base: String
-    ): String {
-
-        val value =
-            raw.trim()
-
-        if (value.isBlank()) {
-            return value
-        }
-
-        if (
-            value.startsWith(
-                "//"
-            )
-        ) {
-
-            val scheme =
-                runCatching {
-                    URI(base)
-                        .scheme
-                }
-                    .getOrNull()
-                    ?: "http"
-
-            return "$scheme:$value"
-        }
-
-        if (
-            value.startsWith(
-                "http://",
-                true
-            ) ||
-            value.startsWith(
-                "https://",
-                true
-            )
-        ) {
-            return value
-        }
-
-        return runCatching {
-
-            URI(base)
-                .resolve(value)
-                .toString()
-
-        }.getOrElse {
-
-            if (value.startsWith("/")) {
-                "$mainUrl$value"
-            } else {
-                "$mainUrl/$value"
-            }
-        }
     }
 
     private fun pageUrl(
         base: String,
         page: Int
     ): String {
-
         if (page <= 1) {
             return base
         }
 
-        return if (
-            base.contains("?")
-        ) {
+        return if (base.contains("?")) {
             "$base&page=$page"
         } else {
             "$base?page=$page"
         }
     }
 
-    private fun cleanUrl(
-        raw: String
-    ): String {
+    private fun isSeriesUrl(
+        url: String
+    ): Boolean {
+        val lower = url.lowercase(Locale.ROOT)
 
-        return raw
-            .trim()
-            .replace(
-                "\\/",
-                "/"
-            )
-            .replace(
-                "\\u0026",
-                "&"
-            )
-            .replace(
-                "&amp;",
-                "&"
-            )
-            .trim(
-                '"',
-                '\'',
-                '`'
-            )
-            .trimEnd(
-                ',',
-                ';',
-                ')',
-                ']',
-                '}'
-            )
+        return lower.contains("tvs.php") ||
+            lower.contains("series.php") ||
+            lower.contains("show.php") ||
+            lower.contains("type=series") ||
+            lower.contains("type=tv")
     }
 
-    private fun decodeJsUrl(
-        raw: String
-    ): String {
-
-        var value =
-            cleanUrl(raw)
-
-        repeat(2) {
-
-            value =
-                runCatching {
-
-                    URLDecoder.decode(
-                        value,
-                        StandardCharsets.UTF_8
-                            .toString()
-                    )
-
-                }.getOrElse {
-                    value
-                }
-        }
-
-        return value
-            .replace(
-                "\\u0026",
-                "&"
-            )
-            .replace(
-                "\\u003F",
-                "?"
-            )
-            .replace(
-                "\\u003D",
-                "="
-            )
-            .replace(
-                "\\/",
-                "/"
-            )
+    private fun isAnimeUrl(
+        url: String
+    ): Boolean {
+        val lower = url.lowercase(Locale.ROOT)
+        return lower.contains("category=anime") ||
+            lower.contains("category=animation") ||
+            lower.contains("/anime")
     }
 
-    private fun cleanHtml(
-        html: String
-    ): String {
+    private fun looksLikeSeriesPage(
+        document: Document
+    ): Boolean {
+        val text = document
+            .text()
+            .lowercase(Locale.ROOT)
 
-        return html
-            .replace(
-                "\\/",
-                "/"
-            )
-            .replace(
-                "\\u0026",
-                "&"
-            )
-            .replace(
-                "\\u003A",
-                ":"
-            )
-            .replace(
-                "\\u003F",
-                "?"
-            )
-            .replace(
-                "\\u003D",
-                "="
-            )
-            .replace(
-                "&amp;",
-                "&"
-            )
+        return text.contains("season") &&
+            text.contains("episode")
     }
-
-    /*
-     * ============================================================
-     * MEDIA
-     * ============================================================
-     */
-
-    private val mediaExtensions =
-        setOf(
-            ".m3u8",
-            ".mpd",
-            ".mp4",
-            ".mkv",
-            ".webm",
-            ".mov",
-            ".m4v",
-            ".avi",
-            ".flv",
-            ".ts"
-        )
 
     private fun isMediaUrl(
         url: String
     ): Boolean {
-
-        val path =
-            runCatching {
-
-                URI(url)
-                    .path
-                    .orEmpty()
-                    .lowercase(
-                        Locale.ROOT
-                    )
-
-            }.getOrElse {
-
-                url.lowercase(
-                    Locale.ROOT
-                )
-            }
+        val path = runCatching {
+            URI(url)
+                .path
+                .lowercase(Locale.ROOT)
+        }.getOrElse {
+            url.lowercase(Locale.ROOT)
+        }
 
         return mediaExtensions.any {
             path.endsWith(it)
         }
     }
 
-    private fun titleFromMediaUrl(
-        url: String
-    ): String {
-
-        val decoded =
-            runCatching {
-
-                URLDecoder.decode(
-                    url,
-                    StandardCharsets.UTF_8
-                        .toString()
-                )
-
-            }.getOrElse {
-                url
-            }
-
-        val file =
-            runCatching {
-
-                URI(decoded)
-                    .path
-                    .substringAfterLast('/')
-
-            }.getOrElse {
-                ""
-            }
-
-        if (file.isBlank()) {
-            return "Cine Plex"
-        }
-
-        return cleanTitle(
-            file
-                .substringBeforeLast(
-                    "."
-                )
-                .replace(
-                    "_",
-                    " "
-                )
-        )
-    }
-
     private fun titleFromUrl(
         url: String
     ): String {
-
-        val decoded =
-            runCatching {
-
-                URLDecoder.decode(
-                    url,
-                    StandardCharsets.UTF_8
-                        .toString()
-                )
-
-            }.getOrElse {
-                url
-            }
-
-        /*
-         * Cine Plex player URL:
-         *
-         * player.php?id=77031
-         *
-         * The actual title is normally on the fetched page,
-         * so this is only a fallback.
-         */
-        return cleanTitle(
-            decoded
-                .substringAfterLast("/")
-                .substringBefore("?")
-                .ifBlank {
-                    "Cine Plex"
+        return runCatching {
+            URI(url)
+                .query
+                ?.split('&')
+                ?.firstOrNull {
+                    it.startsWith("id=")
                 }
-        )
+                ?.substringAfter('=')
+        }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: "Cine Plex"
     }
 
-    /*
-     * ============================================================
-     * SERIES / ANIME
-     * ============================================================
-     */
-
-    private fun isSeriesUrl(
-        url: String
-    ): Boolean {
-
-        val lower =
-            url.lowercase(
-                Locale.ROOT
-            )
-
-        return lower.contains(
-            "tvs.php"
-        ) ||
-            lower.contains(
-                "tcategory.php"
-            ) ||
-            lower.contains(
-                "series.php"
-            ) ||
-            lower.contains(
-                "show.php"
-            ) ||
-            lower.contains(
-                "type=series"
-            ) ||
-            lower.contains(
-                "type=tv"
-            )
+    private fun cleanUrl(
+        raw: String
+    ): String {
+        return raw
+            .trim()
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+            .trim('"', '\'', '`')
+            .trimEnd(',', ';', ')', ']', '}')
     }
-
-    private fun isAnimeUrl(
-        url: String
-    ): Boolean {
-
-        val lower =
-            url.lowercase(
-                Locale.ROOT
-            )
-
-        return lower.contains(
-            "category=anime"
-        ) ||
-            lower.contains(
-                "category=animation"
-            ) ||
-            lower.contains(
-                "anime"
-            ) ||
-            lower.contains(
-                "animation"
-            )
-    }
-
-    private fun looksLikeSeriesPage(
-        document: Document
-    ): Boolean {
-
-        val text =
-            document.text()
-                .lowercase(
-                    Locale.ROOT
-                )
-
-        return (
-            text.contains(
-                "season"
-            ) &&
-                text.contains(
-                    "episode"
-                )
-            )
-    }
-
-    /*
-     * ============================================================
-     * TITLE CLEANUP
-     * ============================================================
-     */
 
     private fun cleanTitle(
         value: String
     ): String {
-
         return value
             .replace(
-                Regex(
-                    "\\s+"
-                ),
+                Regex("\\s+"),
                 " "
             )
             .replace(
@@ -2484,430 +1324,161 @@ class CinePlexFTP : MainAPI() {
     private fun isNavigationTitle(
         value: String
     ): Boolean {
-
         return value
-            .lowercase(
-                Locale.ROOT
-            ) in setOf(
-
-            "home",
-            "movie",
-            "movies",
-            "tv",
-            "tv shows",
-            "tv series",
-            "anime",
-            "animation",
-            "search",
-            "software",
-            "top watch",
-            "download",
-            "download now",
-            "next",
-            "previous"
-        )
-    }
-
-    /*
-     * ============================================================
-     * ADVANCED FUZZY SEARCH ENGINE
-     * ============================================================
-     */
-
-    private fun fuzzyScore(
-        query: String,
-        title: String
-    ): Double {
-
-        val q =
-            normalizeSearchText(
-                query
-            )
-
-        val t =
-            normalizeSearchText(
-                title
-            )
-
-        if (
-            q.isBlank() ||
-            t.isBlank()
-        ) {
-            return 0.0
-        }
-
-        /*
-         * Exact normalized match.
-         */
-        if (q == t) {
-            return 1.0
-        }
-
-        /*
-         * Whole phrase containment.
-         */
-        if (t.contains(q)) {
-            return 0.96
-        }
-
-        /*
-         * Token-based similarity.
-         */
-        val qTokens =
-            q.split(' ')
-                .filter {
-                    it.isNotBlank()
-                }
-                .distinct()
-
-        val tTokens =
-            t.split(' ')
-                .filter {
-                    it.isNotBlank()
-                }
-                .distinct()
-
-        var tokenScore =
-            0.0
-
-        if (
-            qTokens.isNotEmpty() &&
-            tTokens.isNotEmpty()
-        ) {
-
-            val scores =
-                qTokens.map { queryToken ->
-
-                    tTokens.maxOfOrNull { titleToken ->
-
-                        tokenSimilarity(
-                            queryToken,
-                            titleToken
-                        )
-
-                    } ?: 0.0
-                }
-
-            tokenScore =
-                scores.average()
-        }
-
-        /*
-         * Full string edit similarity.
-         */
-        val fullSimilarity =
-            normalizedLevenshteinSimilarity(
-                q,
-                t
-            )
-
-        /*
-         * Compact string similarity.
-         *
-         * This helps cases such as:
-         *
-         * balanboy
-         * balan boy
-         */
-        val compactQ =
-            q.replace(
-                " ",
-                ""
-            )
-
-        val compactT =
-            t.replace(
-                " ",
-                ""
-            )
-
-        val compactSimilarity =
-            normalizedLevenshteinSimilarity(
-                compactQ,
-                compactT
-            )
-
-        /*
-         * First-token / partial matching.
-         */
-        val partialTokenScore =
-            partialTokenSimilarity(
-                qTokens,
-                tTokens
-            )
-
-        /*
-         * Weighted final score.
-         */
-        return (
-            tokenScore * 0.36 +
-                partialTokenScore * 0.20 +
-                fullSimilarity * 0.24 +
-                compactSimilarity * 0.20
-            )
-            .coerceIn(
-                0.0,
-                1.0
+            .lowercase(Locale.ROOT) in
+            setOf(
+                "home",
+                "movies",
+                "tv shows",
+                "tv series",
+                "live tv",
+                "search",
+                "genres",
+                "software",
+                "request",
+                "next",
+                "previous"
             )
     }
 
-    private fun normalizeSearchText(
-        value: String
-    ): String {
+    private fun extractContentUrl(
+        raw: String
+    ): String? {
+        if (raw.isBlank()) {
+            return null
+        }
 
-        return value
-            .lowercase(
-                Locale.ROOT
-            )
-            .replace(
-                Regex(
-                    "[^\\p{L}\\p{N}]+"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "\\s+"
-                ),
-                " "
-            )
+        val cleaned = raw
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
             .trim()
+
+        val patterns = listOf(
+            Regex("""(?i)https?://[^"'<>\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?(?:view|player)\.php\?[^"'<>\s)]+"""),
+            Regex("""(?i)(?:/|\.\.?/)?(?:movie|series|show|details)\.php\?[^"'<>\s)]+""")
+        )
+
+        for (pattern in patterns) {
+            val match = pattern
+                .find(cleaned)
+                ?.value
+                ?: continue
+
+            return match
+                .trim(
+                    ',',
+                    ';',
+                    ')',
+                    ']',
+                    '}',
+                    '"',
+                    '\''
+                )
+                .replace("&amp;", "&")
+        }
+
+        return null
     }
 
-    private fun tokenSimilarity(
-        queryToken: String,
-        titleToken: String
-    ): Double {
+    private fun absoluteUrl(
+        raw: String,
+        base: String
+    ): String {
+        val value = raw.trim()
 
-        if (
-            queryToken == titleToken
-        ) {
-            return 1.0
+        if (value.startsWith("//")) {
+            val scheme = runCatching {
+                URI(base).scheme
+            }.getOrNull() ?: "http"
+
+            return "$scheme:$value"
         }
 
         if (
-            titleToken.contains(
-                queryToken
-            ) ||
-            queryToken.contains(
-                titleToken
-            )
+            value.startsWith("http://") ||
+            value.startsWith("https://")
         ) {
+            return value
+        }
 
-            val shorter =
-                min(
-                    queryToken.length,
-                    titleToken.length
-                )
+        return runCatching {
+            URI(base).resolve(value).toString()
+        }.getOrElse {
+            value
+        }
+    }
 
-            val longer =
-                max(
-                    queryToken.length,
-                    titleToken.length
-                )
+    private fun extractPageTitle(
+        document: Document
+    ): String {
+        val selectors = listOf(
+            "h1",
+            "h2",
+            ".movie-title",
+            ".movie_name",
+            ".title",
+            "meta[property=og:title]"
+        )
 
-            if (longer == 0) {
-                return 0.0
+        for (selector in selectors) {
+            val element = document
+                .selectFirst(selector)
+                ?: continue
+
+            val text =
+                if (element.tagName() == "meta") {
+                    element.attr("content")
+                } else {
+                    element.text()
+                }
+
+            if (text.isNotBlank()) {
+                return cleanTitle(text)
             }
-
-            return (
-                shorter.toDouble() /
-                    longer.toDouble()
-                ) * 0.95
         }
 
-        return normalizedLevenshteinSimilarity(
-            queryToken,
-            titleToken
+        return cleanTitle(
+            document.title()
         )
     }
 
-    private fun partialTokenSimilarity(
-        queryTokens: List<String>,
-        titleTokens: List<String>
-    ): Double {
-
-        if (
-            queryTokens.isEmpty() ||
-            titleTokens.isEmpty()
-        ) {
-            return 0.0
-        }
-
-        var matched =
-            0.0
-
-        for (queryToken in queryTokens) {
-
-            val best =
-                titleTokens.maxOfOrNull { titleToken ->
-
-                    when {
-
-                        titleToken.startsWith(
-                            queryToken
-                        ) ->
-                            0.92
-
-                        queryToken.startsWith(
-                            titleToken
-                        ) ->
-                            0.88
-
-                        titleToken.contains(
-                            queryToken
-                        ) ->
-                            0.82
-
-                        queryToken.contains(
-                            titleToken
-                        ) ->
-                            0.80
-
-                        else ->
-                            normalizedLevenshteinSimilarity(
-                                queryToken,
-                                titleToken
-                            )
-                    }
-
-                } ?: 0.0
-
-            matched += best
-        }
-
-        return (
-            matched /
-                queryTokens.size.toDouble()
-            )
-            .coerceIn(
-                0.0,
-                1.0
-            )
-    }
-
-    private fun normalizedLevenshteinSimilarity(
-        first: String,
-        second: String
-    ): Double {
-
-        if (first == second) {
-            return 1.0
-        }
-
-        if (first.isEmpty() || second.isEmpty()) {
-            return 0.0
-        }
-
-        val distance =
-            levenshteinDistance(
-                first,
-                second
-            )
-
-        val longest =
-            max(
-                first.length,
-                second.length
-            )
-
-        return (
-            1.0 -
-                distance.toDouble() /
-                    longest.toDouble()
-            )
-            .coerceIn(
-                0.0,
-                1.0
-            )
-    }
-
-    private fun levenshteinDistance(
-        a: String,
-        b: String
+    private fun episodeNumber(
+        anchor: Element,
+        title: String,
+        url: String
     ): Int {
+        val candidates = listOf(
+            Regex(
+                "(?i)episode\\s*([0-9]+)"
+            ).find(title)
+                ?.groupValues
+                ?.getOrNull(1),
 
-        if (a == b) {
-            return 0
-        }
+            Regex(
+                "(?i)\\bep\\s*([0-9]+)"
+            ).find(title)
+                ?.groupValues
+                ?.getOrNull(1),
 
-        if (a.isEmpty()) {
-            return b.length
-        }
+            Regex(
+                "(?i)(?:episode|ep)=([0-9]+)"
+            ).find(url)
+                ?.groupValues
+                ?.getOrNull(1),
 
-        if (b.isEmpty()) {
-            return a.length
-        }
+            anchor
+                .attr("data-episode")
+                .takeIf {
+                    it.isNotBlank()
+                }
+        )
 
-        var previous =
-            IntArray(
-                b.length + 1
-            ) { it }
-
-        var current =
-            IntArray(
-                b.length + 1
-            )
-
-        for (i in 1..a.length) {
-
-            current[0] = i
-
-            for (j in 1..b.length) {
-
-                val cost =
-                    if (
-                        a[i - 1] ==
-                        b[j - 1]
-                    ) {
-                        0
-                    } else {
-                        1
-                    }
-
-                current[j] =
-                    min(
-                        min(
-                            current[j - 1] + 1,
-                            previous[j] + 1
-                        ),
-                        previous[j - 1] + cost
-                    )
+        return candidates
+            .firstNotNullOfOrNull {
+                it?.toIntOrNull()
             }
-
-            val swap =
-                previous
-
-            previous =
-                current
-
-            current =
-                swap
-        }
-
-        return previous[b.length]
-    }
-
-    /*
-     * ============================================================
-     * CONSTANTS
-     * ============================================================
-     */
-
-    companion object {
-
-        private const val MAX_HOME_ITEMS =
-            40
-
-        private const val MAX_SEARCH_RESULTS =
-            50
-
-        /*
-         * Lower than CTG's previously used threshold so that
-         * typo/near-match searches have a better chance of
-         * returning a useful result.
-         */
-        private const val SEARCH_MIN_SCORE =
-            0.34
+            ?: 1
     }
 }
