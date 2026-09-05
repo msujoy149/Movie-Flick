@@ -1146,6 +1146,7 @@ class YouTubeKids : MainAPI() {
                 fastMode = fastMode
             )
                 .flatten()
+                .filterIsInstance<StreamInfoItem>()
 
         val candidates =
             mutableListOf<Pair<Int, StreamInfoItem>>()
