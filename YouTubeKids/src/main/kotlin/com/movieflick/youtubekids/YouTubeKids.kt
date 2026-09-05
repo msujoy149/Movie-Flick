@@ -619,7 +619,7 @@ class YouTubeKids : MainAPI() {
         }
 
         val results =
-            mutableListOf<List<InfoItem>>()
+            mutableListOf<List<StreamInfoItem>>()
 
         for (
             batch in cleanQueries.chunked(6)
