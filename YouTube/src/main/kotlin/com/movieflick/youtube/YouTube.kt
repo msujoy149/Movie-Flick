@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 class YouTube : MainAPI() {
 
@@ -119,21 +120,21 @@ class YouTube : MainAPI() {
      */
 
     private val indianMusicQueries = listOf(
-        // Fast path: only two high-value official-label searches run first.
+        // First-pass queries are deliberately restricted to major official labels.
         "T-Series latest Hindi official music video 2026",
         "Zee Music Company latest Hindi official music video 2026",
 
-        // Background searches add variety without delaying the first paint.
+        // Background queries add variety after the first paint.
         "Sony Music India latest Hindi official music video 2026",
         "Tips Official latest Hindi official music video 2026",
         "Saregama Music latest Hindi official music video 2026",
         "Times Music latest Hindi official music video 2026",
         "Universal Music India latest Hindi official music video 2026",
         "Panorama Music latest Hindi official music video 2026",
-        "9XM Hindi latest music video 2026",
-        "Mastiii latest Hindi music video 2026",
-        "latest Hindi movie song official video 2026",
-        "latest Bengali official music video India 2026",
+        "9XM latest Hindi official music video 2026",
+        "Mastiii latest Hindi official music video 2026",
+        "latest Bollywood movie song official video 2026",
+        "latest Indian Bengali official music video 2026",
         "Bengali bhakti official music video 2026"
     )
 
@@ -181,7 +182,7 @@ class YouTube : MainAPI() {
         "8d",
         "karaoke",
         "instrumental",
-        "cover version",
+        "cover",
         "remix",
         "dj mix",
         "bass boosted",
@@ -196,80 +197,80 @@ class YouTube : MainAPI() {
         "music video",
         "full video",
         "official mv",
-        "mv |",
-        "| official video",
         "song video"
     )
 
     private fun isPreferredMusicChannel(name: String): Boolean {
         if (name.isBlank()) return false
+
         return preferredMusicChannels.any { preferred ->
             isSameChannel(name, preferred) ||
                 name.contains(preferred, ignoreCase = true)
         }
     }
 
-    private fun isMusicVideoCandidate(item: StreamInfoItem): Boolean {
+    private fun isMusicVideoCandidate(
+        item: StreamInfoItem
+    ): Boolean {
         if (item.streamType != StreamType.VIDEO_STREAM) return false
         if (item.isShortFormContent) return false
 
-        val title = item.name?.trim().orEmpty()
-        val uploader = item.uploaderName?.trim().orEmpty()
+        val title = item.name
+            ?.trim()
+            .orEmpty()
+
+        val uploader = item.uploaderName
+            ?.trim()
+            .orEmpty()
+
         if (title.isBlank()) return false
 
         if (containsAny(title, bangladeshKeywords)) return false
-        if (containsAny(title, pakistanMusicKeywords)) return false
         if (containsAny(uploader, bangladeshKeywords)) return false
+        if (containsAny(title, pakistanMusicKeywords)) return false
         if (containsAny(uploader, pakistanMusicKeywords)) return false
         if (containsAny(title, musicNonVideoKeywords)) return false
 
-        // Real music videos are normally short VOD items. Reject long
-        // jukebox/compilation-style uploads and tiny audio snippets.
+        // Avoid long compilations/mixes and tiny audio snippets.
         val duration = item.duration
         if (duration > 12 * 60L) return false
         if (duration in 1L..89L) return false
 
-        val hasVideoSignal = containsAny(title, musicVideoKeywords)
-        val isOfficialChannel =
-            isPreferredMusicChannel(uploader) || item.isUploaderVerified
+        val hasMusicVideoSignal =
+            containsAny(title, musicVideoKeywords)
 
-        return hasVideoSignal || isOfficialChannel
+        val officialSignal =
+            isPreferredMusicChannel(uploader)
+
+        return hasMusicVideoSignal || officialSignal
     }
 
-    private fun musicVideoScore(item: StreamInfoItem): Int {
-        val title = item.name?.trim().orEmpty()
-        val uploader = item.uploaderName?.trim().orEmpty()
-        val combined = "$title $uploader".lowercase()
+    private fun musicVideoScore(
+        item: StreamInfoItem
+    ): Int {
+        val title = item.name
+            ?.trim()
+            .orEmpty()
+
+        val uploader = item.uploaderName
+            ?.trim()
+            .orEmpty()
+
+        val combined =
+            "$title $uploader"
 
         var score = 0
 
         if (isPreferredMusicChannel(uploader)) score += 300
-        if (item.isUploaderVerified) score += 80
         if (containsAny(title, musicVideoKeywords)) score += 120
-        if (combined.contains("2026")) score += 50
-        if (combined.contains("new song")) score += 40
-        if (combined.contains("latest")) score += 35
-        if (combined.contains("from the movie")) score += 35
-        if (combined.contains("full video")) score += 25
 
-        // Popularity helps keep genuine hit songs above low-engagement uploads.
-        when {
-            item.viewCount >= 50_000_000L -> score += 80
-            item.viewCount >= 10_000_000L -> score += 60
-            item.viewCount >= 2_000_000L -> score += 40
-            item.viewCount >= 500_000L -> score += 20
-        }
+        if (combined.contains("2026", ignoreCase = true)) score += 60
+        if (combined.contains("latest", ignoreCase = true)) score += 50
+        if (combined.contains("new song", ignoreCase = true)) score += 40
+        if (combined.contains("from the movie", ignoreCase = true)) score += 35
+        if (combined.contains("full video", ignoreCase = true)) score += 25
 
-        // Do not access StreamInfoItem.uploadDate here.
-        //
-        // CloudStream can run plugins with a different NewPipeExtractor
-        // version already bundled inside the host app. Accessing the newer
-        // DateWrapper Instant API can therefore cause a runtime
-        // NoSuchMethodError even when the plugin compiles successfully.
-        //
-        // Recency is intentionally left to YouTube's own search ranking so
-        // this provider stays binary-compatible with the host runtime.
-
+        // Prefer normal music-video duration without touching DateWrapper.
         val duration = item.duration
         if (duration in 150L..480L) score += 20
         if (duration in 481L..720L) score += 5
@@ -1021,25 +1022,38 @@ class YouTube : MainAPI() {
                 .filter { it.isNotBlank() }
                 .distinct()
 
-        if (cleanQueries.isEmpty()) return emptyList()
+        if (cleanQueries.isEmpty()) {
+            return emptyList()
+        }
 
         /*
-         * FAST MODE:
-         * Only the first two high-value queries are used and both are
-         * requested in parallel. The whole operation is bounded so the
-         * first paint is never held hostage by a slow query.
+         * Fast path:
+         * - only the first two high-value queries
+         * - both in parallel
+         * - tight total timeout
+         *
+         * This is the important latency guard for first paint.
          */
         if (fastMode) {
-            val fastQueries = cleanQueries.take(2)
+            val fastQueries =
+                cleanQueries.take(2)
 
-            return withTimeoutOrNull(1_650L) {
+            return withTimeoutOrNull(
+                1_650L
+            ) {
                 coroutineScope {
                     fastQueries.map { query ->
-                        async(Dispatchers.IO) {
-                            withTimeoutOrNull(1_350L) {
+                        async(
+                            Dispatchers.IO
+                        ) {
+                            withTimeoutOrNull(
+                                1_350L
+                            ) {
                                 runCatching {
                                     val extractor =
-                                        service.getSearchExtractor(query)
+                                        service.getSearchExtractor(
+                                            query
+                                        )
 
                                     extractor.fetchPage()
 
@@ -1047,7 +1061,9 @@ class YouTube : MainAPI() {
                                         .initialPage
                                         .items
                                         .toList()
-                                }.getOrElse { emptyList() }
+                                }.getOrElse {
+                                    emptyList()
+                                }
                             } ?: emptyList()
                         }
                     }.awaitAll()
@@ -1058,15 +1074,25 @@ class YouTube : MainAPI() {
         val results =
             mutableListOf<List<InfoItem>>()
 
-        for (batch in cleanQueries.chunked(batchSize)) {
+        for (
+            batch in cleanQueries.chunked(
+                batchSize
+            )
+        ) {
             val batchResults =
                 coroutineScope {
                     batch.map { query ->
-                        async(Dispatchers.IO) {
-                            withTimeoutOrNull(8_000L) {
+                        async(
+                            Dispatchers.IO
+                        ) {
+                            withTimeoutOrNull(
+                                8_000L
+                            ) {
                                 try {
                                     val extractor =
-                                        service.getSearchExtractor(query)
+                                        service.getSearchExtractor(
+                                            query
+                                        )
 
                                     extractor.fetchPage()
 
@@ -1074,8 +1100,9 @@ class YouTube : MainAPI() {
                                         .initialPage
                                         .items
                                         .toList()
-
-                                } catch (_: Exception) {
+                                } catch (
+                                    _: Exception
+                                ) {
                                     emptyList()
                                 }
                             } ?: emptyList()
@@ -1083,7 +1110,9 @@ class YouTube : MainAPI() {
                     }.awaitAll()
                 }
 
-            results.addAll(batchResults)
+            results.addAll(
+                batchResults
+            )
         }
 
         return results
@@ -1275,41 +1304,14 @@ class YouTube : MainAPI() {
     private companion object {
         const val FAST_VISIBLE_COUNT = 6
         const val HOME_CACHE_LIMIT = 50
-        const val BACKGROUND_REFRESH_COOLDOWN_MS = 45_000L
+        const val BACKGROUND_REFRESH_COOLDOWN_MS = 15_000L
+
+        // Survives multiple YouTube provider instances in the same app process.
+        val PREWARM_STARTED = AtomicBoolean(false)
     }
 
     private val backgroundRefreshScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    /*
-     * Prewarm the three most-used dynamic sections as soon as this provider
-     * instance is created. This runs completely off the UI path, so it does
-     * not block CloudStream while the provider opens. Any results discovered
-     * here become immediately reusable through the in-memory cache.
-     */
-    init {
-        backgroundRefreshScope.launch {
-            coroutineScope {
-                listOf(
-                    async(Dispatchers.IO) {
-                        runCatching {
-                            buildIndianMusicPageFull(1, fastMode = true, forceRefresh = false)
-                        }
-                    },
-                    async(Dispatchers.IO) {
-                        runCatching {
-                            buildMoviesPageFull(1, fastMode = true, forceRefresh = false)
-                        }
-                    },
-                    async(Dispatchers.IO) {
-                        runCatching {
-                            buildHindiMoviesPageFull(1, fastMode = true, forceRefresh = false)
-                        }
-                    }
-                ).awaitAll()
-            }
-        }
-    }
 
     private val refreshRunning =
         ConcurrentHashMap<String, Boolean>()
@@ -1322,6 +1324,9 @@ class YouTube : MainAPI() {
      * App-level storage helpers from the host application are not part of the
      * plugin compile classpath, so this extension intentionally stays on the
      * library-safe in-memory cache path.
+     *
+     * Expired snapshots are intentionally still usable: home returns them
+     * immediately while a background refresh replaces them.
      */
     private data class CachedResponses(
         val expiresAt: Long,
@@ -1331,11 +1336,59 @@ class YouTube : MainAPI() {
     private val fastContentCache =
         ConcurrentHashMap<String, CachedResponses>()
 
+    /*
+     * --------------------------------------------------
+     * ULTRA-FAST PREWARM
+     * --------------------------------------------------
+     *
+     * Start a tiny background snapshot as soon as the provider is created.
+     * This never blocks getMainPage() and gives later home requests a warm cache.
+     */
+    init {
+        if (PREWARM_STARTED.compareAndSet(false, true)) {
+            backgroundRefreshScope.launch {
+                coroutineScope {
+                    listOf(
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                buildIndianMusicPageFull(
+                                    page = 1,
+                                    fastMode = true,
+                                    forceRefresh = true
+                                )
+                            }
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                buildMoviesPageFull(
+                                    page = 1,
+                                    fastMode = true,
+                                    forceRefresh = true
+                                )
+                            }
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                buildHindiMoviesPageFull(
+                                    page = 1,
+                                    fastMode = true,
+                                    forceRefresh = true
+                                )
+                            }
+                        }
+                    ).awaitAll()
+                }
+            }
+        }
+    }
+
     private fun cachedResponses(
         section: String,
         kind: String,
         limit: Int = HOME_CACHE_LIMIT
     ): List<SearchResponse> {
+        // Stale-while-revalidate: a usable old snapshot is always preferable
+        // to an empty screen. The caller separately schedules a refresh.
         val cached = fastContentCache[section] ?: return emptyList()
         return cached.items.take(limit)
     }
@@ -1375,14 +1428,23 @@ class YouTube : MainAPI() {
         }
     }
 
-    private suspend fun getIndianMusicPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+    private suspend fun getIndianMusicPage(
+        page: Int
+    ): HomePageResponse {
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
 
-        val cached = cachedResponses("music", "movie")
+        val cached =
+            cachedResponses("music", "movie")
+
         if (cached.isNotEmpty()) {
             scheduleBackgroundRefresh("music") {
                 buildIndianMusicPageFull(
-                    1,
+                    page = 1,
                     fastMode = false,
                     forceRefresh = true
                 )
@@ -1400,16 +1462,17 @@ class YouTube : MainAPI() {
             )
         }
 
-        // Keep the existing fast first-paint behaviour.
-        val fast = buildIndianMusicPageFull(
-            1,
-            fastMode = true,
-            forceRefresh = true
-        )
+        // No cache: use the smallest fast path and immediately refresh in background.
+        val fast =
+            buildIndianMusicPageFull(
+                page = 1,
+                fastMode = true,
+                forceRefresh = true
+            )
 
         scheduleBackgroundRefresh("music") {
             buildIndianMusicPageFull(
-                1,
+                page = 1,
                 fastMode = false,
                 forceRefresh = true
             )
@@ -1423,28 +1486,51 @@ class YouTube : MainAPI() {
         fastMode: Boolean = false,
         forceRefresh: Boolean = false
     ): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+
+        if (page > 1) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
 
         if (!fastMode && !forceRefresh) {
-            getCachedHomePage(musicHomeCache, "music")?.let {
+            getCachedHomePage(
+                musicHomeCache,
+                "music"
+            )?.let {
                 return it
             }
         }
 
-        val candidates = mutableListOf<Pair<Int, StreamInfoItem>>()
-        val seenUrls = mutableSetOf<String>()
+        val candidates =
+            mutableListOf<Pair<Int, StreamInfoItem>>()
 
-        for (items in fetchSearchItemsInBatches(
-            indianMusicQueries,
-            6,
-            fastMode
-        )) {
+        val seenUrls =
+            mutableSetOf<String>()
+
+        for (
+            items in fetchSearchItemsInBatches(
+                indianMusicQueries,
+                6,
+                fastMode
+            )
+        ) {
             for (item in items) {
                 if (item !is StreamInfoItem) continue
                 if (!isMusicVideoCandidate(item)) continue
 
-                val url = item.url?.trim() ?: continue
-                if (url.isBlank() || !seenUrls.add(url)) continue
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: continue
+
+                if (
+                    url.isBlank() ||
+                    !seenUrls.add(url)
+                ) {
+                    continue
+                }
 
                 candidates.add(
                     musicVideoScore(item) to item
@@ -1452,54 +1538,75 @@ class YouTube : MainAPI() {
             }
         }
 
-        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
+        val resultLimit =
+            if (fastMode) FAST_VISIBLE_COUNT else 40
 
-        // Prefer official/verified music videos while keeping recency from
-        // YouTube search order as the secondary tie-breaker.
-        val selected = candidates
-            .sortedByDescending { it.first }
-            .take(resultLimit)
+        val selected =
+            candidates
+                .sortedByDescending {
+                    it.first
+                }
+                .take(resultLimit)
 
-        val results = selected.mapNotNull { (_, item) ->
-            val title = item.name?.trim() ?: return@mapNotNull null
-            val url = item.url?.trim() ?: return@mapNotNull null
-            if (title.isBlank() || url.isBlank()) return@mapNotNull null
+        val results =
+            selected.mapNotNull { (_, item) ->
+                val title =
+                    item.name
+                        ?.trim()
+                        ?: return@mapNotNull null
 
-            newMovieSearchResponse(
-                title,
-                url,
-                TvType.Movie
-            ) {
-                posterUrl = item.thumbnails
-                    .lastOrNull()
-                    ?.url
-                    ?.takeIf { it.isNotBlank() }
+                val url =
+                    item.url
+                        ?.trim()
+                        ?: return@mapNotNull null
+
+                if (
+                    title.isBlank() ||
+                    url.isBlank()
+                ) {
+                    return@mapNotNull null
+                }
+
+                newMovieSearchResponse(
+                    title,
+                    url,
+                    TvType.Movie
+                ) {
+                    posterUrl =
+                        item.thumbnails
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
+                }
             }
-        }
 
-        val response = newHomePageResponse(
-            listOf(
-                HomePageList(
-                    "Trending Music Videos",
-                    results,
-                    false
-                )
-            ),
-            false
-        )
+        val response =
+            newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        "Trending Music Videos",
+                        results,
+                        false
+                    )
+                ),
+                false
+            )
 
-        // Keep the current cache strategy and TTL so loading speed is not
-        // compromised by this content-quality change.
+        // Fresh content stays available for a generous window; background refresh
+        // keeps it current without making the next open wait for YouTube.
         putCachedHomePage(
             musicHomeCache,
             "music",
             response,
-            10 * 60 * 1000L
+            30 * 60 * 1000L
         )
+
         putCachedResponses(
             "music",
             results,
-            10 * 60 * 1000L
+            30 * 60 * 1000L
         )
 
         return response
@@ -2106,13 +2213,13 @@ class YouTube : MainAPI() {
         val seen = mutableSetOf<String>()
 
         val found =
-            withTimeoutOrNull(2_400L) {
+            withTimeoutOrNull(1_800L) {
                 coroutineScope {
                     allowedLiveChannels
                         .take(12)
                         .map { channel ->
                             async(Dispatchers.IO) {
-                                withTimeoutOrNull(2_000L) {
+                                withTimeoutOrNull(1_400L) {
                                     runCatching {
                                         val extractor =
                                             service.getSearchExtractor("$channel live")
@@ -2369,13 +2476,10 @@ class YouTube : MainAPI() {
             return null
         }
 
-        // Keep the first matching live result instead of touching
-        // StreamInfoItem.uploadDate / DateWrapper. The host CloudStream app
-        // may expose an older DateWrapper ABI at runtime, which can otherwise
-        // trigger NoSuchMethodError when the plugin is loaded.
-        //
-        // YouTube search already ranks currently-active results, so the first
-        // accepted live stream is the safest compatibility-first choice.
+        // Keep this runtime-compatible with CloudStream builds whose bundled
+        // NewPipeExtractor does not expose DateWrapper.getInstant().
+        // Search ordering supplies the available live candidate; no DateWrapper
+        // method is invoked here.
         return candidates.firstOrNull()
     }
 
@@ -3868,7 +3972,7 @@ class YouTube : MainAPI() {
             try {
                 val extractor = getKioskExtractor(kioskId)
 
-                withTimeoutOrNull(2_400L) {
+                withTimeoutOrNull(1_650L) {
                     extractor.fetchPage()
                     extractor.initialPage
                 }
