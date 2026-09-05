@@ -22,7 +22,7 @@
     },
     {
         "jarFileSize": 108345,
-        "fileHash": "sha256-af6eab81abb70f7f133e7077c879779070ff943c25c547b1b588db0269b6ba77",
+        "fileHash": "sha256-20b77a87d15067179d085fb7435b968bbb716d509a3538cb0ed2632738569ed8",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
         "fileSize": 31946,
@@ -36,7 +36,7 @@
             "TvSeries",
             "Anime"
         ],
-        "version": 13,
+        "version": 15,
         "internalName": "KhulnaPlex",
         "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.jar",
         "description": "Khulna Plex provider for Movie-Flick",
