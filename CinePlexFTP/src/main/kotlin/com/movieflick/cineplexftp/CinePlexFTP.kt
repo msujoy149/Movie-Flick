@@ -738,7 +738,11 @@ class CinePlexFTP : MainAPI() {
         if (input.isBlank()) return false
 
         if (isMediaUrl(input)) {
-            if (isCinePlexTvMediaUrl(input) || isCinePlexFullMediaUrl(input)) {
+            if (isCinePlexTvMediaUrl(input)) {
+                emitTvMediaLink(input, callback, "$mainUrl/")
+                return true
+            }
+            if (isCinePlexFullMediaUrl(input)) {
                 emitMediaLink(input, callback)
                 return true
             }
@@ -782,7 +786,7 @@ class CinePlexFTP : MainAPI() {
 
             val tvSource = tvSources.firstOrNull()
             if (tvSource != null) {
-                emitMediaLink(tvSource, callback)
+                emitTvMediaLink(tvSource, callback, input)
                 return true
             }
 
@@ -803,7 +807,7 @@ class CinePlexFTP : MainAPI() {
                 .firstOrNull()
 
             if (rawTvSource != null) {
-                emitMediaLink(rawTvSource, callback)
+                emitTvMediaLink(rawTvSource, callback, input)
                 return true
             }
 
@@ -1072,6 +1076,58 @@ class CinePlexFTP : MainAPI() {
      * This function is intentionally suspend because newExtractorLink(...)
      * is a suspend API in the current CloudStream runtime.
      */
+    /*
+     * TV SERIES ONLY:
+     * Cine Plex's TV player serves the episode as an HLS master.m3u8 under
+     * /hls/tr/. The browser loads that manifest from the Cine Plex watch page,
+     * so the CloudStream link must keep a Cine Plex Referer as well.
+     *
+     * This is intentionally separate from the movie emitMediaLink() so no
+     * existing movie/category playback behavior is changed.
+     */
+    private suspend fun emitTvMediaLink(
+        mediaUrl: String,
+        callback: (ExtractorLink) -> Unit,
+        referer: String
+    ) {
+        val lower = mediaUrl.lowercase(Locale.ROOT)
+
+        val quality = when {
+            "2160" in lower || "4k" in lower ->
+                Qualities.P2160.value
+
+            "1440" in lower ->
+                Qualities.P1440.value
+
+            "1080" in lower ->
+                Qualities.P1080.value
+
+            "720" in lower ->
+                Qualities.P720.value
+
+            "480" in lower ->
+                Qualities.P480.value
+
+            "360" in lower ->
+                Qualities.P360.value
+
+            else ->
+                Qualities.Unknown.value
+        }
+
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "Cine Plex TV HLS",
+                url = mediaUrl,
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.referer = referer
+                this.quality = quality
+            }
+        )
+    }
+
     private suspend fun emitMediaLink(
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit
