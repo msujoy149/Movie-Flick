@@ -766,19 +766,17 @@ class CinePlexFTP : MainAPI() {
                 )
             }.getOrNull() ?: return false
 
-            val tvSources = extractMediaUrls(
+            val tvSources = extractTvHlsSources(
                 tvPage.document,
                 tvPage.text,
                 input
             )
-                .filter { isCinePlexTvMediaUrl(it) }
                 .sortedWith(
                     compareByDescending<String> {
                         val lower = it.lowercase(Locale.ROOT)
                         when {
                             "master.m3u8" in lower -> 1000
                             "/hls/tr/" in lower -> 900
-                            ".m3u8" in lower -> 800
                             else -> 0
                         }
                     }.thenByDescending { it.length }
@@ -797,13 +795,15 @@ class CinePlexFTP : MainAPI() {
                 .replace("&amp;", "&")
 
             val tvHlsRegex = Regex(
-                """(?i)(?:https?://[^\"'<>\s]+|/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?)"""
+                """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?)"""
             )
 
             val rawTvSource = tvHlsRegex.findAll(cleanedHtml)
                 .map { it.value.trim() }
+                .map { it.trim('"', '\'', '`', ',', ';', ')', ']', '}') }
                 .map { absoluteUrl(it, input) }
                 .filter { isCinePlexTvMediaUrl(it) }
+                .distinct()
                 .firstOrNull()
 
             if (rawTvSource != null) {
@@ -998,6 +998,71 @@ class CinePlexFTP : MainAPI() {
      * Cine Plex TV episode media uses HLS manifests under /hls/tr/.
      * This is intentionally TV-only and does not change movie media rules.
      */
+    /*
+     * TV SERIES ONLY:
+     * Crawl the exact Cine Plex watch page and collect the HLS manifest from
+     * both the rendered <video>/<source> element and raw page HTML/JS.
+     */
+    private fun extractTvHlsSources(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val value = raw
+                .trim()
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
+
+            if (value.isBlank()) return
+
+            val resolved = absoluteUrl(value, baseUrl)
+            if (isCinePlexTvMediaUrl(resolved)) {
+                found.add(resolved)
+            }
+        }
+
+        document.select(
+            "video source[src], " +
+                "video[src], " +
+                "source[src], " +
+                "[data-src], " +
+                "[data-video], " +
+                "[data-source], " +
+                "[data-stream], " +
+                "[data-manifest]"
+        ).forEach { element ->
+            add(element.attr("src"))
+            add(element.attr("data-src"))
+            add(element.attr("data-video"))
+            add(element.attr("data-source"))
+            add(element.attr("data-stream"))
+            add(element.attr("data-manifest"))
+        }
+
+        val cleanedHtml = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003A", ":")
+            .replace("&amp;", "&")
+
+        val regex = Regex(
+            """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?)"""
+        )
+
+        regex.findAll(cleanedHtml).forEach { match ->
+            add(match.value)
+        }
+
+        return found.toList()
+    }
+
     private fun isCinePlexTvMediaUrl(url: String): Boolean {
         val cleaned = cleanUrl(url)
         if (!isMediaUrl(cleaned)) return false
@@ -1115,6 +1180,19 @@ class CinePlexFTP : MainAPI() {
                 Qualities.Unknown.value
         }
 
+        val hlsHeaders = mapOf(
+            "User-Agent" to
+                "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Accept" to
+                "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "Origin" to mainUrl,
+            "Referer" to referer
+        )
+
         callback(
             newExtractorLink(
                 source = name,
@@ -1123,6 +1201,7 @@ class CinePlexFTP : MainAPI() {
                 type = ExtractorLinkType.M3U8
             ) {
                 this.referer = referer
+                this.headers = hlsHeaders
                 this.quality = quality
             }
         )
