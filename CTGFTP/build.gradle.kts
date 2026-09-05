@@ -23,8 +23,11 @@ cloudstream {
         "TvSeries",
         "Anime"
     )
-    // FTP providers use the Bangladesh locale/flag.
     language = "bn"
     iconUrl = "https://flagcdn.com/w320/bd.png"
     isCrossPlatform = true
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
