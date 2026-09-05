@@ -2519,9 +2519,17 @@ class YouTubeKids : MainAPI() {
          * PATH 1: DIRECT NEWPIPE
          * ----------------------------------------------------------
          *
-         * This is the same underlying YouTube/NewPipe extractor path
-         * used by the working YouTube provider. Media URLs are resolved
-         * only when Play is pressed.
+         * The important part of this path is that we expose every
+         * usable YouTube video resolution that NewPipe gives us.
+         *
+         * YouTube HD+ streams are commonly video-only adaptive
+         * streams, so those streams are emitted as VIDEO links with
+         * CloudStream audioTracks attached. This lets CloudStream
+         * show 360p / 480p / 720p / 1080p / 1440p / 2160p / 4320p
+         * when the source actually provides them.
+         *
+         * Signed media URLs are still resolved only when Play is
+         * pressed. No signed media URL is stored in the home cache.
          */
 
         val directUrls =
@@ -2545,9 +2553,6 @@ class YouTubeKids : MainAPI() {
                             extractor
                         )
 
-                    // Resolve LIVE status first. For VOD, prefer the adaptive
-                    // DASH manifest below because YouTube's muxed progressive
-                    // streams are commonly limited to low resolutions.
                     val isLive =
                         info.streamType
                             ?.name
@@ -2558,6 +2563,9 @@ class YouTubeKids : MainAPI() {
 
                     /*
                      * LIVE -> HLS
+                     *
+                     * Live handling is intentionally left separate from
+                     * the VOD resolution system.
                      */
                     if (isLive) {
                         val hls =
@@ -2565,9 +2573,7 @@ class YouTubeKids : MainAPI() {
                                 info.hlsUrl
                             }.getOrNull()
 
-                        if (
-                            !hls.isNullOrBlank()
-                        ) {
+                        if (!hls.isNullOrBlank()) {
                             callback(
                                 newExtractorLink(
                                     source = name,
@@ -2595,12 +2601,27 @@ class YouTubeKids : MainAPI() {
                     }
 
                     /*
-                     * VOD -> DASH FIRST
+                     * VOD -> ALL AVAILABLE DIRECT RESOLUTIONS FIRST
                      *
-                     * The adaptive DASH manifest is the important path for
-                     * HD / Full HD / 2K / 4K / higher source resolutions.
-                     * Do not replace it with a fixed low-resolution muxed
-                     * stream when DASH is available.
+                     * This is the actual HD/4K/8K fix.
+                     *
+                     * The helper emits one CloudStream source for each
+                     * distinct resolution available from YouTube. For
+                     * video-only streams it attaches NewPipe audio streams
+                     * through CloudStream's audioTracks support.
+                     */
+                    if (
+                        emitYouTubeResolutionStreams(
+                            info = info,
+                            callback = callback
+                        )
+                    ) {
+                        return true
+                    }
+
+                    /*
+                     * If NewPipe did not expose direct video streams,
+                     * retain the adaptive DASH fallback.
                      */
                     val dash =
                         runCatching {
@@ -2671,9 +2692,11 @@ class YouTubeKids : MainAPI() {
                         return true
                     }
 
-                    // Last resort only: muxed progressive video. This path is
-                    // intentionally after DASH/HLS so it cannot downgrade an
-                    // HD-capable source to the low-resolution progressive stream.
+                    /*
+                     * Absolute last resort: a single muxed progressive
+                     * stream. This remains only for cases where NewPipe
+                     * cannot expose the normal adaptive/direct stream set.
+                     */
                     if (
                         emitProgressiveVideoStreams(
                             info = info,
@@ -2700,6 +2723,7 @@ class YouTubeKids : MainAPI() {
          * CloudStream can have more than one compatible extractor
          * installed.
          */
+
         val fallbackUrls =
             linkedSetOf(
                 canonical,
@@ -2731,6 +2755,290 @@ class YouTubeKids : MainAPI() {
     }
 
     /*
+     * ============================================================
+     * YOUTUBE RESOLUTION / AUDIO TRACK EXTRACTION
+     * ============================================================
+     *
+     * NewPipe separates YouTube's adaptive video streams from audio.
+     *
+     * A video-only VideoStream has no audio. CloudStream, however,
+     * supports attaching separate AudioFile objects to an ExtractorLink.
+     * Therefore each available YouTube video resolution can be exposed
+     * directly while retaining sound.
+     *
+     * Result:
+     *   360p  -> 360p source when available
+     *   480p  -> 480p source when available
+     *   720p  -> 720p source when available
+     *   1080p -> 1080p source when available
+     *   1440p -> 1440p / 2K source when available
+     *   2160p -> 2160p / 4K source when available
+     *   4320p -> 4320p / 8K source when available
+     *
+     * The helper does NOT invent a quality. It only exposes resolutions
+     * that NewPipe actually returned for this specific YouTube video.
+     */
+
+    private suspend fun emitYouTubeResolutionStreams(
+        info: StreamInfo,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        /*
+         * NewPipe keeps muxed/progressive video streams and adaptive
+         * video-only streams separately. The old implementation looked
+         * only at videoStreams, which is why CloudStream was seeing the
+         * low-resolution 360p muxed source even when YouTube had
+         * 720p/1080p/1440p/2160p/4320p adaptive variants.
+         */
+        val streams: List<VideoStream> =
+            (
+                runCatching {
+                    info.videoStreams
+                }.getOrDefault(emptyList()) +
+                    runCatching {
+                        info.videoOnlyStreams
+                    }.getOrDefault(emptyList())
+            )
+                .distinctBy { stream ->
+                    Triple(
+                        stream.content.trim(),
+                        stream.resolution,
+                        runCatching {
+                            stream.isVideoOnly
+                        }.getOrDefault(false)
+                    )
+                }
+
+        if (streams.isEmpty()) {
+            return false
+        }
+
+        data class ResolutionCandidate(
+            val stream: VideoStream,
+            val resolution: Int,
+            val hasAudio: Boolean,
+            val bitrate: Int
+        )
+
+        /*
+         * Build the separate audio track list once.
+         *
+         * newAudioFile(url) is enough for CloudStream to know how to
+         * load the audio source. We deliberately avoid adding optional
+         * metadata here so this stays compatible with the broadest
+         * range of CloudStream AudioFile implementations.
+         */
+        val audioTracks =
+            runCatching {
+                info.audioStreams
+                    .asSequence()
+                    .mapNotNull { audio ->
+                        val url =
+                            runCatching {
+                                if (audio.isUrl) audio.content else ""
+                            }.getOrNull()
+                                ?.trim()
+                                .orEmpty()
+
+                        if (
+                            url.isBlank() ||
+                            !url.startsWith(
+                                "http",
+                                ignoreCase = true
+                            )
+                        ) {
+                            null
+                        } else {
+                            newAudioFile(url)
+                        }
+                    }
+                    .distinctBy {
+                        it.url
+                    }
+                    .toList()
+            }.getOrDefault(emptyList())
+
+        val candidates =
+            streams
+                .asSequence()
+                .mapNotNull { stream ->
+                    val url =
+                        runCatching {
+                            stream.content
+                        }.getOrNull()
+                            ?.trim()
+                            .orEmpty()
+
+                    if (
+                        !stream.isUrl ||
+                        url.isBlank() ||
+                        !url.startsWith(
+                            "http",
+                            ignoreCase = true
+                        )
+                    ) {
+                        return@mapNotNull null
+                    }
+
+                    val height =
+                        runCatching {
+                            stream.height
+                        }.getOrDefault(0)
+
+                    val resolution =
+                        if (height > 0) {
+                            height
+                        } else {
+                            parseResolution(
+                                stream.resolution
+                            )
+                        }
+
+                    if (resolution <= 0) {
+                        return@mapNotNull null
+                    }
+
+                    val isVideoOnly =
+                        runCatching {
+                            stream.isVideoOnly
+                        }.getOrDefault(false)
+
+                    /*
+                     * A video-only stream is useful only when we have at
+                     * least one separate audio source to merge into it.
+                     */
+                    if (
+                        isVideoOnly &&
+                        audioTracks.isEmpty()
+                    ) {
+                        return@mapNotNull null
+                    }
+
+                    val bitrate =
+                        runCatching {
+                            stream.bitrate
+                        }.getOrDefault(0)
+
+                    ResolutionCandidate(
+                        stream = stream,
+                        resolution = resolution,
+                        hasAudio = !isVideoOnly,
+                        bitrate = bitrate
+                    )
+                }
+                .distinctBy { candidate ->
+                    Triple(
+                        candidate.resolution,
+                        candidate.hasAudio,
+                        candidate.stream.content.trim()
+                    )
+                }
+                .groupBy {
+                    it.resolution
+                }
+                .mapNotNull { (resolution, sameResolution) ->
+                    /*
+                     * Prefer a muxed stream when it exists at the same
+                     * resolution because it needs no audio merge.
+                     *
+                     * Otherwise choose the highest-bitrate video-only
+                     * stream. This is especially important for 1080p,
+                     * 1440p, 2160p and 4320p where YouTube commonly
+                     * provides adaptive video-only variants.
+                     */
+                    sameResolution
+                        .sortedWith(
+                            compareByDescending<ResolutionCandidate> {
+                                it.hasAudio
+                            }.thenByDescending {
+                                it.bitrate
+                            }
+                        )
+                        .firstOrNull()
+                }
+                .sortedByDescending {
+                    it.resolution
+                }
+                .toList()
+
+        if (candidates.isEmpty()) {
+            return false
+        }
+
+        var emittedCount = 0
+
+        for (candidate in candidates) {
+            val stream =
+                candidate.stream
+
+            val resolution =
+                candidate.resolution
+
+            val url =
+                stream.content
+                    .trim()
+
+            val isVideoOnly =
+                !candidate.hasAudio
+
+            val linkName =
+                buildYouTubeQualityName(
+                    resolution = resolution,
+                    isVideoOnly = isVideoOnly
+                )
+
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "$name $linkName",
+                    url = url,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    referer =
+                        "https://www.youtube.com/"
+
+                    headers =
+                        mapOf(
+                            "User-Agent" to
+                                USER_AGENT
+                        )
+
+                    quality =
+                        resolution
+
+                    if (isVideoOnly) {
+                        this.audioTracks =
+                            audioTracks
+                    }
+                }
+            )
+
+            emittedCount++
+        }
+
+        return emittedCount > 0
+    }
+
+    private fun buildYouTubeQualityName(
+        resolution: Int,
+        isVideoOnly: Boolean
+    ): String {
+        val label =
+            when {
+                resolution >= 4320 -> "8K (${resolution}p)"
+                resolution >= 2160 -> "4K (${resolution}p)"
+                resolution >= 1440 -> "2K (${resolution}p)"
+                else -> "${resolution}p"
+            }
+
+        return if (isVideoOnly) {
+            "$label Adaptive"
+        } else {
+            label
+        }
+    }
+
+        /*
      * ============================================================
      * PROGRESSIVE / MUXED VIDEO STREAM EXTRACTION
      * ============================================================
