@@ -10,6 +10,14 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 
+/**
+ * CTG FTP v4 — movie playback fix
+ *
+ * Movie playback:
+ * detail -> watch -> serialized links[] -> actual media URL -> ExtractorLink
+ *
+ * Existing TV/Anime parsing and fallback playback paths are preserved.
+ */
 class CTGFTP : MainAPI() {
 
     override var mainUrl = "https://ctgmovies.com"
@@ -187,23 +195,22 @@ class CTGFTP : MainAPI() {
         }
 
         /*
-         * CTG detail pages contain the real Play URL:
-         *   /watch/<id>?type=movie
+         * Movies use a two-step playback chain:
          *
-         * CloudStream must receive that watch URL as its playback data.
-         * The old implementation passed /movies/<slug>, which is only a
-         * metadata page and does not contain the actual FTP media source.
+         *   /movies/<slug>
+         *       -> /watch/<id>?type=movie
+         *       -> serialized CTG links[]
+         *       -> actual media URL(s)
+         *
+         * Keep the movie detail URL as the CloudStream data. loadLinks()
+         * resolves the current watch page and playback sources at Play time.
+         * TV/Anime episode data remains unchanged above.
          */
-        val playbackUrl = extractPlaybackPageUrl(
-            document = document,
-            baseUrl = clean
-        ) ?: clean
-
         return newMovieLoadResponse(
             title,
             clean,
             typeFromUrl(clean),
-            playbackUrl
+            clean
         ) {
             posterUrl = poster
             this.plot = plot
@@ -222,25 +229,117 @@ class CTGFTP : MainAPI() {
 
         /*
          * Direct media:
-         * The CTG FTP files are normal MP4/MKV/M3U8/MPD resources. Give the
-         * exact media URL directly to CloudStream's player.
+         * Keep the existing behavior for TV/Anime/direct episode sources.
          */
         if (isMediaUrl(input)) {
             emitMediaLink(
                 mediaUrl = input,
-                referer = "$mainUrl/",
+                referer = mainUrl,
                 callback = callback
             )
             return true
         }
 
         /*
-         * CTG flow:
-         * Movie page -> /watch/<id>?type=movie -> real FTP source.
+         * ============================================================
+         * MOVIE-SPECIFIC PLAYBACK
+         * ============================================================
          *
-         * The watch page is intentionally fetched here, at Play time, so the
-         * provider always resolves the current source rather than caching an
-         * old FTP URL.
+         * Movies on CTG are different from normal episode pages:
+         *
+         *   movie detail
+         *       -> watch page
+         *       -> Next.js serialized `links`
+         *       -> link.url / link.hls_url
+         *
+         * The previous implementation fetched only the watch page and then
+         * searched for normal HTML <source>/<video> URLs. CTG's actual movie
+         * sources are serialized inside the Next.js payload, so that approach
+         * can return zero sources even though the browser player has them.
+         */
+        val isMovieDetail = runCatching {
+            URI(input).path.orEmpty().lowercase(Locale.ROOT)
+                .startsWith("/movies/")
+        }.getOrDefault(false)
+
+        if (isMovieDetail) {
+            val detailResponse = runCatching {
+                app.get(
+                    input,
+                    headers = pageHeaders + ("Referer" to "$mainUrl/")
+                )
+            }.getOrNull()
+
+            if (detailResponse != null) {
+                val detailDocument = detailResponse.document
+
+                val watchUrl = extractPlaybackPageUrl(
+                    document = detailDocument,
+                    baseUrl = input
+                )
+
+                if (!watchUrl.isNullOrBlank()) {
+                    val watchResponse = runCatching {
+                        app.get(
+                            watchUrl,
+                            headers = pageHeaders + ("Referer" to input)
+                        )
+                    }.getOrNull()
+
+                    if (watchResponse != null) {
+                        val ctgSources = extractCtgPlaybackLinks(
+                            html = watchResponse.text,
+                            baseUrl = watchUrl
+                        )
+
+                        if (ctgSources.isNotEmpty()) {
+                            var emitted = false
+
+                            ctgSources.forEach { source ->
+                                val mediaUrl = source.url
+                                if (!isMediaUrl(mediaUrl)) return@forEach
+
+                                emitMediaLink(
+                                    mediaUrl = mediaUrl,
+                                    referer = watchUrl,
+                                    qualityHint = source.quality,
+                                    sourceName = source.sourceName,
+                                    callback = callback
+                                )
+                                emitted = true
+                            }
+
+                            if (emitted) return true
+                        }
+
+                        /*
+                         * Keep the existing generic fallback as a secondary path.
+                         * This protects against a CTG markup change where a direct
+                         * <video>/<source> suddenly becomes available again.
+                         */
+                        val fallbackSources = extractMediaUrls(
+                            document = watchResponse.document,
+                            html = watchResponse.text,
+                            baseUrl = watchUrl
+                        ).distinct()
+
+                        if (fallbackSources.isNotEmpty()) {
+                            fallbackSources.forEach { source ->
+                                emitMediaLink(
+                                    mediaUrl = source,
+                                    referer = watchUrl,
+                                    callback = callback
+                                )
+                            }
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+
+        /*
+         * Existing generic playback path for TV/Anime and any non-movie page.
          */
         val response = runCatching {
             app.get(
@@ -253,7 +352,7 @@ class CTGFTP : MainAPI() {
         val html = response.text
 
         /*
-         * Priority 1: explicit video/source/data-* values and direct FTP URLs.
+         * Priority 1: explicit video/source/data-* values and direct media URLs.
          */
         val sources = extractMediaUrls(
             document = document,
@@ -323,9 +422,274 @@ class CTGFTP : MainAPI() {
         return false
     }
 
+    private data class CtgPlaybackSource(
+        val url: String,
+        val quality: String?,
+        val sourceName: String?
+    )
+
+    /*
+     * Extract the real CTG `links[]` payload from the Next.js serialized
+     * server-rendered data.
+     *
+     * CTG's watch page contains data shaped like:
+     *
+     *   "target": {...},
+     *   "links": [
+     *      {
+     *          "quality": "1080p WebRip",
+     *          "url": "https://...",
+     *          "hls_url": null,
+     *          "type": "download",
+     *          "source": "auto:serverA"
+     *      },
+     *      ...
+     *   ],
+     *   "initialTime": 0
+     *
+     * This parser does not try to parse the complete Next.js document as JSON.
+     * It only isolates the `links` array and extracts its individual URL fields.
+     */
+    private fun extractCtgPlaybackLinks(
+        html: String,
+        baseUrl: String
+    ): List<CtgPlaybackSource> {
+        if (html.isBlank()) return emptyList()
+
+        val normalized = normalizeCtgPayload(html)
+        val arrayText = extractJsonArrayAfterKey(
+            normalized,
+            "\"links\""
+        ) ?: return emptyList()
+
+        val result = mutableListOf<CtgPlaybackSource>()
+
+        /*
+         * Each link object is small enough that a targeted object scan is safer
+         * than a giant cross-document regex.
+         */
+        extractTopLevelJsonObjects(arrayText).forEach { objectText ->
+            val url = extractJsonString(objectText, "url")
+            val hlsUrl = extractJsonString(objectText, "hls_url")
+            val quality = extractJsonString(objectText, "quality")
+            val source = extractJsonString(objectText, "source")
+
+            /*
+             * Prefer CTG's explicit `url`. If it is absent, use the CTG-provided
+             * hls_url. This follows the site's own source priority.
+             */
+            val candidates = listOfNotNull(
+                url,
+                hlsUrl
+            )
+
+            candidates.forEach { raw ->
+                val media = absoluteUrl(
+                    cleanUrl(raw),
+                    baseUrl
+                )
+
+                if (isMediaUrl(media)) {
+                    result.add(
+                        CtgPlaybackSource(
+                            url = media,
+                            quality = quality,
+                            sourceName = source
+                        )
+                    )
+                }
+            }
+        }
+
+        /*
+         * Preserve source order while removing duplicates.
+         */
+        val seen = linkedSetOf<String>()
+        return result.filter { seen.add(it.url) }
+    }
+
+    private fun normalizeCtgPayload(
+        html: String
+    ): String {
+        return html
+            .replace("\\\\\"", "\"")
+            .replace("\\\"", "\"")
+            .replace("\\\\/", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+    }
+
+    private fun extractJsonArrayAfterKey(
+        text: String,
+        key: String
+    ): String? {
+        val startKey = text.indexOf(key)
+        if (startKey < 0) return null
+
+        val arrayStart = text.indexOf('[', startKey + key.length)
+        if (arrayStart < 0) return null
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        for (index in arrayStart until text.length) {
+            val ch = text[index]
+
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+                continue
+            }
+
+            when (ch) {
+                '"' -> inString = true
+                '[' -> depth++
+                ']' -> {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(
+                            arrayStart,
+                            index + 1
+                        )
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun extractTopLevelJsonObjects(
+        arrayText: String
+    ): List<String> {
+        val result = mutableListOf<String>()
+
+        var depth = 0
+        var objectStart = -1
+        var inString = false
+        var escaped = false
+
+        for (index in arrayText.indices) {
+            val ch = arrayText[index]
+
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+                continue
+            }
+
+            when (ch) {
+                '"' -> inString = true
+                '{' -> {
+                    if (depth == 0) {
+                        objectStart = index
+                    }
+                    depth++
+                }
+                '}' -> {
+                    if (depth > 0) {
+                        depth--
+                        if (depth == 0 && objectStart >= 0) {
+                            result.add(
+                                arrayText.substring(
+                                    objectStart,
+                                    index + 1
+                                )
+                            )
+                            objectStart = -1
+                        }
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    private fun extractJsonString(
+        objectText: String,
+        key: String
+    ): String? {
+        val marker = "\"$key\""
+        val keyIndex = objectText.indexOf(marker)
+        if (keyIndex < 0) return null
+
+        val colonIndex = objectText.indexOf(
+            ':',
+            keyIndex + marker.length
+        )
+        if (colonIndex < 0) return null
+
+        val quoteStart = objectText.indexOf(
+            '"',
+            colonIndex + 1
+        )
+        if (quoteStart < 0) return null
+
+        val value = StringBuilder()
+        var escaped = false
+
+        for (index in quoteStart + 1 until objectText.length) {
+            val ch = objectText[index]
+
+            if (escaped) {
+                when (ch) {
+                    '"' -> value.append('"')
+                    '\\' -> value.append('\\')
+                    '/' -> value.append('/')
+                    'b' -> value.append('\b')
+                    'f' -> value.append('\u000C')
+                    'n' -> value.append('\n')
+                    'r' -> value.append('\r')
+                    't' -> value.append('\t')
+                    'u' -> {
+                        if (index + 4 < objectText.length) {
+                            val hex = objectText.substring(
+                                index + 1,
+                                index + 5
+                            )
+                            val decoded = hex.toIntOrNull(16)
+                            if (decoded != null) {
+                                value.append(decoded.toChar())
+                                escaped = false
+                                continue
+                            }
+                        }
+                        value.append('u')
+                    }
+                    else -> value.append(ch)
+                }
+                escaped = false
+                continue
+            }
+
+            when (ch) {
+                '\\' -> escaped = true
+                '"' -> return value.toString()
+                else -> value.append(ch)
+            }
+        }
+
+        return null
+    }
+
     private suspend fun emitMediaLink(
         mediaUrl: String,
         referer: String,
+        qualityHint: String? = null,
+        sourceName: String? = null,
         callback: (ExtractorLink) -> Unit
     ) {
         val url = cleanUrl(mediaUrl)
@@ -342,16 +706,33 @@ class CTGFTP : MainAPI() {
                 ExtractorLinkType.VIDEO
         }
 
-        val quality = qualityFromUrl(url)
+        val quality =
+            qualityFromHint(qualityHint)
+                ?: qualityFromUrl(
+                    buildString {
+                        append(url)
+                        if (!qualityHint.isNullOrBlank()) {
+                            append(' ')
+                            append(qualityHint)
+                        }
+                    }
+                )
+
+        val labelSuffix = when {
+            !sourceName.isNullOrBlank() ->
+                " ${sourceName.trim()}"
+            type == ExtractorLinkType.M3U8 ->
+                " HLS"
+            type == ExtractorLinkType.DASH ->
+                " DASH"
+            else ->
+                " Direct"
+        }
 
         callback(
             newExtractorLink(
                 source = name,
-                name = when (type) {
-                    ExtractorLinkType.M3U8 -> "$name HLS"
-                    ExtractorLinkType.DASH -> "$name DASH"
-                    else -> "$name Direct"
-                },
+                name = "$name$labelSuffix",
                 url = url,
                 type = type
             ) {
@@ -1232,6 +1613,40 @@ class CTGFTP : MainAPI() {
             path.contains(".mkv") ||
             path.contains(".m3u8") ||
             path.contains(".mpd")
+    }
+
+    private fun qualityFromHint(
+        quality: String?
+    ): Int? {
+        val lower = quality
+            ?.lowercase(Locale.ROOT)
+            ?: return null
+
+        return when {
+            lower.contains("4320") || lower.contains("8k") ->
+                4320
+
+            lower.contains("2160") || lower.contains("4k") ->
+                Qualities.P2160.value
+
+            lower.contains("1440") ->
+                Qualities.P1440.value
+
+            lower.contains("1080") ->
+                Qualities.P1080.value
+
+            lower.contains("720") ->
+                Qualities.P720.value
+
+            lower.contains("480") ->
+                Qualities.P480.value
+
+            lower.contains("360") ->
+                Qualities.P360.value
+
+            else ->
+                null
+        }
     }
 
     private fun qualityFromUrl(
