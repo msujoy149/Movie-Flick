@@ -1,11 +1,11 @@
 [
     {
         "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
-        "jarFileSize": 207014,
-        "fileHash": "sha256-6df19c849067c39bfc1552f0826dfc6ccf3a858055632ecef83bfdc5f0bc984b",
+        "jarFileSize": 207748,
+        "fileHash": "sha256-36bcf20ca3e318ddfa20e4de26251aac5da293e0c9a9072b7fb2dcdedbfa1d7c",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 55018,
+        "fileSize": 55330,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -22,7 +22,7 @@
         "description": "Cine Plex FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.cs3",
         "name": "CinePlexFTP",
-        "jarHash": "sha256-540c4bb23664cb053b5618cc9a7d95cbc2e5a5c627a4ae2860978edde1f1c4bf"
+        "jarHash": "sha256-75a4d14a037c9b214b25b0221f8d4a0416a2702b08fa6a68d299a7f1213713df"
     },
     {
         "iconUrl": "https://flagcdn.com/w320/bd.png",
