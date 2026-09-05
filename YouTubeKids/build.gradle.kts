@@ -12,3 +12,22 @@ android {
         minSdk = 21
     }
 }
+
+version = 1
+
+cloudstream {
+    description = "YouTube Kids provider for Movie-Flick"
+    authors = listOf("Movie-Flick")
+    status = 1
+
+    tvTypes = listOf(
+        "Other"
+    )
+
+    language = "bn"
+    isCrossPlatform = true
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+}
