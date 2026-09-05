@@ -2422,13 +2422,7 @@ class YouTubeKids : MainAPI() {
         val name: String,
         val version: String,
         val userAgent: String,
-        val isEmbedded: Boolean = false,
-        val deviceMake: String? = null,
-        val deviceModel: String? = null,
-        val androidSdkVersion: Int? = null,
-        val osName: String? = null,
-        val osVersion: String? = null,
-        val includeUserAgentInContext: Boolean = false
+        val isEmbedded: Boolean = false
     )
 
     private data class InnerTubeVideoCandidate(
@@ -2473,10 +2467,7 @@ class YouTubeKids : MainAPI() {
         val mimeType: String? = null,
         val width: Int? = null,
         val height: Int? = null,
-        val bitrate: Int? = null,
-        val itag: Int? = null,
-        val cipher: String? = null,
-        val signatureCipher: String? = null
+        val bitrate: Int? = null
     )
 
     override suspend fun loadLinks(
@@ -2491,56 +2482,34 @@ class YouTubeKids : MainAPI() {
 
         val original = data.trim()
         val canonical = canonicalYouTubeUrl(original)
+        val directUrls = linkedSetOf(canonical, original)
 
         /*
-         * RESOLUTION-ONLY STRATEGY
+         * PRIMARY PATH
          *
-         * 1) Ask NewPipe for the adaptive DASH manifest first.
-         * 2) If that path is unavailable, ask several InnerTube clients,
-         *    including the currently used ANDROID_VR fallback that is known
-         *    to restore 720p/1080p+ URLs when standard clients expose only
-         *    the legacy 360p stream.
-         * 3) Publish every real resolution, sorted highest-first, with the
-         *    best available resolution appearing first.
-         * 4) Keep the original CloudStream extractor fallback so playback
-         *    remains available when an adaptive source is rejected.
+         * Keep the same proven playback architecture as the working
+         * YouTube provider: NewPipe -> StreamInfo -> DASH/HLS.
          *
-         * Nothing outside playback/resolution is changed.
+         * The critical resolution source is the DASH MPD. When it exists,
+         * publish it directly and stop there. This prevents a legacy 360p
+         * progressive/InnerTube source from becoming the preferred source.
          */
-        val extractionUrls =
-            linkedSetOf(
-                canonical,
-                mobileYouTubeUrl(canonical),
-                noCookieYouTubeUrl(canonical),
-                original
-            )
-
-        var emittedAdaptive = false
-        var emittedHls = false
-
-        for (videoUrl in extractionUrls) {
+        for (videoUrl in directUrls) {
             try {
-                val extractor =
-                    service.getStreamExtractor(videoUrl)
-
+                val extractor = service.getStreamExtractor(videoUrl)
                 extractor.fetchPage()
 
-                val info =
-                    StreamInfo.getInfo(extractor)
+                val info = StreamInfo.getInfo(extractor)
 
                 val isLive =
                     info.streamType
                         ?.name
-                        ?.contains(
-                            "LIVE",
-                            ignoreCase = true
-                        ) == true
+                        ?.contains("LIVE", ignoreCase = true) == true
 
                 if (isLive) {
                     val hls =
-                        runCatching {
-                            info.hlsUrl
-                        }.getOrNull()
+                        runCatching { info.hlsUrl }
+                            .getOrNull()
 
                     if (!hls.isNullOrBlank()) {
                         callback(
@@ -2550,14 +2519,11 @@ class YouTubeKids : MainAPI() {
                                 url = hls,
                                 type = ExtractorLinkType.M3U8
                             ) {
-                                referer =
-                                    "https://www.youtube.com/"
-                                headers =
-                                    mapOf(
-                                        "User-Agent" to USER_AGENT
-                                    )
-                                quality =
-                                    Qualities.Unknown.value
+                                referer = "https://www.youtube.com/"
+                                headers = mapOf(
+                                    "User-Agent" to USER_AGENT
+                                )
+                                quality = Qualities.Unknown.value
                             }
                         )
                         return true
@@ -2567,53 +2533,41 @@ class YouTubeKids : MainAPI() {
                 }
 
                 /*
-                 * THE IMPORTANT PATH:
-                 * NewPipe DASH -> CloudStream DASH.
-                 *
-                 * Do not stop processing merely because one DASH URL was
-                 * exposed. We remember that it exists and continue through
-                 * the high-quality resolver so a direct 1080p+ source can
-                 * be published too. The player can then use the best source
-                 * while DASH remains a safe adaptive fallback.
+                 * VOD -> DASH.
+                 * This exactly follows the working YouTube provider's
+                 * resolution path.
                  */
                 val dash =
-                    runCatching {
-                        info.dashMpdUrl
-                    }.getOrNull()
+                    runCatching { info.dashMpdUrl }
+                        .getOrNull()
 
-                if (!dash.isNullOrBlank() && !emittedAdaptive) {
+                if (!dash.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name =
-                                "$name Adaptive (YouTube)",
+                            name = "$name Adaptive (YouTube)",
                             url = dash,
-                            type =
-                                ExtractorLinkType.DASH
+                            type = ExtractorLinkType.DASH
                         ) {
-                            referer =
-                                "https://www.youtube.com/"
-                            headers =
-                                mapOf(
-                                    "User-Agent" to
-                                        USER_AGENT
-                                )
-                            quality =
-                                Qualities.Unknown.value
+                            referer = "https://www.youtube.com/"
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT
+                            )
+                            quality = Qualities.Unknown.value
                         }
                     )
-                    emittedAdaptive = true
+                    return true
                 }
 
                 /*
-                 * HLS remains only a secondary fallback for VOD.
+                 * HLS fallback only when the adaptive DASH manifest is not
+                 * available for this response.
                  */
                 val hls =
-                    runCatching {
-                        info.hlsUrl
-                    }.getOrNull()
+                    runCatching { info.hlsUrl }
+                        .getOrNull()
 
-                if (!hls.isNullOrBlank() && !emittedHls) {
+                if (!hls.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
                             source = name,
@@ -2621,34 +2575,29 @@ class YouTubeKids : MainAPI() {
                             url = hls,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            referer =
-                                "https://www.youtube.com/"
-                            headers =
-                                mapOf(
-                                    "User-Agent" to
-                                        USER_AGENT
-                                )
-                            quality =
-                                Qualities.Unknown.value
+                            referer = "https://www.youtube.com/"
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT
+                            )
+                            quality = Qualities.Unknown.value
                         }
                     )
-                    emittedHls = true
+                    return true
                 }
             } catch (_: Exception) {
-                /*
-                 * Keep trying other YouTube URL forms. This is intentionally
-                 * resolution-only redundancy and does not alter categories.
-                 */
+                // Continue to the next URL/fallback.
             }
         }
 
         /*
-         * If NewPipe did not expose adaptive playback, use the direct
-         * InnerTube resolver. This is the part that addresses the current
-         * YouTube 360p/SABR behaviour.
+         * SECONDARY RESOLUTION PATH
+         *
+         * Only reached when NewPipe could not expose a DASH/HLS source.
+         * Keep the existing InnerTube implementation from the stable file
+         * so direct 1080p/1440p/2160p/4320p streams can still be used when
+         * YouTube actually returns them.
          */
-        val videoId =
-            videoIdFromUrl(canonical)
+        val videoId = videoIdFromUrl(canonical)
 
         if (!videoId.isNullOrBlank()) {
             val innerTube =
@@ -2674,16 +2623,9 @@ class YouTubeKids : MainAPI() {
         }
 
         /*
-         * If DASH/HLS was already emitted above, report success now.
-         * This keeps playback working even when InnerTube could not provide
-         * direct high-resolution URLs.
-         */
-        if (emittedAdaptive || emittedHls) {
-            return true
-        }
-
-        /*
-         * FINAL EXISTING CLOUDSTREAM FALLBACK.
+         * FINAL PLAYBACK FALLBACK
+         *
+         * Preserve the original provider's CloudStream extractor fallback.
          */
         val fallbackUrls =
             linkedSetOf(
@@ -2694,8 +2636,7 @@ class YouTubeKids : MainAPI() {
             )
 
         for (videoUrl in fallbackUrls) {
-            var found =
-                false
+            var found = false
 
             runCatching {
                 loadExtractor(
@@ -2714,7 +2655,6 @@ class YouTubeKids : MainAPI() {
 
         return false
     }
-
     private suspend fun extractInnerTubeFormats(
         videoId: String
     ): InnerTubeResult? {
@@ -2765,42 +2705,6 @@ class YouTubeKids : MainAPI() {
 
         val clients =
             listOf(
-                /*
-                 * Current SABR workaround used by several open-source
-                 * YouTube clients: Oculus Quest 3 / ANDROID_VR.
-                 *
-                 * 1.61.48 is intentionally kept before 1.65.10 because newer
-                 * versions have been observed to be more frequently placed
-                 * behind the SABR-only path.
-                 */
-                InnerTubeClient(
-                    name = "ANDROID_VR",
-                    version = "1.61.48",
-                    userAgent =
-                        "com.google.android.apps.youtube.vr.oculus/1.61.48 " +
-                            "(Linux; U; Android 12; en_US; Oculus Quest 3; " +
-                            "Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
-                    deviceMake = "Oculus",
-                    deviceModel = "Quest 3",
-                    androidSdkVersion = 32,
-                    osName = "Android",
-                    osVersion = "12",
-                    includeUserAgentInContext = true
-                ),
-                InnerTubeClient(
-                    name = "ANDROID_VR",
-                    version = "1.65.10",
-                    userAgent =
-                        "com.google.android.apps.youtube.vr.oculus/1.65.10 " +
-                            "(Linux; U; Android 12L; eureka-user " +
-                            "Build/SQ3A.220605.009.A1) gzip",
-                    deviceMake = "Oculus",
-                    deviceModel = "Quest 3",
-                    androidSdkVersion = 32,
-                    osName = "Android",
-                    osVersion = "12L",
-                    includeUserAgentInContext = true
-                ),
                 InnerTubeClient(
                     name = "WEB_EMBEDDED_PLAYER",
                     version = webVersion,
@@ -2955,38 +2859,6 @@ class YouTubeKids : MainAPI() {
                 ""
             }
 
-        val deviceMakePart =
-            client.deviceMake?.let {
-                ",\"deviceMake\":\"${escapeJson(it)}\""
-            } ?: ""
-
-        val deviceModelPart =
-            client.deviceModel?.let {
-                ",\"deviceModel\":\"${escapeJson(it)}\""
-            } ?: ""
-
-        val sdkPart =
-            client.androidSdkVersion?.let {
-                ",\"androidSdkVersion\":$it"
-            } ?: ""
-
-        val osNamePart =
-            client.osName?.let {
-                ",\"osName\":\"${escapeJson(it)}\""
-            } ?: ""
-
-        val osVersionPart =
-            client.osVersion?.let {
-                ",\"osVersion\":\"${escapeJson(it)}\""
-            } ?: ""
-
-        val contextUserAgentPart =
-            if (client.includeUserAgentInContext) {
-                ",\"userAgent\":\"${escapeJson(client.userAgent)}\""
-            } else {
-                ""
-            }
-
         val payload =
             """
             {
@@ -2995,7 +2867,7 @@ class YouTubeKids : MainAPI() {
                   "hl": "en",
                   "gl": "IN",
                   "clientName": "${escapeJson(client.name)}",
-                  "clientVersion": "${escapeJson(client.version)}"$embeddedPart$visitorPart$deviceMakePart$deviceModelPart$sdkPart$osNamePart$osVersionPart$contextUserAgentPart
+                  "clientVersion": "${escapeJson(client.version)}"$embeddedPart$visitorPart
                 }$thirdPartyPart
               },
               "videoId": "${escapeJson(videoId)}",
@@ -3253,7 +3125,7 @@ class YouTubeKids : MainAPI() {
                             height to it
                         }
                 }
-                .sortedByDescending {
+                .sortedBy {
                     it.first
                 }
                 .toList()
