@@ -26,20 +26,27 @@ class CinePlexFTP : MainAPI() {
         TvType.Anime
     )
 
+    /*
+     * HOME SECTIONS
+     *
+     * Movies -> Cine Plex's real "All Movies" feed.
+     * The site renders the first 24 movies on category.php and then
+     * appends more using load_more_movies.php?offset=24,48,72,...
+     *
+     * Other sections remain tied to their real Cine Plex categories.
+     */
+    /*
+     * FIVE TOP-LEVEL SECTIONS
+     *
+     * Each section can merge several real Cine Plex pages into one
+     * CloudStream home row.
+     */
     override val mainPage = mainPageOf(
-        "$mainUrl/movies" to "Movies",
-        "$mainUrl/category.php?category=Indian+Bangla" to "Movies",
-        "$mainUrl/category.php?category=Korean" to "Movies",
-        "$mainUrl/category.php?category=3D+Movies" to "Movies",
-        "$mainUrl/category.php?category=Bangla+Dubbed" to "Movies",
-        "$mainUrl/category.php?category=Bangla+Movies" to "Movies",
-        "$mainUrl/category.php?category=English" to "Movies",
-        "$mainUrl/category.php?category=Dual+Audio" to "Dual Audio",
-        "$mainUrl/category.php?category=Hindi+Dubbed" to "Dual Audio",
-        "$mainUrl/category.php?category=Hindi" to "Hindi",
-        "$mainUrl/tvs.php" to "TV Shows",
-        "$mainUrl/category.php?category=Anime" to "Anime",
-        "$mainUrl/category.php?category=Animation" to "Anime"
+        "cineplex://movies" to "Movies",
+        "cineplex://dual-audio" to "Dual Audio",
+        "cineplex://hindi" to "Hindi",
+        "cineplex://tv" to "TV Shows",
+        "cineplex://anime" to "Anime"
     )
 
     private data class SiteItem(
@@ -79,6 +86,15 @@ class CinePlexFTP : MainAPI() {
     private val maxHomeItems = 25
 
     /*
+     * Verified from Cine Plex's own All Movies page JavaScript:
+     * the first 24 cards are rendered in the page and the next request
+     * starts at offset=24.
+     */
+    private companion object {
+        const val ALL_MOVIES_BATCH_SIZE = 24
+    }
+
+    /*
      * Page requests use normal browser headers.
      *
      * IMPORTANT:
@@ -94,6 +110,8 @@ class CinePlexFTP : MainAPI() {
         "Accept" to
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.9",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
         "Referer" to referer
     )
 
@@ -129,26 +147,202 @@ class CinePlexFTP : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = pageUrl(request.data, page)
-        val document = getDocument(url)
-            ?: return newHomePageResponse(request, emptyList(), false)
+        return when (request.data) {
+            "cineplex://movies" -> {
+                getMergedHomePage(
+                    request = request,
+                    page = page,
+                    sources = listOf(
+                        "$mainUrl/category.php",
+                        "$mainUrl/category.php?category=Indian+Bangla",
+                        "$mainUrl/category.php?category=Korean",
+                        "$mainUrl/category.php?category=3D+Movies",
+                        "$mainUrl/category.php?category=Bangla+Dubbed",
+                        "$mainUrl/category.php?category=Bangla+Movies",
+                        "$mainUrl/category.php?category=English"
+                    )
+                )
+            }
 
-        /*
-         * Cine Plex puts many cards on one listing page.
-         * Keep the home request fast: parse only the current page.
-         */
-        val items = parseItems(
-            document = document,
-            sourceUrl = url,
-            sectionName = request.name,
-            page = page
-        ).take(maxHomeItems)
+            "cineplex://dual-audio" -> {
+                getMergedHomePage(
+                    request = request,
+                    page = page,
+                    sources = listOf(
+                        "$mainUrl/category.php?category=Dual+Audio",
+                        "$mainUrl/category.php?category=Hindi+Dubbed"
+                    )
+                )
+            }
+
+            "cineplex://hindi" -> {
+                getMergedHomePage(
+                    request = request,
+                    page = page,
+                    sources = listOf(
+                        "$mainUrl/category.php?category=Hindi"
+                    )
+                )
+            }
+
+            "cineplex://tv" -> {
+                getMergedHomePage(
+                    request = request,
+                    page = page,
+                    sources = listOf(
+                        "$mainUrl/tvs.php"
+                    )
+                )
+            }
+
+            "cineplex://anime" -> {
+                getMergedHomePage(
+                    request = request,
+                    page = page,
+                    sources = listOf(
+                        "$mainUrl/category.php?category=Anime",
+                        "$mainUrl/category.php?category=Animation"
+                    )
+                )
+            }
+
+            else -> {
+                val url = pageUrl(request.data, page)
+                val document = getDocument(url)
+                    ?: return newHomePageResponse(
+                        request,
+                        emptyList(),
+                        false
+                    )
+
+                val items = parseItems(
+                    document = document,
+                    sourceUrl = url,
+                    sectionName = request.name,
+                    page = page
+                ).take(maxHomeItems)
+
+                newHomePageResponse(
+                    request,
+                    items.map { it.toSearchResponse() },
+                    hasNextPage(document, page)
+                )
+            }
+        }
+    }
+
+    private suspend fun getMergedHomePage(
+        request: MainPageRequest,
+        page: Int,
+        sources: List<String>
+    ): HomePageResponse {
+        val merged = linkedMapOf<String, SiteItem>()
+        var anySourceHasNext = false
+
+        for (source in sources) {
+            val items = if (source.equals("$mainUrl/category.php", true)) {
+                getAllMoviesItems(page, request.name)
+            } else {
+                getCategoryItems(
+                    sourceUrl = source,
+                    page = page,
+                    sectionName = request.name
+                )
+            }
+
+            items.forEach { item ->
+                merged.putIfAbsent(item.url, item)
+            }
+
+            if (source.equals("$mainUrl/category.php", true)) {
+                /*
+                 * All Movies uses the site's lazy endpoint. If this page
+                 * returned a full 24-item batch, another batch may exist.
+                 */
+                if (items.size >= ALL_MOVIES_BATCH_SIZE) {
+                    anySourceHasNext = true
+                }
+            } else {
+                val document = getDocument(pageUrl(source, page))
+                if (document != null && hasNextPage(document, page)) {
+                    anySourceHasNext = true
+                }
+            }
+        }
+
+        val responses = merged.values
+            .take(maxHomeItems)
+            .map { it.toSearchResponse() }
 
         return newHomePageResponse(
             request,
-            items.map { it.toSearchResponse() },
-            hasNextPage(document, page)
+            responses,
+            anySourceHasNext
         )
+    }
+
+    private suspend fun getCategoryItems(
+        sourceUrl: String,
+        page: Int,
+        sectionName: String
+    ): List<SiteItem> {
+        val url = pageUrl(sourceUrl, page)
+        val document = getDocument(url) ?: return emptyList()
+
+        return parseItems(
+            document = document,
+            sourceUrl = url,
+            sectionName = sectionName,
+            page = page
+        )
+    }
+
+    private suspend fun getAllMoviesItems(
+        page: Int,
+        sectionName: String
+    ): List<SiteItem> {
+        val pageNumber = page.coerceAtLeast(1)
+
+        if (pageNumber == 1) {
+            val url = "$mainUrl/category.php"
+            val document = getDocument(url) ?: return emptyList()
+
+            return parseItems(
+                document = document,
+                sourceUrl = url,
+                sectionName = sectionName,
+                page = 1
+            ).take(ALL_MOVIES_BATCH_SIZE)
+        }
+
+        val offset = (pageNumber - 1) * ALL_MOVIES_BATCH_SIZE
+        val endpoint = "$mainUrl/load_more_movies.php?offset=$offset"
+
+        val response = runCatching {
+            app.get(
+                endpoint,
+                headers = pageHeaders("$mainUrl/category.php")
+            )
+        }.getOrNull() ?: return emptyList()
+
+        val html = response.text.trim()
+        if (html.isBlank()) return emptyList()
+
+        /*
+         * load_more_movies.php returns the same movie-card HTML fragment
+         * that the site's JavaScript appends to #movieGrid.
+         */
+        val document = org.jsoup.Jsoup.parse(
+            "<html><body>$html</body></html>",
+            "$mainUrl/"
+        )
+
+        return parseItems(
+            document = document,
+            sourceUrl = "$mainUrl/category.php",
+            sectionName = sectionName,
+            page = pageNumber
+        ).take(ALL_MOVIES_BATCH_SIZE)
     }
 
     override suspend fun search(
@@ -184,7 +378,7 @@ class CinePlexFTP : MainAPI() {
         // spelling differences and partial titles when search.php is strict.
         val fallback = linkedMapOf<String, SiteItem>()
         val sources = listOf(
-            "$mainUrl/movies",
+            "$mainUrl/category.php",
             "$mainUrl/category.php?category=Indian+Bangla",
             "$mainUrl/category.php?category=Korean",
             "$mainUrl/category.php?category=3D+Movies",
@@ -363,33 +557,88 @@ class CinePlexFTP : MainAPI() {
             return true
         }
 
-        val response = runCatching {
-            app.get(input, headers = pageHeaders(input))
+        /*
+         * The Cine Plex player does not permanently expose the final movie
+         * file in the page URL. It generates a signed videoSrc URL containing
+         * md5 + expires. We therefore resolve it only when Play is pressed.
+         *
+         * We try twice so a stale/cached player response can immediately be
+         * replaced by a fresh token.
+         */
+        var resolvedPlayerUrl: String? = null
+
+        for (attempt in 0 until 2) {
+            val response = runCatching {
+                app.get(
+                    input,
+                    headers = pageHeaders(input) + mapOf(
+                        "Cache-Control" to "no-cache, no-store, max-age=0",
+                        "Pragma" to "no-cache"
+                    )
+                )
+            }.getOrNull()
+
+            if (response != null) {
+                val playerSources = extractPlayerVideoSrcCandidates(
+                    response.text,
+                    input
+                )
+
+                val bestPlayer = playerSources
+                    .filter { isMediaUrl(it) }
+                    .maxByOrNull { playerMediaScore(it) }
+
+                if (bestPlayer != null) {
+                    resolvedPlayerUrl = bestPlayer
+                    break
+                }
+
+                /*
+                 * Fallback only after checking videoSrc. This prevents a
+                 * generic preview/clip <video> source from winning over the
+                 * site's real movie source.
+                 */
+                val direct = extractMediaUrls(
+                    response.document,
+                    response.text,
+                    input
+                )
+                    .distinct()
+                    .maxByOrNull { playerMediaScore(it) }
+
+                if (direct != null) {
+                    resolvedPlayerUrl = direct
+                    break
+                }
+            }
+
+            /*
+             * Give the next attempt a fresh HTTP request. The page itself
+             * controls md5/expires, so the provider never invents a token.
+             */
+            if (attempt == 0) continue
+        }
+
+        if (resolvedPlayerUrl != null) {
+            emitMediaLink(
+                resolvedPlayerUrl!!,
+                callback
+            )
+            return true
+        }
+
+        /*
+         * External iframe fallback.
+         */
+        val iframeResponse = runCatching {
+            app.get(
+                input,
+                headers = pageHeaders(input)
+            )
         }.getOrNull() ?: return false
 
-        val document = response.document
-        val html = response.text
-
-        // Cine Plex player.php publishes the actual temporary/signed MP4 URL
-        // in JavaScript as: const videoSrc = "...mp4?md5=...&expires=..."
-        // Resolve it at play time so expired URLs are never cached.
-        val playerSource = extractPlayerVideoSrc(html, input)
-        if (playerSource != null) {
-            emitMediaLink(playerSource, callback)
-
-            return true
-        }
-
-        // Generic fallback for any direct source exposed in the DOM/JS.
-        val directSources = extractMediaUrls(document, html, input).distinct()
-        if (directSources.isNotEmpty()) {
-            directSources.take(6).forEach { source ->
-                emitMediaLink(source, callback)
-            }
-            return true
-        }
-
-        val iframes = document.select("iframe[src], iframe[data-src]")
+        val iframes = iframeResponse.document
+            .select("iframe[src], iframe[data-src]")
             .mapNotNull { iframe ->
                 iframe.attr("src")
                     .ifBlank { iframe.attr("data-src") }
@@ -401,33 +650,101 @@ class CinePlexFTP : MainAPI() {
 
         for (iframe in iframes) {
             val extracted = runCatching {
-                loadExtractor(iframe, subtitleCallback, callback)
+                loadExtractor(
+                    iframe,
+                    subtitleCallback,
+                    callback
+                )
             }.getOrDefault(false)
+
             if (extracted) return true
         }
 
         return false
     }
 
-    private fun extractPlayerVideoSrc(html: String, baseUrl: String): String? {
+    private fun extractPlayerVideoSrc(
+        html: String,
+        baseUrl: String
+    ): String? {
+        return extractPlayerVideoSrcCandidates(
+            html,
+            baseUrl
+        ).maxByOrNull { playerMediaScore(it) }
+    }
+
+    private fun extractPlayerVideoSrcCandidates(
+        html: String,
+        baseUrl: String
+    ): List<String> {
         val cleaned = html
-            .replace("\\/", "/")
+            .replace("\\/","/")
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
 
         val patterns = listOf(
-            Regex("""(?is)\bvideoSrc\s*=\s*[\"']([^\"']+)[\"']"""),
-            Regex("""(?is)[\"']videoSrc[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']""")
+            Regex("""(?is)\\b(?:const|let|var)?\\s*videoSrc\\s*=\\s*["']([^"']+)["']"""),
+            Regex("""(?is)["']videoSrc["']?\\s*[:=]\\s*["']([^"']+)["']"""),
+            Regex("""(?is)\\bvideoSrc\\s*\\+=\\s*["']([^"']+)["']""")
         )
 
+        val found = linkedSetOf<String>()
+
         for (pattern in patterns) {
-            val raw = pattern.find(cleaned)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-            if (raw.isBlank()) continue
-            val resolved = absoluteUrl(raw, baseUrl)
-            if (isMediaUrl(resolved)) return resolved
+            pattern.findAll(cleaned).forEach { match ->
+                val raw = match.groupValues
+                    .getOrNull(1)
+                    ?.trim()
+                    .orEmpty()
+
+                if (raw.isBlank()) return@forEach
+
+                val resolved = absoluteUrl(raw, baseUrl)
+
+                if (isMediaUrl(resolved)) {
+                    found.add(resolved)
+                }
+            }
         }
 
-        return null
+        return found.toList()
+    }
+
+    private fun playerMediaScore(url: String): Int {
+        val lower = url.lowercase(Locale.ROOT)
+        var score = 0
+
+        /*
+         * Prefer complete movie sources over preview/clip-like URLs.
+         */
+        if ("preview" in lower) score -= 100
+        if ("trailer" in lower) score -= 100
+        if ("sample" in lower) score -= 80
+        if ("clip" in lower) score -= 80
+        if ("teaser" in lower) score -= 80
+
+        /*
+         * The Cine Plex player uses /v/m/ for its actual movie stream.
+         */
+        if ("/v/m/" in lower) score += 200
+
+        /*
+         * Preserve a real signed URL. Do not remove md5/expires parameters.
+         */
+        if ("md5=" in lower) score += 40
+        if ("expires=" in lower) score += 40
+
+        if (lower.contains("1080")) score += 20
+        else if (lower.contains("720")) score += 15
+        else if (lower.contains("480")) score += 10
+
+        /*
+         * A longer file path generally represents the complete named source
+         * rather than a tiny preview asset.
+         */
+        score += minOf(url.length / 25, 20)
+
+        return score
     }
 
     /*
