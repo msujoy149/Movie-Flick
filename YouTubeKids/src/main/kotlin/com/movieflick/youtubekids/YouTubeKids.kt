@@ -2135,7 +2135,7 @@ class YouTubeKids : MainAPI() {
          * This is important because YouTube can change the direct
          * stream response independently of the search result.
          */
-        runCatching {
+        try {
             if (loadExtractor(cleanData, subtitleCallback, callback)) {
                 return true
             }
