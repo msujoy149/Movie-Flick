@@ -94,11 +94,11 @@
     },
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
-        "jarFileSize": 277286,
-        "fileHash": "sha256-3dfb48cdd0e2acb90037aa6dde2045c8306b53d6fbe96a4538c0d35ed1bccb6c",
+        "jarFileSize": 285152,
+        "fileHash": "sha256-33db8e1a810c037d2aee829b879da9bcc5067b4f0676c8494af09c5c98541559",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 62154,
+        "fileSize": 62515,
         "status": 1,
         "language": "bn-IN",
         "authors": [
@@ -114,6 +114,6 @@
         "description": "Bengali India YouTube Kids provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.cs3",
         "name": "YouTubeKids",
-        "jarHash": "sha256-8bb7f86f6ced93b0a2544c09b061467b40ac202f1955b568627468041604cdd6"
+        "jarHash": "sha256-84936e297bdf62fcea60261b21e429b39625b9453fa1b148764c46da35156bab"
     }
 ]
