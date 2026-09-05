@@ -789,6 +789,65 @@ class CinePlexFTP : MainAPI() {
         return score
     }
 
+
+    /*
+     * Emit the Cine Plex source as a native CloudStream video link.
+     *
+     * This function is intentionally suspend because newExtractorLink(...)
+     * is a suspend API in the current CloudStream runtime.
+     */
+    private suspend fun emitMediaLink(
+        mediaUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val type = when {
+            mediaUrl.contains(".m3u8", true) ->
+                ExtractorLinkType.M3U8
+
+            mediaUrl.contains(".mpd", true) ->
+                ExtractorLinkType.DASH
+
+            else ->
+                ExtractorLinkType.VIDEO
+        }
+
+        val lower = mediaUrl.lowercase(Locale.ROOT)
+
+        val quality = when {
+            "2160" in lower || "4k" in lower ->
+                Qualities.P2160.value
+
+            "1440" in lower ->
+                Qualities.P1440.value
+
+            "1080" in lower ->
+                Qualities.P1080.value
+
+            "720" in lower ->
+                Qualities.P720.value
+
+            "480" in lower ->
+                Qualities.P480.value
+
+            "360" in lower ->
+                Qualities.P360.value
+
+            else ->
+                Qualities.Unknown.value
+        }
+
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "Cine Plex Direct",
+                url = mediaUrl,
+                type = type
+            ) {
+                this.quality = quality
+            }
+        )
+    }
+
     private fun extractDirectMediaFromDownloads(
         document: Document,
         html: String,
