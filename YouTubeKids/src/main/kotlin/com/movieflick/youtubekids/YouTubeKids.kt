@@ -2675,10 +2675,9 @@ class YouTubeKids : MainAPI() {
             }
         }
 
-        return
-            emittedAdaptive ||
-                emittedInnerTube ||
-                emittedFallback
+        return emittedAdaptive ||
+            emittedInnerTube ||
+            emittedFallback
     }
 
     /*
