@@ -2484,27 +2484,15 @@ class YouTubeKids : MainAPI() {
         val canonical = canonicalYouTubeUrl(original)
         val directUrls = linkedSetOf(canonical, original)
 
-        var emittedAdaptive = false
-        var emittedLive = false
-
         /*
-         * ============================================================
-         * PRIMARY PLAYBACK PATH
-         * ============================================================
+         * PRIMARY PATH
          *
-         * Keep the same proven architecture as the working YouTube
-         * provider: NewPipe -> StreamInfo -> DASH/HLS.
+         * Keep the same proven playback architecture as the working
+         * YouTube provider: NewPipe -> StreamInfo -> DASH/HLS.
          *
-         * IMPORTANT DIFFERENCE FROM v12:
-         * We do NOT return immediately after publishing a DASH link.
-         * Some YouTube videos expose a DASH manifest which the player
-         * cannot actually open for that particular response/client.
-         * Returning immediately made those videos completely unplayable.
-         *
-         * We therefore keep the DASH source (for adaptive HD/2K/4K) but
-         * continue through the compatibility fallbacks as well. If DASH
-         * is playable, CloudStream can use its full adaptive tracks. If it
-         * is not, a working fallback source is still available.
+         * The critical resolution source is the DASH MPD. When it exists,
+         * publish it directly and stop there. This prevents a legacy 360p
+         * progressive/InnerTube source from becoming the preferred source.
          */
         for (videoUrl in directUrls) {
             try {
@@ -2516,16 +2504,12 @@ class YouTubeKids : MainAPI() {
                 val isLive =
                     info.streamType
                         ?.name
-                        ?.contains(
-                            "LIVE",
-                            ignoreCase = true
-                        ) == true
+                        ?.contains("LIVE", ignoreCase = true) == true
 
                 if (isLive) {
                     val hls =
-                        runCatching {
-                            info.hlsUrl
-                        }.getOrNull()
+                        runCatching { info.hlsUrl }
+                            .getOrNull()
 
                     if (!hls.isNullOrBlank()) {
                         callback(
@@ -2536,31 +2520,26 @@ class YouTubeKids : MainAPI() {
                                 type = ExtractorLinkType.M3U8
                             ) {
                                 referer = "https://www.youtube.com/"
-                                headers =
-                                    mapOf(
-                                        "User-Agent" to USER_AGENT
-                                    )
+                                headers = mapOf(
+                                    "User-Agent" to USER_AGENT
+                                )
                                 quality = Qualities.Unknown.value
                             }
                         )
-                        emittedLive = true
+                        return true
                     }
-                    // Do not try VOD adaptive handling for a live stream.
+
                     continue
                 }
 
                 /*
-                 * VOD -> DASH
-                 *
-                 * This is the critical resolution path. The MPD contains
-                 * YouTube's adaptive representations, so CloudStream can
-                 * expose 720p/1080p/1440p/2160p/etc. according to what the
-                 * video actually provides.
+                 * VOD -> DASH.
+                 * This exactly follows the working YouTube provider's
+                 * resolution path.
                  */
                 val dash =
-                    runCatching {
-                        info.dashMpdUrl
-                    }.getOrNull()
+                    runCatching { info.dashMpdUrl }
+                        .getOrNull()
 
                 if (!dash.isNullOrBlank()) {
                     callback(
@@ -2571,24 +2550,22 @@ class YouTubeKids : MainAPI() {
                             type = ExtractorLinkType.DASH
                         ) {
                             referer = "https://www.youtube.com/"
-                            headers =
-                                mapOf(
-                                    "User-Agent" to USER_AGENT
-                                )
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT
+                            )
                             quality = Qualities.Unknown.value
                         }
                     )
-                    emittedAdaptive = true
+                    return true
                 }
 
                 /*
-                 * HLS is also kept as an adaptive compatibility fallback.
-                 * It is emitted without replacing the DASH source.
+                 * HLS fallback only when the adaptive DASH manifest is not
+                 * available for this response.
                  */
                 val hls =
-                    runCatching {
-                        info.hlsUrl
-                    }.getOrNull()
+                    runCatching { info.hlsUrl }
+                        .getOrNull()
 
                 if (!hls.isNullOrBlank()) {
                     callback(
@@ -2599,59 +2576,56 @@ class YouTubeKids : MainAPI() {
                             type = ExtractorLinkType.M3U8
                         ) {
                             referer = "https://www.youtube.com/"
-                            headers =
-                                mapOf(
-                                    "User-Agent" to USER_AGENT
-                                )
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT
+                            )
                             quality = Qualities.Unknown.value
                         }
                     )
+                    return true
                 }
             } catch (_: Exception) {
-                // Try the next compatibility path instead of failing playback.
+                // Continue to the next URL/fallback.
             }
         }
 
-        if (emittedLive) {
-            return true
-        }
-
         /*
-         * ============================================================
-         * SECONDARY PATH: INNER TUBE DIRECT FORMATS
-         * ============================================================
+         * SECONDARY RESOLUTION PATH
          *
-         * Only reached after the proven NewPipe DASH/HLS path has been
-         * offered. This keeps the high-resolution direct-format logic
-         * available without allowing it to break working playback.
+         * Only reached when NewPipe could not expose a DASH/HLS source.
+         * Keep the existing InnerTube implementation from the stable file
+         * so direct 1080p/1440p/2160p/4320p streams can still be used when
+         * YouTube actually returns them.
          */
         val videoId = videoIdFromUrl(canonical)
-
-        var emittedInnerTube = false
 
         if (!videoId.isNullOrBlank()) {
             val innerTube =
                 runCatching {
-                    extractInnerTubeFormats(videoId)
+                    extractInnerTubeFormats(
+                        videoId = videoId
+                    )
                 }.getOrNull()
 
             if (innerTube != null) {
-                emittedInnerTube =
-                    emitInnerTubeResolutionSources(
-                        result = innerTube,
-                        callback = callback
-                    )
+                val emitted =
+                    runCatching {
+                        emitInnerTubeResolutionSources(
+                            result = innerTube,
+                            callback = callback
+                        )
+                    }.getOrDefault(false)
+
+                if (emitted) {
+                    return true
+                }
             }
         }
 
         /*
-         * ============================================================
-         * FINAL PATH: REGISTERED CLOUDSTREAM EXTRACTORS
-         * ============================================================
+         * FINAL PLAYBACK FALLBACK
          *
-         * This is deliberately still reached even when DASH was emitted.
-         * A DASH URL can exist yet fail at playback time for a specific
-         * video; the registered extractor may still provide a valid stream.
+         * Preserve the original provider's CloudStream extractor fallback.
          */
         val fallbackUrls =
             linkedSetOf(
@@ -2661,31 +2635,26 @@ class YouTubeKids : MainAPI() {
                 original
             )
 
-        var emittedFallback = false
-
         for (videoUrl in fallbackUrls) {
+            var found = false
+
             runCatching {
                 loadExtractor(
                     videoUrl,
                     subtitleCallback
                 ) { link ->
-                    emittedFallback = true
+                    found = true
                     callback(link)
                 }
             }
+
+            if (found) {
+                return true
+            }
         }
 
-        return emittedAdaptive ||
-            emittedInnerTube ||
-            emittedFallback
+        return false
     }
-
-    /*
-     * ============================================================
-     * INNER TUBE CONFIGURATION
-     * ============================================================
-     */
-
     private suspend fun extractInnerTubeFormats(
         videoId: String
     ): InnerTubeResult? {
