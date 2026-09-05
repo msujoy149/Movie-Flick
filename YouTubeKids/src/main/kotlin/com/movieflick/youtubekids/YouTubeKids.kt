@@ -15,6 +15,7 @@ import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
+import org.schabi.newpipe.extractor.stream.VideoStream
 import org.schabi.newpipe.extractor.stream.StreamType
 import java.net.URLDecoder
 import java.util.concurrent.ConcurrentHashMap
@@ -2515,50 +2516,14 @@ class YouTubeKids : MainAPI() {
 
         /*
          * ----------------------------------------------------------
-         * PATH 1: DELEGATE TO MAIN YOUTUBE PROVIDER
+         * PATH 1: DIRECT NEWPIPE
          * ----------------------------------------------------------
          *
-         * The user already has a separate YouTube provider in
-         * Movie-Flick that can play YouTube. Use its exact loadLinks
-         * implementation as the first compatibility path.
-         *
-         * A callback counter is used because some CloudStream
-         * extractor functions can report success without actually
-         * emitting a stream link.
+         * This is the same underlying YouTube/NewPipe extractor path
+         * used by the working YouTube provider. Media URLs are resolved
+         * only when Play is pressed.
          */
-        val mainYouTube =
-            runCatching {
-                APIHolder.getApiFromNameNull(
-                    "YouTube"
-                )
-            }.getOrNull()
 
-        if (
-            mainYouTube != null &&
-            mainYouTube !== this
-        ) {
-            var delegatedLinkFound =
-                false
-
-            runCatching {
-                mainYouTube.loadLinks(
-                    canonical,
-                    isCasting,
-                    subtitleCallback
-                ) { link ->
-                    delegatedLinkFound = true
-                    callback(link)
-                }
-            }
-
-            if (delegatedLinkFound) {
-                return true
-            }
-        }
-
-        /*
-         * ----------------------------------------------------------
-         * PATH 2: DIRECT NEWPIPE
          * ----------------------------------------------------------
          */
         val directUrls =
@@ -2761,11 +2726,10 @@ class YouTubeKids : MainAPI() {
      * PROGRESSIVE / MUXED VIDEO STREAM EXTRACTION
      * ============================================================
      *
-     * NewPipe's VideoStream model contains URL/content, resolution
-     * and an isVideoOnly flag. Reflection is deliberately used for
-     * the getVideoStreams() accessor so this extension remains
-     * compatible with hosts bundling slightly different
-     * NewPipeExtractor versions.
+     * NewPipe's VideoStream model exposes the media URL/content,
+     * resolution and video-only flag directly. This implementation
+     * uses the typed API instead of reflection, so Kotlin nullability
+     * inference cannot degrade the stream object to Any?.
      *
      * A muxed progressive stream already contains audio + video and
      * is therefore the simplest possible input for ExoPlayer.
@@ -2775,29 +2739,14 @@ class YouTubeKids : MainAPI() {
         info: StreamInfo,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val streams =
+        /*
+         * NewPipe exposes normal video streams through getVideoStreams().
+         * VideoStream entries marked video-only are skipped because a
+         * single VIDEO link must already contain the audio track.
+         */
+        val streams: List<VideoStream> =
             runCatching {
-                val method =
-                    info.javaClass.methods
-                        .firstOrNull {
-                            it.name == "getVideoStreams" &&
-                                it.parameterTypes.isEmpty()
-                        }
-                        ?: return@runCatching emptyList<Any?>()
-
-                val value =
-                    method.invoke(info)
-
-                when (value) {
-                    is Iterable<*> ->
-                        value.filterNotNull()
-
-                    is Array<*> ->
-                        value.filterNotNull()
-
-                    else ->
-                        emptyList()
-                }
+                info.videoStreams
             }.getOrDefault(emptyList())
 
         if (streams.isEmpty()) {
@@ -2810,86 +2759,33 @@ class YouTubeKids : MainAPI() {
         )
 
         val candidates =
-            streams.mapNotNull { stream ->
-                runCatching {
-                    val isUrl =
-                        stream.javaClass.methods
-                            .firstOrNull {
-                                it.name == "isUrl" &&
-                                    it.parameterTypes.isEmpty()
-                            }
-                            ?.invoke(stream) as? Boolean
-                            ?: false
-
-                    val isVideoOnly =
-                        stream.javaClass.methods
-                            .firstOrNull {
-                                it.name == "isVideoOnly" &&
-                                    it.parameterTypes.isEmpty()
-                            }
-                            ?.invoke(stream) as? Boolean
-                            ?: true
-
-                    if (
-                        !isUrl ||
-                        isVideoOnly
-                    ) {
-                        return@runCatching null
-                    }
-
-                    val content =
-                        stream.javaClass.methods
-                            .firstOrNull {
-                                it.name == "getContent" &&
-                                    it.parameterTypes.isEmpty()
-                            }
-                            ?.invoke(stream)
-                            ?.toString()
-                            ?.trim()
-                            .orEmpty()
-
-                    if (
-                        content.isBlank() ||
-                        !content.startsWith("http", true)
-                    ) {
-                        return@runCatching null
-                    }
-
-                    val resolutionText =
-                        stream.javaClass.methods
-                            .firstOrNull {
-                                it.name == "getResolution" &&
-                                    it.parameterTypes.isEmpty()
-                            }
-                            ?.invoke(stream)
-                            ?.toString()
-                            .orEmpty()
-
-                    Candidate(
-                        url = content,
-                        resolution =
-                            parseResolution(
-                                resolutionText
-                            )
-                    )
-                }.getOrNull()
-            }
-                .filterNotNull()
-                .distinctBy { it.url }
-                .sortedByDescending {
-                    it.resolution
+            streams
+                .asSequence()
+                .filter { stream ->
+                    stream.isUrl &&
+                        !stream.isVideoOnly &&
+                        stream.content.isNotBlank() &&
+                        stream.content.startsWith(
+                            "http",
+                            ignoreCase = true
+                        )
                 }
+                .map { stream ->
+                    Candidate(
+                        url = stream.content.trim(),
+                        resolution = parseResolution(
+                            stream.resolution
+                        )
+                    )
+                }
+                .distinctBy { it.url }
+                .sortedByDescending { it.resolution }
+                .toList()
 
         if (candidates.isEmpty()) {
             return false
         }
 
-        /*
-         * Prefer <=720p when available. This is much more reliable
-         * across Android devices than blindly selecting a very large
-         * progressive stream. If no <=720p stream exists, use the
-         * highest available progressive stream.
-         */
         val preferred =
             candidates.firstOrNull {
                 it.resolution in 240..720
@@ -2899,9 +2795,7 @@ class YouTubeKids : MainAPI() {
             newExtractorLink(
                 source = name,
                 name =
-                    if (
-                        preferred.resolution > 0
-                    ) {
+                    if (preferred.resolution > 0) {
                         "$name ${preferred.resolution}p"
                     } else {
                         "$name Direct"
@@ -2914,14 +2808,11 @@ class YouTubeKids : MainAPI() {
 
                 headers =
                     mapOf(
-                        "User-Agent" to
-                            USER_AGENT
+                        "User-Agent" to USER_AGENT
                     )
 
                 quality =
-                    if (
-                        preferred.resolution > 0
-                    ) {
+                    if (preferred.resolution > 0) {
                         preferred.resolution
                     } else {
                         Qualities.Unknown.value
