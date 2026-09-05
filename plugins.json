@@ -95,7 +95,7 @@
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
         "jarFileSize": 277286,
-        "fileHash": "sha256-207a944aa5b59c9356e73f8b51df04f491d613eaeec6a21a02bfe2556a24de60",
+        "fileHash": "sha256-3dfb48cdd0e2acb90037aa6dde2045c8306b53d6fbe96a4538c0d35ed1bccb6c",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
         "fileSize": 62154,
@@ -108,7 +108,7 @@
             "Other",
             "TvSeries"
         ],
-        "version": 2,
+        "version": 11,
         "internalName": "YouTubeKids",
         "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.jar",
         "description": "Bengali India YouTube Kids provider for Movie-Flick",
