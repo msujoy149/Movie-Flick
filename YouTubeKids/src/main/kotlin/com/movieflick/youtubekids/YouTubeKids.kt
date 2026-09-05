@@ -2828,35 +2828,35 @@ class YouTubeKids : MainAPI() {
          * metadata here so this stays compatible with the broadest
          * range of CloudStream AudioFile implementations.
          */
-        val audioTracks =
-            runCatching {
-                info.audioStreams
-                    .asSequence()
-                    .mapNotNull { audio ->
-                        val url =
-                            runCatching {
-                                if (audio.isUrl) audio.content else ""
-                            }.getOrNull()
-                                ?.trim()
-                                .orEmpty()
+        val audioTracks = mutableListOf<AudioFile>()
 
-                        if (
-                            url.isBlank() ||
-                            !url.startsWith(
-                                "http",
-                                ignoreCase = true
-                            )
-                        ) {
-                            null
-                        } else {
-                            newAudioFile(url)
-                        }
-                    }
-                    .distinctBy {
-                        it.url
-                    }
-                    .toList()
-            }.getOrDefault(emptyList())
+        for (audio in runCatching { info.audioStreams }.getOrDefault(emptyList())) {
+            val url =
+                runCatching {
+                    if (audio.isUrl) audio.content else ""
+                }.getOrNull()
+                    ?.trim()
+                    .orEmpty()
+
+            if (
+                url.isBlank() ||
+                !url.startsWith(
+                    "http",
+                    ignoreCase = true
+                )
+            ) {
+                continue
+            }
+
+            try {
+                val audioFile = newAudioFile(url)
+                if (audioTracks.none { it.url == audioFile.url }) {
+                    audioTracks.add(audioFile)
+                }
+            } catch (_: Exception) {
+                // Ignore an invalid audio variant and keep the remaining ones.
+            }
+        }
 
         val candidates =
             streams
