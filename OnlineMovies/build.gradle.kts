@@ -9,6 +9,7 @@ cloudstream {
         System.getenv("GITHUB_REPOSITORY")
             ?: "msujoy149/Movie-Flick"
     )
+    iconUrl = "https://flagcdn.com/w320/in.png"
 }
 
 android {
@@ -31,7 +32,9 @@ dependencies {
         "com.github.recloudstream.cloudstream:library:-SNAPSHOT"
     )
 
-    implementation(kotlin("stdlib"))
+    implementation(
+        kotlin("stdlib")
+    )
 
     implementation(
         "com.github.Blatzar:NiceHttp:0.4.11"
