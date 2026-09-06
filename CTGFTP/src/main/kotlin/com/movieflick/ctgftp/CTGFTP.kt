@@ -1789,7 +1789,7 @@ class CTGFTP : MainAPI() {
                 ?.split(',')
                 ?.asSequence()
                 ?.map { it.trim() }
-                ?.map { it.substringBefore(Regex("""\s+""")).trim() }
+                ?.map { it.split(Regex("""\s+""")).firstOrNull().orEmpty().trim() }
                 ?.firstOrNull { it.isNotBlank() }
         }
 
