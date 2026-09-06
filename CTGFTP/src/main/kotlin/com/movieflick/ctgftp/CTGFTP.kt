@@ -9,6 +9,9 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 /**
  * CTG FTP v5 — advanced fuzzy search + movie playback fix
@@ -72,21 +75,35 @@ class CTGFTP : MainAPI() {
         ".ts"
     )
 
+    private companion object {
+        const val HOME_BATCH_SIZE = 6
+        const val CACHE_TTL_MS = 45_000L
+    }
+
+    private data class CachedItems(
+        val timestamp: Long,
+        val items: List<SiteItem>,
+        val hasNext: Boolean
+    )
+
+    private val pageCache = java.util.concurrent.ConcurrentHashMap<String, CachedItems>()
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val document = getDocument(url)
+
+        val pageData = getCachedPageData(url)
             ?: return newHomePageResponse(request, emptyList(), false)
 
-        val items = parseItems(document, url)
-            .take(30)
+        val items = pageData.items
+            .take(HOME_BATCH_SIZE)
 
         return newHomePageResponse(
             request,
             items.map { it.toSearchResponse() },
-            hasNextPage(document, page)
+            pageData.hasNext
         )
     }
 
@@ -206,17 +223,18 @@ class CTGFTP : MainAPI() {
             "$mainUrl/anime"
         )
 
-        for (categoryUrl in categoryUrls) {
-            val document = getDocument(
-                pageUrl(categoryUrl, page)
-            ) ?: continue
-
-            parseItems(
-                document,
-                document.location().ifBlank { categoryUrl }
-            ).forEach { item ->
-                allItems.putIfAbsent(item.url, item)
-            }
+        coroutineScope {
+            categoryUrls.map { categoryUrl ->
+                async {
+                    getCachedPageData(pageUrl(categoryUrl, page))
+                        ?.items
+                        .orEmpty()
+                }
+            }.awaitAll()
+                .flatten()
+                .forEach { item ->
+                    allItems.putIfAbsent(item.url, item)
+                }
         }
 
         if (allItems.isEmpty()) {
@@ -477,11 +495,20 @@ class CTGFTP : MainAPI() {
          * resolves the current watch page and playback sources at Play time.
          * TV/Anime episode data remains unchanged above.
          */
+        val movieWatchUrl = if (
+            typeFromUrl(clean) == TvType.Movie &&
+            runCatching { URI(clean).path.orEmpty().startsWith("/movies/") }.getOrDefault(false)
+        ) {
+            extractPlaybackPageUrl(document, clean)
+        } else {
+            null
+        }
+
         return newMovieLoadResponse(
             title,
             clean,
             typeFromUrl(clean),
-            clean
+            movieWatchUrl ?: clean
         ) {
             posterUrl = poster
             this.plot = plot
@@ -528,45 +555,64 @@ class CTGFTP : MainAPI() {
          * sources are serialized inside the Next.js payload, so that approach
          * can return zero sources even though the browser player has them.
          */
-        val isMovieDetail = runCatching {
+        val inputPath = runCatching {
             URI(input).path.orEmpty().lowercase(Locale.ROOT)
-                .startsWith("/movies/")
-        }.getOrDefault(false)
+        }.getOrDefault("")
 
-        if (isMovieDetail) {
-            val detailResponse = runCatching {
-                app.get(
-                    input,
-                    headers = pageHeaders + ("Referer" to "$mainUrl/")
-                )
-            }.getOrNull()
+        val isMovieDetail = inputPath.startsWith("/movies/")
+        val isMovieWatch = inputPath.startsWith("/watch/") &&
+            URI(input).rawQuery.orEmpty().contains("type=movie", true)
 
-            if (detailResponse != null) {
-                val detailDocument = detailResponse.document
+        if (isMovieDetail || isMovieWatch) {
+            val watchUrl = if (isMovieWatch) {
+                input
+            } else {
+                val detailResponse = runCatching {
+                    app.get(
+                        input,
+                        headers = pageHeaders + ("Referer" to "$mainUrl/")
+                    )
+                }.getOrNull()
 
-                val watchUrl = extractPlaybackPageUrl(
-                    document = detailDocument,
-                    baseUrl = input
-                )
+                detailResponse?.let {
+                    extractPlaybackPageUrl(
+                        document = it.document,
+                        baseUrl = input
+                    )
+                }
+            }
 
-                if (!watchUrl.isNullOrBlank()) {
-                    val watchResponse = runCatching {
-                        app.get(
-                            watchUrl,
-                            headers = pageHeaders + ("Referer" to input)
-                        )
-                    }.getOrNull()
+            if (!watchUrl.isNullOrBlank()) {
+                val watchResponse = runCatching {
+                    app.get(
+                        watchUrl,
+                        headers = pageHeaders + ("Referer" to if (isMovieWatch) "$mainUrl/" else input)
+                    )
+                }.getOrNull()
 
-                    if (watchResponse != null) {
-                        val ctgSources = extractCtgPlaybackLinks(
-                            html = watchResponse.text,
-                            baseUrl = watchUrl
-                        )
+                if (watchResponse != null) {
+                    val ctgSources = extractCtgPlaybackLinks(
+                        html = watchResponse.text,
+                        baseUrl = watchUrl
+                    )
 
-                        if (ctgSources.isNotEmpty()) {
-                            var emitted = false
+                    if (ctgSources.isNotEmpty()) {
+                        var emitted = false
 
-                            ctgSources.forEach { source ->
+                        /*
+                         * Prefer HLS when CTG explicitly provides it because HLS
+                         * normally starts playback faster than a large direct file.
+                         * Keep both sources so CloudStream still has a fallback.
+                         */
+                        ctgSources
+                            .sortedWith(
+                                compareBy<CtgPlaybackSource> {
+                                    if (it.url.contains(".m3u8", true)) 0 else 1
+                                }.thenByDescending {
+                                    qualityFromHint(it.quality) ?: 0
+                                }
+                            )
+                            .forEach { source ->
                                 val mediaUrl = source.url
                                 if (!isMediaUrl(mediaUrl)) return@forEach
 
@@ -580,30 +626,24 @@ class CTGFTP : MainAPI() {
                                 emitted = true
                             }
 
-                            if (emitted) return true
-                        }
+                        if (emitted) return true
+                    }
 
-                        /*
-                         * Keep the existing generic fallback as a secondary path.
-                         * This protects against a CTG markup change where a direct
-                         * <video>/<source> suddenly becomes available again.
-                         */
-                        val fallbackSources = extractMediaUrls(
-                            document = watchResponse.document,
-                            html = watchResponse.text,
-                            baseUrl = watchUrl
-                        ).distinct()
+                    val fallbackSources = extractMediaUrls(
+                        document = watchResponse.document,
+                        html = watchResponse.text,
+                        baseUrl = watchUrl
+                    ).distinct()
 
-                        if (fallbackSources.isNotEmpty()) {
-                            fallbackSources.forEach { source ->
-                                emitMediaLink(
-                                    mediaUrl = source,
-                                    referer = watchUrl,
-                                    callback = callback
-                                )
-                            }
-                            return true
+                    if (fallbackSources.isNotEmpty()) {
+                        fallbackSources.forEach { source ->
+                            emitMediaLink(
+                                mediaUrl = source,
+                                referer = watchUrl,
+                                callback = callback
+                            )
                         }
+                        return true
                     }
                 }
             }
@@ -750,8 +790,8 @@ class CTGFTP : MainAPI() {
              * hls_url. This follows the site's own source priority.
              */
             val candidates = listOfNotNull(
-                url,
-                hlsUrl
+                hlsUrl,
+                url
             )
 
             candidates.forEach { raw ->
@@ -1023,6 +1063,41 @@ class CTGFTP : MainAPI() {
                 headers = pageHeaders + ("Referer" to "$mainUrl/")
             ).document
         }.getOrNull()
+    }
+
+    private suspend fun getCachedPageData(url: String): CachedItems? {
+        val normalized = cleanUrl(url)
+        if (normalized.isBlank()) return null
+
+        val now = System.currentTimeMillis()
+        pageCache[normalized]?.let { cached ->
+            if (now - cached.timestamp <= CACHE_TTL_MS) {
+                return cached
+            }
+            pageCache.remove(normalized, cached)
+        }
+
+        val document = getDocument(normalized) ?: return null
+        val sourceUrl = document.location().ifBlank { normalized }
+        val items = parseItems(document, sourceUrl)
+        val data = CachedItems(
+            timestamp = System.currentTimeMillis(),
+            items = items,
+            hasNext = hasNextPage(document, page = pageFromUrl(normalized))
+        )
+
+        pageCache[normalized] = data
+        return data
+    }
+
+    private fun pageFromUrl(url: String): Int {
+        val query = runCatching { URI(url).rawQuery.orEmpty() }.getOrDefault("")
+        return query.split('&')
+            .firstOrNull { it.substringBefore('=').equals("page", true) }
+            ?.substringAfter('=', "")
+            ?.toIntOrNull()
+            ?.coerceAtLeast(1)
+            ?: 1
     }
 
     private fun parseItems(
@@ -1741,24 +1816,61 @@ class CTGFTP : MainAPI() {
             "img[data-src], " +
             "img[data-lazy-src], " +
             "img[data-original], " +
-            "img[data-poster]"
+            "img[data-poster], " +
+            "img[data-cover], " +
+            "img[data-image]"
         ).firstOrNull()
 
         if (image != null) {
-            val source = sequenceOf(
+            val directSource = sequenceOf(
                 image.attr("data-poster"),
+                image.attr("data-cover"),
+                image.attr("data-image"),
                 image.attr("data-src"),
                 image.attr("data-lazy-src"),
                 image.attr("data-original"),
                 image.attr("src")
             ).firstOrNull { it.isNotBlank() }
 
-            if (!source.isNullOrBlank()) {
+            if (!directSource.isNullOrBlank() &&
+                !directSource.startsWith("data:", true)
+            ) {
                 return absoluteUrl(
-                    source,
+                    directSource,
                     pageUrl
                 )
             }
+
+            val srcset = firstNonBlank(
+                image.attr("data-srcset"),
+                image.attr("srcset")
+            )
+
+            if (!srcset.isNullOrBlank()) {
+                val best = srcset
+                    .split(',')
+                    .map { it.trim().substringBefore(' ').trim() }
+                    .firstOrNull { it.isNotBlank() }
+
+                if (!best.isNullOrBlank()) {
+                    return absoluteUrl(best, pageUrl)
+                }
+            }
+        }
+
+        val background = element
+            .select("[style*=background], [style*=background-image]")
+            .asSequence()
+            .map { it.attr("style") }
+            .flatMap { style ->
+                Regex("""(?i)url\(\s*['"]?([^'")]+)['"]?\s*\)""")
+                    .findAll(style)
+                    .map { it.groupValues[1] }
+            }
+            .firstOrNull { it.isNotBlank() }
+
+        if (!background.isNullOrBlank()) {
+            return absoluteUrl(background, pageUrl)
         }
 
         return null
