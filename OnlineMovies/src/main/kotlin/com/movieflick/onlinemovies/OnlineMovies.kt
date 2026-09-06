@@ -596,16 +596,25 @@ class OnlineMovies : MainAPI() {
      * LINK LOADER
      * ============================================================
      *
-     * Playback crawler:
-     * - scans the selected detail / episode page
-     * - ignores known advertising / tracking URLs
-     * - keeps crawling even after the first playable URL is found
-     * - collects multiple resolutions instead of stopping at 360p
-     * - preserves the page URL as Referer
-     * - ignores YouTube trailer embeds
+     * Playback resolver:
+     * - Collects every playable source instead of stopping at first
+     *   source.
+     * - Does not use surrounding page text to guess the quality of a
+     *   media URL.
+     * - Reads quality from the source URL / source element metadata.
+     * - Expands HLS master playlists into their actual quality
+     *   variants when the manifest exposes RESOLUTION=WxH.
+     * - Keeps the HLS master itself so adaptive playback and alternate
+     *   audio tracks remain available to the player.
+     * - Filters obvious advertising/tracking/trailer URLs.
+     *
+     * NOTE:
+     * A single MP4 can contain multiple audio tracks internally.
+     * CloudStream/player decides whether to expose those tracks.
+     * Separate audio files cannot be merged client-side here without
+     * a server-side remux/manifest.
      */
-    
-override suspend fun loadLinks(
+    override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -649,25 +658,25 @@ override suspend fun loadLinks(
             val html = response.text
 
             /*
-             * Collect EVERY playable media candidate on this page.
-             * We deliberately never stop after the first URL.
+             * Collect everything from this page. Never stop merely
+             * because one playable source was found.
              */
-            val pageCandidates = extractMediaCandidates(
+            extractMediaCandidates(
                 document = document,
                 html = html,
                 baseUrl = cleanPage
-            )
+            ).forEach { candidate ->
 
-            pageCandidates.forEach { candidate ->
-                if (isPlayableMedia(candidate.url) &&
+                if (
                     !isAdvertisingUrl(candidate.url) &&
-                    !isIgnoredPlaybackHost(candidate.url)
+                    !isIgnoredPlaybackHost(candidate.url) &&
+                    isPlayableMedia(candidate.url)
                 ) {
                     val old = found[candidate.url]
 
                     if (
                         old == null ||
-                        betterMediaCandidate(candidate, old)
+                        candidate.quality > old.quality
                     ) {
                         found[candidate.url] = candidate
                     }
@@ -675,9 +684,8 @@ override suspend fun loadLinks(
             }
 
             /*
-             * Continue into player/watch/embed pages even after we already
-             * found a source. This is important when 360p is exposed on the
-             * first page while 720p/1080p are exposed by another player page.
+             * Continue through likely player/watch/embed pages.
+             * This is still bounded so the resolver stays fast.
              */
             val nestedPages =
                 extractPlaybackPageCandidates(
@@ -686,7 +694,13 @@ override suspend fun loadLinks(
                 )
 
             for (nested in nestedPages) {
-                if (visitedPages.size >= MAX_PLAYBACK_PAGES) break
+                if (
+                    visitedPages.size >=
+                    MAX_PLAYBACK_PAGES
+                ) {
+                    break
+                }
+
                 crawlPage(
                     nested,
                     depth + 1
@@ -704,73 +718,59 @@ override suspend fun loadLinks(
         }
 
         /*
-         * First expand HLS master playlists. A single master.m3u8 can contain
-         * 360p/480p/720p/1080p variants even when the page itself exposes only
-         * one m3u8 URL.
+         * ------------------------------------------------------------
+         * Expand HLS master playlists.
+         * ------------------------------------------------------------
+         *
+         * We retain the master manifest because it may carry alternate
+         * audio tracks. We also add each exposed video variant as a
+         * separately selectable CloudStream source.
          */
         val expanded =
             linkedMapOf<String, MediaCandidate>()
 
-        for (candidate in found.values) {
+        found.values.forEach { candidate ->
+
+            expanded.putIfAbsent(
+                candidate.url,
+                candidate
+            )
 
             if (
-                candidate.url
-                    .lowercase(Locale.ROOT)
-                    .contains(".m3u8")
+                isHlsUrl(candidate.url)
             ) {
 
-                val variants =
-                    expandHlsVariants(
-                        candidate
-                    )
-
-                if (variants.isNotEmpty()) {
-
-                    variants.forEach { variant ->
-                        expanded[
-                            variant.url
-                        ] = variant
-                    }
-
-                    /*
-                     * Keep the master as a fallback too. This is useful when
-                     * the playlist is not a conventional multi-variant HLS
-                     * master or the player wants to handle the manifest itself.
-                     */
-                    expanded.putIfAbsent(
-                        candidate.url,
-                        candidate
-                    )
-
-                } else {
-
-                    expanded.putIfAbsent(
-                        candidate.url,
-                        candidate
-                    )
-
-                }
-
-            } else {
-
-                expanded.putIfAbsent(
-                    candidate.url,
+                expandHlsVariants(
                     candidate
-                )
+                ).forEach { variant ->
+
+                    if (
+                        !isAdvertisingUrl(
+                            variant.url
+                        )
+                    ) {
+                        expanded.putIfAbsent(
+                            variant.url,
+                            variant
+                        )
+                    }
+                }
             }
         }
 
         /*
-         * One best source per known resolution.
+         * ------------------------------------------------------------
+         * Keep the best URL for each concrete resolution.
+         * ------------------------------------------------------------
          *
-         * IMPORTANT:
-         * Quality is determined from the actual source URL / source tag
-         * metadata, not from arbitrary surrounding HTML. This prevents a
-         * page containing the text "360" somewhere else from incorrectly
-         * turning a 720p/1080p source into "360p".
+         * Adaptive master manifests remain separate so alternate audio
+         * tracks and automatic quality switching are not lost.
          */
         val bestByQuality =
             linkedMapOf<Int, MediaCandidate>()
+
+        val adaptiveMasters =
+            linkedMapOf<String, MediaCandidate>()
 
         val unknownSources =
             linkedMapOf<String, MediaCandidate>()
@@ -778,9 +778,12 @@ override suspend fun loadLinks(
         expanded.values.forEach { candidate ->
 
             if (
-                isAdvertisingUrl(candidate.url) ||
-                isIgnoredPlaybackHost(candidate.url)
+                candidate.isAdaptiveMaster
             ) {
+                adaptiveMasters.putIfAbsent(
+                    candidate.url,
+                    candidate
+                )
                 return@forEach
             }
 
@@ -789,33 +792,42 @@ override suspend fun loadLinks(
                     candidate.quality
                 )
 
-            if (q > 0) {
+            when {
 
-                val old =
-                    bestByQuality[q]
+                q > 0 -> {
 
-                if (
-                    old == null ||
-                    betterMediaCandidate(
-                        candidate,
-                        old
-                    )
-                ) {
-                    bestByQuality[q] = candidate
+                    val old =
+                        bestByQuality[q]
+
+                    if (
+                        old == null ||
+                        betterMediaCandidate(
+                            candidate,
+                            old
+                        )
+                    ) {
+                        bestByQuality[q] =
+                            candidate
+                    }
                 }
 
-            } else {
+                else -> {
 
-                unknownSources.putIfAbsent(
-                    candidate.url,
-                    candidate
-                )
+                    unknownSources.putIfAbsent(
+                        candidate.url,
+                        candidate
+                    )
+                }
             }
         }
 
+        /*
+         * Highest quality first, then adaptive master, then unknown.
+         */
         val sorted =
             (
                 bestByQuality.values +
+                    adaptiveMasters.values +
                     unknownSources.values
                 )
                 .sortedWith(
@@ -823,6 +835,8 @@ override suspend fun loadLinks(
                         qualityValue(
                             it.quality
                         )
+                    }.thenByDescending {
+                        it.isAdaptiveMaster
                     }.thenBy {
                         it.url.length
                     }
@@ -836,6 +850,7 @@ override suspend fun loadLinks(
         }
 
         sorted.forEach { candidate ->
+
             emitMediaLink(
                 candidate = candidate,
                 callback = callback
@@ -853,12 +868,13 @@ override suspend fun loadLinks(
     private data class MediaCandidate(
         val url: String,
         val quality: Int,
-        val referer: String
+        val referer: String,
+        val isAdaptiveMaster: Boolean = false
     )
 
     /*
      * ============================================================
-     * PLAYBACK MEDIA EXTRACTION
+     * PLAYBACK CRAWLER HELPERS
      * ============================================================
      */
     private fun extractMediaCandidates(
@@ -874,7 +890,6 @@ override suspend fun loadLinks(
             raw: String?,
             qualityHint: String? = null
         ) {
-
             if (raw.isNullOrBlank()) {
                 return
             }
@@ -882,10 +897,7 @@ override suspend fun loadLinks(
             val cleanedRaw =
                 raw
                     .trim()
-                    .replace(
-                        "\\/",
-                        "/"
-                    )
+                    .replace("\\/", "/")
                     .replace(
                         "\\u0026",
                         "&"
@@ -906,26 +918,21 @@ override suspend fun loadLinks(
                     absolute
                 )
 
-            if (!isHttpUrl(cleaned)) {
-                return
-            }
-
-            if (isIgnoredPlaybackHost(cleaned)) {
-                return
-            }
-
-            if (isAdvertisingUrl(cleaned)) {
-                return
-            }
-
-            if (!isPlayableMedia(cleaned)) {
+            if (
+                !isHttpUrl(cleaned) ||
+                isIgnoredPlaybackHost(cleaned) ||
+                isAdvertisingUrl(cleaned) ||
+                !isPlayableMedia(cleaned)
+            ) {
                 return
             }
 
             /*
-             * ONLY source-local information is used to determine quality.
-             * We never inspect the whole surrounding HTML for "360", "720",
-             * etc., because unrelated page text can create false labels.
+             * IMPORTANT:
+             * Quality comes ONLY from the local source hint + URL.
+             * We do not pass the whole surrounding HTML into
+             * detectQuality(), preventing unrelated "360" text from
+             * mislabelling a 1080p source.
              */
             val quality =
                 detectQuality(
@@ -933,11 +940,18 @@ override suspend fun loadLinks(
                     cleaned
                 )
 
+            val adaptive =
+                isHlsUrl(cleaned) &&
+                    looksLikeMasterPlaylistUrl(
+                        cleaned
+                    )
+
             val candidate =
                 MediaCandidate(
                     url = cleaned,
                     quality = quality,
-                    referer = baseUrl
+                    referer = baseUrl,
+                    isAdaptiveMaster = adaptive
                 )
 
             val old =
@@ -945,10 +959,11 @@ override suspend fun loadLinks(
 
             if (
                 old == null ||
-                betterMediaCandidate(
-                    candidate,
-                    old
-                )
+                quality > old.quality ||
+                (
+                    candidate.isAdaptiveMaster &&
+                        !old.isAdaptiveMaster
+                    )
             ) {
                 result[cleaned] =
                     candidate
@@ -956,9 +971,7 @@ override suspend fun loadLinks(
         }
 
         /*
-         * ------------------------------------------------------------
-         * HTML5 <video>
-         * ------------------------------------------------------------
+         * Video elements
          */
         document
             .select(
@@ -975,10 +988,10 @@ override suspend fun loadLinks(
                             "data-quality"
                         ),
                         video.attr(
-                            "data-resolution"
+                            "data-res"
                         ),
                         video.attr(
-                            "data-res"
+                            "data-resolution"
                         ),
                         video.attr(
                             "resolution"
@@ -995,38 +1008,28 @@ override suspend fun loadLinks(
                     )
 
                 add(
-                    video.attr(
-                        "src"
-                    ),
+                    video.attr("src"),
                     hint
                 )
 
                 add(
-                    video.attr(
-                        "data-src"
-                    ),
+                    video.attr("data-src"),
                     hint
                 )
 
                 add(
-                    video.attr(
-                        "data-file"
-                    ),
+                    video.attr("data-file"),
                     hint
                 )
 
                 add(
-                    video.attr(
-                        "data-video"
-                    ),
+                    video.attr("data-video"),
                     hint
                 )
             }
 
         /*
-         * ------------------------------------------------------------
-         * HTML5 <source>
-         * ------------------------------------------------------------
+         * Source elements
          */
         document
             .select(
@@ -1036,75 +1039,45 @@ override suspend fun loadLinks(
 
                 val hint =
                     firstNonBlank(
-                        source.attr(
-                            "label"
-                        ),
-                        source.attr(
-                            "res"
-                        ),
-                        source.attr(
-                            "resolution"
-                        ),
-                        source.attr(
-                            "data-quality"
-                        ),
-                        source.attr(
-                            "data-resolution"
-                        ),
-                        source.attr(
-                            "data-res"
-                        ),
-                        source.attr(
-                            "data-label"
-                        ),
-                        source.attr(
-                            "size"
-                        ),
-                        source.attr(
-                            "title"
-                        )
+                        source.attr("label"),
+                        source.attr("res"),
+                        source.attr("resolution"),
+                        source.attr("data-quality"),
+                        source.attr("data-res"),
+                        source.attr("data-resolution"),
+                        source.attr("data-label"),
+                        source.attr("size"),
+                        source.attr("title")
                     )
 
                 add(
-                    source.attr(
-                        "src"
-                    ),
+                    source.attr("src"),
                     hint
                 )
 
                 add(
-                    source.attr(
-                        "data-src"
-                    ),
+                    source.attr("data-src"),
                     hint
                 )
 
                 add(
-                    source.attr(
-                        "data-file"
-                    ),
+                    source.attr("data-file"),
                     hint
                 )
 
                 add(
-                    source.attr(
-                        "data-video"
-                    ),
+                    source.attr("data-video"),
                     hint
                 )
 
                 add(
-                    source.attr(
-                        "data-url"
-                    ),
+                    source.attr("data-url"),
                     hint
                 )
             }
 
         /*
-         * ------------------------------------------------------------
-         * data-* media attributes
-         * ------------------------------------------------------------
+         * Data attributes
          */
         document
             .select(
@@ -1123,13 +1096,19 @@ override suspend fun loadLinks(
                 val hint =
                     firstNonBlank(
                         element.attr(
+                            "label"
+                        ),
+                        element.attr(
+                            "title"
+                        ),
+                        element.attr(
                             "data-quality"
                         ),
                         element.attr(
-                            "data-resolution"
+                            "data-res"
                         ),
                         element.attr(
-                            "data-res"
+                            "data-resolution"
                         ),
                         element.attr(
                             "resolution"
@@ -1138,13 +1117,10 @@ override suspend fun loadLinks(
                             "res"
                         ),
                         element.attr(
-                            "label"
-                        ),
-                        element.attr(
-                            "title"
-                        ),
-                        element.attr(
                             "size"
+                        ),
+                        element.attr(
+                            "data-label"
                         )
                     )
 
@@ -1213,9 +1189,7 @@ override suspend fun loadLinks(
             }
 
         /*
-         * ------------------------------------------------------------
-         * Direct links / iframe / embed
-         * ------------------------------------------------------------
+         * Explicit links / iframes that directly contain playable URLs.
          */
         document
             .select(
@@ -1250,13 +1224,16 @@ override suspend fun loadLinks(
                             "label"
                         ),
                         element.attr(
+                            "title"
+                        ),
+                        element.attr(
                             "data-quality"
                         ),
                         element.attr(
-                            "data-resolution"
+                            "data-res"
                         ),
                         element.attr(
-                            "data-res"
+                            "data-resolution"
                         ),
                         element.attr(
                             "resolution"
@@ -1266,7 +1243,15 @@ override suspend fun loadLinks(
                         ),
                         element.attr(
                             "size"
-                        )
+                        ),
+                        element.text().trim()
+                            .takeIf {
+                                Regex(
+                                    """(?i)(?:2160|1440|1080|720|480|360)\s*p?"""
+                                ).containsMatchIn(
+                                    it
+                                )
+                            }
                     )
 
                 add(
@@ -1276,9 +1261,7 @@ override suspend fun loadLinks(
             }
 
         /*
-         * ------------------------------------------------------------
-         * Absolute media URLs in JavaScript / JSON
-         * ------------------------------------------------------------
+         * Absolute media URLs in page source / JSON / inline JS.
          */
         val mediaRegex =
             Regex(
@@ -1289,12 +1272,29 @@ override suspend fun loadLinks(
             .findAll(html)
             .forEach { match ->
 
+                val url =
+                    match.value
+                        .replace(
+                            "\\/",
+                            "/"
+                        )
+                        .replace(
+                            "\\u0026",
+                            "&"
+                        )
+
+                /*
+                 * Derive quality only from the URL itself here.
+                 */
                 add(
-                    match.value,
+                    url,
                     null
                 )
             }
 
+        /*
+         * Quoted URLs.
+         */
         val quotedMediaRegex =
             Regex(
                 """(?i)[\"']([^\"']+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\"']*)?)[\"']"""
@@ -1305,7 +1305,15 @@ override suspend fun loadLinks(
             .forEach { match ->
 
                 add(
-                    match.groupValues[1],
+                    match.groupValues[1]
+                        .replace(
+                            "\\/",
+                            "/"
+                        )
+                        .replace(
+                            "\\u0026",
+                            "&"
+                        ),
                     null
                 )
             }
@@ -1313,233 +1321,10 @@ override suspend fun loadLinks(
         return result.values.toList()
     }
 
-    /*
-     * ============================================================
-     * HLS MASTER PLAYLIST EXPANSION
-     * ============================================================
-     */
-    private suspend fun expandHlsVariants(
-        master: MediaCandidate
-    ): List<MediaCandidate> {
-
-        val result =
-            linkedMapOf<String, MediaCandidate>()
-
-        val response =
-            runCatching {
-
-                app.get(
-                    master.url,
-                    headers =
-                        pageHeaders +
-                            (
-                                "Referer" to
-                                    master.referer
-                                )
-                )
-
-            }.getOrNull()
-                ?: return emptyList()
-
-        val body =
-            response.text
-
-        if (
-            !body.contains(
-                "#EXT-X-STREAM-INF",
-                ignoreCase = true
-            )
-        ) {
-            return emptyList()
-        }
-
-        val lines =
-            body.lines()
-
-        for (index in lines.indices) {
-
-            val line =
-                lines[index].trim()
-
-            if (
-                !line.startsWith(
-                    "#EXT-X-STREAM-INF",
-                    ignoreCase = true
-                )
-            ) {
-                continue
-            }
-
-            val resolutionMatch =
-                Regex(
-                    """(?i)RESOLUTION\s*=\s*(\d+)\s*x\s*(\d+)"""
-                ).find(line)
-
-            val bandwidth =
-                Regex(
-                    """(?i)BANDWIDTH\s*=\s*(\d+)"""
-                )
-                    .find(line)
-                    ?.groupValues
-                    ?.getOrNull(1)
-                    ?.toLongOrNull()
-
-            val resolution =
-                resolutionMatch?.let {
-                    val width =
-                        it.groupValues[1]
-                            .toIntOrNull()
-
-                    val height =
-                        it.groupValues[2]
-                            .toIntOrNull()
-
-                    if (
-                        width != null &&
-                        height != null
-                    ) {
-                        Pair(
-                            width,
-                            height
-                        )
-                    } else {
-                        null
-                    }
-                }
-
-            var variantUrl: String? =
-                null
-
-            var nextIndex =
-                index + 1
-
-            while (
-                nextIndex < lines.size
-            ) {
-
-                val next =
-                    lines[nextIndex]
-                        .trim()
-
-                if (next.isBlank()) {
-                    nextIndex++
-                    continue
-                }
-
-                if (
-                    next.startsWith("#")
-                ) {
-                    nextIndex++
-                    continue
-                }
-
-                variantUrl =
-                    next
-
-                break
-            }
-
-            if (variantUrl.isNullOrBlank()) {
-                continue
-            }
-
-            val absolute =
-                absoluteUrlLocal(
-                    variantUrl,
-                    master.url
-                )
-
-            if (
-                !isHttpUrl(
-                    absolute
-                )
-            ) {
-                continue
-            }
-
-            if (
-                isAdvertisingUrl(
-                    absolute
-                )
-            ) {
-                continue
-            }
-
-            val quality =
-                when {
-
-                    resolution != null &&
-                        resolution.second >= 2160 ->
-                        Qualities.P2160.value
-
-                    resolution != null &&
-                        resolution.second >= 1440 ->
-                        Qualities.P1440.value
-
-                    resolution != null &&
-                        resolution.second >= 1080 ->
-                        Qualities.P1080.value
-
-                    resolution != null &&
-                        resolution.second >= 720 ->
-                        Qualities.P720.value
-
-                    resolution != null &&
-                        resolution.second >= 480 ->
-                        Qualities.P480.value
-
-                    resolution != null &&
-                        resolution.second >= 360 ->
-                        Qualities.P360.value
-
-                    else ->
-                        detectQuality(
-                            null,
-                            absolute
-                        )
-                }
-
-            /*
-             * The bitrate is not used as the displayed quality. It only
-             * helps when several variants accidentally share the same height.
-             */
-            val candidate =
-                MediaCandidate(
-                    url = absolute,
-                    quality = quality,
-                    referer = master.referer
-                )
-
-            val old =
-                result[absolute]
-
-            if (
-                old == null ||
-                betterMediaCandidate(
-                    candidate,
-                    old
-                )
-            ) {
-                result[absolute] =
-                    candidate
-            }
-
-            @Suppress("UNUSED_VARIABLE")
-            val ignoredBandwidth =
-                bandwidth
-        }
-
-        return result.values.toList()
-    }
-
-    /*
-     * ============================================================
-     * SEARCH RESPONSE
-     * ============================================================
-     */
-private fun firstNonBlank(
+    private fun firstNonBlank(
         vararg values: String
     ): String? {
+
         return values
             .firstOrNull {
                 it.isNotBlank()
@@ -1550,228 +1335,558 @@ private fun firstNonBlank(
             }
     }
 
+    /*
+     * ============================================================
+     * HLS VARIANT EXPANSION
+     * ============================================================
+     */
+    private suspend fun expandHlsVariants(
+        master: MediaCandidate
+    ): List<MediaCandidate> {
+
+        val manifest =
+            runCatching {
+                app.get(
+                    master.url,
+                    headers =
+                        pageHeaders +
+                            (
+                                "Referer" to
+                                    master.referer
+                                )
+                ).text
+            }.getOrNull()
+                ?: return emptyList()
+
+        if (
+            !manifest.contains(
+                "#EXT-X-STREAM-INF",
+                ignoreCase = true
+            )
+        ) {
+            return emptyList()
+        }
+
+        val lines =
+            manifest
+                .lines()
+
+        val result =
+            linkedMapOf<String, MediaCandidate>()
+
+        var pendingWidth =
+            0
+
+        var pendingHeight =
+            0
+
+        var pendingBandwidth =
+            0L
+
+        for (index in lines.indices) {
+
+            val line =
+                lines[index].trim()
+
+            if (
+                line.startsWith(
+                    "#EXT-X-STREAM-INF",
+                    ignoreCase = true
+                )
+            ) {
+
+                val resolution =
+                    Regex(
+                        """(?i)\bRESOLUTION=(\d+)x(\d+)"""
+                    ).find(
+                        line
+                    )
+
+                pendingWidth =
+                    resolution
+                        ?.groupValues
+                        ?.getOrNull(
+                            1
+                        )
+                        ?.toIntOrNull()
+                        ?: 0
+
+                pendingHeight =
+                    resolution
+                        ?.groupValues
+                        ?.getOrNull(
+                            2
+                        )
+                        ?.toIntOrNull()
+                        ?: 0
+
+                pendingBandwidth =
+                    Regex(
+                        """(?i)\bBANDWIDTH=(\d+)"""
+                    ).find(
+                        line
+                    )
+                        ?.groupValues
+                        ?.getOrNull(
+                            1
+                        )
+                        ?.toLongOrNull()
+                        ?: 0L
+
+                continue
+            }
+
+            if (
+                line.isBlank() ||
+                line.startsWith("#")
+            ) {
+                continue
+            }
+
+            if (
+                pendingHeight <= 0 &&
+                    pendingWidth <= 0
+            ) {
+                continue
+            }
+
+            val variantUrl =
+                absoluteUrlLocal(
+                    line,
+                    master.url
+                )
+
+            if (
+                !isHttpUrl(
+                    variantUrl
+                ) ||
+                !isPlayableMedia(
+                    variantUrl
+                ) ||
+                isAdvertisingUrl(
+                    variantUrl
+                )
+            ) {
+                pendingWidth = 0
+                pendingHeight = 0
+                pendingBandwidth = 0L
+                continue
+            }
+
+            val quality =
+                when {
+
+                    pendingHeight >= 2160 ->
+                        Qualities.P2160.value
+
+                    pendingHeight >= 1440 ->
+                        Qualities.P1440.value
+
+                    pendingHeight >= 1080 ->
+                        Qualities.P1080.value
+
+                    pendingHeight >= 720 ->
+                        Qualities.P720.value
+
+                    pendingHeight >= 480 ->
+                        Qualities.P480.value
+
+                    pendingHeight >= 360 ->
+                        Qualities.P360.value
+
+                    else ->
+                        Qualities.Unknown.value
+                }
+
+            val candidate =
+                MediaCandidate(
+                    url =
+                        cleanUrlLocal(
+                            variantUrl
+                        ),
+                    quality = quality,
+                    referer =
+                        master.referer,
+                    isAdaptiveMaster = false
+                )
+
+            result.putIfAbsent(
+                candidate.url,
+                candidate
+            )
+
+            pendingWidth = 0
+            pendingHeight = 0
+            pendingBandwidth = 0L
+        }
+
+        /*
+         * Use bandwidth only as a stable deterministic tie-breaker
+         * internally; the CloudStream quality remains RESOLUTION-based.
+         */
+        @Suppress("UNUSED_VARIABLE")
+        val ignoredBandwidth =
+            pendingBandwidth
+
+        return result.values.toList()
+    }
+
+    private fun isHlsUrl(
+        url: String
+    ): Boolean {
+        return url
+            .lowercase(
+                Locale.ROOT
+            )
+            .contains(
+                ".m3u8"
+            )
+    }
+
+    private fun looksLikeMasterPlaylistUrl(
+        url: String
+    ): Boolean {
+
+        val lower =
+            url.lowercase(
+                Locale.ROOT
+            )
+
+        return lower.contains(
+            "master"
+        ) ||
+            lower.contains(
+                "playlist"
+            ) ||
+            lower.contains(
+                "manifest"
+            ) ||
+            lower.contains(
+                "stream"
+            ) ||
+            lower.contains(
+                "index"
+            ) ||
+            lower.contains(
+                "hls"
+            )
+    }
+
     private fun extractPlaybackPageCandidates(
         document: Document,
         baseUrl: String
     ): List<String> {
 
-        val result = linkedSetOf<String>()
+        val result =
+            linkedSetOf<String>()
 
-        document.select(
-            "a[href], iframe[src], embed[src], " +
-                "[data-src], [data-url]"
-        ).forEach { element ->
-
-            val raw = when {
-                element.hasAttr("href") -> element.attr("href")
-                element.hasAttr("src") -> element.attr("src")
-                element.hasAttr("data-src") -> element.attr("data-src")
-                element.hasAttr("data-url") -> element.attr("data-url")
-                else -> ""
-            }.trim()
-
-            if (raw.isBlank()) return@forEach
-
-            val absolute = absoluteUrlLocal(
-                raw,
-                baseUrl
+        document
+            .select(
+                "a[href], iframe[src], embed[src], " +
+                    "[data-src], [data-url]"
             )
+            .forEach { element ->
 
-            if (!isHttpUrl(absolute)) return@forEach
-            if (isPlayableMedia(absolute)) return@forEach
-            if (isIgnoredPlaybackHost(absolute)) return@forEach
-            if (isAdvertisingUrl(absolute)) return@forEach
+                val raw =
+                    when {
 
-            val lower = absolute.lowercase(Locale.ROOT)
-            val text = (
-                element.text() + " " +
-                    element.attr("title") + " " +
-                    element.attr("class") + " " +
-                    element.attr("id") + " " +
-                    element.attr("data-label")
-                ).lowercase(Locale.ROOT)
+                        element.hasAttr(
+                            "href"
+                        ) ->
+                            element.attr(
+                                "href"
+                            )
 
-            val looksLikePlayer =
-                lower.contains("watch") ||
-                    lower.contains("player") ||
-                    lower.contains("stream") ||
-                    lower.contains("play") ||
-                    lower.contains("embed") ||
-                    lower.contains("video") ||
-                    lower.contains("server") ||
-                    lower.contains("source") ||
-                    text.contains("watch") ||
-                    text.contains("player") ||
-                    text.contains("play") ||
-                    text.contains("stream") ||
-                    text.contains("server") ||
-                    text.contains("source")
+                        element.hasAttr(
+                            "src"
+                        ) ->
+                            element.attr(
+                                "src"
+                            )
 
-            if (looksLikePlayer) {
-                result.add(absolute)
+                        element.hasAttr(
+                            "data-src"
+                        ) ->
+                            element.attr(
+                                "data-src"
+                            )
+
+                        element.hasAttr(
+                            "data-url"
+                        ) ->
+                            element.attr(
+                                "data-url"
+                            )
+
+                        else ->
+                            ""
+                    }.trim()
+
+                if (raw.isBlank()) {
+                    return@forEach
+                }
+
+                val absolute =
+                    absoluteUrlLocal(
+                        raw,
+                        baseUrl
+                    )
+
+                if (
+                    !isHttpUrl(
+                        absolute
+                    ) ||
+                    isPlayableMedia(
+                        absolute
+                    ) ||
+                    isIgnoredPlaybackHost(
+                        absolute
+                    ) ||
+                    isAdvertisingUrl(
+                        absolute
+                    )
+                ) {
+                    return@forEach
+                }
+
+                val lower =
+                    absolute.lowercase(
+                        Locale.ROOT
+                    )
+
+                val text =
+                    (
+                        element.text() + " " +
+                            element.attr("title") + " " +
+                            element.attr("class") + " " +
+                            element.attr("id") + " " +
+                            element.attr("data-label")
+                        )
+                        .lowercase(
+                            Locale.ROOT
+                        )
+
+                val looksLikePlayer =
+                    lower.contains(
+                        "watch"
+                    ) ||
+                        lower.contains(
+                            "player"
+                        ) ||
+                        lower.contains(
+                            "stream"
+                        ) ||
+                        lower.contains(
+                            "play"
+                        ) ||
+                        lower.contains(
+                            "embed"
+                        ) ||
+                        lower.contains(
+                            "video"
+                        ) ||
+                        lower.contains(
+                            "server"
+                        ) ||
+                        lower.contains(
+                            "source"
+                        ) ||
+                        text.contains(
+                            "watch"
+                        ) ||
+                        text.contains(
+                            "player"
+                        ) ||
+                        text.contains(
+                            "play"
+                        ) ||
+                        text.contains(
+                            "stream"
+                        ) ||
+                        text.contains(
+                            "server"
+                        ) ||
+                        text.contains(
+                            "source"
+                        )
+
+                if (looksLikePlayer) {
+                    result.add(
+                        absolute
+                    )
+                }
             }
-        }
 
         return result
-            .take(MAX_NESTED_PAGES)
+            .take(
+                MAX_NESTED_PAGES
+            )
     }
 
     private fun isPlayableMedia(
         url: String
     ): Boolean {
 
-        val lower = url.lowercase(Locale.ROOT)
+        val lower =
+            url.lowercase(
+                Locale.ROOT
+            )
 
-        return lower.contains(".m3u8") ||
-            lower.contains(".mpd") ||
-            lower.contains(".mp4") ||
-            lower.contains(".mkv") ||
-            lower.contains(".webm") ||
-            lower.contains(".mov") ||
-            lower.contains(".m4v") ||
-            lower.contains(".avi") ||
-            lower.contains(".flv") ||
-            lower.contains(".ts")
+        return lower.contains(
+            ".m3u8"
+        ) ||
+            lower.contains(
+                ".mpd"
+            ) ||
+            lower.contains(
+                ".mp4"
+            ) ||
+            lower.contains(
+                ".mkv"
+            ) ||
+            lower.contains(
+                ".webm"
+            ) ||
+            lower.contains(
+                ".mov"
+            ) ||
+            lower.contains(
+                ".m4v"
+            ) ||
+            lower.contains(
+                ".avi"
+            ) ||
+            lower.contains(
+                ".flv"
+            ) ||
+            lower.contains(
+                ".ts"
+            )
     }
 
     private fun isHttpUrl(
         url: String
     ): Boolean {
-        return url.startsWith("http://", true) ||
-            url.startsWith("https://", true)
+        return url.startsWith(
+            "http://",
+            true
+        ) ||
+            url.startsWith(
+                "https://",
+                true
+            )
     }
 
     /*
-     * Known ad / tracker destinations are ignored.
-     * This keeps advertising media from becoming CloudStream sources.
+     * ============================================================
+     * AD / TRAILER FILTERS
+     * ============================================================
      */
     private fun isAdvertisingUrl(
         url: String
     ): Boolean {
 
-        val lower = url.lowercase(Locale.ROOT)
+        val lower =
+            url.lowercase(
+                Locale.ROOT
+            )
 
-        val blockedHosts = listOf(
-            "doubleclick.net",
-            "googlesyndication.com",
-            "googleadservices.com",
-            "adservice.google.com",
-            "adsafeprotected.com",
-            "adnxs.com",
-            "adsrvr.org",
-            "adskeeper.com",
-            "popads.net",
-            "propellerads.com",
-            "exoclick.com",
-            "juicyads.com",
-            "trafficjunky.com",
-            "outbrain.com",
-            "taboola.com",
-            "criteo.com",
-            "prebid.org",
-            "adsterra.com",
-            "onclickads.net",
-            "onclicka.com",
-            "ad-maven.com"
-        )
+        val blockedHosts =
+            listOf(
+                "doubleclick.net",
+                "googlesyndication.com",
+                "googleadservices.com",
+                "adservice.google.com",
+                "adsafeprotected.com",
+                "adnxs.com",
+                "adsrvr.org",
+                "adskeeper.com",
+                "popads.net",
+                "propellerads.com",
+                "exoclick.com",
+                "juicyads.com",
+                "trafficjunky.com",
+                "outbrain.com",
+                "taboola.com",
+                "criteo.com",
+                "prebid.org",
+                "adsterra.com",
+                "onclickads.net",
+                "onclicka.com",
+                "ad-maven.com"
+            )
 
-        if (blockedHosts.any { host -> lower.contains(host) }) {
+        if (
+            blockedHosts.any { host ->
+                lower.contains(host)
+            }
+        ) {
             return true
         }
 
-        val adPatterns = listOf(
-            "preroll",
-            "pre-roll",
-            "midroll",
-            "mid-roll",
-            "postroll",
-            "post-roll",
-            "advertisement",
-            "advertising",
-            "/ads/",
-            "-ads-",
-            "_ads_",
-            "?ad=",
-            "&ad=",
-            "adtype=",
-            "vast=",
-            "vpaid=",
-            "adtag=",
-            "adserver=",
-            "adurl=",
-            "adsource=",
-            "bannerad",
-            "banner_ad"
-        )
+        val adPatterns =
+            listOf(
+                "preroll",
+                "pre-roll",
+                "midroll",
+                "mid-roll",
+                "postroll",
+                "post-roll",
+                "advertisement",
+                "advertising",
+                "/ads/",
+                "-ads-",
+                "_ads_",
+                "?ad=",
+                "&ad=",
+                "adtype=",
+                "vast=",
+                "vpaid=",
+                "adtag=",
+                "adserver=",
+                "adurl=",
+                "adsource=",
+                "bannerad",
+                "banner_ad"
+            )
 
         return adPatterns.any { pattern ->
             lower.contains(pattern)
         }
     }
 
-    /*
-     * Reject a playable-looking URL when the surrounding HTML explicitly
-     * identifies it as advertising/trailer material. This catches ad media
-     * even when the ad CDN hostname itself is not in the host deny-list.
-     */
-    private fun isAdvertisingContext(
-        hint: String?,
-        contextText: String?
-    ): Boolean {
-
-        val context = (
-            (hint ?: "") + " " + (contextText ?: "")
-            ).lowercase(Locale.ROOT)
-
-        val patterns = listOf(
-            "preroll",
-            "pre-roll",
-            "midroll",
-            "mid-roll",
-            "postroll",
-            "post-roll",
-            "advertisement",
-            "advertising",
-            "adserver",
-            "adtag",
-            "vast",
-            "vpaid",
-            "bannerad",
-            "banner_ad",
-            "\"ad\":",
-            "\"adurl\":",
-            "trailer",
-            "youtube.com",
-            "youtu.be"
-        )
-
-        return patterns.any { pattern ->
-            context.contains(pattern)
-        }
-    }
-
-    /* YouTube is used by the site's trailer widget and is not a movie source. */
     private fun isIgnoredPlaybackHost(
         url: String
     ): Boolean {
 
-        val lower = url.lowercase(Locale.ROOT)
+        val lower =
+            url.lowercase(
+                Locale.ROOT
+            )
 
-        return lower.contains("youtube.com") ||
-            lower.contains("youtu.be") ||
-            lower.contains("youtube-nocookie.com")
+        return lower.contains(
+            "youtube.com"
+        ) ||
+            lower.contains(
+                "youtu.be"
+            ) ||
+            lower.contains(
+                "youtube-nocookie.com"
+            )
     }
 
-    
-private fun detectQuality(
+    /*
+     * ============================================================
+     * QUALITY DETECTION
+     * ============================================================
+     *
+     * Deliberately only uses source-local data.
+     */
+    private fun detectQuality(
         hint: String?,
         url: String
     ): Int {
 
-        /*
-         * Resolution must come from source-local metadata or the URL itself.
-         * Do NOT inspect arbitrary surrounding page HTML.
-         */
         val source =
             (
                 (hint ?: "") +
@@ -1786,71 +1901,94 @@ private fun detectQuality(
 
             Regex(
                 """\b2160(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b3840x2160\b"""
-                ).containsMatchIn(source) ||
+                ).containsMatchIn(
+                    source
+                ) ||
                 "4k" in source ||
                 "uhd" in source ->
-
                 Qualities.P2160.value
 
             Regex(
                 """\b1440(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b2560x1440\b"""
-                ).containsMatchIn(source) ||
+                ).containsMatchIn(
+                    source
+                ) ||
                 "2k" in source ->
-
                 Qualities.P1440.value
 
             Regex(
                 """\b1080(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b1920x1080\b"""
-                ).containsMatchIn(source) ||
+                ).containsMatchIn(
+                    source
+                ) ||
                 "fullhd" in source ||
                 "full-hd" in source ||
-                "fhd" in source ->
-
+                Regex(
+                    """\bfhd\b"""
+                ).containsMatchIn(
+                    source
+                ) ->
                 Qualities.P1080.value
 
             Regex(
                 """\b720(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b1280x720\b"""
-                ).containsMatchIn(source) ||
+                ).containsMatchIn(
+                    source
+                ) ||
                 Regex(
-                    """\b720x\d+\b"""
-                ).containsMatchIn(source) ->
-
+                    """\b720i\b"""
+                ).containsMatchIn(
+                    source
+                ) ->
                 Qualities.P720.value
 
             Regex(
                 """\b480(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b854x480\b"""
-                ).containsMatchIn(source) ||
+                ).containsMatchIn(
+                    source
+                ) ||
                 Regex(
-                    """\b480x\d+\b"""
-                ).containsMatchIn(source) ->
-
+                    """\b640x480\b"""
+                ).containsMatchIn(
+                    source
+                ) ->
                 Qualities.P480.value
 
             Regex(
                 """\b360(?:p)?\b"""
-            ).containsMatchIn(source) ||
+            ).containsMatchIn(
+                source
+            ) ||
                 Regex(
                     """\b640x360\b"""
-                ).containsMatchIn(source) ||
-                Regex(
-                    """\b360x\d+\b"""
-                ).containsMatchIn(source) ->
-
+                ).containsMatchIn(
+                    source
+                ) ->
                 Qualities.P360.value
 
             else ->
@@ -1858,17 +1996,38 @@ private fun detectQuality(
         }
     }
 
-private fun qualityValue(
+    private fun qualityValue(
         quality: Int
     ): Int {
+
         return when {
-            quality >= Qualities.P2160.value -> 2160
-            quality >= Qualities.P1440.value -> 1440
-            quality >= Qualities.P1080.value -> 1080
-            quality >= Qualities.P720.value -> 720
-            quality >= Qualities.P480.value -> 480
-            quality >= Qualities.P360.value -> 360
-            else -> 0
+
+            quality >=
+                Qualities.P2160.value ->
+                2160
+
+            quality >=
+                Qualities.P1440.value ->
+                1440
+
+            quality >=
+                Qualities.P1080.value ->
+                1080
+
+            quality >=
+                Qualities.P720.value ->
+                720
+
+            quality >=
+                Qualities.P480.value ->
+                480
+
+            quality >=
+                Qualities.P360.value ->
+                360
+
+            else ->
+                0
         }
     }
 
@@ -1877,76 +2036,157 @@ private fun qualityValue(
         b: MediaCandidate
     ): Boolean {
 
-        val aq = qualityValue(a.quality)
-        val bq = qualityValue(b.quality)
+        val aq =
+            qualityValue(
+                a.quality
+            )
+
+        val bq =
+            qualityValue(
+                b.quality
+            )
 
         if (aq != bq) {
             return aq > bq
         }
 
-        val aLower = a.url.lowercase(Locale.ROOT)
-        val bLower = b.url.lowercase(Locale.ROOT)
+        /*
+         * Prefer adaptive master HLS when quality itself is tied.
+         */
+        if (
+            a.isAdaptiveMaster !=
+                b.isAdaptiveMaster
+        ) {
+            return a.isAdaptiveMaster
+        }
+
+        val aLower =
+            a.url.lowercase(
+                Locale.ROOT
+            )
+
+        val bLower =
+            b.url.lowercase(
+                Locale.ROOT
+            )
 
         val aDirect =
-            aLower.contains(".mp4") ||
-                aLower.contains(".webm") ||
-                aLower.contains(".mkv")
+            aLower.contains(
+                ".mp4"
+            ) ||
+                aLower.contains(
+                    ".webm"
+                ) ||
+                aLower.contains(
+                    ".mkv"
+                )
 
         val bDirect =
-            bLower.contains(".mp4") ||
-                bLower.contains(".webm") ||
-                bLower.contains(".mkv")
+            bLower.contains(
+                ".mp4"
+            ) ||
+                bLower.contains(
+                    ".webm"
+                ) ||
+                bLower.contains(
+                    ".mkv"
+                )
 
         return aDirect && !bDirect
     }
 
+    /*
+     * ============================================================
+     * EMIT CLOUDSTREAM SOURCE
+     * ============================================================
+     */
     private suspend fun emitMediaLink(
         candidate: MediaCandidate,
         callback: (ExtractorLink) -> Unit
     ) {
 
-        val mediaUrl = cleanUrlLocal(candidate.url)
-        if (!isPlayableMedia(mediaUrl)) return
-        if (isAdvertisingUrl(mediaUrl)) return
-        if (isIgnoredPlaybackHost(mediaUrl)) return
+        val mediaUrl =
+            cleanUrlLocal(
+                candidate.url
+            )
 
-        val lower = mediaUrl.lowercase(Locale.ROOT)
-
-        val type = when {
-            lower.contains(".m3u8") ->
-                ExtractorLinkType.M3U8
-
-            lower.contains(".mpd") ->
-                ExtractorLinkType.DASH
-
-            else ->
-                ExtractorLinkType.VIDEO
+        if (
+            !isPlayableMedia(
+                mediaUrl
+            )
+        ) {
+            return
         }
 
-        val quality = candidate.quality
-
-        val label = when {
-            quality >= Qualities.P2160.value ->
-                "Online Movies 2160p"
-
-            quality >= Qualities.P1440.value ->
-                "Online Movies 1440p"
-
-            quality >= Qualities.P1080.value ->
-                "Online Movies 1080p"
-
-            quality >= Qualities.P720.value ->
-                "Online Movies 720p"
-
-            quality >= Qualities.P480.value ->
-                "Online Movies 480p"
-
-            quality >= Qualities.P360.value ->
-                "Online Movies 360p"
-
-            else ->
-                "Online Movies Direct"
+        if (
+            isAdvertisingUrl(
+                mediaUrl
+            ) ||
+            isIgnoredPlaybackHost(
+                mediaUrl
+            )
+        ) {
+            return
         }
+
+        val lower =
+            mediaUrl.lowercase(
+                Locale.ROOT
+            )
+
+        val type =
+            when {
+
+                lower.contains(
+                    ".m3u8"
+                ) ->
+                    ExtractorLinkType.M3U8
+
+                lower.contains(
+                    ".mpd"
+                ) ->
+                    ExtractorLinkType.DASH
+
+                else ->
+                    ExtractorLinkType.VIDEO
+            }
+
+        val quality =
+            candidate.quality
+
+        val label =
+            when {
+
+                candidate.isAdaptiveMaster ->
+                    "Online Movies Adaptive"
+
+                quality >=
+                    Qualities.P2160.value ->
+                    "Online Movies 2160p"
+
+                quality >=
+                    Qualities.P1440.value ->
+                    "Online Movies 1440p"
+
+                quality >=
+                    Qualities.P1080.value ->
+                    "Online Movies 1080p"
+
+                quality >=
+                    Qualities.P720.value ->
+                    "Online Movies 720p"
+
+                quality >=
+                    Qualities.P480.value ->
+                    "Online Movies 480p"
+
+                quality >=
+                    Qualities.P360.value ->
+                    "Online Movies 360p"
+
+                else ->
+                    "Online Movies Direct"
+            }
 
         callback(
             newExtractorLink(
@@ -1955,8 +2195,22 @@ private fun qualityValue(
                 url = mediaUrl,
                 type = type
             ) {
-                this.referer = candidate.referer
-                this.quality = quality
+
+                this.referer =
+                    candidate.referer
+
+                /*
+                 * Keep the master HLS source adaptive rather than
+                 * forcing an artificial quality value.
+                 */
+                this.quality =
+                    if (
+                        candidate.isAdaptiveMaster
+                    ) {
+                        Qualities.Unknown.value
+                    } else {
+                        quality
+                    }
             }
         )
     }
