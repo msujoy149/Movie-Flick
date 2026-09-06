@@ -1664,23 +1664,26 @@ class CinePlexFTP : MainAPI() {
          * Keep the request as close as possible to the website's actual
          * same-origin HLS GET. In particular, do not add an Origin header.
          */
-        val headers = headersOverride ?: mapOf(
-            "User-Agent" to
-                "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-            "Accept" to "*/*",
-            "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache"
-        )
+        /*
+         * IMPORTANT: send the exact Cine Plex playlist URL as-is.
+         *
+         * The site itself exposes playable HLS URLs such as:
+         *   .../Episode.mp4/index-v1-a1.m3u8
+         *
+         * Do not invent/upgrade the URL and do not force browser headers here.
+         * Some Cine Plex HLS revisions return a bad HTTP status when a custom
+         * header profile is attached by the extractor.
+         */
+        val headers = headersOverride ?: emptyMap()
 
         callback(
             newExtractorLink(
                 source = name,
-                name = "Cine Plex TV HLS",
+                name = "Cine Plex TV HLS • Exact M3U8",
                 url = cleanMediaUrl,
                 type = ExtractorLinkType.M3U8
             ) {
-                this.referer = referer
+                this.referer = referer.takeIf { it.isNotBlank() } ?: ""
                 this.headers = headers
                 this.quality = quality
             }
