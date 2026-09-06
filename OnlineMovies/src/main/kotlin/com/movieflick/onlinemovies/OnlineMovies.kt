@@ -1,30 +1,10 @@
 package com.movieflick.onlinemovies
 
-import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SearchResponseList
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.mainPageOf
-import com.lagradost.cloudstream3.newEpisode
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
-import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.newSearchResponseList
-import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import com.lagradost.cloudstream3.newTvSeriesSearchResponse
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
-import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
@@ -64,10 +44,6 @@ class OnlineMovies : MainAPI() {
      * ============================================================
      * MOVIE GENRES
      * ============================================================
-     *
-     * The website has no single direct Movies archive in the
-     * structure supplied by the user. Therefore all requested
-     * genres are merged into the Movies section.
      */
     private val movieGenreUrls = listOf(
         "$mainUrl/drama/",
@@ -85,14 +61,14 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * HTTP HEADERS
+     * HEADERS
      * ============================================================
      */
     private val pageHeaders = mapOf(
         "User-Agent" to
             "Mozilla/5.0 (Linux; Android 13; Mobile) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) " +
-            "Chrome/131.0.0.0 Mobile Safari/537.36",
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/131.0.0.0 Mobile Safari/537.36",
 
         "Accept" to
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -100,16 +76,13 @@ class OnlineMovies : MainAPI() {
         "Accept-Language" to
             "en-US,en;q=0.9",
 
-        "Cache-Control" to
-            "no-cache",
-
-        "Pragma" to
-            "no-cache"
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache"
     )
 
     /*
      * ============================================================
-     * INTERNAL DATA MODEL
+     * DATA MODELS
      * ============================================================
      */
     private data class SiteItem(
@@ -121,7 +94,7 @@ class OnlineMovies : MainAPI() {
 
     private data class EpisodeInfo(
         val url: String,
-        val name: String?,
+        val name: String,
         val season: Int?,
         val episode: Int?
     )
@@ -138,120 +111,105 @@ class OnlineMovies : MainAPI() {
 
         val currentPage = page.coerceAtLeast(1)
 
-        return when (request.data) {
+        /*
+         * --------------------------------------------------------
+         * MOVIES = MERGED 11 GENRES
+         * --------------------------------------------------------
+         */
+        if (request.data == "onlinemovies://movies") {
 
-            /*
-             * ----------------------------------------------------
-             * COMBINED MOVIES
-             * ----------------------------------------------------
-             */
-            "onlinemovies://movies" -> {
+            val merged =
+                linkedMapOf<String, SiteItem>()
 
-                val merged =
-                    linkedMapOf<String, SiteItem>()
-
-                movieGenreUrls.forEach { genreUrl ->
-
-                    val pageUrl =
-                        buildPageUrl(
-                            genreUrl,
-                            currentPage
-                        )
-
-                    val document =
-                        getDocument(pageUrl)
-                            ?: return@forEach
-
-                    parseArchiveItems(
-                        document = document,
-                        sourceUrl = pageUrl,
-                        forceSeries = false
-                    ).forEach { item ->
-
-                        merged.putIfAbsent(
-                            item.url,
-                            item
-                        )
-                    }
-                }
-
-                val results =
-                    merged.values
-                        .take(MAX_ITEMS_PER_PAGE)
-                        .map { item ->
-                            item.toSearchResponse()
-                        }
-
-                return newHomePageResponse(
-                    request,
-                    results,
-                    currentPage < MAX_MOVIE_COMBINED_PAGES
-                )
-            }
-
-            /*
-             * ----------------------------------------------------
-             * LATEST MOVIES / TV SHOW
-             * ----------------------------------------------------
-             */
-            else -> {
+            movieGenreUrls.forEach { genreUrl ->
 
                 val url =
                     buildPageUrl(
-                        request.data,
+                        genreUrl,
                         currentPage
                     )
 
                 val document =
                     getDocument(url)
-                        ?: return newHomePageResponse(
-                            request,
-                            emptyList(),
-                            false
-                        )
+                        ?: return@forEach
 
-                val forceSeries =
-                    request.name.equals(
-                        "TV Show",
-                        ignoreCase = true
+                parseArchiveItems(
+                    document = document,
+                    sourceUrl = url,
+                    forceSeries = false
+                ).forEach { item ->
+
+                    merged.putIfAbsent(
+                        item.url,
+                        item
                     )
-
-                val items =
-                    parseArchiveItems(
-                        document = document,
-                        sourceUrl = url,
-                        forceSeries = forceSeries
-                    )
-
-                val results =
-                    items
-                        .take(MAX_ITEMS_PER_PAGE)
-                        .map { item ->
-                            item.toSearchResponse()
-                        }
-
-                return newHomePageResponse(
-                    request,
-                    results,
-                    hasNextPage(document)
-                )
+                }
             }
+
+            val responses =
+                merged.values
+                    .take(MAX_ITEMS_PER_PAGE)
+                    .map {
+                        it.toSearchResponse()
+                    }
+
+            return newHomePageResponse(
+                request,
+                responses,
+                currentPage < MAX_MOVIE_PAGES
+            )
         }
+
+        /*
+         * --------------------------------------------------------
+         * LATEST MOVIES / TV SHOW
+         * --------------------------------------------------------
+         */
+        val url =
+            buildPageUrl(
+                request.data,
+                currentPage
+            )
+
+        val document =
+            getDocument(url)
+                ?: return newHomePageResponse(
+                    request,
+                    emptyList(),
+                    false
+                )
+
+        val forceSeries =
+            request.name.equals(
+                "TV Show",
+                ignoreCase = true
+            )
+
+        val items =
+            parseArchiveItems(
+                document = document,
+                sourceUrl = url,
+                forceSeries = forceSeries
+            )
+
+        val responses =
+            items
+                .take(MAX_ITEMS_PER_PAGE)
+                .map {
+                    it.toSearchResponse()
+                }
+
+        return newHomePageResponse(
+            request,
+            responses,
+            hasNextPage(document)
+        )
     }
 
     /*
      * ============================================================
      * SEARCH
      * ============================================================
-     *
-     * Search order:
-     *
-     * 1. Native WordPress search
-     * 2. Query normalization
-     * 3. Punctuation variants
-     * 4. Movie genre fallback
-     * 5. TV fallback
-     * 6. Fuzzy ranking
      */
     override suspend fun search(
         query: String,
@@ -269,53 +227,45 @@ class OnlineMovies : MainAPI() {
         }
 
         val normalized =
-            normalizeSearchText(
-                original
-            )
+            normalizeSearchText(original)
 
         val compact =
-            compactSearchText(
-                original
-            )
+            compactSearchText(original)
 
         val variants =
-            linkedSetOf<String>().apply {
+            linkedSetOf<String>()
 
-                add(original)
+        variants.add(original)
 
-                if (normalized.isNotBlank()) {
-                    add(normalized)
-                }
+        if (normalized.isNotBlank()) {
+            variants.add(normalized)
+        }
 
-                if (compact.isNotBlank()) {
-                    add(compact)
-                }
+        if (compact.isNotBlank()) {
+            variants.add(compact)
+        }
 
-                add(
-                    original
-                        .replace(":", " ")
-                        .replace("-", " ")
-                        .replace("_", " ")
+        variants.add(
+            original
+                .replace(":", " ")
+                .replace("-", " ")
+                .replace("_", " ")
+        )
+
+        variants.add(
+            original
+                .replace(
+                    Regex("\\s+"),
+                    " "
                 )
-
-                add(
-                    original
-                        .replace(
-                            Regex("\\s+"),
-                            " "
-                        )
-                )
-            }
-                .filter {
-                    it.isNotBlank()
-                }
+        )
 
         val candidates =
             linkedMapOf<String, SiteItem>()
 
         /*
          * --------------------------------------------------------
-         * Native WordPress search
+         * NATIVE SEARCH
          * --------------------------------------------------------
          */
         for (variant in variants) {
@@ -326,22 +276,22 @@ class OnlineMovies : MainAPI() {
                     StandardCharsets.UTF_8.toString()
                 )
 
-            val urls =
+            val searchUrls =
                 listOf(
                     "$mainUrl/?s=$encoded",
                     "$mainUrl/?search=$encoded",
                     "$mainUrl/search/$encoded/"
-                ).distinct()
+                )
 
-            for (url in urls) {
+            for (searchUrl in searchUrls) {
 
                 val document =
-                    getDocument(url)
+                    getDocument(searchUrl)
                         ?: continue
 
                 parseArchiveItems(
                     document = document,
-                    sourceUrl = url
+                    sourceUrl = searchUrl
                 ).forEach { item ->
 
                     candidates.putIfAbsent(
@@ -368,7 +318,7 @@ class OnlineMovies : MainAPI() {
 
         /*
          * --------------------------------------------------------
-         * Genre fallback
+         * GENRE FALLBACK
          * --------------------------------------------------------
          */
         if (
@@ -378,19 +328,19 @@ class OnlineMovies : MainAPI() {
 
             movieGenreUrls.forEach { genreUrl ->
 
-                val pageUrl =
+                val url =
                     buildPageUrl(
                         genreUrl,
                         1
                     )
 
                 val document =
-                    getDocument(pageUrl)
+                    getDocument(url)
                         ?: return@forEach
 
                 parseArchiveItems(
                     document = document,
-                    sourceUrl = pageUrl
+                    sourceUrl = url
                 ).forEach { item ->
 
                     candidates.putIfAbsent(
@@ -398,19 +348,12 @@ class OnlineMovies : MainAPI() {
                         item
                     )
                 }
-
-                if (
-                    candidates.size >=
-                    SEARCH_FALLBACK_LIMIT
-                ) {
-                    return@forEach
-                }
             }
         }
 
         /*
          * --------------------------------------------------------
-         * TV fallback
+         * TV FALLBACK
          * --------------------------------------------------------
          */
         if (
@@ -424,13 +367,13 @@ class OnlineMovies : MainAPI() {
                     1
                 )
 
-            val document =
+            val tvDocument =
                 getDocument(tvUrl)
 
-            if (document != null) {
+            if (tvDocument != null) {
 
                 parseArchiveItems(
-                    document = document,
+                    document = tvDocument,
                     sourceUrl = tvUrl,
                     forceSeries = true
                 ).forEach { item ->
@@ -447,22 +390,22 @@ class OnlineMovies : MainAPI() {
 
         /*
          * --------------------------------------------------------
-         * Ranking
+         * FUZZY RANKING
          * --------------------------------------------------------
          */
         val ranked =
             candidates.values
                 .map { item ->
 
-                    val score =
+                    Pair(
+                        item,
                         searchScore(
                             normalized,
                             normalizeSearchText(
                                 item.title
                             )
                         )
-
-                    item to score
+                    )
                 }
                 .filter {
                     it.second >=
@@ -474,7 +417,9 @@ class OnlineMovies : MainAPI() {
                         > {
                         it.second
                     }.thenBy {
-                        it.first.title
+                        it.first.title.lowercase(
+                            Locale.ROOT
+                        )
                     }
                 )
                 .map {
@@ -527,45 +472,34 @@ class OnlineMovies : MainAPI() {
             )
         }
 
-        /*
-         * Do not use generic page text such as "TV Show" to
-         * classify a page. URL + actual episode links are stronger.
-         */
         val document =
             getDocument(clean)
 
         if (document == null) {
 
-            return if (
-                looksLikeTvUrl(clean)
-            ) {
+            if (looksLikeTvUrl(clean)) {
 
-                newTvSeriesLoadResponse(
+                return newTvSeriesLoadResponse(
                     titleFromUrlLocal(clean),
                     clean,
                     TvType.TvSeries,
                     emptyList()
                 )
-
-            } else {
-
-                newMovieLoadResponse(
-                    titleFromUrlLocal(clean),
-                    clean,
-                    TvType.Movie,
-                    clean
-                )
             }
+
+            return newMovieLoadResponse(
+                titleFromUrlLocal(clean),
+                clean,
+                TvType.Movie,
+                clean
+            )
         }
 
         val title =
-            extractDetailTitle(
-                document
-            ).ifBlank {
-                titleFromUrlLocal(
-                    clean
-                )
-            }
+            extractDetailTitle(document)
+                .ifBlank {
+                    titleFromUrlLocal(clean)
+                }
 
         val poster =
             extractPoster(
@@ -574,9 +508,7 @@ class OnlineMovies : MainAPI() {
             )
 
         val plot =
-            extractPlot(
-                document
-            )
+            extractPlot(document)
 
         val year =
             extractYear(
@@ -590,9 +522,15 @@ class OnlineMovies : MainAPI() {
                 clean
             )
 
+        /*
+         * Important:
+         * /tv/ and /eps/ are treated as TV URLs.
+         * We do NOT classify a page merely because some text says
+         * "TV Show".
+         */
         val isSeries =
             looksLikeTvUrl(clean) ||
-            episodeLinks.isNotEmpty()
+                episodeLinks.isNotEmpty()
 
         /*
          * --------------------------------------------------------
@@ -619,12 +557,6 @@ class OnlineMovies : MainAPI() {
                         episode =
                             info.episode
                                 ?: (index + 1)
-
-                        posterUrl =
-                            poster
-
-                        description =
-                            null
                     }
                 }
 
@@ -661,13 +593,10 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * PLAYBACK
+     * LINK LOADER
      * ============================================================
      *
-     * Playback source resolution is intentionally left out here.
-     *
-     * This means the provider can browse, search and load metadata
-     * without exposing third-party media extraction behavior.
+     * This provider currently handles catalog/detail parsing only.
      */
     override suspend fun loadLinks(
         data: String,
@@ -710,29 +639,30 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * HTTP
+     * DOCUMENT LOADER
      * ============================================================
      */
     private suspend fun getDocument(
         url: String
     ): Document? {
 
-        val clean =
-            cleanUrlLocal(
-                url
-            )
+        val normalized =
+            cleanUrlLocal(url)
 
-        if (clean.isBlank()) {
+        if (normalized.isBlank()) {
             return null
         }
 
         return runCatching {
 
             app.get(
-                clean,
-                headers = pageHeaders + mapOf(
-                    "Referer" to "$mainUrl/"
-                )
+                normalized,
+                headers =
+                    pageHeaders +
+                        (
+                            "Referer" to
+                                "$mainUrl/"
+                            )
             ).document
 
         }.getOrNull()
@@ -742,18 +672,6 @@ class OnlineMovies : MainAPI() {
      * ============================================================
      * ARCHIVE PARSER
      * ============================================================
-     *
-     * Based on the supplied site structure:
-     *
-     * article
-     *   content-thumbnail
-     *      a[href]
-     *          img
-     *   entry-title
-     *      a[href]
-     *
-     * The supplied source also exposes title, image and category
-     * information in each archive card.
      */
     private fun parseArchiveItems(
         document: Document,
@@ -765,105 +683,27 @@ class OnlineMovies : MainAPI() {
             linkedMapOf<String, SiteItem>()
 
         /*
-         * --------------------------------------------------------
-         * Primary: article cards
-         * --------------------------------------------------------
+         * Primary WordPress article structure
          */
-        document.select(
-            "article"
-        ).forEach { article ->
-
-            val anchor =
-                article.selectFirst(
-                    "p.entry-title a[href], " +
-                    ".entry-title a[href], " +
-                    "a[rel='bookmark'][href]"
-                )
-                    ?: article.selectFirst(
-                        "a[href]"
-                    )
-                    ?: return@forEach
-
-            val href =
-                anchor.attr(
-                    "href"
-                ).trim()
-
-            if (href.isBlank()) {
-                return@forEach
-            }
-
-            val absolute =
-                absoluteUrlLocal(
-                    href,
-                    sourceUrl
-                )
-
-            if (!isContentUrl(absolute)) {
-                return@forEach
-            }
-
-            val title =
-                cleanArchiveTitle(
-                    anchor.text()
-                        .trim()
-                        .ifBlank {
-                            anchor.attr(
-                                "title"
-                            ).trim()
-                        }
-                )
-
-            if (title.isBlank()) {
-                return@forEach
-            }
-
-            val poster =
-                extractCardPoster(
-                    article,
-                    sourceUrl
-                )
-
-            val isSeries =
-                forceSeries ||
-                looksLikeTvUrl(
-                    absolute
-                )
-
-            result.putIfAbsent(
-                absolute,
-                SiteItem(
-                    title = title,
-                    url = absolute,
-                    poster = poster,
-                    isSeries = isSeries
-                )
-            )
-        }
-
-        /*
-         * --------------------------------------------------------
-         * Secondary fallback
-         * --------------------------------------------------------
-         */
-        if (result.isEmpty()) {
-
-            document.select(
-                ".gmr-box-content, " +
-                ".item-article, " +
-                ".content-thumbnail"
-            ).forEach { element ->
+        document
+            .select("article")
+            .forEach { article ->
 
                 val anchor =
-                    element.selectFirst(
-                        "a[href]"
+                    article.selectFirst(
+                        "p.entry-title a[href], " +
+                            ".entry-title a[href], " +
+                            "a[rel='bookmark'][href]"
                     )
+                        ?: article.selectFirst(
+                            "a[href]"
+                        )
                         ?: return@forEach
 
                 val href =
-                    anchor.attr(
-                        "href"
-                    ).trim()
+                    anchor
+                        .attr("href")
+                        .trim()
 
                 if (href.isBlank()) {
                     return@forEach
@@ -875,17 +715,22 @@ class OnlineMovies : MainAPI() {
                         sourceUrl
                     )
 
-                if (!isContentUrl(absolute)) {
+                if (
+                    !isContentUrl(
+                        absolute
+                    )
+                ) {
                     return@forEach
                 }
 
                 val title =
                     cleanArchiveTitle(
-                        anchor.attr(
-                            "title"
-                        ).trim()
+                        anchor
+                            .text()
+                            .trim()
                             .ifBlank {
-                                anchor.text()
+                                anchor
+                                    .attr("title")
                                     .trim()
                             }
                     )
@@ -896,9 +741,15 @@ class OnlineMovies : MainAPI() {
 
                 val poster =
                     extractCardPoster(
-                        element,
+                        article,
                         sourceUrl
                     )
+
+                val series =
+                    forceSeries ||
+                        looksLikeTvUrl(
+                            absolute
+                        )
 
                 result.putIfAbsent(
                     absolute,
@@ -906,14 +757,89 @@ class OnlineMovies : MainAPI() {
                         title = title,
                         url = absolute,
                         poster = poster,
-                        isSeries =
-                            forceSeries ||
-                                looksLikeTvUrl(
-                                    absolute
-                                )
+                        isSeries = series
                     )
                 )
             }
+
+        /*
+         * Fallback selectors
+         */
+        if (result.isEmpty()) {
+
+            document
+                .select(
+                    ".gmr-box-content, " +
+                        ".item-article, " +
+                        ".content-thumbnail"
+                )
+                .forEach { element ->
+
+                    val anchor =
+                        element.selectFirst(
+                            "a[href]"
+                        )
+                            ?: return@forEach
+
+                    val href =
+                        anchor
+                            .attr("href")
+                            .trim()
+
+                    if (href.isBlank()) {
+                        return@forEach
+                    }
+
+                    val absolute =
+                        absoluteUrlLocal(
+                            href,
+                            sourceUrl
+                        )
+
+                    if (
+                        !isContentUrl(
+                            absolute
+                        )
+                    ) {
+                        return@forEach
+                    }
+
+                    val title =
+                        cleanArchiveTitle(
+                            anchor
+                                .attr("title")
+                                .trim()
+                                .ifBlank {
+                                    anchor
+                                        .text()
+                                        .trim()
+                                }
+                        )
+
+                    if (title.isBlank()) {
+                        return@forEach
+                    }
+
+                    val poster =
+                        extractCardPoster(
+                            element,
+                            sourceUrl
+                        )
+
+                    result.putIfAbsent(
+                        absolute,
+                        SiteItem(
+                            title = title,
+                            url = absolute,
+                            poster = poster,
+                            isSeries =
+                                forceSeries ||
+                                    looksLikeTvUrl(
+                                        absolute
+                                    )
+                        )
+                    )
+                }
         }
 
         return result.values.toList()
@@ -921,15 +847,8 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * POSTER PARSER
+     * POSTER
      * ============================================================
-     *
-     * Supports:
-     * src
-     * data-src
-     * data-lazy-src
-     * data-original
-     * srcset
      */
     private fun extractCardPoster(
         element: Element,
@@ -939,28 +858,29 @@ class OnlineMovies : MainAPI() {
         val image =
             element.selectFirst(
                 "img[src], " +
-                "img[data-src], " +
-                "img[data-lazy-src], " +
-                "img[data-original]"
+                    "img[data-src], " +
+                    "img[data-lazy-src], " +
+                    "img[data-original]"
             )
                 ?: return null
 
         val preferred =
-            image.attr(
-                "data-src"
-            ).ifBlank {
-                image.attr(
-                    "data-lazy-src"
-                )
-            }.ifBlank {
-                image.attr(
-                    "data-original"
-                )
-            }.ifBlank {
-                image.attr(
-                    "src"
-                )
-            }.trim()
+            image
+                .attr("data-src")
+                .ifBlank {
+                    image.attr(
+                        "data-lazy-src"
+                    )
+                }
+                .ifBlank {
+                    image.attr(
+                        "data-original"
+                    )
+                }
+                .ifBlank {
+                    image.attr("src")
+                }
+                .trim()
 
         if (preferred.isNotBlank()) {
 
@@ -971,9 +891,9 @@ class OnlineMovies : MainAPI() {
         }
 
         val srcSet =
-            image.attr(
-                "srcset"
-            ).trim()
+            image
+                .attr("srcset")
+                .trim()
 
         if (srcSet.isNotBlank()) {
 
@@ -984,12 +904,12 @@ class OnlineMovies : MainAPI() {
                         it.trim()
                     }
                     .lastOrNull()
-                    ?.substringBefore(
-                        " "
-                    )
+                    ?.substringBefore(" ")
                     ?.trim()
 
-            if (!largest.isNullOrBlank()) {
+            if (
+                !largest.isNullOrBlank()
+            ) {
 
                 return absoluteUrlLocal(
                     largest,
@@ -1003,16 +923,8 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * EPISODE PARSER
+     * TV EPISODES
      * ============================================================
-     *
-     * Supplied TV source contains:
-     *
-     * .gmr-listseries
-     *   S1 Eps1
-     *   S1 Eps2
-     *   S1 Eps3
-     *   ...
      */
     private fun parseEpisodeLinks(
         document: Document,
@@ -1022,93 +934,22 @@ class OnlineMovies : MainAPI() {
         val result =
             linkedMapOf<String, EpisodeInfo>()
 
-        document.select(
-            ".gmr-listseries a[href]"
-        ).forEachIndexed {
-            index,
-            anchor ->
-
-            val href =
-                anchor.attr(
-                    "href"
-                ).trim()
-
-            if (href.isBlank()) {
-                return@forEachIndexed
-            }
-
-            val absolute =
-                absoluteUrlLocal(
-                    href,
-                    baseUrl
-                )
-
-            if (
-                !absolute.contains(
-                    "/eps/",
-                    ignoreCase = true
-                )
-            ) {
-                return@forEachIndexed
-            }
-
-            val visibleText =
-                anchor.text()
-                    .trim()
-
-            val titleAttribute =
-                anchor.attr(
-                    "title"
-                ).trim()
-
-            val sourceName =
-                visibleText
-                    .ifBlank {
-                        titleAttribute
-                    }
-
-            val parsed =
-                parseSeasonEpisode(
-                    sourceName
-                )
-
-            val season =
-                parsed?.first
-
-            val episode =
-                parsed?.second
-                    ?: (index + 1)
-
-            result.putIfAbsent(
-                absolute,
-                EpisodeInfo(
-                    url = absolute,
-                    name =
-                        buildEpisodeName(
-                            season,
-                            episode
-                        ),
-                    season = season,
-                    episode = episode
-                )
-            )
-        }
-
         /*
-         * Fallback in case the theme changes the wrapper class.
+         * Primary source:
+         * .gmr-listseries a[href]
          */
-        if (result.isEmpty()) {
-
-            document.select(
-                "a[href*='/eps/']"
-            ).forEachIndexed {
+        document
+            .select(
+                ".gmr-listseries a[href]"
+            )
+            .forEachIndexed {
                 index,
                 anchor ->
 
                 val href =
-                    anchor.attr(
-                        "href"
-                    ).trim()
+                    anchor
+                        .attr("href")
+                        .trim()
 
                 if (href.isBlank()) {
                     return@forEachIndexed
@@ -1120,14 +961,42 @@ class OnlineMovies : MainAPI() {
                         baseUrl
                     )
 
-                val text =
-                    anchor.text()
+                if (
+                    !absolute.contains(
+                        "/eps/",
+                        ignoreCase = true
+                    )
+                ) {
+                    return@forEachIndexed
+                }
+
+                val visible =
+                    anchor
+                        .text()
                         .trim()
+
+                val titleAttr =
+                    anchor
+                        .attr("title")
+                        .trim()
+
+                val sourceName =
+                    visible
+                        .ifBlank {
+                            titleAttr
+                        }
 
                 val parsed =
                     parseSeasonEpisode(
-                        text
+                        sourceName
                     )
+
+                val season =
+                    parsed?.first
+
+                val episode =
+                    parsed?.second
+                        ?: (index + 1)
 
                 result.putIfAbsent(
                     absolute,
@@ -1135,23 +1004,81 @@ class OnlineMovies : MainAPI() {
                         url = absolute,
                         name =
                             buildEpisodeName(
-                                parsed?.first,
-                                parsed?.second
-                                    ?: (index + 1)
+                                season,
+                                episode
                             ),
-                        season =
-                            parsed?.first,
-                        episode =
-                            parsed?.second
-                                ?: (index + 1)
+                        season = season,
+                        episode = episode
                     )
                 )
             }
+
+        /*
+         * Fallback:
+         * any /eps/ links
+         */
+        if (result.isEmpty()) {
+
+            document
+                .select(
+                    "a[href*='/eps/']"
+                )
+                .forEachIndexed {
+                    index,
+                    anchor ->
+
+                    val href =
+                        anchor
+                            .attr("href")
+                            .trim()
+
+                    if (href.isBlank()) {
+                        return@forEachIndexed
+                    }
+
+                    val absolute =
+                        absoluteUrlLocal(
+                            href,
+                            baseUrl
+                        )
+
+                    val parsed =
+                        parseSeasonEpisode(
+                            anchor
+                                .text()
+                                .trim()
+                        )
+
+                    val episode =
+                        parsed?.second
+                            ?: (index + 1)
+
+                    result.putIfAbsent(
+                        absolute,
+                        EpisodeInfo(
+                            url = absolute,
+                            name =
+                                buildEpisodeName(
+                                    parsed?.first,
+                                    episode
+                                ),
+                            season =
+                                parsed?.first,
+                            episode =
+                                episode
+                        )
+                    )
+                }
         }
 
         return result.values.toList()
     }
 
+    /*
+     * ============================================================
+     * SEASON / EPISODE PARSER
+     * ============================================================
+     */
     private fun parseSeasonEpisode(
         value: String
     ): Pair<Int, Int>? {
@@ -1160,6 +1087,12 @@ class OnlineMovies : MainAPI() {
             return null
         }
 
+        /*
+         * Examples:
+         * S1 E1
+         * S1 Ep1
+         * S1 Eps1
+         */
         val shortPattern =
             Regex(
                 """(?i)\bS\s*(\d+)\s*E(?:p(?:s)?)?\s*(\d+)\b"""
@@ -1171,16 +1104,22 @@ class OnlineMovies : MainAPI() {
         if (shortMatch != null) {
 
             return Pair(
-                shortMatch.groupValues[1]
+                shortMatch
+                    .groupValues[1]
                     .toIntOrNull()
                     ?: 1,
 
-                shortMatch.groupValues[2]
+                shortMatch
+                    .groupValues[2]
                     .toIntOrNull()
                     ?: 1
             )
         }
 
+        /*
+         * Examples:
+         * Season 1 Episode 1
+         */
         val longPattern =
             Regex(
                 """(?i)\bSeason\s*(\d+).*?\bEpisode\s*(\d+)\b"""
@@ -1192,11 +1131,13 @@ class OnlineMovies : MainAPI() {
         if (longMatch != null) {
 
             return Pair(
-                longMatch.groupValues[1]
+                longMatch
+                    .groupValues[1]
                     .toIntOrNull()
                     ?: 1,
 
-                longMatch.groupValues[2]
+                longMatch
+                    .groupValues[2]
                     .toIntOrNull()
                     ?: 1
             )
@@ -1234,9 +1175,10 @@ class OnlineMovies : MainAPI() {
     ): String {
 
         val ogTitle =
-            document.selectFirst(
-                "meta[property='og:title']"
-            )
+            document
+                .selectFirst(
+                    "meta[property='og:title']"
+                )
                 ?.attr("content")
                 ?.trim()
 
@@ -1248,9 +1190,10 @@ class OnlineMovies : MainAPI() {
         }
 
         val h1 =
-            document.selectFirst(
-                "h1.entry-title, h1"
-            )
+            document
+                .selectFirst(
+                    "h1.entry-title, h1"
+                )
                 ?.text()
                 ?.trim()
 
@@ -1264,6 +1207,11 @@ class OnlineMovies : MainAPI() {
         return ""
     }
 
+    /*
+     * ============================================================
+     * PLOT
+     * ============================================================
+     */
     private fun extractPlot(
         document: Document
     ): String? {
@@ -1279,15 +1227,21 @@ class OnlineMovies : MainAPI() {
             }
     }
 
+    /*
+     * ============================================================
+     * DETAIL POSTER
+     * ============================================================
+     */
     private fun extractPoster(
         document: Document,
         baseUrl: String
     ): String? {
 
         val raw =
-            document.selectFirst(
-                "meta[property='og:image']"
-            )
+            document
+                .selectFirst(
+                    "meta[property='og:image']"
+                )
                 ?.attr("content")
                 ?.trim()
 
@@ -1301,15 +1255,21 @@ class OnlineMovies : MainAPI() {
         )
     }
 
+    /*
+     * ============================================================
+     * YEAR
+     * ============================================================
+     */
     private fun extractYear(
         document: Document,
         title: String
     ): Int? {
 
         val date =
-            document.selectFirst(
-                "time[datetime]"
-            )
+            document
+                .selectFirst(
+                    "time[datetime]"
+                )
                 ?.attr("datetime")
                 ?.trim()
 
@@ -1338,7 +1298,7 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * URL / CONTENT HELPERS
+     * URL HELPERS
      * ============================================================
      */
     private fun cleanUrlLocal(
@@ -1371,17 +1331,14 @@ class OnlineMovies : MainAPI() {
                     "&amp;",
                     "&"
                 )
-
-        if (value.isBlank()) {
-            return baseUrl
-        }
-
-        value =
-            value
                 .replace(
                     "\\/",
                     "/"
                 )
+
+        if (value.isBlank()) {
+            return baseUrl
+        }
 
         if (
             value.startsWith(
@@ -1397,9 +1354,7 @@ class OnlineMovies : MainAPI() {
         }
 
         if (
-            value.startsWith(
-                "//"
-            )
+            value.startsWith("//")
         ) {
 
             val scheme =
@@ -1421,9 +1376,7 @@ class OnlineMovies : MainAPI() {
         }.getOrElse {
 
             if (
-                value.startsWith(
-                    "/"
-                )
+                value.startsWith("/")
             ) {
 
                 val uri =
@@ -1452,12 +1405,16 @@ class OnlineMovies : MainAPI() {
             return baseUrl
         }
 
-        val clean =
+        return "${
             baseUrl.trimEnd('/')
-
-        return "$clean/page/$current/"
+        }/page/$current/"
     }
 
+    /*
+     * ============================================================
+     * CONTENT URL DETECTION
+     * ============================================================
+     */
     private fun isContentUrl(
         url: String
     ): Boolean {
@@ -1478,9 +1435,15 @@ class OnlineMovies : MainAPI() {
             return false
         }
 
-        return lower.contains("/eps/") ||
-            lower.contains("/tv/") ||
-            lower.contains("/tv-show/") ||
+        return lower.contains(
+            "/eps/"
+        ) ||
+            lower.contains(
+                "/tv/"
+            ) ||
+            lower.contains(
+                "/tv-show/"
+            ) ||
             movieGenreUrls.any {
                 lower.startsWith(
                     it.lowercase(
@@ -1502,12 +1465,12 @@ class OnlineMovies : MainAPI() {
         return lower.contains(
             "/eps/"
         ) ||
-        lower.contains(
-            "/tv/"
-        ) ||
-        lower.contains(
-            "/tv-show/"
-        )
+            lower.contains(
+                "/tv/"
+            ) ||
+            lower.contains(
+                "/tv-show/"
+            )
     }
 
     private fun titleFromUrlLocal(
@@ -1524,9 +1487,7 @@ class OnlineMovies : MainAPI() {
 
             val last =
                 path
-                    .substringAfterLast(
-                        '/'
-                    )
+                    .substringAfterLast("/")
                     .ifBlank {
                         "Online Movies"
                     }
@@ -1666,7 +1627,7 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * FUZZY SEARCH
+     * LEVENSHTEIN
      * ============================================================
      */
     private fun levenshtein(
@@ -1706,9 +1667,7 @@ class OnlineMovies : MainAPI() {
             for (j in b.indices) {
 
                 val cost =
-                    if (
-                        a[i] == b[j]
-                    ) {
+                    if (a[i] == b[j]) {
                         0
                     } else {
                         1
@@ -1776,7 +1735,7 @@ class OnlineMovies : MainAPI() {
                     (
                         minLength /
                             maxLength
-                    )
+                        )
                 )
         }
 
@@ -1806,6 +1765,11 @@ class OnlineMovies : MainAPI() {
             )
     }
 
+    /*
+     * ============================================================
+     * SEARCH SCORE
+     * ============================================================
+     */
     private fun searchScore(
         query: String,
         title: String
@@ -1833,14 +1797,10 @@ class OnlineMovies : MainAPI() {
         }
 
         val qc =
-            compactSearchText(
-                q
-            )
+            compactSearchText(q)
 
         val tc =
-            compactSearchText(
-                t
-            )
+            compactSearchText(t)
 
         if (
             qc.isNotBlank() &&
@@ -1849,14 +1809,12 @@ class OnlineMovies : MainAPI() {
             return 0.995
         }
 
-        var score =
-            0.0
+        var score = 0.0
 
-        if (
-            t.contains(
-                q
-            )
-        ) {
+        /*
+         * Full substring match
+         */
+        if (t.contains(q)) {
 
             score =
                 maxOf(
@@ -1865,41 +1823,41 @@ class OnlineMovies : MainAPI() {
                 )
         }
 
+        /*
+         * Spacing-insensitive match
+         */
         if (
             qc.isNotBlank() &&
-            tc.contains(
-                qc
-            )
+            tc.contains(qc)
         ) {
 
             val ratio =
                 qc.length.toDouble() /
                     tc.length
-                        .coerceAtLeast(
-                            1
-                        )
+                        .coerceAtLeast(1)
                         .toDouble()
 
             score =
                 maxOf(
                     score,
                     0.86 +
-                        (
-                            ratio * 0.11
-                        )
+                        ratio * 0.11
                 )
         }
 
+        /*
+         * Token-by-token matching
+         */
         val qTokens =
             q.split(
-                ' '
+                " "
             ).filter {
                 it.length >= 2
             }
 
         val tTokens =
             t.split(
-                ' '
+                " "
             ).filter {
                 it.length >= 2
             }
@@ -1910,35 +1868,38 @@ class OnlineMovies : MainAPI() {
         ) {
 
             val tokenScore =
-                qTokens.map { qToken ->
+                qTokens
+                    .map { qToken ->
 
-                    tTokens.maxOfOrNull {
-                        tToken ->
+                        tTokens
+                            .maxOfOrNull {
+                                tToken ->
 
-                        when {
+                                when {
 
-                            tToken ==
-                                qToken ->
-                                1.0
+                                    tToken ==
+                                        qToken ->
+                                        1.0
 
-                            tToken.startsWith(
-                                qToken
-                            ) ||
-                            qToken.startsWith(
-                                tToken
-                            ) ->
-                                0.92
+                                    tToken.startsWith(
+                                        qToken
+                                    ) ||
+                                        qToken.startsWith(
+                                            tToken
+                                        ) ->
+                                        0.92
 
-                            else ->
-                                similarity(
-                                    qToken,
-                                    tToken
-                                )
-                        }
+                                    else ->
+                                        similarity(
+                                            qToken,
+                                            tToken
+                                        )
+                                }
+                            }
+                            ?: 0.0
 
-                    } ?: 0.0
-
-                }.average()
+                    }
+                    .average()
 
             score =
                 maxOf(
@@ -1947,6 +1908,9 @@ class OnlineMovies : MainAPI() {
                 )
         }
 
+        /*
+         * Whole-string fuzzy matching
+         */
         score =
             maxOf(
                 score,
@@ -1964,7 +1928,7 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * PAGINATION
+     * NEXT PAGE
      * ============================================================
      */
     private fun hasNextPage(
@@ -1975,21 +1939,21 @@ class OnlineMovies : MainAPI() {
             "link[rel='next']"
         ) != null ||
 
-        document.selectFirst(
-            "a.next"
-        ) != null ||
+            document.selectFirst(
+                "a.next"
+            ) != null ||
 
-        document.selectFirst(
-            "a[rel='next']"
-        ) != null ||
+            document.selectFirst(
+                "a[rel='next']"
+            ) != null ||
 
-        document.selectFirst(
-            ".pagination a.next"
-        ) != null ||
+            document.selectFirst(
+                ".pagination a.next"
+            ) != null ||
 
-        document.selectFirst(
-            ".nav-links a.next"
-        ) != null
+            document.selectFirst(
+                ".nav-links a.next"
+            ) != null
     }
 
     /*
@@ -1999,22 +1963,16 @@ class OnlineMovies : MainAPI() {
      */
     private companion object {
 
-        const val MAX_ITEMS_PER_PAGE =
-            30
+        const val MAX_ITEMS_PER_PAGE = 30
 
-        const val MAX_MOVIE_COMBINED_PAGES =
-            12
+        const val MAX_MOVIE_PAGES = 12
 
-        const val SEARCH_NATIVE_LIMIT =
-            80
+        const val SEARCH_NATIVE_LIMIT = 80
 
-        const val SEARCH_FALLBACK_MINIMUM =
-            20
+        const val SEARCH_FALLBACK_MINIMUM = 20
 
-        const val SEARCH_FALLBACK_LIMIT =
-            100
+        const val SEARCH_FALLBACK_LIMIT = 100
 
-        const val SEARCH_MIN_SCORE =
-            0.32
+        const val SEARCH_MIN_SCORE = 0.32
     }
 }
