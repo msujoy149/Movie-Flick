@@ -9,7 +9,7 @@ cloudstream {
         "Live",
         "TvSeries"
     )
-    language = "en"
+    language = "hi"
     isCrossPlatform = true
 }
 
