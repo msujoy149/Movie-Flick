@@ -1061,9 +1061,17 @@ class YouTube : MainAPI() {
                                         extractor.initialPage
 
                                     if (continuationSection != null) {
-                                        searchContinuationCache[
+                                        val continuationKey =
                                             "$continuationSection|$query"
-                                        ] = initialPage.nextPage
+                                        if (initialPage.nextPage != null) {
+                                            searchContinuationCache[
+                                                continuationKey
+                                            ] = initialPage.nextPage
+                                        } else {
+                                            searchContinuationCache.remove(
+                                                continuationKey
+                                            )
+                                        }
                                     }
 
                                     initialPage
@@ -1108,9 +1116,17 @@ class YouTube : MainAPI() {
                                         extractor.initialPage
 
                                     if (continuationSection != null) {
-                                        searchContinuationCache[
+                                        val continuationKey =
                                             "$continuationSection|$query"
-                                        ] = initialPage.nextPage
+                                        if (initialPage.nextPage != null) {
+                                            searchContinuationCache[
+                                                continuationKey
+                                            ] = initialPage.nextPage
+                                        } else {
+                                            searchContinuationCache.remove(
+                                                continuationKey
+                                            )
+                                        }
                                     }
 
                                     initialPage
@@ -2434,10 +2450,13 @@ class YouTube : MainAPI() {
                                             next
                                         )
 
-                                    searchContinuationCache[
-                                        key
-                                    ] =
-                                        page.nextPage
+                                    if (page.nextPage != null) {
+                                        searchContinuationCache[
+                                            key
+                                        ] = page.nextPage
+                                    } else {
+                                        searchContinuationCache.remove(key)
+                                    }
 
                                     page.items.toList()
 
@@ -2919,10 +2938,13 @@ class YouTube : MainAPI() {
                 }
             )
 
-            genericContinuationCache[
-                kioskId
-            ] =
-                pageData.nextPage
+            if (pageData.nextPage != null) {
+                genericContinuationCache[
+                    kioskId
+                ] = pageData.nextPage
+            } else {
+                genericContinuationCache.remove(kioskId)
+            }
 
             val following =
                 pageData.nextPage
@@ -4762,7 +4784,12 @@ class YouTube : MainAPI() {
 
         if (pageData != null) {
             pageCache[kioskId] = pageData.nextPage
-            genericContinuationCache[kioskId] = pageData.nextPage
+
+            if (pageData.nextPage != null) {
+                genericContinuationCache[kioskId] = pageData.nextPage
+            } else {
+                genericContinuationCache.remove(kioskId)
+            }
         }
 
         val results =
@@ -4830,10 +4857,13 @@ class YouTube : MainAPI() {
                             )
                     }
 
-                    genericContinuationCache[
-                        kioskId
-                    ] =
-                        page.nextPage
+                    if (page.nextPage != null) {
+                        genericContinuationCache[
+                            kioskId
+                        ] = page.nextPage
+                    } else {
+                        genericContinuationCache.remove(kioskId)
+                    }
 
                     collected
                         .distinctBy {
