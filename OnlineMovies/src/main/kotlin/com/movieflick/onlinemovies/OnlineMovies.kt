@@ -604,7 +604,8 @@ class OnlineMovies : MainAPI() {
      * - preserves the page URL as Referer
      * - ignores YouTube trailer embeds
      */
-    override suspend fun loadLinks(
+    
+override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -629,6 +630,7 @@ class OnlineMovies : MainAPI() {
             if (visitedPages.size > MAX_PLAYBACK_PAGES) return
 
             if (isIgnoredPlaybackHost(cleanPage)) return
+            if (isAdvertisingUrl(cleanPage)) return
 
             val response = runCatching {
                 app.get(
@@ -646,6 +648,10 @@ class OnlineMovies : MainAPI() {
             val document = response.document
             val html = response.text
 
+            /*
+             * Collect EVERY playable media candidate on this page.
+             * We deliberately never stop after the first URL.
+             */
             val pageCandidates = extractMediaCandidates(
                 document = document,
                 html = html,
@@ -653,50 +659,153 @@ class OnlineMovies : MainAPI() {
             )
 
             pageCandidates.forEach { candidate ->
-                if (!isAdvertisingUrl(candidate.url) &&
-                    isPlayableMedia(candidate.url)
+                if (isPlayableMedia(candidate.url) &&
+                    !isAdvertisingUrl(candidate.url) &&
+                    !isIgnoredPlaybackHost(candidate.url)
                 ) {
                     val old = found[candidate.url]
-                    if (old == null || candidate.quality > old.quality) {
+
+                    if (
+                        old == null ||
+                        betterMediaCandidate(candidate, old)
+                    ) {
                         found[candidate.url] = candidate
                     }
                 }
             }
 
             /*
-             * IMPORTANT:
-             * Do NOT stop after finding the first source.
-             * A page may contain 360p + 720p + 1080p together.
+             * Continue into player/watch/embed pages even after we already
+             * found a source. This is important when 360p is exposed on the
+             * first page while 720p/1080p are exposed by another player page.
              */
-            val nestedPages = extractPlaybackPageCandidates(
-                document = document,
-                baseUrl = cleanPage
-            )
+            val nestedPages =
+                extractPlaybackPageCandidates(
+                    document = document,
+                    baseUrl = cleanPage
+                )
 
             for (nested in nestedPages) {
                 if (visitedPages.size >= MAX_PLAYBACK_PAGES) break
-                crawlPage(nested, depth + 1)
+                crawlPage(
+                    nested,
+                    depth + 1
+                )
             }
         }
 
-        crawlPage(input, 0)
+        crawlPage(
+            input,
+            0
+        )
+
+        if (found.isEmpty()) {
+            return false
+        }
 
         /*
-         * Keep the best source for each resolution whenever possible.
-         * Unknown-quality sources are kept as well.
+         * First expand HLS master playlists. A single master.m3u8 can contain
+         * 360p/480p/720p/1080p variants even when the page itself exposes only
+         * one m3u8 URL.
          */
-        val bestByQuality = linkedMapOf<Int, MediaCandidate>()
-        val unknownSources = linkedMapOf<String, MediaCandidate>()
+        val expanded =
+            linkedMapOf<String, MediaCandidate>()
 
-        found.values.forEach { candidate ->
-            val q = qualityValue(candidate.quality)
+        for (candidate in found.values) {
+
+            if (
+                candidate.url
+                    .lowercase(Locale.ROOT)
+                    .contains(".m3u8")
+            ) {
+
+                val variants =
+                    expandHlsVariants(
+                        candidate
+                    )
+
+                if (variants.isNotEmpty()) {
+
+                    variants.forEach { variant ->
+                        expanded[
+                            variant.url
+                        ] = variant
+                    }
+
+                    /*
+                     * Keep the master as a fallback too. This is useful when
+                     * the playlist is not a conventional multi-variant HLS
+                     * master or the player wants to handle the manifest itself.
+                     */
+                    expanded.putIfAbsent(
+                        candidate.url,
+                        candidate
+                    )
+
+                } else {
+
+                    expanded.putIfAbsent(
+                        candidate.url,
+                        candidate
+                    )
+
+                }
+
+            } else {
+
+                expanded.putIfAbsent(
+                    candidate.url,
+                    candidate
+                )
+            }
+        }
+
+        /*
+         * One best source per known resolution.
+         *
+         * IMPORTANT:
+         * Quality is determined from the actual source URL / source tag
+         * metadata, not from arbitrary surrounding HTML. This prevents a
+         * page containing the text "360" somewhere else from incorrectly
+         * turning a 720p/1080p source into "360p".
+         */
+        val bestByQuality =
+            linkedMapOf<Int, MediaCandidate>()
+
+        val unknownSources =
+            linkedMapOf<String, MediaCandidate>()
+
+        expanded.values.forEach { candidate ->
+
+            if (
+                isAdvertisingUrl(candidate.url) ||
+                isIgnoredPlaybackHost(candidate.url)
+            ) {
+                return@forEach
+            }
+
+            val q =
+                qualityValue(
+                    candidate.quality
+                )
 
             if (q > 0) {
-                val old = bestByQuality[q]
-                if (old == null || betterMediaCandidate(candidate, old)) {
+
+                val old =
+                    bestByQuality[q]
+
+                if (
+                    old == null ||
+                    betterMediaCandidate(
+                        candidate,
+                        old
+                    )
+                ) {
                     bestByQuality[q] = candidate
                 }
+
             } else {
+
                 unknownSources.putIfAbsent(
                     candidate.url,
                     candidate
@@ -704,17 +813,27 @@ class OnlineMovies : MainAPI() {
             }
         }
 
-        val sorted = (
-            bestByQuality.values + unknownSources.values
-        )
-            .sortedWith(
-                compareByDescending<MediaCandidate> {
-                    qualityValue(it.quality)
-                }.thenBy { it.url.length }
-            )
-            .take(MAX_PLAYBACK_LINKS)
+        val sorted =
+            (
+                bestByQuality.values +
+                    unknownSources.values
+                )
+                .sortedWith(
+                    compareByDescending<MediaCandidate> {
+                        qualityValue(
+                            it.quality
+                        )
+                    }.thenBy {
+                        it.url.length
+                    }
+                )
+                .take(
+                    MAX_PLAYBACK_LINKS
+                )
 
-        if (sorted.isEmpty()) return false
+        if (sorted.isEmpty()) {
+            return false
+        }
 
         sorted.forEach { candidate ->
             emitMediaLink(
@@ -739,7 +858,7 @@ class OnlineMovies : MainAPI() {
 
     /*
      * ============================================================
-     * PLAYBACK CRAWLER HELPERS
+     * PLAYBACK MEDIA EXTRACTION
      * ============================================================
      */
     private fun extractMediaCandidates(
@@ -748,190 +867,677 @@ class OnlineMovies : MainAPI() {
         baseUrl: String
     ): List<MediaCandidate> {
 
-        val result = linkedMapOf<String, MediaCandidate>()
+        val result =
+            linkedMapOf<String, MediaCandidate>()
 
         fun add(
             raw: String?,
-            qualityHint: String? = null,
-            contextText: String? = null
+            qualityHint: String? = null
         ) {
-            if (raw.isNullOrBlank()) return
 
-            val cleanedRaw = raw
-                .trim()
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
+            if (raw.isNullOrBlank()) {
+                return
+            }
 
-            if (cleanedRaw.isBlank()) return
+            val cleanedRaw =
+                raw
+                    .trim()
+                    .replace(
+                        "\\/",
+                        "/"
+                    )
+                    .replace(
+                        "\\u0026",
+                        "&"
+                    )
 
-            val absolute = absoluteUrlLocal(
-                cleanedRaw,
-                baseUrl
-            )
+            if (cleanedRaw.isBlank()) {
+                return
+            }
 
-            val cleaned = cleanUrlLocal(absolute)
-            if (!isHttpUrl(cleaned)) return
-            if (isIgnoredPlaybackHost(cleaned)) return
-            if (!isPlayableMedia(cleaned)) return
-            if (isAdvertisingUrl(cleaned)) return
-            if (isAdvertisingContext(qualityHint, contextText)) return
+            val absolute =
+                absoluteUrlLocal(
+                    cleanedRaw,
+                    baseUrl
+                )
 
-            val quality = detectQuality(
-                qualityHint,
-                cleaned,
-                contextText
-            )
+            val cleaned =
+                cleanUrlLocal(
+                    absolute
+                )
 
-            val candidate = MediaCandidate(
-                url = cleaned,
-                quality = quality,
-                referer = baseUrl
-            )
+            if (!isHttpUrl(cleaned)) {
+                return
+            }
 
-            val old = result[cleaned]
-            if (old == null || quality > old.quality) {
-                result[cleaned] = candidate
+            if (isIgnoredPlaybackHost(cleaned)) {
+                return
+            }
+
+            if (isAdvertisingUrl(cleaned)) {
+                return
+            }
+
+            if (!isPlayableMedia(cleaned)) {
+                return
+            }
+
+            /*
+             * ONLY source-local information is used to determine quality.
+             * We never inspect the whole surrounding HTML for "360", "720",
+             * etc., because unrelated page text can create false labels.
+             */
+            val quality =
+                detectQuality(
+                    qualityHint,
+                    cleaned
+                )
+
+            val candidate =
+                MediaCandidate(
+                    url = cleaned,
+                    quality = quality,
+                    referer = baseUrl
+                )
+
+            val old =
+                result[cleaned]
+
+            if (
+                old == null ||
+                betterMediaCandidate(
+                    candidate,
+                    old
+                )
+            ) {
+                result[cleaned] =
+                    candidate
             }
         }
 
-        /* video tag */
-        document.select(
-            "video[src], video[data-src], video[data-file], video[data-video]"
-        ).forEach { video ->
-            val context = video.outerHtml()
-
-            val hint = firstNonBlank(
-                video.attr("data-quality"),
-                video.attr("data-res"),
-                video.attr("data-resolution"),
-                video.attr("resolution"),
-                video.attr("label"),
-                video.attr("res"),
-                video.attr("size")
+        /*
+         * ------------------------------------------------------------
+         * HTML5 <video>
+         * ------------------------------------------------------------
+         */
+        document
+            .select(
+                "video[src], " +
+                    "video[data-src], " +
+                    "video[data-file], " +
+                    "video[data-video]"
             )
+            .forEach { video ->
 
-            add(video.attr("src"), hint, context)
-            add(video.attr("data-src"), hint, context)
-            add(video.attr("data-file"), hint, context)
-            add(video.attr("data-video"), hint, context)
-        }
+                val hint =
+                    firstNonBlank(
+                        video.attr(
+                            "data-quality"
+                        ),
+                        video.attr(
+                            "data-resolution"
+                        ),
+                        video.attr(
+                            "data-res"
+                        ),
+                        video.attr(
+                            "resolution"
+                        ),
+                        video.attr(
+                            "label"
+                        ),
+                        video.attr(
+                            "res"
+                        ),
+                        video.attr(
+                            "size"
+                        )
+                    )
 
-        /* source tags */
-        document.select(
-            "video source, source"
-        ).forEach { source ->
-            val context = source.outerHtml()
+                add(
+                    video.attr(
+                        "src"
+                    ),
+                    hint
+                )
 
-            val hint = firstNonBlank(
-                source.attr("label"),
-                source.attr("res"),
-                source.attr("resolution"),
-                source.attr("data-quality"),
-                source.attr("data-res"),
-                source.attr("data-resolution"),
-                source.attr("data-label"),
-                source.attr("size"),
-                source.attr("title")
-            )
+                add(
+                    video.attr(
+                        "data-src"
+                    ),
+                    hint
+                )
 
-            add(source.attr("src"), hint, context)
-            add(source.attr("data-src"), hint, context)
-            add(source.attr("data-file"), hint, context)
-            add(source.attr("data-video"), hint, context)
-            add(source.attr("data-url"), hint, context)
-        }
+                add(
+                    video.attr(
+                        "data-file"
+                    ),
+                    hint
+                )
 
-        /* Other media-bearing elements */
-        document.select(
-            "[data-src], [data-file], [data-video], " +
-                "[data-url], [data-hls], [data-m3u8], " +
-                "[data-mp4], [data-stream], [data-source]"
-        ).forEach { element ->
-            val context = element.outerHtml()
-
-            val hint = firstNonBlank(
-                element.attr("label"),
-                element.attr("title"),
-                element.attr("data-quality"),
-                element.attr("data-res"),
-                element.attr("data-resolution"),
-                element.attr("resolution"),
-                element.attr("res"),
-                element.attr("size"),
-                element.attr("data-label")
-            )
-
-            add(element.attr("data-src"), hint, context)
-            add(element.attr("data-file"), hint, context)
-            add(element.attr("data-video"), hint, context)
-            add(element.attr("data-url"), hint, context)
-            add(element.attr("data-hls"), hint, context)
-            add(element.attr("data-m3u8"), hint, context)
-            add(element.attr("data-mp4"), hint, context)
-            add(element.attr("data-stream"), hint, context)
-            add(element.attr("data-source"), hint, context)
-        }
-
-        /* Direct source links. */
-        document.select(
-            "a[href], iframe[src], embed[src]"
-        ).forEach { element ->
-            val raw = when {
-                element.hasAttr("href") -> element.attr("href")
-                element.hasAttr("src") -> element.attr("src")
-                else -> ""
+                add(
+                    video.attr(
+                        "data-video"
+                    ),
+                    hint
+                )
             }
 
-            val context = element.outerHtml()
-
-            val hint = firstNonBlank(
-                element.attr("label"),
-                element.attr("title"),
-                element.attr("data-quality"),
-                element.attr("data-res"),
-                element.attr("data-resolution"),
-                element.attr("resolution"),
-                element.attr("res"),
-                element.attr("size"),
-                element.text().trim()
+        /*
+         * ------------------------------------------------------------
+         * HTML5 <source>
+         * ------------------------------------------------------------
+         */
+        document
+            .select(
+                "video source, source"
             )
+            .forEach { source ->
 
-            add(raw, hint, context)
-        }
+                val hint =
+                    firstNonBlank(
+                        source.attr(
+                            "label"
+                        ),
+                        source.attr(
+                            "res"
+                        ),
+                        source.attr(
+                            "resolution"
+                        ),
+                        source.attr(
+                            "data-quality"
+                        ),
+                        source.attr(
+                            "data-resolution"
+                        ),
+                        source.attr(
+                            "data-res"
+                        ),
+                        source.attr(
+                            "data-label"
+                        ),
+                        source.attr(
+                            "size"
+                        ),
+                        source.attr(
+                            "title"
+                        )
+                    )
 
-        /* Absolute URLs inside inline JavaScript / JSON. */
-        val mediaRegex = Regex(
-            """(?i)(https?:\/\/[^\s"'<>]+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\s"'<>]*)?)"""
-        )
+                add(
+                    source.attr(
+                        "src"
+                    ),
+                    hint
+                )
 
-        mediaRegex.findAll(html).forEach { match ->
-            val nearbyStart = (match.range.first - 300).coerceAtLeast(0)
-            val nearbyEnd = (match.range.last + 300).coerceAtMost(html.length - 1)
-            val context = if (html.isNotEmpty() && nearbyStart <= nearbyEnd) {
-                html.substring(nearbyStart, nearbyEnd + 1)
-            } else {
-                ""
+                add(
+                    source.attr(
+                        "data-src"
+                    ),
+                    hint
+                )
+
+                add(
+                    source.attr(
+                        "data-file"
+                    ),
+                    hint
+                )
+
+                add(
+                    source.attr(
+                        "data-video"
+                    ),
+                    hint
+                )
+
+                add(
+                    source.attr(
+                        "data-url"
+                    ),
+                    hint
+                )
             }
 
-            add(match.value, null, context)
+        /*
+         * ------------------------------------------------------------
+         * data-* media attributes
+         * ------------------------------------------------------------
+         */
+        document
+            .select(
+                "[data-src], " +
+                    "[data-file], " +
+                    "[data-video], " +
+                    "[data-url], " +
+                    "[data-hls], " +
+                    "[data-m3u8], " +
+                    "[data-mp4], " +
+                    "[data-stream], " +
+                    "[data-source]"
+            )
+            .forEach { element ->
+
+                val hint =
+                    firstNonBlank(
+                        element.attr(
+                            "data-quality"
+                        ),
+                        element.attr(
+                            "data-resolution"
+                        ),
+                        element.attr(
+                            "data-res"
+                        ),
+                        element.attr(
+                            "resolution"
+                        ),
+                        element.attr(
+                            "res"
+                        ),
+                        element.attr(
+                            "label"
+                        ),
+                        element.attr(
+                            "title"
+                        ),
+                        element.attr(
+                            "size"
+                        )
+                    )
+
+                add(
+                    element.attr(
+                        "data-src"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-file"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-video"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-url"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-hls"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-m3u8"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-mp4"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-stream"
+                    ),
+                    hint
+                )
+
+                add(
+                    element.attr(
+                        "data-source"
+                    ),
+                    hint
+                )
+            }
+
+        /*
+         * ------------------------------------------------------------
+         * Direct links / iframe / embed
+         * ------------------------------------------------------------
+         */
+        document
+            .select(
+                "a[href], iframe[src], embed[src]"
+            )
+            .forEach { element ->
+
+                val raw =
+                    when {
+
+                        element.hasAttr(
+                            "href"
+                        ) ->
+                            element.attr(
+                                "href"
+                            )
+
+                        element.hasAttr(
+                            "src"
+                        ) ->
+                            element.attr(
+                                "src"
+                            )
+
+                        else ->
+                            ""
+                    }
+
+                val hint =
+                    firstNonBlank(
+                        element.attr(
+                            "label"
+                        ),
+                        element.attr(
+                            "data-quality"
+                        ),
+                        element.attr(
+                            "data-resolution"
+                        ),
+                        element.attr(
+                            "data-res"
+                        ),
+                        element.attr(
+                            "resolution"
+                        ),
+                        element.attr(
+                            "res"
+                        ),
+                        element.attr(
+                            "size"
+                        )
+                    )
+
+                add(
+                    raw,
+                    hint
+                )
+            }
+
+        /*
+         * ------------------------------------------------------------
+         * Absolute media URLs in JavaScript / JSON
+         * ------------------------------------------------------------
+         */
+        val mediaRegex =
+            Regex(
+                """(?i)(https?:\/\/[^\s"'<>]+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\s"'<>]*)?)"""
+            )
+
+        mediaRegex
+            .findAll(html)
+            .forEach { match ->
+
+                add(
+                    match.value,
+                    null
+                )
+            }
+
+        val quotedMediaRegex =
+            Regex(
+                """(?i)[\"']([^\"']+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\"']*)?)[\"']"""
+            )
+
+        quotedMediaRegex
+            .findAll(html)
+            .forEach { match ->
+
+                add(
+                    match.groupValues[1],
+                    null
+                )
+            }
+
+        return result.values.toList()
+    }
+
+    /*
+     * ============================================================
+     * HLS MASTER PLAYLIST EXPANSION
+     * ============================================================
+     */
+    private suspend fun expandHlsVariants(
+        master: MediaCandidate
+    ): List<MediaCandidate> {
+
+        val result =
+            linkedMapOf<String, MediaCandidate>()
+
+        val response =
+            runCatching {
+
+                app.get(
+                    master.url,
+                    headers =
+                        pageHeaders +
+                            (
+                                "Referer" to
+                                    master.referer
+                                )
+                )
+
+            }.getOrNull()
+                ?: return emptyList()
+
+        val body =
+            response.text
+
+        if (
+            !body.contains(
+                "#EXT-X-STREAM-INF",
+                ignoreCase = true
+            )
+        ) {
+            return emptyList()
         }
 
-        val quotedMediaRegex = Regex(
-            """(?i)[\"']([^\"']+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\"']*)?)[\"']"""
-        )
+        val lines =
+            body.lines()
 
-        quotedMediaRegex.findAll(html).forEach { match ->
-            add(
-                match.groupValues[1],
-                null,
-                match.value
-            )
+        for (index in lines.indices) {
+
+            val line =
+                lines[index].trim()
+
+            if (
+                !line.startsWith(
+                    "#EXT-X-STREAM-INF",
+                    ignoreCase = true
+                )
+            ) {
+                continue
+            }
+
+            val resolutionMatch =
+                Regex(
+                    """(?i)RESOLUTION\s*=\s*(\d+)\s*x\s*(\d+)"""
+                ).find(line)
+
+            val bandwidth =
+                Regex(
+                    """(?i)BANDWIDTH\s*=\s*(\d+)"""
+                )
+                    .find(line)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toLongOrNull()
+
+            val resolution =
+                resolutionMatch?.let {
+                    val width =
+                        it.groupValues[1]
+                            .toIntOrNull()
+
+                    val height =
+                        it.groupValues[2]
+                            .toIntOrNull()
+
+                    if (
+                        width != null &&
+                        height != null
+                    ) {
+                        Pair(
+                            width,
+                            height
+                        )
+                    } else {
+                        null
+                    }
+                }
+
+            var variantUrl: String? =
+                null
+
+            var nextIndex =
+                index + 1
+
+            while (
+                nextIndex < lines.size
+            ) {
+
+                val next =
+                    lines[nextIndex]
+                        .trim()
+
+                if (next.isBlank()) {
+                    nextIndex++
+                    continue
+                }
+
+                if (
+                    next.startsWith("#")
+                ) {
+                    nextIndex++
+                    continue
+                }
+
+                variantUrl =
+                    next
+
+                break
+            }
+
+            if (variantUrl.isNullOrBlank()) {
+                continue
+            }
+
+            val absolute =
+                absoluteUrlLocal(
+                    variantUrl,
+                    master.url
+                )
+
+            if (
+                !isHttpUrl(
+                    absolute
+                )
+            ) {
+                continue
+            }
+
+            if (
+                isAdvertisingUrl(
+                    absolute
+                )
+            ) {
+                continue
+            }
+
+            val quality =
+                when {
+
+                    resolution != null &&
+                        resolution.second >= 2160 ->
+                        Qualities.P2160.value
+
+                    resolution != null &&
+                        resolution.second >= 1440 ->
+                        Qualities.P1440.value
+
+                    resolution != null &&
+                        resolution.second >= 1080 ->
+                        Qualities.P1080.value
+
+                    resolution != null &&
+                        resolution.second >= 720 ->
+                        Qualities.P720.value
+
+                    resolution != null &&
+                        resolution.second >= 480 ->
+                        Qualities.P480.value
+
+                    resolution != null &&
+                        resolution.second >= 360 ->
+                        Qualities.P360.value
+
+                    else ->
+                        detectQuality(
+                            null,
+                            absolute
+                        )
+                }
+
+            /*
+             * The bitrate is not used as the displayed quality. It only
+             * helps when several variants accidentally share the same height.
+             */
+            val candidate =
+                MediaCandidate(
+                    url = absolute,
+                    quality = quality,
+                    referer = master.referer
+                )
+
+            val old =
+                result[absolute]
+
+            if (
+                old == null ||
+                betterMediaCandidate(
+                    candidate,
+                    old
+                )
+            ) {
+                result[absolute] =
+                    candidate
+            }
+
+            @Suppress("UNUSED_VARIABLE")
+            val ignoredBandwidth =
+                bandwidth
         }
 
         return result.values.toList()
     }
 
-    private fun firstNonBlank(
+    /*
+     * ============================================================
+     * SEARCH RESPONSE
+     * ============================================================
+     */
+private fun firstNonBlank(
         vararg values: String
     ): String? {
         return values
@@ -1156,46 +1762,95 @@ class OnlineMovies : MainAPI() {
             lower.contains("youtube-nocookie.com")
     }
 
-    private fun detectQuality(
+    
+private fun detectQuality(
         hint: String?,
-        url: String,
-        contextText: String? = null
+        url: String
     ): Int {
 
-        val source = (
-            (hint ?: "") + " " +
-                url + " " +
-                (contextText ?: "")
-            ).lowercase(Locale.ROOT)
+        /*
+         * Resolution must come from source-local metadata or the URL itself.
+         * Do NOT inspect arbitrary surrounding page HTML.
+         */
+        val source =
+            (
+                (hint ?: "") +
+                    " " +
+                    url
+                )
+                .lowercase(
+                    Locale.ROOT
+                )
 
         return when {
-            Regex("\\b2160(?:p)?\\b").containsMatchIn(source) ||
+
+            Regex(
+                """\b2160(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b3840x2160\b"""
+                ).containsMatchIn(source) ||
                 "4k" in source ||
                 "uhd" in source ->
+
                 Qualities.P2160.value
 
-            Regex("\\b1440(?:p)?\\b").containsMatchIn(source) ||
+            Regex(
+                """\b1440(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b2560x1440\b"""
+                ).containsMatchIn(source) ||
                 "2k" in source ->
+
                 Qualities.P1440.value
 
-            Regex("\\b1080(?:p)?\\b").containsMatchIn(source) ||
+            Regex(
+                """\b1080(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b1920x1080\b"""
+                ).containsMatchIn(source) ||
                 "fullhd" in source ||
                 "full-hd" in source ||
                 "fhd" in source ->
+
                 Qualities.P1080.value
 
-            Regex("\\b720(?:p)?\\b").containsMatchIn(source) ||
-                Regex("\\b1280x720\\b").containsMatchIn(source) ||
-                Regex("\\bhd\\b").containsMatchIn(source) ->
+            Regex(
+                """\b720(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b1280x720\b"""
+                ).containsMatchIn(source) ||
+                Regex(
+                    """\b720x\d+\b"""
+                ).containsMatchIn(source) ->
+
                 Qualities.P720.value
 
-            Regex("\\b480(?:p)?\\b").containsMatchIn(source) ||
-                Regex("\\b854x480\\b").containsMatchIn(source) ||
-                Regex("\\bsd\\b").containsMatchIn(source) ->
+            Regex(
+                """\b480(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b854x480\b"""
+                ).containsMatchIn(source) ||
+                Regex(
+                    """\b480x\d+\b"""
+                ).containsMatchIn(source) ->
+
                 Qualities.P480.value
 
-            Regex("\\b360(?:p)?\\b").containsMatchIn(source) ||
-                Regex("\\b640x360\\b").containsMatchIn(source) ->
+            Regex(
+                """\b360(?:p)?\b"""
+            ).containsMatchIn(source) ||
+                Regex(
+                    """\b640x360\b"""
+                ).containsMatchIn(source) ||
+                Regex(
+                    """\b360x\d+\b"""
+                ).containsMatchIn(source) ->
+
                 Qualities.P360.value
 
             else ->
@@ -1203,7 +1858,7 @@ class OnlineMovies : MainAPI() {
         }
     }
 
-    private fun qualityValue(
+private fun qualityValue(
         quality: Int
     ): Int {
         return when {
