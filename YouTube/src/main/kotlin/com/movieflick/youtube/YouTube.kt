@@ -3041,7 +3041,17 @@ class YouTube : MainAPI() {
 
             results.add(
                 newMovieSearchResponse(title, url, TvType.Live) {
-                    posterUrl = selected.thumbnails.lastOrNull()?.url
+                    posterUrl =
+                        selected
+                            .uploaderAvatars
+                            .lastOrNull()
+                            ?.url
+                            ?.takeIf {
+                                it.isNotBlank()
+                            }
+                            ?: selected.thumbnails
+                                .lastOrNull()
+                                ?.url
                 }
             )
 
@@ -3173,12 +3183,16 @@ class YouTube : MainAPI() {
 
                         posterUrl =
                             selected
-                                .thumbnails
+                                .uploaderAvatars
                                 .lastOrNull()
                                 ?.url
                                 ?.takeIf {
                                     it.isNotBlank()
                                 }
+                                ?: selected
+                                    .thumbnails
+                                    .lastOrNull()
+                                    ?.url
                     }
                 )
             }
