@@ -1463,6 +1463,24 @@ class CinePlexFTP : MainAPI() {
         ).containsMatchIn(path)
     }
 
+    private fun forceScheme(url: String, scheme: String): String {
+        val clean = cleanUrl(url)
+        if (clean.isBlank()) return clean
+
+        return runCatching {
+            val uri = URI(clean)
+            val host = uri.host.orEmpty()
+            if (host.isBlank()) return@runCatching clean
+
+            val port = if (uri.port >= 0) ":${uri.port}" else ""
+            val path = uri.rawPath.orEmpty()
+            val query = uri.rawQuery.orEmpty()
+
+            "$scheme://$host$port$path" +
+                if (query.isBlank()) "" else "?$query"
+        }.getOrElse { clean }
+    }
+
     private fun tvExactHlsHeaders(episodeUrl: String): Map<String, String> {
         return mapOf(
             "User-Agent" to
