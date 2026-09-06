@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Locale
 import org.json.JSONArray
+import okhttp3.Headers
 
 class CinePlexFTP : MainAPI() {
 
@@ -1639,38 +1640,24 @@ class CinePlexFTP : MainAPI() {
     }
 
     private fun captureSetCookies(
-        headers: Map<String, String>,
+        headers: Headers,
         cookieJar: MutableMap<String, String>
     ) {
-        val rawSetCookie =
-            headers.entries
-                .firstOrNull { it.key.equals("Set-Cookie", ignoreCase = true) }
-                ?.value
-                ?: headers.entries
-                    .firstOrNull { it.key.equals("set-cookie", ignoreCase = true) }
-                    ?.value
-                ?: return
+        val setCookies = headers.values("Set-Cookie")
+        if (setCookies.isEmpty()) return
 
-        /*
-         * CloudStream exposes response headers as a simple map in the provider
-         * API. When several Set-Cookie values are collapsed into one string,
-         * split only at commas followed by a new cookie name so Expires dates
-         * are not accidentally cut in the middle.
-         */
-        rawSetCookie
-            .split(Regex(",(?=\\s*[A-Za-z0-9_!#$%&'*+\\-.^`|~]+\\s*=)"))
-            .forEach { item ->
-                val pair = item.substringBefore(';').trim()
-                val separator = pair.indexOf('=')
-                if (separator <= 0) return@forEach
+        for (rawSetCookie in setCookies) {
+            val pair = rawSetCookie.substringBefore(';').trim()
+            val separator = pair.indexOf('=')
+            if (separator <= 0) continue
 
-                val name = pair.substring(0, separator).trim()
-                val value = pair.substring(separator + 1).trim()
+            val name = pair.substring(0, separator).trim()
+            val value = pair.substring(separator + 1).trim()
 
-                if (name.isNotBlank() && value.isNotBlank()) {
-                    cookieJar[name] = value
-                }
+            if (name.isNotBlank() && value.isNotBlank()) {
+                cookieJar[name] = value
             }
+        }
     }
 
     private fun extractHlsPlaylistUrisFromManifest(
