@@ -1119,22 +1119,28 @@ class CinePlexFTP : MainAPI() {
             val httpsEpisode = forceScheme(episodeUrl, "https")
             val httpEpisode = forceScheme(episodeUrl, "http")
 
-            if (httpsUrl.isNotBlank()) {
-                add(
-                    url = httpsUrl,
-                    referer = httpsEpisode,
-                    headers = tvHlsHeaders(httpsEpisode),
-                    score = score + 30,
-                    label = "$label • HTTPS"
-                )
-            }
+            /*
+             * Cine Plex exposes the HLS URL as HTTP in its own player HTML.
+             * Keep the site-native HTTP variant first, then use HTTPS only as a
+             * fallback. This avoids making a protocol upgrade that the origin
+             * server may handle differently from the URL used by the website.
+             */
             if (httpUrl.isNotBlank()) {
                 add(
                     url = httpUrl,
                     referer = httpEpisode,
                     headers = tvHlsHeaders(httpEpisode),
-                    score = score,
+                    score = score + 30,
                     label = "$label • HTTP"
+                )
+            }
+            if (httpsUrl.isNotBlank()) {
+                add(
+                    url = httpsUrl,
+                    referer = httpsEpisode,
+                    headers = tvHlsHeaders(httpsEpisode),
+                    score = score,
+                    label = "$label • HTTPS"
                 )
             }
         }
@@ -1225,16 +1231,19 @@ class CinePlexFTP : MainAPI() {
             if (scheme.isBlank() || host.isBlank()) "" else "$scheme://$host"
         }.getOrElse { "" }
 
+        /*
+         * Keep the HLS request headers intentionally minimal. The Cine Plex
+         * player itself supplies the manifest URL from the episode page, and
+         * a forced Origin/Sec-Fetch profile can turn an otherwise valid HLS
+         * request into a server-side HTTP error. Referer + User-Agent are the
+         * important same-site values here.
+         */
         return mapOf(
             "User-Agent" to ua,
             "Accept" to "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
             "Cache-Control" to "no-cache, no-store, max-age=0",
             "Pragma" to "no-cache",
-            "Referer" to cleanEpisode,
-            "Origin" to if (origin.isNotBlank()) origin else mainUrl,
-            "Sec-Fetch-Dest" to "empty",
-            "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "same-origin"
+            "Referer" to cleanEpisode
         )
     }
 
@@ -1262,6 +1271,185 @@ class CinePlexFTP : MainAPI() {
 
         return found.toList()
     }
+
+    private fun buildTvEpisodePageCandidates(url: String): List<String> {
+        val clean = url.substringBefore('#').trim()
+        val result = linkedSetOf<String>()
+        result.add(clean)
+
+        runCatching {
+            val uri = URI(clean)
+            val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
+            val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
+            val path = uri.rawPath.orEmpty()
+            val query = uri.rawQuery.orEmpty()
+
+            if (host.isNotBlank() && path.isNotBlank()) {
+                val otherScheme = when (scheme) {
+                    "http" -> "https"
+                    "https" -> "http"
+                    else -> null
+                }
+
+                if (otherScheme != null) {
+                    result.add(
+                        "$otherScheme://$host$path" +
+                            if (query.isBlank()) "" else "?$query"
+                    )
+                }
+            }
+        }
+
+        /*
+         * Also try the same episode without autoplay. The actual HLS source
+         * is the same player source, but this can bypass page variants.
+         */
+        val withoutAutoplay = clean.replace(
+            Regex("(?i)([?&])autoplay=[^&]*&?"),
+            "$1"
+        )
+            .replace("?&", "?")
+            .replace(Regex("[?&]$"), "")
+
+        if (withoutAutoplay != clean) {
+            result.add(withoutAutoplay)
+        }
+
+        return result.toList()
+    }
+
+    private fun buildTvPageRequestVariants(
+        url: String
+    ): List<Pair<String, Map<String, String>>> {
+        val base = pageHeaders("$mainUrl/")
+        return listOf(
+            url to (
+                base + mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache"
+                )
+            ),
+            url to (
+                base + mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "same-origin"
+                )
+            )
+        )
+    }
+
+    private fun appendQueryParameter(
+        url: String,
+        key: String,
+        value: String
+    ): String {
+        val separator = if (url.contains('?')) '&' else '?'
+        return "$url$separator${URLEncoder.encode(key, StandardCharsets.UTF_8.toString())}=" +
+            URLEncoder.encode(value, StandardCharsets.UTF_8.toString())
+    }
+
+    /*
+     * Extremely broad TV-only M3U8 crawler.
+     *
+     * It scans:
+     *   - normal raw HTML
+     *   - escaped HTML
+     *   - URL-encoded HTML
+     *   - JS variables
+     *
+     * Only a Cine Plex-hosted URL containing .m3u8 is accepted.
+     */
+    private fun extractAnyCinePlexM3u8(
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        if (html.isBlank()) return emptyList()
+
+        val variants = linkedSetOf<String>()
+        variants.add(html)
+
+        val normalized = html
+            .replace("\\/", "/")
+            .replace("\\x2F", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+            .replace("&amp;", "&")
+
+        variants.add(normalized)
+
+        runCatching {
+            variants.add(
+                URLDecoder.decode(
+                    normalized,
+                    StandardCharsets.UTF_8.toString()
+                )
+            )
+        }
+
+        val found = linkedSetOf<String>()
+
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val candidate = raw
+                .trim()
+                .replace("\\/", "/")
+                .replace("\\x2F", "/")
+                .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
+
+            if (candidate.isBlank()) return
+
+            val absolute = absoluteUrl(candidate, baseUrl)
+            if (isCinePlexTvMediaUrl(absolute)) {
+                found.add(absolute)
+            }
+        }
+
+        val patterns = listOf(
+            Regex(
+                """(?is)(?:https?:)?//[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
+            ),
+            Regex(
+                """(?is)/[^"'<>\s\\]*\.m3u8(?:\?[^"'<>\s\\]*)?"""
+            ),
+            Regex(
+                """(?is)(?:src|source|file|url|video|videoUrl|stream|streamUrl|playlist|manifest)\s*[:=]\s*["']([^"']+?\.m3u8(?:\?[^"']*)?)["']"""
+            ),
+            Regex(
+                """(?is)(?:https?:)?//[^"'<>\s\\]+/hls/[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
+            )
+        )
+
+        for (variant in variants) {
+            for (pattern in patterns) {
+                pattern.findAll(variant).forEach { match ->
+                    val value = match.groupValues
+                        .getOrNull(1)
+                        ?.takeIf { it.isNotBlank() }
+                        ?: match.value
+
+                    add(value)
+                }
+            }
+        }
+
+        return found.toList()
+    }
+
+
 
     private fun extractTvHlsSources(
         document: Document,
