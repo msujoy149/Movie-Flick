@@ -80,17 +80,8 @@ class CTGFTP : MainAPI() {
         val document = getDocument(url)
             ?: return newHomePageResponse(request, emptyList(), false)
 
-        val forcedType = when {
-            request.data.contains("/tv", true) -> TvType.TvSeries
-            request.data.contains("/anime", true) -> TvType.Anime
-            else -> TvType.Movie
-        }
-
-        val items = parseCategoryItems(
-            document = document,
-            sourceUrl = url,
-            forcedType = forcedType
-        ).take(30)
+        val items = parseItems(document, url)
+            .take(30)
 
         return newHomePageResponse(
             request,
@@ -567,32 +558,6 @@ class CTGFTP : MainAPI() {
                     }.getOrNull()
 
                     if (watchResponse != null) {
-                        /*
-                         * First try the direct CTG storage/download URLs exposed
-                         * by the watch page. This is the same simple path used
-                         * by the older working provider and is the safest
-                         * recovery path when the serialized JSON changes.
-                         */
-                        val directWatchSources = recoverPlayableUrls(
-                            document = watchResponse.document,
-                            html = watchResponse.text,
-                            baseUrl = watchUrl
-                        ).distinct()
-
-                        if (directWatchSources.isNotEmpty()) {
-                            directWatchSources.forEach { source ->
-                                emitMediaLink(
-                                    mediaUrl = source,
-                                    referer = watchUrl,
-                                    callback = callback
-                                )
-                            }
-                            return true
-                        }
-
-                        /*
-                         * Next try the current Next.js serialized links[] payload.
-                         */
                         val ctgSources = extractCtgPlaybackLinks(
                             html = watchResponse.text,
                             baseUrl = watchUrl
@@ -619,7 +584,9 @@ class CTGFTP : MainAPI() {
                         }
 
                         /*
-                         * Final page-level fallback for normal video/source tags.
+                         * Keep the existing generic fallback as a secondary path.
+                         * This protects against a CTG markup change where a direct
+                         * <video>/<source> suddenly becomes available again.
                          */
                         val fallbackSources = extractMediaUrls(
                             document = watchResponse.document,
@@ -1056,175 +1023,6 @@ class CTGFTP : MainAPI() {
                 headers = pageHeaders + ("Referer" to "$mainUrl/")
             ).document
         }.getOrNull()
-    }
-
-    private fun parseCategoryItems(
-        document: Document,
-        sourceUrl: String,
-        forcedType: TvType
-    ): List<SiteItem> {
-        val normal = parseItems(document, sourceUrl)
-        if (normal.isNotEmpty()) return normal
-
-        val result = linkedMapOf<String, SiteItem>()
-        val sourcePath = runCatching {
-            URI(sourceUrl).path.orEmpty().lowercase(Locale.ROOT)
-        }.getOrDefault("")
-
-        val selectors =
-            "a[href], [data-href], [data-url], [data-link], [onclick], " +
-                "[data-movie], [data-series], [data-tv], [data-anime], " +
-                "[role=link]"
-
-        document.select(selectors).forEach { element ->
-            val raw = sequenceOf(
-                element.attr("href"),
-                element.attr("data-href"),
-                element.attr("data-url"),
-                element.attr("data-link"),
-                element.attr("data-movie"),
-                element.attr("data-series"),
-                element.attr("data-tv"),
-                element.attr("data-anime"),
-                element.attr("onclick")
-            ).firstOrNull { it.isNotBlank() } ?: return@forEach
-
-            val extracted = extractContentPath(raw) ?: raw
-            val absolute = absoluteUrl(cleanUrl(extracted), sourceUrl)
-            val path = runCatching {
-                URI(absolute).path.orEmpty().lowercase(Locale.ROOT)
-            }.getOrDefault("")
-
-            val matchesForcedCategory = when (forcedType) {
-                TvType.TvSeries ->
-                    path.startsWith("/tv/") ||
-                        path.startsWith("/series/") ||
-                        path.startsWith("/tv-shows/") ||
-                        path.startsWith("/tvshows/")
-                TvType.Anime -> path.startsWith("/anime/")
-                else -> path.startsWith("/movies/") || path.startsWith("/movie/")
-            }
-
-            val categoryPageFallback = when (forcedType) {
-                TvType.TvSeries -> sourcePath == "/tv" || sourcePath.startsWith("/tv?")
-                TvType.Anime -> sourcePath == "/anime" || sourcePath.startsWith("/anime?")
-                else -> sourcePath == "/movies" || sourcePath.startsWith("/movies?")
-            }
-
-            if (!matchesForcedCategory) {
-                if (!categoryPageFallback) return@forEach
-                if (!isContentUrl(absolute)) return@forEach
-            }
-
-            val card = findCard(element)
-            val title = cleanTitle(
-                firstNonBlank(
-                    card.selectFirst(".title")?.text(),
-                    card.selectFirst(".movie-title")?.text(),
-                    card.selectFirst(".movie_name")?.text(),
-                    card.selectFirst(".name")?.text(),
-                    card.selectFirst("h1")?.text(),
-                    card.selectFirst("h2")?.text(),
-                    card.selectFirst("h3")?.text(),
-                    element.attr("aria-label"),
-                    card.selectFirst("img")?.attr("alt"),
-                    element.text(),
-                    titleFromUrl(absolute)
-                )
-            )
-
-            if (title.isBlank() || isNavigationTitle(title)) return@forEach
-
-            result.putIfAbsent(
-                absolute,
-                SiteItem(
-                    title = title,
-                    url = absolute,
-                    poster = extractPosterFromElement(card, sourceUrl),
-                    type = forcedType
-                )
-            )
-        }
-
-        /*
-         * Final raw-HTML fallback for CTG responses where the content links are
-         * embedded in scripts instead of normal <a href> attributes.
-         */
-        if (result.isEmpty()) {
-            val html = document.html()
-                .replace("\\/", "/")
-                .replace("&amp;", "&")
-                .replace("\\u002F", "/")
-                .replace("\\u002f", "/")
-
-            val urlPattern = Regex(
-                """(?i)(?:https?://[^\"'<>\s]+)?/(?:movies|movie|tv|series|tv-shows|tvshows|anime)/[A-Za-z0-9%._~!$&'()*+,;=:@/-]+"""
-            )
-
-            urlPattern.findAll(html).forEach { match ->
-                val absolute = absoluteUrl(match.value, sourceUrl)
-                val path = runCatching {
-                    URI(absolute).path.orEmpty().lowercase(Locale.ROOT)
-                }.getOrDefault("")
-
-                val matches = when (forcedType) {
-                    TvType.TvSeries ->
-                        path.startsWith("/tv/") ||
-                            path.startsWith("/series/") ||
-                            path.startsWith("/tv-shows/") ||
-                            path.startsWith("/tvshows/")
-                    TvType.Anime -> path.startsWith("/anime/")
-                    else -> path.startsWith("/movies/") || path.startsWith("/movie/")
-                }
-
-                if (!matches) return@forEach
-
-                val title = titleFromUrl(absolute)
-                    .replace('-', ' ')
-                    .replace('_', ' ')
-                    .trim()
-
-                if (title.isBlank() || isNavigationTitle(title)) return@forEach
-
-                result.putIfAbsent(
-                    absolute,
-                    SiteItem(
-                        title = cleanTitle(title),
-                        url = absolute,
-                        poster = null,
-                        type = forcedType
-                    )
-                )
-            }
-        }
-
-        return result.values.toList()
-    }
-
-    private fun extractContentPath(raw: String): String? {
-        val value = cleanUrl(raw)
-        if (value.isBlank()) return null
-
-        if (value.startsWith("http://", true) ||
-            value.startsWith("https://", true) ||
-            value.startsWith("/")) {
-            return value
-        }
-
-        val patterns = listOf(
-            Regex("""(?i)(?:window\.location(?:\.href)?|location(?:\.href)?|href)\s*=\s*['\"]([^'\"]+)['\"]"""),
-            Regex("""(?i)(?:openMovie|openSeries|openTv|openAnime)\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"""),
-            Regex("""(?i)(/(?:movies|movie|tv|series|tv-shows|tvshows|anime)/[^'\"\s)]+)"""),
-            Regex("""(?i)(https?://[^'\"\s)]+/(?:movies|movie|tv|series|tv-shows|tvshows|anime)/[^'\"\s)]+)""")
-        )
-
-        for (pattern in patterns) {
-            val match = pattern.find(value) ?: continue
-            val candidate = match.groupValues.getOrNull(1)?.trim()
-            if (!candidate.isNullOrBlank()) return candidate
-        }
-
-        return null
     }
 
     private fun parseItems(
@@ -1927,142 +1725,39 @@ class CTGFTP : MainAPI() {
         element: Element,
         pageUrl: String
     ): String? {
-        /*
-         * CTG can use normal images, lazy-loading attributes, responsive
-         * srcset, or CSS background-image.
-         */
-        fun validPoster(raw: String?): String? {
-            if (raw.isNullOrBlank()) return null
+        val og = element.selectFirst(
+            "meta[property=og:image], meta[name=twitter:image]"
+        )?.attr("content")
 
-            val value = raw
-                .trim()
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-                .trim('"', '\'', '`')
-
-            if (
-                value.isBlank() ||
-                value.startsWith("data:", true) ||
-                value.startsWith("javascript:", true) ||
-                value == "#"
-            ) {
-                return null
-            }
-
-            val absolute = absoluteUrl(value, pageUrl).trim()
-            if (absolute.isBlank()) return null
-
-            val path = runCatching {
-                URI(absolute).path.orEmpty().lowercase(Locale.ROOT)
-            }.getOrDefault("")
-
-            if (mediaExtensions.any { path.endsWith(it) }) return null
-            return absolute
-        }
-
-        fun firstSrcsetUrl(raw: String?): String? {
-            if (raw.isNullOrBlank()) return null
-
-            return raw
-                .split(',')
-                .asSequence()
-                .map { candidate ->
-                    candidate.trim()
-                        .split(Regex("""\s+"""))
-                        .firstOrNull()
-                        .orEmpty()
-                        .trim()
-                }
-                .firstOrNull { it.isNotBlank() }
-        }
-
-        val metaCandidates = listOf(
-            element.selectFirst("meta[property=og:image]")?.attr("content"),
-            element.selectFirst("meta[property=og:image:url]")?.attr("content"),
-            element.selectFirst("meta[name=twitter:image]")?.attr("content")
-        )
-
-        for (candidate in metaCandidates) {
-            val poster = validPoster(candidate)
-            if (poster != null) return poster
-        }
-
-        /*
-         * Prefer likely poster/cover images, while avoiding obvious logos and
-         * avatars. Do not use sortedByDescending here; a simple score pass is
-         * more compatible with older Kotlin/compiler combinations.
-         */
-        var bestImage: Element? = null
-        var bestScore = Int.MIN_VALUE
-
-        for (image in element.select("img, picture source")) {
-            val info = (
-                image.attr("alt") + " " +
-                    image.attr("class") + " " +
-                    image.attr("data-testid")
-            ).lowercase(Locale.ROOT)
-
-            var score = 0
-
-            if (info.contains("poster")) score += 10
-            if (info.contains("cover")) score += 8
-            if (info.contains("thumb")) score += 6
-            if (info.contains("movie")) score += 4
-            if (info.contains("logo")) score -= 10
-            if (info.contains("avatar")) score -= 10
-
-            val hasImageSource =
-                image.attr("data-poster").isNotBlank() ||
-                    image.attr("data-cover").isNotBlank() ||
-                    image.attr("data-src").isNotBlank() ||
-                    image.attr("data-lazy-src").isNotBlank() ||
-                    image.attr("data-original").isNotBlank() ||
-                    image.attr("data-image").isNotBlank() ||
-                    image.attr("data-url").isNotBlank() ||
-                    image.attr("src").isNotBlank() ||
-                    image.attr("data-srcset").isNotBlank() ||
-                    image.attr("srcset").isNotBlank()
-
-            if (hasImageSource) score += 1
-
-            if (bestImage == null || score > bestScore) {
-                bestImage = image
-                bestScore = score
-            }
-        }
-
-        if (bestImage != null) {
-            val candidates = listOf(
-                bestImage.attr("data-poster"),
-                bestImage.attr("data-cover"),
-                bestImage.attr("data-src"),
-                bestImage.attr("data-lazy-src"),
-                bestImage.attr("data-original"),
-                bestImage.attr("data-image"),
-                bestImage.attr("data-url"),
-                bestImage.attr("src"),
-                firstSrcsetUrl(bestImage.attr("data-srcset")),
-                firstSrcsetUrl(bestImage.attr("srcset"))
+        if (!og.isNullOrBlank()) {
+            return absoluteUrl(
+                og,
+                pageUrl
             )
-
-            for (raw in candidates) {
-                val poster = validPoster(raw)
-                if (poster != null) return poster
-            }
         }
 
-        /*
-         * Some card designs store the poster in CSS background-image.
-         */
-        val backgroundRegex = Regex(
-            """url\(\s*['"]?([^'")]+)['"]?\s*\)"""
-        )
+        val image = element.select(
+            "img[src], " +
+            "img[data-src], " +
+            "img[data-lazy-src], " +
+            "img[data-original], " +
+            "img[data-poster]"
+        ).firstOrNull()
 
-        for (node in element.select("[style*=background]")) {
-            for (match in backgroundRegex.findAll(node.attr("style"))) {
-                val poster = validPoster(match.groupValues.getOrNull(1))
-                if (poster != null) return poster
+        if (image != null) {
+            val source = sequenceOf(
+                image.attr("data-poster"),
+                image.attr("data-src"),
+                image.attr("data-lazy-src"),
+                image.attr("data-original"),
+                image.attr("src")
+            ).firstOrNull { it.isNotBlank() }
+
+            if (!source.isNullOrBlank()) {
+                return absoluteUrl(
+                    source,
+                    pageUrl
+                )
             }
         }
 
@@ -2154,10 +1849,7 @@ class CTGFTP : MainAPI() {
         }
 
         return when {
-            path.startsWith("/tv/") ||
-                path.startsWith("/series/") ||
-                path.startsWith("/tv-shows/") ||
-                path.startsWith("/tvshows/") -> TvType.TvSeries
+            path.startsWith("/tv/") -> TvType.TvSeries
             path.startsWith("/anime/") -> TvType.Anime
             else -> TvType.Movie
         }
@@ -2173,11 +1865,7 @@ class CTGFTP : MainAPI() {
         }
 
         return path.startsWith("/movies/") ||
-            path.startsWith("/movie/") ||
             path.startsWith("/tv/") ||
-            path.startsWith("/series/") ||
-            path.startsWith("/tv-shows/") ||
-            path.startsWith("/tvshows/") ||
             path.startsWith("/anime/")
     }
 
