@@ -1381,8 +1381,7 @@ class CinePlexFTP : MainAPI() {
 
         fun add(raw: String?) {
             if (raw.isNullOrBlank()) return
-            val value = raw
-                .trim()
+            val value = raw.trim()
                 .replace("\\/", "/")
                 .replace("\\x2F", "/")
                 .replace("\\u002F", "/")
@@ -1392,18 +1391,15 @@ class CinePlexFTP : MainAPI() {
                 .replace("\\u003a", ":")
                 .replace("&amp;", "&")
                 .trim('"', '\'', '`', ',', ';', ')', ']', '}')
-
             if (value.isBlank()) return
             val absolute = absoluteUrl(value, baseUrl)
-            if (isExactCinePlexHlsUrl(absolute)) {
-                found.add(cleanUrl(absolute))
-            }
+            if (isExactCinePlexHlsUrl(absolute)) found.add(cleanUrl(absolute))
         }
 
         document.select(
-            "video source[src], video[src], source[src], " +
-                "[src], [data-src], [data-video], [data-source], " +
-                "[data-stream], [data-manifest], [data-playlist]"
+            "video source[src], video[src], source[src], [src], " +
+                "[data-src], [data-video], [data-source], [data-stream], " +
+                "[data-manifest], [data-playlist]"
         ).forEach { element ->
             add(element.attr("src"))
             add(element.attr("data-src"))
@@ -1426,25 +1422,23 @@ class CinePlexFTP : MainAPI() {
             .replace("\\u003a", ":")
             .replace("&amp;", "&")
         variants.add(normalized)
-        runCatching {
-            variants.add(
-                URLDecoder.decode(
-                    normalized,
-                    StandardCharsets.UTF_8.toString()
-                )
-            )
-        }
+        runCatching { variants.add(URLDecoder.decode(normalized, StandardCharsets.UTF_8.toString())) }
 
+        // Find ANY m3u8 URL first. Then keep only the exact video-file-backed form.
         val absolutePattern = Regex(
-            """(?is)(?:https?:)?//[^\"'<>\s\\]+?/hls/[^\"'<>\s\\]*?\\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^\"'<>\s\\]+?\\.m3u8(?:\\?[^\"'<>\s\\]*)?"""
+            """(?is)(?:https?:)?//[^\"'<>\s\\]+?\.m3u8(?:\?[^\"'<>\s\\]*)?"""
         )
         val relativePattern = Regex(
-            """(?is)/hls/[^\"'<>\s\\]*?\\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^\"'<>\s\\]+?\\.m3u8(?:\\?[^\"'<>\s\\]*)?"""
+            """(?is)(?:/|\.\.?/)[^\"'<>\s\\]+?\.m3u8(?:\?[^\"'<>\s\\]*)?"""
+        )
+        val quotedPattern = Regex(
+            """(?is)[\"']([^\"']+?\.m3u8(?:\?[^\"']*)?)[\"']"""
         )
 
         for (variant in variants) {
             absolutePattern.findAll(variant).forEach { add(it.value) }
             relativePattern.findAll(variant).forEach { add(it.value) }
+            quotedPattern.findAll(variant).forEach { add(it.groupValues[1]) }
         }
 
         return found.toList()
@@ -1454,12 +1448,10 @@ class CinePlexFTP : MainAPI() {
         val cleaned = cleanUrl(url)
         if (!isCinePlexTvMediaUrl(cleaned)) return false
 
-        val path = runCatching {
-            URI(cleaned).path.orEmpty()
-        }.getOrDefault("")
+        val path = runCatching { URI(cleaned).rawPath.orEmpty() }.getOrDefault("")
 
         return Regex(
-            """(?i)^/hls/.+\\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\\.m3u8$"""
+            """(?i)^/hls/.+\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\.m3u8$"""
         ).containsMatchIn(path)
     }
 
