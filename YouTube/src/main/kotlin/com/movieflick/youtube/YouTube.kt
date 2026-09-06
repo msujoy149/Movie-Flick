@@ -24,7 +24,7 @@ class YouTube : MainAPI() {
 
     override var mainUrl = "https://www.youtube.com"
     override var name = "YouTube"
-    override var lang = "en"
+    override var lang = "hi"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -44,7 +44,6 @@ class YouTube : MainAPI() {
      */
 
     override val mainPage = mainPageOf(
-        "Trending" to "Trending",
         "trending_movies_and_shows" to "Movie Trailers",
         "music_india" to "Trending Music Videos",
         "movies" to "Movies",
@@ -1160,35 +1159,62 @@ class YouTube : MainAPI() {
         val key =
             request.data
 
-        if (page == 1) {
-            val cacheSection = "generic_" + key
-            val cached = cachedResponses(cacheSection, "generic")
+        val cacheSection =
+            "generic_" + key
 
-            if (cached.isNotEmpty()) {
-                scheduleBackgroundRefresh(cacheSection) {
-                    refreshGenericKioskHome(request.data, request.name, cacheSection)
-                }
-
-                return newHomePageResponse(
-                    listOf(HomePageList(request.name, cached, false)),
-                    false
-                )
-            }
-
-            val fast = buildGenericKioskFast(request.data, request.name, cacheSection)
-            scheduleBackgroundRefresh(cacheSection) {
-                refreshGenericKioskHome(request.data, request.name, cacheSection)
-            }
-            return fast
-        }
-
-        if (page == 1) {
-            pageCache.remove(
-                key
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                cacheSection,
+                request.name,
+                page
             )
         }
 
-        val extractor =
+        val cached =
+            cachedResponses(
+                cacheSection,
+                "generic",
+                HOME_CACHE_LIMIT
+            )
+
+        if (cached.isNotEmpty()) {
+            scheduleBackgroundRefresh(cacheSection) {
+                refreshGenericKioskHome(
+                    request.data,
+                    request.name,
+                    cacheSection
+                )
+            }
+
+            return newHomePageResponse(
+                listOf(
+                    HomePageList(
+                        request.name,
+                        cached.take(FAST_VISIBLE_COUNT),
+                        true
+                    )
+                ),
+                true
+            )
+        }
+
+        val fast =
+            buildGenericKioskFast(
+                request.data,
+                request.name,
+                cacheSection
+            )
+
+        scheduleBackgroundRefresh(cacheSection) {
+            refreshGenericKioskHome(
+                request.data,
+                request.name,
+                cacheSection
+            )
+        }
+
+        return fast
+
             try {
 
                 getKioskExtractor(
@@ -1305,6 +1331,7 @@ class YouTube : MainAPI() {
         const val FAST_VISIBLE_COUNT = 6
         const val HOME_CACHE_LIMIT = 50
         const val BACKGROUND_REFRESH_COOLDOWN_MS = 15_000L
+        const val GENERIC_BACKGROUND_PAGES = 6
 
         // Survives multiple YouTube provider instances in the same app process.
         val PREWARM_STARTED = AtomicBoolean(false)
@@ -1428,13 +1455,66 @@ class YouTube : MainAPI() {
         }
     }
 
-    private suspend fun getIndianMusicPage(
+    private fun getCachedHomePageChunk(
+        section: String,
+        title: String,
         page: Int
     ): HomePageResponse {
-        if (page > 1) {
+
+        val all =
+            cachedResponses(
+                section,
+                section,
+                HOME_CACHE_LIMIT
+            )
+
+        if (all.isEmpty() || page <= 1) {
             return newHomePageResponse(
                 emptyList(),
                 false
+            )
+        }
+
+        val start =
+            (page - 1) *
+                FAST_VISIBLE_COUNT
+
+        if (start >= all.size) {
+            return newHomePageResponse(
+                emptyList(),
+                false
+            )
+        }
+
+        val chunk =
+            all
+                .drop(start)
+                .take(FAST_VISIBLE_COUNT)
+
+        val hasMore =
+            start + chunk.size <
+                all.size
+
+        return newHomePageResponse(
+            listOf(
+                HomePageList(
+                    title,
+                    chunk,
+                    hasMore
+                )
+            ),
+            hasMore
+        )
+    }
+
+        private suspend fun getIndianMusicPage(
+        page: Int
+    ): HomePageResponse {
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                "music",
+                "Trending Music Videos",
+                page
             )
         }
 
@@ -1454,11 +1534,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Trending Music Videos",
-                        cached.take(HOME_CACHE_LIMIT),
-                        false
+                        cached.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
         }
 
@@ -1587,11 +1667,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Trending Music Videos",
-                        results,
-                        false
+                        results.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
 
         // Fresh content stays available for a generous window; background refresh
@@ -1620,7 +1700,13 @@ class YouTube : MainAPI() {
 
 
     private suspend fun getMoviesPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                "movies",
+                "Movies",
+                page
+            )
+        }
 
         val cached = cachedResponses("movies", "movie")
         if (cached.isNotEmpty()) {
@@ -1628,7 +1714,7 @@ class YouTube : MainAPI() {
                 buildMoviesPageFull(1, fastMode = false, forceRefresh = true)
             }
             return newHomePageResponse(
-                listOf(HomePageList("Movies", cached, false)),
+                listOf(HomePageList("Movies", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
                 false
             )
         }
@@ -1666,7 +1752,7 @@ class YouTube : MainAPI() {
         val results =
             mutableListOf<SearchResponse>()
 
-        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else HOME_CACHE_LIMIT
 
         val seenUrls =
             mutableSetOf<String>()
@@ -1778,11 +1864,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Movies",
-                        results,
-                        false
+                        results.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
 
         putCachedHomePage(
@@ -1949,7 +2035,13 @@ class YouTube : MainAPI() {
 
 
     private suspend fun getHindiMoviesPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                "hindi_movies",
+                "Hindi Movies",
+                page
+            )
+        }
 
         val cached = cachedResponses("hindi_movies", "movie")
         if (cached.isNotEmpty()) {
@@ -1957,7 +2049,7 @@ class YouTube : MainAPI() {
                 buildHindiMoviesPageFull(1, fastMode = false, forceRefresh = true)
             }
             return newHomePageResponse(
-                listOf(HomePageList("Hindi Movies", cached, false)),
+                listOf(HomePageList("Hindi Movies", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
                 false
             )
         }
@@ -1995,7 +2087,7 @@ class YouTube : MainAPI() {
         val candidates =
             mutableListOf<SearchResponse>()
 
-        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else 40
+        val resultLimit = if (fastMode) FAST_VISIBLE_COUNT else HOME_CACHE_LIMIT
 
         val scores =
             mutableMapOf<String, Int>()
@@ -2161,11 +2253,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Hindi Movies",
-                        finalResults,
-                        false
+                        finalResults.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
 
         putCachedHomePage(
@@ -2188,7 +2280,13 @@ class YouTube : MainAPI() {
 
 
     private suspend fun getCuratedLivePage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                "live",
+                "Live",
+                page
+            )
+        }
 
         val cached = cachedResponses("live", "live")
         if (cached.isNotEmpty()) {
@@ -2196,7 +2294,7 @@ class YouTube : MainAPI() {
                 buildCuratedLivePageFull(1, fastMode = false, forceRefresh = true)
             }
             return newHomePageResponse(
-                listOf(HomePageList("Live", cached, false)),
+                listOf(HomePageList("Live", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
                 false
             )
         }
@@ -2253,8 +2351,8 @@ class YouTube : MainAPI() {
         }
 
         return newHomePageResponse(
-            listOf(HomePageList("Live", results.take(FAST_VISIBLE_COUNT), false)),
-            false
+            listOf(HomePageList("Live", results.take(FAST_VISIBLE_COUNT), true)),
+            true
         )
     }
 
@@ -2393,11 +2491,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Live",
-                        results,
-                        false
+                        results.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
 
         putCachedHomePage(
@@ -2529,7 +2627,13 @@ class YouTube : MainAPI() {
 
 
     private suspend fun getReligionPage(page: Int): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList(), false)
+        if (page > 1) {
+            return getCachedHomePageChunk(
+                "religion",
+                "Religion",
+                page
+            )
+        }
 
         val cached = cachedResponses("religion", "religion")
         if (cached.isNotEmpty()) {
@@ -2537,7 +2641,7 @@ class YouTube : MainAPI() {
                 buildReligionPageFull(1, fastMode = false, forceRefresh = true)
             }
             return newHomePageResponse(
-                listOf(HomePageList("Religion", cached, false)),
+                listOf(HomePageList("Religion", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
                 false
             )
         }
@@ -2636,8 +2740,8 @@ class YouTube : MainAPI() {
         }
 
         return newHomePageResponse(
-            listOf(HomePageList("Religion", results.take(FAST_VISIBLE_COUNT), false)),
-            false
+            listOf(HomePageList("Religion", results.take(FAST_VISIBLE_COUNT), true)),
+            true
         )
     }
 
@@ -2840,11 +2944,11 @@ class YouTube : MainAPI() {
                 listOf(
                     HomePageList(
                         "Religion",
-                        finalResults,
-                        false
+                        finalResults.take(FAST_VISIBLE_COUNT),
+                        true
                     )
                 ),
-                false
+                true
             )
 
         putCachedHomePage(
@@ -3999,11 +4103,11 @@ class YouTube : MainAPI() {
             listOf(
                 HomePageList(
                     sectionName,
-                    results,
+                    results.take(FAST_VISIBLE_COUNT),
                     true
                 )
             ),
-            pageData?.hasNextPage() == true
+            true
         )
     }
 
@@ -4014,12 +4118,48 @@ class YouTube : MainAPI() {
     ) {
         val fresh =
             try {
-                val extractor = getKioskExtractor(kioskId)
                 withTimeoutOrNull(8_000L) {
+                    val extractor =
+                        getKioskExtractor(kioskId)
+
                     extractor.fetchPage()
-                    extractor.initialPage.items
-                        .map { it.toSearchResponse() }
-                        .take(40)
+
+                    val collected =
+                        mutableListOf<SearchResponse>()
+
+                    var page =
+                        extractor.initialPage
+
+                    repeat(
+                        GENERIC_BACKGROUND_PAGES
+                    ) {
+                        collected.addAll(
+                            page.items.map {
+                                it.toSearchResponse()
+                            }
+                        )
+
+                        if (
+                            collected.size >=
+                            HOME_CACHE_LIMIT ||
+                            !page.hasNextPage()
+                        ) {
+                            return@repeat
+                        }
+
+                        page =
+                            extractor.getPage(
+                                page.nextPage
+                            )
+                    }
+
+                    collected
+                        .distinctBy {
+                            it.url
+                        }
+                        .take(
+                            HOME_CACHE_LIMIT
+                        )
                 } ?: emptyList()
             } catch (_: Exception) {
                 emptyList()
@@ -4027,7 +4167,11 @@ class YouTube : MainAPI() {
 
         if (fresh.isEmpty()) return
 
-        putCachedResponses(cacheSection, fresh, 15 * 60 * 1000L)
+        putCachedResponses(
+            cacheSection,
+            fresh,
+            15 * 60 * 1000L
+        )
     }
 
     override suspend fun search(
