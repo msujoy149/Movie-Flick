@@ -1012,7 +1012,8 @@ class YouTube : MainAPI() {
     private suspend fun fetchSearchItemsInBatches(
         queries: List<String>,
         batchSize: Int = 6,
-        fastMode: Boolean = false
+        fastMode: Boolean = false,
+        continuationSection: String? = null
     ): List<List<InfoItem>> {
 
         val cleanQueries =
@@ -1056,8 +1057,16 @@ class YouTube : MainAPI() {
 
                                     extractor.fetchPage()
 
-                                    extractor
-                                        .initialPage
+                                    val initialPage =
+                                        extractor.initialPage
+
+                                    if (continuationSection != null) {
+                                        searchContinuationCache[
+                                            "$continuationSection|$query"
+                                        ] = initialPage.nextPage
+                                    }
+
+                                    initialPage
                                         .items
                                         .toList()
                                 }.getOrElse {
@@ -1095,8 +1104,16 @@ class YouTube : MainAPI() {
 
                                     extractor.fetchPage()
 
-                                    extractor
-                                        .initialPage
+                                    val initialPage =
+                                        extractor.initialPage
+
+                                    if (continuationSection != null) {
+                                        searchContinuationCache[
+                                            "$continuationSection|$query"
+                                        ] = initialPage.nextPage
+                                    }
+
+                                    initialPage
                                         .items
                                         .toList()
                                 } catch (
@@ -1178,13 +1195,7 @@ class YouTube : MainAPI() {
             )
 
         if (cached.isNotEmpty()) {
-            scheduleBackgroundRefresh(cacheSection) {
-                refreshGenericKioskHome(
-                    request.data,
-                    request.name,
-                    cacheSection
-                )
-            }
+            startCoreBackgroundWarmup()
 
             return newHomePageResponse(
                 listOf(
@@ -1205,13 +1216,7 @@ class YouTube : MainAPI() {
                 cacheSection
             )
 
-        scheduleBackgroundRefresh(cacheSection) {
-            refreshGenericKioskHome(
-                request.data,
-                request.name,
-                cacheSection
-            )
-        }
+        startCoreBackgroundWarmup()
 
         return fast
     }
@@ -1240,11 +1245,16 @@ class YouTube : MainAPI() {
     private companion object {
         const val FAST_VISIBLE_COUNT = 6
         const val HOME_CACHE_LIMIT = 50
+        const val MAX_CACHED_ITEMS = 2000
+        const val BACKGROUND_BATCH_SIZE = 50
         const val BACKGROUND_REFRESH_COOLDOWN_MS = 15_000L
         const val GENERIC_BACKGROUND_PAGES = 6
+        const val CORE_BACKGROUND_START_DELAY_MS = 500L
+        const val CACHE_GROWTH_WAIT_MS = 1800L
 
-        // Survives multiple YouTube provider instances in the same app process.
-        val PREWARM_STARTED = AtomicBoolean(false)
+        // Starts the four heavy home sections together only after the first
+        // visible home content has had a chance to render.
+        val CORE_BACKGROUND_STARTED = AtomicBoolean(false)
     }
 
     private val backgroundRefreshScope =
@@ -1273,51 +1283,18 @@ class YouTube : MainAPI() {
     private val fastContentCache =
         ConcurrentHashMap<String, CachedResponses>()
 
-    /*
-     * --------------------------------------------------
-     * ULTRA-FAST PREWARM
-     * --------------------------------------------------
-     *
-     * Start a tiny background snapshot as soon as the provider is created.
-     * This never blocks getMainPage() and gives later home requests a warm cache.
-     */
-    init {
-        if (PREWARM_STARTED.compareAndSet(false, true)) {
-            backgroundRefreshScope.launch {
-                coroutineScope {
-                    listOf(
-                        async(Dispatchers.IO) {
-                            runCatching {
-                                buildIndianMusicPageFull(
-                                    page = 1,
-                                    fastMode = true,
-                                    forceRefresh = true
-                                )
-                            }
-                        },
-                        async(Dispatchers.IO) {
-                            runCatching {
-                                buildMoviesPageFull(
-                                    page = 1,
-                                    fastMode = true,
-                                    forceRefresh = true
-                                )
-                            }
-                        },
-                        async(Dispatchers.IO) {
-                            runCatching {
-                                buildHindiMoviesPageFull(
-                                    page = 1,
-                                    fastMode = true,
-                                    forceRefresh = true
-                                )
-                            }
-                        }
-                    ).awaitAll()
-                }
-            }
-        }
-    }
+    // Search continuation state for the four expandable home sections.
+    private val searchContinuationCache =
+        ConcurrentHashMap<String, org.schabi.newpipe.extractor.Page?>()
+
+    // Kiosk continuation state for Movie Trailers.
+    private val genericContinuationCache =
+        ConcurrentHashMap<String, org.schabi.newpipe.extractor.Page?>()
+
+    // Prevents two background 50-item batches for the same section from
+    // running at the same time.
+    private val sectionBatchRunning =
+        ConcurrentHashMap<String, Boolean>()
 
     private fun cachedResponses(
         section: String,
@@ -1338,7 +1315,9 @@ class YouTube : MainAPI() {
         if (items.isEmpty()) return
         fastContentCache[section] = CachedResponses(
             expiresAt = System.currentTimeMillis() + ttlMs,
-            items = items.distinctBy { it.url }.take(HOME_CACHE_LIMIT)
+            items = items
+                .distinctBy { it.url }
+                .take(MAX_CACHED_ITEMS)
         )
     }
 
@@ -1365,31 +1344,80 @@ class YouTube : MainAPI() {
         }
     }
 
-    private fun getCachedHomePageChunk(
+    private suspend fun getCachedHomePageChunk(
         section: String,
         title: String,
         page: Int
     ): HomePageResponse {
 
-        val all =
-            cachedResponses(
-                section,
-                section,
-                HOME_CACHE_LIMIT
-            )
-
-        if (all.isEmpty() || page <= 1) {
+        if (page <= 1) {
             return newHomePageResponse(
                 emptyList(),
                 false
             )
         }
 
+        var all =
+            cachedResponses(
+                section,
+                section,
+                MAX_CACHED_ITEMS
+            )
+
         val start =
             (page - 1) *
                 FAST_VISIBLE_COUNT
 
-        if (start >= all.size) {
+        /*
+         * When the user reaches the end of the currently cached 50-item
+         * window, immediately start the next 50-item background batch.
+         * This only happens because the user requested a later page by
+         * scrolling/continuing; it never runs continuously while idle.
+         */
+        if (
+            isExpandableSection(section) &&
+            start + FAST_VISIBLE_COUNT * 2 >= all.size
+        ) {
+            scheduleNextSectionBatch(section)
+        }
+
+        /*
+         * If CloudStream asks for the next page before the background batch
+         * has finished, wait only briefly for the cache to grow. This keeps
+         * scrolling smooth without making the initial home page wait.
+         */
+        if (
+            isExpandableSection(section) &&
+            start >= all.size
+        ) {
+
+            val deadline =
+                System.currentTimeMillis() +
+                    CACHE_GROWTH_WAIT_MS
+
+            while (
+                System.currentTimeMillis() < deadline
+            ) {
+
+                all =
+                    cachedResponses(
+                        section,
+                        section,
+                        MAX_CACHED_ITEMS
+                    )
+
+                if (start < all.size) {
+                    break
+                }
+
+                kotlinx.coroutines.delay(80L)
+            }
+        }
+
+        if (
+            all.isEmpty() ||
+            start >= all.size
+        ) {
             return newHomePageResponse(
                 emptyList(),
                 false
@@ -1403,7 +1431,8 @@ class YouTube : MainAPI() {
 
         val hasMore =
             start + chunk.size <
-                all.size
+                all.size ||
+                isExpandableSection(section)
 
         return newHomePageResponse(
             listOf(
@@ -1417,7 +1446,7 @@ class YouTube : MainAPI() {
         )
     }
 
-        private suspend fun getIndianMusicPage(
+    private suspend fun getIndianMusicPage(
         page: Int
     ): HomePageResponse {
         if (page > 1) {
@@ -1432,13 +1461,7 @@ class YouTube : MainAPI() {
             cachedResponses("music", "movie")
 
         if (cached.isNotEmpty()) {
-            scheduleBackgroundRefresh("music") {
-                buildIndianMusicPageFull(
-                    page = 1,
-                    fastMode = false,
-                    forceRefresh = true
-                )
-            }
+            startCoreBackgroundWarmup()
 
             return newHomePageResponse(
                 listOf(
@@ -1460,13 +1483,7 @@ class YouTube : MainAPI() {
                 forceRefresh = true
             )
 
-        scheduleBackgroundRefresh("music") {
-            buildIndianMusicPageFull(
-                page = 1,
-                fastMode = false,
-                forceRefresh = true
-            )
-        }
+        startCoreBackgroundWarmup()
 
         return fast
     }
@@ -1503,7 +1520,8 @@ class YouTube : MainAPI() {
             items in fetchSearchItemsInBatches(
                 indianMusicQueries,
                 6,
-                fastMode
+                fastMode,
+                continuationSection = "music"
             )
         ) {
             for (item in items) {
@@ -1529,7 +1547,7 @@ class YouTube : MainAPI() {
         }
 
         val resultLimit =
-            if (fastMode) FAST_VISIBLE_COUNT else 40
+            if (fastMode) FAST_VISIBLE_COUNT else HOME_CACHE_LIMIT
 
         val selected =
             candidates
@@ -1620,19 +1638,28 @@ class YouTube : MainAPI() {
 
         val cached = cachedResponses("movies", "movie")
         if (cached.isNotEmpty()) {
-            scheduleBackgroundRefresh("movies") {
-                buildMoviesPageFull(1, fastMode = false, forceRefresh = true)
-            }
+            startCoreBackgroundWarmup()
             return newHomePageResponse(
-                listOf(HomePageList("Movies", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
-                false
+                listOf(
+                    HomePageList(
+                        "Movies",
+                        cached.take(FAST_VISIBLE_COUNT),
+                        true
+                    )
+                ),
+                true
             )
         }
 
-        val fast = buildMoviesPageFull(1, fastMode = true, forceRefresh = true)
-        scheduleBackgroundRefresh("movies") {
-            buildMoviesPageFull(1, fastMode = false, forceRefresh = true)
-        }
+        val fast =
+            buildMoviesPageFull(
+                1,
+                fastMode = true,
+                forceRefresh = true
+            )
+
+        startCoreBackgroundWarmup()
+
         return fast
     }
 
@@ -1671,7 +1698,8 @@ class YouTube : MainAPI() {
             items in fetchSearchItemsInBatches(
                 movieQueries,
                 5,
-                fastMode
+                fastMode,
+                continuationSection = "movies"
             )
         ) {
 
@@ -1955,19 +1983,28 @@ class YouTube : MainAPI() {
 
         val cached = cachedResponses("hindi_movies", "movie")
         if (cached.isNotEmpty()) {
-            scheduleBackgroundRefresh("hindi_movies") {
-                buildHindiMoviesPageFull(1, fastMode = false, forceRefresh = true)
-            }
+            startCoreBackgroundWarmup()
             return newHomePageResponse(
-                listOf(HomePageList("Hindi Movies", cached.take(FAST_VISIBLE_COUNT), cached.size > FAST_VISIBLE_COUNT)),
-                false
+                listOf(
+                    HomePageList(
+                        "Hindi Movies",
+                        cached.take(FAST_VISIBLE_COUNT),
+                        true
+                    )
+                ),
+                true
             )
         }
 
-        val fast = buildHindiMoviesPageFull(1, fastMode = true, forceRefresh = true)
-        scheduleBackgroundRefresh("hindi_movies") {
-            buildHindiMoviesPageFull(1, fastMode = false, forceRefresh = true)
-        }
+        val fast =
+            buildHindiMoviesPageFull(
+                1,
+                fastMode = true,
+                forceRefresh = true
+            )
+
+        startCoreBackgroundWarmup()
+
         return fast
     }
 
@@ -2009,7 +2046,8 @@ class YouTube : MainAPI() {
             items in fetchSearchItemsInBatches(
                 hindiMovieQueries,
                 6,
-                fastMode
+                fastMode,
+                continuationSection = "hindi_movies"
             )
         ) {
 
@@ -2180,6 +2218,734 @@ class YouTube : MainAPI() {
         putCachedResponses("hindi_movies", candidates, 15 * 60 * 1000L)
 
         return response
+    }
+
+    /*
+     * --------------------------------------------------
+     * CORE BACKGROUND HOME LOADER
+     * --------------------------------------------------
+     *
+     * After the first visible home content is returned, the four expandable
+     * sections are refreshed together:
+     *
+     *   1. Movie Trailers
+     *   2. Trending Music Videos
+     *   3. Movies
+     *   4. Hindi Movies
+     *
+     * Each section grows independently in 50-item background batches.
+     */
+    private fun startCoreBackgroundWarmup() {
+
+        if (
+            !CORE_BACKGROUND_STARTED.compareAndSet(
+                false,
+                true
+            )
+        ) {
+            return
+        }
+
+        backgroundRefreshScope.launch {
+
+            kotlinx.coroutines.delay(
+                CORE_BACKGROUND_START_DELAY_MS
+            )
+
+            scheduleBackgroundRefresh(
+                "generic_trending_movies_and_shows"
+            ) {
+                refreshGenericKioskHome(
+                    "trending_movies_and_shows",
+                    "Movie Trailers",
+                    "generic_trending_movies_and_shows"
+                )
+            }
+
+            scheduleBackgroundRefresh("music") {
+                buildIndianMusicPageFull(
+                    page = 1,
+                    fastMode = false,
+                    forceRefresh = true
+                )
+            }
+
+            scheduleBackgroundRefresh("movies") {
+                buildMoviesPageFull(
+                    page = 1,
+                    fastMode = false,
+                    forceRefresh = true
+                )
+            }
+
+            scheduleBackgroundRefresh("hindi_movies") {
+                buildHindiMoviesPageFull(
+                    page = 1,
+                    fastMode = false,
+                    forceRefresh = true
+                )
+            }
+        }
+    }
+
+    private fun isExpandableSection(
+        section: String
+    ): Boolean {
+
+        return section == "music" ||
+            section == "movies" ||
+            section == "hindi_movies" ||
+            section == "generic_trending_movies_and_shows"
+    }
+
+    private fun scheduleNextSectionBatch(
+        section: String
+    ) {
+
+        if (!isExpandableSection(section)) {
+            return
+        }
+
+        if (
+            sectionBatchRunning.putIfAbsent(
+                section,
+                true
+            ) != null
+        ) {
+            return
+        }
+
+        backgroundRefreshScope.launch {
+
+            try {
+
+                when (section) {
+
+                    "music" ->
+                        appendIndianMusicBatch()
+
+                    "movies" ->
+                        appendMoviesBatch()
+
+                    "hindi_movies" ->
+                        appendHindiMoviesBatch()
+
+                    "generic_trending_movies_and_shows" ->
+                        appendGenericKioskBatch(
+                            "trending_movies_and_shows",
+                            "Movie Trailers",
+                            section
+                        )
+                }
+
+            } catch (_: Exception) {
+                // Background pagination must never break the visible UI.
+            } finally {
+                sectionBatchRunning.remove(
+                    section
+                )
+            }
+        }
+    }
+
+    /*
+     * --------------------------------------------------
+     * SEARCH PAGE CONTINUATION
+     * --------------------------------------------------
+     */
+    private suspend fun fetchNextSearchItemsBatch(
+        section: String,
+        queries: List<String>,
+        batchSize: Int
+    ): List<InfoItem> {
+
+        val cleanQueries =
+            queries
+                .map {
+                    it.trim()
+                }
+                .filter {
+                    it.isNotBlank()
+                }
+                .distinct()
+
+        if (cleanQueries.isEmpty()) {
+            return emptyList()
+        }
+
+        val results =
+            mutableListOf<InfoItem>()
+
+        for (
+            batch in cleanQueries.chunked(
+                batchSize
+            )
+        ) {
+
+            val batchResults =
+                coroutineScope {
+
+                    batch.map { query ->
+
+                        async(
+                            Dispatchers.IO
+                        ) {
+
+                            withTimeoutOrNull(
+                                8_000L
+                            ) {
+
+                                runCatching {
+
+                                    val key =
+                                        "$section|$query"
+
+                                    val extractor =
+                                        service.getSearchExtractor(
+                                            query
+                                        )
+
+                                    var next =
+                                        searchContinuationCache[
+                                            key
+                                        ]
+
+                                    /*
+                                     * If the initial background build did not
+                                     * get a continuation, initialize it and
+                                     * immediately request the second page.
+                                     */
+                                    if (next == null) {
+
+                                        extractor.fetchPage()
+
+                                        next =
+                                            extractor
+                                                .initialPage
+                                                .nextPage
+                                    }
+
+                                    if (next == null) {
+                                        return@runCatching emptyList<InfoItem>()
+                                    }
+
+                                    val page =
+                                        extractor.getPage(
+                                            next
+                                        )
+
+                                    searchContinuationCache[
+                                        key
+                                    ] =
+                                        page.nextPage
+
+                                    page.items.toList()
+
+                                }.getOrElse {
+                                    emptyList()
+                                }
+
+                            } ?: emptyList()
+
+                        }
+                    }.awaitAll()
+                }
+
+            results.addAll(
+                batchResults.flatten()
+            )
+        }
+
+        return results
+    }
+
+    /*
+     * --------------------------------------------------
+     * MUSIC NEXT 50
+     * --------------------------------------------------
+     */
+    private suspend fun appendIndianMusicBatch() {
+
+        val current =
+            cachedResponses(
+                "music",
+                "movie",
+                MAX_CACHED_ITEMS
+            )
+
+        val seenUrls =
+            current
+                .mapNotNull {
+                    it.url
+                }
+                .toMutableSet()
+
+        val nextItems =
+            fetchNextSearchItemsBatch(
+                "music",
+                indianMusicQueries,
+                6
+            )
+
+        val candidates =
+            nextItems
+                .filterIsInstance<StreamInfoItem>()
+                .filter {
+                    isMusicVideoCandidate(it)
+                }
+                .mapNotNull { item ->
+
+                    val url =
+                        item.url
+                            ?.trim()
+                            ?: return@mapNotNull null
+
+                    if (
+                        url.isBlank() ||
+                        !seenUrls.add(url)
+                    ) {
+                        return@mapNotNull null
+                    }
+
+                    val title =
+                        item.name
+                            ?.trim()
+                            ?: return@mapNotNull null
+
+                    if (title.isBlank()) {
+                        return@mapNotNull null
+                    }
+
+                    newMovieSearchResponse(
+                        title,
+                        url,
+                        TvType.Movie
+                    ) {
+
+                        posterUrl =
+                            item
+                                .thumbnails
+                                .lastOrNull()
+                                ?.url
+                    }
+                }
+
+        if (candidates.isEmpty()) {
+            return
+        }
+
+        val merged =
+            (
+                current +
+                    candidates
+                )
+                .distinctBy {
+                    it.url
+                }
+
+        putCachedResponses(
+            "music",
+            merged,
+            30 * 60 * 1000L
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * MOVIES NEXT 50
+     * --------------------------------------------------
+     */
+    private suspend fun appendMoviesBatch() {
+
+        val current =
+            cachedResponses(
+                "movies",
+                "movie",
+                MAX_CACHED_ITEMS
+            )
+
+        val seenUrls =
+            current
+                .mapNotNull {
+                    it.url
+                }
+                .toMutableSet()
+
+        val nextItems =
+            fetchNextSearchItemsBatch(
+                "movies",
+                movieQueries,
+                5
+            )
+
+        val newResults =
+            mutableListOf<SearchResponse>()
+
+        for (
+            item in nextItems
+        ) {
+
+            if (
+                item !is StreamInfoItem
+            ) {
+                continue
+            }
+
+            if (
+                item.streamType !=
+                    StreamType.VIDEO_STREAM
+            ) {
+                continue
+            }
+
+            if (
+                item.isShortFormContent
+            ) {
+                continue
+            }
+
+            val url =
+                item.url
+                    ?.trim()
+                    ?: continue
+
+            if (
+                url.isBlank() ||
+                !seenUrls.add(url)
+            ) {
+                continue
+            }
+
+            val title =
+                item.name
+                    ?.trim()
+                    ?: continue
+
+            if (title.isBlank()) {
+                continue
+            }
+
+            if (
+                containsAny(
+                    title,
+                    bangladeshKeywords
+                )
+            ) {
+                continue
+            }
+
+            val uploader =
+                item
+                    .uploaderName
+                    ?.trim()
+                    ?: ""
+
+            if (
+                containsAny(
+                    uploader,
+                    bangladeshKeywords
+                )
+            ) {
+                continue
+            }
+
+            newResults.add(
+                newMovieSearchResponse(
+                    title,
+                    url,
+                    TvType.Movie
+                ) {
+
+                    posterUrl =
+                        item
+                            .thumbnails
+                            .lastOrNull()
+                            ?.url
+                }
+            )
+
+            if (
+                newResults.size >=
+                    BACKGROUND_BATCH_SIZE
+            ) {
+                break
+            }
+        }
+
+        if (newResults.isEmpty()) {
+            return
+        }
+
+        putCachedResponses(
+            "movies",
+            (
+                current +
+                    newResults
+                ).distinctBy {
+                    it.url
+                },
+            20 * 60 * 1000L
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * HINDI MOVIES NEXT 50
+     * --------------------------------------------------
+     */
+    private suspend fun appendHindiMoviesBatch() {
+
+        val current =
+            cachedResponses(
+                "hindi_movies",
+                "movie",
+                MAX_CACHED_ITEMS
+            )
+
+        val seenUrls =
+            current
+                .mapNotNull {
+                    it.url
+                }
+                .toMutableSet()
+
+        val nextItems =
+            fetchNextSearchItemsBatch(
+                "hindi_movies",
+                hindiMovieQueries,
+                6
+            )
+
+        val candidatePairs =
+            mutableListOf<Pair<SearchResponse, Int>>()
+
+        for (
+            item in nextItems
+        ) {
+
+            if (
+                item !is StreamInfoItem
+            ) {
+                continue
+            }
+
+            if (
+                item.streamType !=
+                    StreamType.VIDEO_STREAM
+            ) {
+                continue
+            }
+
+            if (
+                item.isShortFormContent
+            ) {
+                continue
+            }
+
+            val url =
+                item.url
+                    ?.trim()
+                    ?: continue
+
+            if (
+                url.isBlank() ||
+                !seenUrls.add(url)
+            ) {
+                continue
+            }
+
+            val title =
+                item.name
+                    ?.trim()
+                    ?: continue
+
+            if (title.isBlank()) {
+                continue
+            }
+
+            val uploader =
+                item
+                    .uploaderName
+                    ?.trim()
+                    ?: ""
+
+            val combined =
+                "$title $uploader"
+
+            if (
+                containsAny(
+                    combined,
+                    bangladeshKeywords
+                )
+            ) {
+                continue
+            }
+
+            if (
+                looksLikeNonMovieUpload(
+                    title
+                )
+            ) {
+                continue
+            }
+
+            val response =
+                newMovieSearchResponse(
+                    title,
+                    url,
+                    TvType.Movie
+                ) {
+
+                    posterUrl =
+                        item
+                            .thumbnails
+                            .lastOrNull()
+                            ?.url
+                }
+
+            candidatePairs.add(
+                response to
+                    scoreHindiMovie(
+                        title,
+                        uploader
+                    )
+            )
+
+            if (
+                candidatePairs.size >=
+                    BACKGROUND_BATCH_SIZE
+            ) {
+                break
+            }
+        }
+
+        if (candidatePairs.isEmpty()) {
+            return
+        }
+
+        val merged =
+            (
+                current +
+                    candidatePairs
+                        .sortedByDescending {
+                            it.second
+                        }
+                        .map {
+                            it.first
+                        }
+                )
+                .distinctBy {
+                    it.url
+                }
+
+        putCachedResponses(
+            "hindi_movies",
+            merged,
+            15 * 60 * 1000L
+        )
+    }
+
+    /*
+     * --------------------------------------------------
+     * MOVIE TRAILERS NEXT 50
+     * --------------------------------------------------
+     */
+    private suspend fun appendGenericKioskBatch(
+        kioskId: String,
+        sectionName: String,
+        cacheSection: String
+    ) {
+
+        val current =
+            cachedResponses(
+                cacheSection,
+                "generic",
+                MAX_CACHED_ITEMS
+            )
+
+        val extractor =
+            try {
+                getKioskExtractor(
+                    kioskId
+                )
+            } catch (_: Exception) {
+                return
+            }
+
+        var next =
+            genericContinuationCache[
+                kioskId
+            ]
+
+        if (next == null) {
+
+            try {
+                extractor.fetchPage()
+                next =
+                    extractor
+                        .initialPage
+                        .nextPage
+            } catch (_: Exception) {
+                return
+            }
+        }
+
+        if (next == null) {
+            return
+        }
+
+        val collected =
+            mutableListOf<SearchResponse>()
+
+        var currentPage =
+            next
+
+        repeat(
+            GENERIC_BACKGROUND_PAGES
+        ) {
+
+            val pageData =
+                try {
+                    extractor.getPage(
+                        currentPage
+                    )
+                } catch (_: Exception) {
+                    return@repeat
+                }
+
+            collected.addAll(
+                pageData.items.map {
+                    it.toSearchResponse()
+                }
+            )
+
+            genericContinuationCache[
+                kioskId
+            ] =
+                pageData.nextPage
+
+            val following =
+                pageData.nextPage
+                    ?: return@repeat
+
+            currentPage =
+                following
+        }
+
+        if (collected.isEmpty()) {
+            return
+        }
+
+        putCachedResponses(
+            cacheSection,
+            (
+                current +
+                    collected
+                ).distinctBy {
+                    it.url
+                },
+            15 * 60 * 1000L
+        )
     }
 
     /*
@@ -3996,6 +4762,7 @@ class YouTube : MainAPI() {
 
         if (pageData != null) {
             pageCache[kioskId] = pageData.nextPage
+            genericContinuationCache[kioskId] = pageData.nextPage
         }
 
         val results =
@@ -4062,6 +4829,11 @@ class YouTube : MainAPI() {
                                 page.nextPage
                             )
                     }
+
+                    genericContinuationCache[
+                        kioskId
+                    ] =
+                        page.nextPage
 
                     collected
                         .distinctBy {
