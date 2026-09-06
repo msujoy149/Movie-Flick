@@ -757,118 +757,247 @@ class CinePlexFTP : MainAPI() {
          */
         if (input.contains("watch.php", true)) {
             /*
-             * TV PLAYBACK — SITE-NATIVE HLS FLOW
+             * TV PLAYBACK — COOKIE-PRESERVED, BROWSER-ALIGNED HLS FLOW
              *
-             * Verified from 10 supplied Cine Plex episode player sources:
-             * every tested episode exposes its playable HLS entry point as:
+             * Verified from multiple Cine Plex episode pages:
+             *   episode page -> <source .../Episode.mp4/master.m3u8>
+             *   browser/HLS.js -> same directory -> index-v1-a1.m3u8
              *
-             *   .../<episode-video>.mp4/master.m3u8
+             * The successful browser request also carries Cine Plex session
+             * cookies (hlse/hlsk/cp_device_id/REDFORCE). Therefore the TV
+             * resolver must preserve cookies obtained from Cine Plex page and
+             * manifest requests and attach them to the final HLS ExtractorLink.
              *
-             * The browser can also play the concrete media playlist under
-             * the same directory (for example index-v1-a1.m3u8).
-             *
-             * Therefore we do NOT try to discover a nonexistent direct
-             * index URL in the HTML. We first extract the exact master URL
-             * that Cine Plex itself publishes, then derive ONLY the concrete
-             * a1 media playlist from that same directory and give that exact
-             * HLS URL to CloudStream. The full original URL path is preserved.
+             * We never invent the direct playlist name when the master
+             * manifest itself exposes a concrete child .m3u8. We first parse
+             * that child URL from the master's actual content. A deterministic
+             * index-v1-a1 fallback is kept only when the master response does
+             * not expose a child URI, because that is the browser-observed
+             * Cine Plex naming convention.
              */
             val cleanEpisodeUrl = input.substringBefore('#').trim()
             if (cleanEpisodeUrl.isBlank()) return false
 
+            val cookieJar = linkedMapOf<String, String>()
             val discoveredM3u8 = linkedSetOf<String>()
 
-            for (episodePageUrl in buildTvEpisodePageCandidates(cleanEpisodeUrl)) {
-                for ((requestUrl, requestHeaders) in buildTvPageRequestVariants(episodePageUrl)) {
+            /*
+             * Establish a Cine Plex web session before touching the HLS
+             * manifest. The site can set/refresh cookies on normal page loads.
+             */
+            val bootstrapUrls = linkedSetOf(
+                "$mainUrl/",
+                "$mainUrl/tvs.php",
+                cleanEpisodeUrl
+            )
+
+            for (bootstrapUrl in bootstrapUrls) {
+                val response = runCatching {
+                    app.get(
+                        bootstrapUrl,
+                        headers = pageHeaders(
+                            if (bootstrapUrl == cleanEpisodeUrl) "$mainUrl/" else "$mainUrl/"
+                        )
+                    )
+                }.getOrNull() ?: continue
+
+                captureSetCookies(response.headers, cookieJar)
+
+                /*
+                 * The episode page itself is the authoritative source for the
+                 * published master manifest.
+                 */
+                if (bootstrapUrl == cleanEpisodeUrl) {
+                    extractAnyCinePlexM3u8(
+                        html = response.text,
+                        baseUrl = bootstrapUrl
+                    ).forEach { discoveredM3u8.add(cleanUrl(it)) }
+                }
+            }
+
+            /*
+             * Also try the episode page variants in case autoplay/page mode
+             * affects which cookies or player markup are returned.
+             */
+            if (discoveredM3u8.isEmpty()) {
+                for (episodePageUrl in buildTvEpisodePageCandidates(cleanEpisodeUrl)) {
+                    val requestHeaders = pageHeaders("$mainUrl/") +
+                        cookieHeaderMap(cookieJar)
+
                     val response = runCatching {
-                        app.get(requestUrl, headers = requestHeaders)
+                        app.get(
+                            episodePageUrl,
+                            headers = requestHeaders
+                        )
                     }.getOrNull() ?: continue
+
+                    captureSetCookies(response.headers, cookieJar)
 
                     extractAnyCinePlexM3u8(
                         html = response.text,
-                        baseUrl = requestUrl
+                        baseUrl = episodePageUrl
                     ).forEach { discoveredM3u8.add(cleanUrl(it)) }
 
                     if (discoveredM3u8.isNotEmpty()) break
                 }
+            }
 
-                if (discoveredM3u8.isEmpty()) {
-                    val metaUrl = appendQueryParameter(
-                        episodePageUrl,
-                        "meta",
-                        "1"
+            /*
+             * The site's own page source publishes master.m3u8. Prefer that
+             * exact published URL.
+             */
+            val masterUrls = discoveredM3u8
+                .filter {
+                    it.substringBefore('?')
+                        .lowercase(Locale.ROOT)
+                        .endsWith("/master.m3u8")
+                }
+                .toList()
+
+            if (masterUrls.isEmpty() && discoveredM3u8.isEmpty()) {
+                return false
+            }
+
+            val candidateMasters =
+                if (masterUrls.isNotEmpty()) masterUrls
+                else discoveredM3u8.toList()
+
+            /*
+             * Ask the actual master manifest for its real HLS child playlist.
+             * This is the key step missing from the older implementation:
+             * do not manufacture index-v1-a1 unless the master did not expose
+             * a child URI.
+             */
+            val childPlaylists = linkedSetOf<String>()
+
+            for (masterUrl in candidateMasters) {
+                for (requestUrl in tvManifestUrlVariants(masterUrl)) {
+                    val headers = tvExactHlsHeaders(
+                        episodeUrl = cleanEpisodeUrl,
+                        cookieJar = cookieJar
                     )
-                    runCatching {
+
+                    val response = runCatching {
                         app.get(
-                            metaUrl,
-                            headers = pageHeaders(episodePageUrl) + mapOf(
-                                "Accept" to "application/json,text/plain,*/*",
-                                "Cache-Control" to "no-cache, no-store, max-age=0",
-                                "Pragma" to "no-cache",
-                                "X-Requested-With" to "XMLHttpRequest"
-                            )
+                            requestUrl,
+                            headers = headers
                         )
-                    }.getOrNull()?.let { meta ->
-                        extractAnyCinePlexM3u8(
-                            html = meta.text,
-                            baseUrl = metaUrl
-                        ).forEach { discoveredM3u8.add(cleanUrl(it)) }
+                    }.getOrNull() ?: continue
+
+                    captureSetCookies(response.headers, cookieJar)
+
+                    if (response.text.isBlank()) continue
+
+                    extractHlsPlaylistUrisFromManifest(
+                        manifestText = response.text,
+                        manifestUrl = requestUrl
+                    ).forEach { childPlaylists.add(cleanUrl(it)) }
+
+                    /*
+                     * If the master itself is a valid media playlist, retain it
+                     * as a last-resort playable manifest.
+                     */
+                    if (
+                        response.text.contains("#EXTINF", ignoreCase = true) ||
+                        response.text.contains("#EXT-X-TARGETDURATION", ignoreCase = true)
+                    ) {
+                        discoveredM3u8.add(cleanUrl(requestUrl))
                     }
+
+                    if (childPlaylists.isNotEmpty()) break
                 }
 
-                if (discoveredM3u8.isNotEmpty()) break
-            }
-
-            if (discoveredM3u8.isEmpty()) return false
-
-            /*
-             * Prefer the exact master URL published by the site because all
-             * supplied episode sources use that naming convention. From its
-             * exact parent directory, derive the confirmed direct media
-             * playlist name used by the user's working browser URL.
-             */
-            val master = discoveredM3u8.firstOrNull {
-                it.substringBefore('?').lowercase(Locale.ROOT).endsWith("/master.m3u8")
-            }
-
-            val directA1 = master?.let { masterUrl ->
-                masterUrl.substringBefore('?')
-                    .replace(
-                        Regex("/master\\.m3u8$", RegexOption.IGNORE_CASE),
-                        "/index-v1-a1.m3u8"
-                    )
+                if (childPlaylists.isNotEmpty()) break
             }
 
             /*
-             * If a concrete playlist was actually exposed by the page, use it
-             * unchanged. Otherwise use the a1 playlist derived from the exact
-             * master directory. No HTTPS rewrite, filename rewrite, or other
-             * guessed playlist is introduced.
+             * Prefer a concrete media playlist under the same .mp4/.mkv/.../
+             * directory. No playlist filename is assumed here.
              */
-            val playable = discoveredM3u8
-                .firstOrNull {
-                    val path = it.substringBefore('?').lowercase(Locale.ROOT)
-                    Regex("\\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\\.m3u8$")
-                        .containsMatchIn(path)
+            val exactChild = childPlaylists.firstOrNull {
+                isExactCinePlexHlsUrl(it)
+            }
+
+            /*
+             * Browser-observed fallback. Only use this when the master itself
+             * did not expose a child playlist in its response body.
+             */
+            val deterministicA1 =
+                if (exactChild == null) {
+                    val master = masterUrls.firstOrNull()
+                        ?: candidateMasters.firstOrNull()
+
+                    master?.let {
+                        it.substringBefore('?')
+                            .replace(
+                                Regex("/master\\.m3u8$", RegexOption.IGNORE_CASE),
+                                "/index-v1-a1.m3u8"
+                            )
+                    }
+                } else {
+                    null
                 }
-                ?: directA1
-                ?: master
+
+            val playable =
+                exactChild
+                    ?: deterministicA1
+                    ?: discoveredM3u8.firstOrNull { isExactCinePlexHlsUrl(it) }
+                    ?: masterUrls.firstOrNull()
+                    ?: discoveredM3u8.firstOrNull()
 
             if (playable.isNullOrBlank()) return false
 
             /*
-             * Send exactly one source. This prevents CloudStream from choosing
-             * a master/HTTPS fallback instead of the concrete browser-verified
-             * media playlist.
-             *
-             * No custom playback headers are forced. CloudStream receives the
-             * exact URL plus the episode page as referer metadata.
+             * Re-test the exact selected media playlist using the SAME session
+             * cookies before handing it to CloudStream. This mirrors the
+             * successful browser request and prevents an anonymous M3U8 link
+             * from being emitted when Cine Plex requires session cookies.
              */
+            val preflightHeaders = tvExactHlsHeaders(
+                episodeUrl = cleanEpisodeUrl,
+                cookieJar = cookieJar
+            )
+
+            val selectedUrl =
+                runCatching {
+                    val response = app.get(
+                        cleanUrl(playable),
+                        headers = preflightHeaders
+                    )
+                    captureSetCookies(response.headers, cookieJar)
+
+                    if (
+                        response.text.contains("#EXTM3U", ignoreCase = true) ||
+                        response.text.contains("#EXT-X-STREAM-INF", ignoreCase = true) ||
+                        response.text.contains("#EXTINF", ignoreCase = true)
+                    ) {
+                        cleanUrl(playable)
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+
+            /*
+             * If a preflight response body could not be read as text but the URL
+             * is known to be an exact Cine Plex HLS endpoint, still emit it with
+             * the preserved session.
+             */
+            val finalUrl = selectedUrl ?: cleanUrl(playable)
+
+            /*
+             * Rebuild headers AFTER all page/master/media requests so any
+             * Set-Cookie values learned during preflight are included too.
+             */
+            val finalHeaders = tvExactHlsHeaders(
+                episodeUrl = cleanEpisodeUrl,
+                cookieJar = cookieJar
+            )
+
             emitTvMediaLink(
-                mediaUrl = cleanUrl(playable),
+                mediaUrl = finalUrl,
                 callback = callback,
                 referer = cleanEpisodeUrl,
-                headersOverride = emptyMap()
+                headersOverride = finalHeaders
             )
 
             return true
@@ -1471,16 +1600,138 @@ class CinePlexFTP : MainAPI() {
         }.getOrElse { clean }
     }
 
-    private fun tvExactHlsHeaders(episodeUrl: String): Map<String, String> {
-        return mapOf(
+    private fun tvExactHlsHeaders(
+        episodeUrl: String,
+        cookieJar: Map<String, String>
+    ): Map<String, String> {
+        val headers = linkedMapOf(
             "User-Agent" to
                 "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-            "Accept" to "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-            "Cache-Control" to "no-cache, no-store, max-age=0",
-            "Pragma" to "no-cache",
+            "Accept" to "*/*",
+            "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+            "Accept-Encoding" to "gzip, deflate",
+            "Connection" to "keep-alive",
             "Referer" to episodeUrl
         )
+
+        val cookieHeader = cookieHeaderValue(cookieJar)
+        if (cookieHeader.isNotBlank()) {
+            headers["Cookie"] = cookieHeader
+        }
+
+        return headers
+    }
+
+    private fun cookieHeaderMap(
+        cookieJar: Map<String, String>
+    ): Map<String, String> {
+        val value = cookieHeaderValue(cookieJar)
+        return if (value.isBlank()) emptyMap() else mapOf("Cookie" to value)
+    }
+
+    private fun cookieHeaderValue(
+        cookieJar: Map<String, String>
+    ): String {
+        return cookieJar.entries
+            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+            .joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
+    private fun captureSetCookies(
+        headers: Map<String, String>,
+        cookieJar: MutableMap<String, String>
+    ) {
+        val rawSetCookie =
+            headers.entries
+                .firstOrNull { it.key.equals("Set-Cookie", ignoreCase = true) }
+                ?.value
+                ?: headers.entries
+                    .firstOrNull { it.key.equals("set-cookie", ignoreCase = true) }
+                    ?.value
+                ?: return
+
+        /*
+         * CloudStream exposes response headers as a simple map in the provider
+         * API. When several Set-Cookie values are collapsed into one string,
+         * split only at commas followed by a new cookie name so Expires dates
+         * are not accidentally cut in the middle.
+         */
+        rawSetCookie
+            .split(Regex(",(?=\\s*[A-Za-z0-9_!#$%&'*+\\-.^`|~]+\\s*=)"))
+            .forEach { item ->
+                val pair = item.substringBefore(';').trim()
+                val separator = pair.indexOf('=')
+                if (separator <= 0) return@forEach
+
+                val name = pair.substring(0, separator).trim()
+                val value = pair.substring(separator + 1).trim()
+
+                if (name.isNotBlank() && value.isNotBlank()) {
+                    cookieJar[name] = value
+                }
+            }
+    }
+
+    private fun extractHlsPlaylistUrisFromManifest(
+        manifestText: String,
+        manifestUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        val normalized = manifestText
+            .replace("\uFEFF", "")
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        normalized
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .filterNot { it.startsWith("#") }
+            .forEach { line ->
+                val token = line
+                    .trim()
+                    .trim('"', '\'', '`')
+                    .substringBefore('#')
+                    .trim()
+
+                if (!token.endsWith(".m3u8", ignoreCase = true)) return@forEach
+
+                val absolute = absoluteUrl(token, manifestUrl)
+                if (isExactCinePlexHlsUrl(absolute)) {
+                    found.add(cleanUrl(absolute))
+                } else if (isCinePlexTvMediaUrl(absolute)) {
+                    found.add(cleanUrl(absolute))
+                }
+            }
+
+        /*
+         * Some manifests can place a child URI inline with attributes.
+         * Keep a regex fallback for those variants.
+         */
+        Regex("""(?im)(?:https?://|/|[A-Za-z0-9._~%+\-]).*?\.m3u8(?:\?[^\s]*)?""")
+            .findAll(normalized)
+            .forEach { match ->
+                val candidate = match.value
+                    .trim()
+                    .trim('"', '\'', '`', ',', ';')
+                    .substringAfterLast("URI=", match.value)
+                    .trim('"', '\'', '`', ',', ';')
+
+                val absolute = absoluteUrl(candidate, manifestUrl)
+                if (
+                    isExactCinePlexHlsUrl(absolute) ||
+                    isCinePlexTvMediaUrl(absolute)
+                ) {
+                    found.add(cleanUrl(absolute))
+                }
+            }
+
+        return found.toList()
     }
 
     private fun extractTvHlsSources(
