@@ -134,11 +134,11 @@
         "name": "OnlineMovies"
     },
     {
-        "jarFileSize": 501381,
-        "fileHash": "sha256-616814a08cf2ff7fb2314e38bf7179f18ef1707cafe52a4172a0a07038fd4103",
+        "jarFileSize": 501954,
+        "fileHash": "sha256-9bc9a5524b7fc765218ccfbd334e011e3452052f1561eacdb63f37eac3ab32db",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 76875,
+        "fileSize": 76991,
         "status": 1,
         "language": "hi",
         "authors": [
@@ -155,7 +155,7 @@
         "description": "YouTube provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
         "name": "YouTube",
-        "jarHash": "sha256-50b70d23b398c2cbe1e5dbddc6a0ff56dda3c5a4abb303adbc886011bd3af367"
+        "jarHash": "sha256-fa8e6fd38164aa828efda8f6b2b02d1420cdbcc409395da2d73a5744cffb258d"
     },
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
