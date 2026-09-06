@@ -1751,8 +1751,7 @@ class CTGFTP : MainAPI() {
     ): String? {
         /*
          * CTG can use normal images, lazy-loading attributes, responsive
-         * srcset, or CSS background-image. Prefer an actual poster URL and
-         * reject data: placeholders.
+         * srcset, or CSS background-image.
          */
         fun validPoster(raw: String?): String? {
             if (raw.isNullOrBlank()) return null
@@ -1785,12 +1784,19 @@ class CTGFTP : MainAPI() {
         }
 
         fun firstSrcsetUrl(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+
             return raw
-                ?.split(',')
-                ?.asSequence()
-                ?.map { it.trim() }
-                ?.map { it.split(Regex("""\s+""")).firstOrNull().orEmpty().trim() }
-                ?.firstOrNull { it.isNotBlank() }
+                .split(',')
+                .asSequence()
+                .map { candidate ->
+                    candidate.trim()
+                        .split(Regex("""\s+"""))
+                        .firstOrNull()
+                        .orEmpty()
+                        .trim()
+                }
+                .firstOrNull { it.isNotBlank() }
         }
 
         val metaCandidates = listOf(
@@ -1799,59 +1805,86 @@ class CTGFTP : MainAPI() {
             element.selectFirst("meta[name=twitter:image]")?.attr("content")
         )
 
-        metaCandidates.forEach { validPoster(it)?.let { poster -> return poster } }
-
-        val images = element.select("img, picture source")
+        for (candidate in metaCandidates) {
+            val poster = validPoster(candidate)
+            if (poster != null) return poster
+        }
 
         /*
-         * Score likely poster/cover images above logos or avatars.
+         * Prefer likely poster/cover images, while avoiding obvious logos and
+         * avatars. Do not use sortedByDescending here; a simple score pass is
+         * more compatible with older Kotlin/compiler combinations.
          */
-        val ranked = images.sortedByDescending { image ->
+        var bestImage: Element? = null
+        var bestScore = Int.MIN_VALUE
+
+        for (image in element.select("img, picture source")) {
             val info = (
                 image.attr("alt") + " " +
                     image.attr("class") + " " +
                     image.attr("data-testid")
-                ).lowercase(Locale.ROOT)
+            ).lowercase(Locale.ROOT)
 
             var score = 0
+
             if (info.contains("poster")) score += 10
             if (info.contains("cover")) score += 8
             if (info.contains("thumb")) score += 6
             if (info.contains("movie")) score += 4
             if (info.contains("logo")) score -= 10
             if (info.contains("avatar")) score -= 10
-            score
-        })
 
-        for (image in ranked) {
+            val hasImageSource =
+                image.attr("data-poster").isNotBlank() ||
+                    image.attr("data-cover").isNotBlank() ||
+                    image.attr("data-src").isNotBlank() ||
+                    image.attr("data-lazy-src").isNotBlank() ||
+                    image.attr("data-original").isNotBlank() ||
+                    image.attr("data-image").isNotBlank() ||
+                    image.attr("data-url").isNotBlank() ||
+                    image.attr("src").isNotBlank() ||
+                    image.attr("data-srcset").isNotBlank() ||
+                    image.attr("srcset").isNotBlank()
+
+            if (hasImageSource) score += 1
+
+            if (bestImage == null || score > bestScore) {
+                bestImage = image
+                bestScore = score
+            }
+        }
+
+        if (bestImage != null) {
             val candidates = listOf(
-                image.attr("data-poster"),
-                image.attr("data-cover"),
-                image.attr("data-src"),
-                image.attr("data-lazy-src"),
-                image.attr("data-original"),
-                image.attr("data-image"),
-                image.attr("data-url"),
-                image.attr("src"),
-                firstSrcsetUrl(image.attr("data-srcset")),
-                firstSrcsetUrl(image.attr("srcset"))
+                bestImage.attr("data-poster"),
+                bestImage.attr("data-cover"),
+                bestImage.attr("data-src"),
+                bestImage.attr("data-lazy-src"),
+                bestImage.attr("data-original"),
+                bestImage.attr("data-image"),
+                bestImage.attr("data-url"),
+                bestImage.attr("src"),
+                firstSrcsetUrl(bestImage.attr("data-srcset")),
+                firstSrcsetUrl(bestImage.attr("srcset"))
             )
 
-            candidates.forEach { raw ->
-                validPoster(raw)?.let { return it }
+            for (raw in candidates) {
+                val poster = validPoster(raw)
+                if (poster != null) return poster
             }
         }
 
         /*
          * Some card designs store the poster in CSS background-image.
          */
-        element.select("[style*=background]").forEach { node ->
-            val style = node.attr("style")
-            Regex(
-                """(?i)url\(\s*['"]?([^'")]+)['"]?\s*\)"""
-            ).findAll(style).forEach { match ->
-                validPoster(match.groupValues.getOrNull(1))
-                    ?.let { return it }
+        val backgroundRegex = Regex(
+            """url\(\s*['"]?([^'")]+)['"]?\s*\)"""
+        )
+
+        for (node in element.select("[style*=background]")) {
+            for (match in backgroundRegex.findAll(node.attr("style"))) {
+                val poster = validPoster(match.groupValues.getOrNull(1))
+                if (poster != null) return poster
             }
         }
 
