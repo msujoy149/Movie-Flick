@@ -682,7 +682,8 @@ class OnlineMovies : MainAPI() {
      */
     private data class MediaCandidate(
         val url: String,
-        val quality: Int
+        val quality: Int,
+        val referer: String
     )
 
     /*
@@ -718,7 +719,8 @@ class OnlineMovies : MainAPI() {
                 cleaned,
                 MediaCandidate(
                     url = cleaned,
-                    quality = quality
+                    quality = quality,
+                    referer = baseUrl
                 )
             )
         }
@@ -972,6 +974,7 @@ class OnlineMovies : MainAPI() {
                 url = mediaUrl,
                 type = type
             ) {
+                this.referer = candidate.referer
                 this.quality = quality
             }
         )
