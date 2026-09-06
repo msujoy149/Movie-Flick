@@ -13,7 +13,7 @@ class OnlineMovies : MainAPI() {
 
     override var mainUrl = "https://111.90.159.132"
     override var name = "Online Movies"
-    override var lang = "en"
+    override var lang = "hi"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
