@@ -751,196 +751,31 @@ class CinePlexFTP : MainAPI() {
 
         /*
          * TV SERIES ONLY:
-         * Cine Plex episode links use watch.php?id=...&season=...&ep=... .
-         * The real episode source is an HLS master.m3u8 under /hls/tr/.
-         * Handle that exact player flow before the movie player logic below.
+         * Exact Cine Plex HLS playlist discovery.
+         *
+         * USER-VERIFIED RULE:
+         * The playable URL is the COMPLETE .m3u8 URL whose path contains:
+         *
+         *     .../SomeVideo.mp4/<anything>.m3u8
+         *     .../SomeVideo.mkv/<anything>.m3u8
+         *
+         * We do NOT require master.m3u8.
+         * We do NOT replace any filename.
+         * We do NOT synthesize a playlist from the video directory.
+         *
+         * We search the actual Cine Plex episode page and, when an exact
+         * filename-backed HLS URL is present, send that exact URL unchanged.
          */
         if (input.contains("watch.php", true)) {
-            /*
-             * TV PLAYBACK — EXACT CINE PLEX HLS URL DISCOVERY
-             *
-             * IMPORTANT:
-             * Do not require "master.m3u8".
-             *
-             * Cine Plex's real playable HLS URL is exposed in the episode page
-             * using a structure like:
-             *
-             *   .../SomeVideo.mp4/index-v1-a1.m3u8
-             *   .../SomeVideo.mkv/index-v1-a1.m3u8
-             *
-             * The part before the final .m3u8 is part of the real URL.
-             * We therefore:
-             *
-             *   1. Fetch the exact episode page.
-             *   2. Search the page for a COMPLETE Cine Plex /hls/... URL
-             *      containing ".mp4/" or ".mkv/" before the final .m3u8.
-             *   3. Keep that COMPLETE URL exactly as exposed by Cine Plex.
-             *   4. Send that exact URL to CloudStream as M3U8.
-             *
-             * We do NOT:
-             *   - invent a master.m3u8
-             *   - replace the filename
-             *   - alter the path after .mp4/.mkv
-             *   - synthesize another playlist unless the page itself exposes it.
-             */
             val cleanEpisodeUrl = input.substringBefore('#').trim()
             if (cleanEpisodeUrl.isBlank()) return false
 
             val exactPlaylists = linkedSetOf<String>()
-            val genericPlaylists = linkedSetOf<String>()
 
-            fun collectExactPlaylists(
-                html: String,
-                baseUrl: String
-            ) {
-                if (html.isBlank()) return
+            for (episodePageUrl in buildTvEpisodePageCandidates(cleanEpisodeUrl)) {
+                val pageRequests = buildTvPageRequestVariants(episodePageUrl)
 
-                val variants = linkedSetOf<String>()
-                variants.add(html)
-
-                val normalized = html
-                    .replace("\\/", "/")
-                    .replace("\\x2F", "/")
-                    .replace("\\u002F", "/")
-                    .replace("\\u002f", "/")
-                    .replace("\\u0026", "&")
-                    .replace("\\u003A", ":")
-                    .replace("\\u003a", ":")
-                    .replace("&amp;", "&")
-
-                variants.add(normalized)
-
-                runCatching {
-                    variants.add(
-                        URLDecoder.decode(
-                            normalized,
-                            StandardCharsets.UTF_8.toString()
-                        )
-                    )
-                }
-
-                /*
-                 * PRIMARY:
-                 * Complete Cine Plex HLS URL where a video filename
-                 * (.mp4/.mkv/.webm/etc.) is followed by / and then .m3u8.
-                 *
-                 * Example:
-                 * /hls/tr/.../Episode.mp4/index-v1-a1.m3u8
-                 */
-                val exactPatterns = listOf(
-                    Regex(
-                        """(?is)(?:https?:)?//[^"'<>\s\\]+?/hls/[^"'<>\s\\]*?\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:/[^"'<>\s\\]+?)?\.m3u8(?:\?[^"'<>\s\\]*)?"""
-                    ),
-                    Regex(
-                        """(?is)/hls/[^"'<>\s\\]*?\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:/[^"'<>\s\\]+?)?\.m3u8(?:\?[^"'<>\s\\]*)?"""
-                    )
-                )
-
-                for (variant in variants) {
-                    for (pattern in exactPatterns) {
-                        pattern.findAll(variant).forEach { match ->
-                            val raw = match.value
-                                .trim()
-                                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
-
-                            val absolute = absoluteUrl(raw, baseUrl)
-                                .trim()
-
-                            if (isCinePlexTvMediaUrl(absolute)) {
-                                exactPlaylists.add(absolute)
-                            }
-                        }
-                    }
-                }
-
-                /*
-                 * SECONDARY:
-                 * If the page contains a normal Cine Plex /hls/...m3u8 URL
-                 * but its filename does not contain an obvious video extension,
-                 * keep it as a fallback. Still send the COMPLETE URL unchanged.
-                 */
-                val genericPatterns = listOf(
-                    Regex(
-                        """(?is)(?:https?:)?//[^"'<>\s\\]+?/hls/[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
-                    ),
-                    Regex(
-                        """(?is)/hls/[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
-                    )
-                )
-
-                for (variant in variants) {
-                    for (pattern in genericPatterns) {
-                        pattern.findAll(variant).forEach { match ->
-                            val raw = match.value
-                                .trim()
-                                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
-
-                            val absolute = absoluteUrl(raw, baseUrl)
-                                .trim()
-
-                            if (isCinePlexTvMediaUrl(absolute)) {
-                                genericPlaylists.add(absolute)
-                            }
-                        }
-                    }
-                }
-
-                /*
-                 * DOM attributes are checked separately so HTML entities,
-                 * quoted attributes and source tags are handled reliably.
-                 */
-                runCatching {
-                    val document = org.jsoup.Jsoup.parse(
-                        normalized,
-                        baseUrl
-                    )
-
-                    document.select(
-                        "video source[src], video[src], source[src], " +
-                            "[src], [data-src], [data-video], [data-source], " +
-                            "[data-stream], [data-manifest], [data-playlist]"
-                    ).forEach { element ->
-                        val attrs = listOf(
-                            element.attr("src"),
-                            element.attr("data-src"),
-                            element.attr("data-video"),
-                            element.attr("data-source"),
-                            element.attr("data-stream"),
-                            element.attr("data-manifest"),
-                            element.attr("data-playlist")
-                        )
-
-                        attrs.forEach { attr ->
-                            if (attr.isBlank()) return@forEach
-
-                            val absolute = absoluteUrl(
-                                attr.replace("\\/", "/")
-                                    .replace("&amp;", "&")
-                                    .trim('"', '\'', '`'),
-                                baseUrl
-                            )
-
-                            if (!isCinePlexTvMediaUrl(absolute)) return@forEach
-
-                            val lower = absolute.lowercase(Locale.ROOT)
-                            val extRegex = Regex(
-                                """\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\.m3u8(?:\?.*)?$"""
-                            )
-
-                            if (extRegex.containsMatchIn(lower)) {
-                                exactPlaylists.add(absolute)
-                            } else {
-                                genericPlaylists.add(absolute)
-                            }
-                        }
-                    }
-                }
-            }
-
-            val pageCandidates = buildTvEpisodePageCandidates(cleanEpisodeUrl)
-
-            for (episodePageUrl in pageCandidates) {
-                for ((requestUrl, requestHeaders) in buildTvPageRequestVariants(episodePageUrl)) {
+                for ((requestUrl, requestHeaders) in pageRequests) {
                     val pageResponse = runCatching {
                         app.get(
                             requestUrl,
@@ -948,24 +783,21 @@ class CinePlexFTP : MainAPI() {
                         )
                     }.getOrNull() ?: continue
 
-                    collectExactPlaylists(
+                    extractExactCinePlexHlsPlaylists(
+                        document = pageResponse.document,
                         html = pageResponse.text,
                         baseUrl = requestUrl
-                    )
+                    ).forEach { exactPlaylists.add(it) }
 
-                    /*
-                     * Stop crawling once the actual filename-backed playlist
-                     * has been found. This avoids accidentally choosing a
-                     * different generic/master playlist from the same page.
-                     */
                     if (exactPlaylists.isNotEmpty()) break
                 }
 
                 if (exactPlaylists.isNotEmpty()) break
 
                 /*
-                 * Try the site's metadata response only when the exact page
-                 * itself did not expose the playable playlist.
+                 * Some Cine Plex revisions expose the player source through
+                 * ?meta=1. Search that response too, but still only accept the
+                 * exact .mp4/.mkv/.../.m3u8 pattern.
                  */
                 val metaUrl = appendQueryParameter(
                     episodePageUrl,
@@ -973,7 +805,7 @@ class CinePlexFTP : MainAPI() {
                     "1"
                 )
 
-                runCatching {
+                val metaResponse = runCatching {
                     app.get(
                         metaUrl,
                         headers = pageHeaders(episodePageUrl) + mapOf(
@@ -983,90 +815,56 @@ class CinePlexFTP : MainAPI() {
                             "X-Requested-With" to "XMLHttpRequest"
                         )
                     )
-                }.getOrNull()?.let { metaResponse ->
-                    collectExactPlaylists(
+                }.getOrNull()
+
+                if (metaResponse != null) {
+                    extractExactCinePlexHlsPlaylists(
+                        document = metaResponse.document,
                         html = metaResponse.text,
                         baseUrl = metaUrl
-                    )
+                    ).forEach { exactPlaylists.add(it) }
                 }
 
                 if (exactPlaylists.isNotEmpty()) break
             }
 
+            if (exactPlaylists.isEmpty()) return false
+
             /*
-             * Exact filename-backed playlists are the ONLY preferred TV
-             * playback sources. Generic /hls/*.m3u8 is fallback only when the
-             * actual .mp4/.mkv/....m3u8 URL is absent from the page.
+             * Prefer the exact a1 playlist because the user's confirmed
+             * Cine Plex examples use index-v1-a1.m3u8. Other exact playlists
+             * remain available as fallback links.
              */
-            val ordered = linkedSetOf<String>()
-            exactPlaylists
+            val ordered = exactPlaylists
+                .distinct()
                 .sortedWith(
                     compareByDescending<String> {
                         val lower = it.lowercase(Locale.ROOT)
                         when {
                             "/index-v1-a1.m3u8" in lower -> 1000
-                            Regex("/index-v[0-9]+-a[0-9]+\\.m3u8").containsMatchIn(lower) -> 900
+                            Regex(
+                                """/index-v\d+-a\d+\.m3u8(?:\?.*)?$"""
+                            ).containsMatchIn(lower) -> 900
                             else -> 800
                         }
                     }.thenBy { it }
                 )
-                .forEach { ordered.add(it) }
 
-            if (ordered.isEmpty()) {
-                genericPlaylists.sorted().forEach { ordered.add(it) }
-            }
-
-            if (ordered.isEmpty()) return false
-
-            /*
-             * IMPORTANT:
-             * Send the COMPLETE URL exactly as discovered.
-             * No master substitution. No path rewriting.
-             */
             var emitted = false
             val emittedUrls = linkedSetOf<String>()
 
             for (playlistUrl in ordered.take(8)) {
                 if (!emittedUrls.add(playlistUrl)) continue
 
-                val referer = runCatching {
-                    URI(cleanEpisodeUrl).let { uri ->
-                        val scheme = uri.scheme.orEmpty()
-                        val host = uri.host.orEmpty()
-                        if (scheme.isBlank() || host.isBlank()) {
-                            cleanEpisodeUrl
-                        } else {
-                            "$scheme://$host/"
-                        }
-                    }
-                }.getOrElse {
-                    "$mainUrl/"
-                }
-
+                /*
+                 * IMPORTANT:
+                 * Keep the exact scheme/path/filename/playlist name that the
+                 * Cine Plex page exposed. Only use the episode page as Referer.
+                 */
                 emitTvMediaLink(
                     mediaUrl = playlistUrl,
                     callback = callback,
-                    referer = referer,
-                    headersOverride = mapOf(
-                        "User-Agent" to
-                            "Mozilla/5.0 (Linux; Android 13; Mobile) " +
-                                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                                "Chrome/131.0.0.0 Mobile Safari/537.36",
-                        "Accept" to "*/*",
-                        "Cache-Control" to "no-cache",
-                        "Pragma" to "no-cache",
-                        "Referer" to referer
-                    ),
-                    sourceLabel = if (
-                        Regex(
-                            """\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\.m3u8(?:\?.*)?$""",
-                            RegexOption.IGNORE_CASE
-                        ).containsMatchIn(playlistUrl)
-                    ) {
-                        "Cine Plex TV • Exact HLS"
-                    } else {
-                        "Cine Plex TV • HLS"
-                    }
+                    referer = cleanEpisodeUrl
                 )
 
                 emitted = true
@@ -1268,6 +1066,7 @@ class CinePlexFTP : MainAPI() {
         val result = linkedSetOf<String>()
         val clean = cleanUrl(url).trim()
         if (clean.isBlank()) return emptyList()
+
         result.add(clean)
 
         runCatching {
@@ -1276,226 +1075,104 @@ class CinePlexFTP : MainAPI() {
             val host = uri.host.orEmpty()
             val path = uri.rawPath.orEmpty()
             val query = uri.rawQuery.orEmpty()
-            val other = when (scheme) {
-                "http" -> "https"
-                "https" -> "http"
-                else -> null
-            }
-            if (other != null && host.isNotBlank() && path.isNotBlank()) {
-                result.add(
-                    "$other://$host$path" + if (query.isBlank()) "" else "?$query"
-                )
+
+            when (scheme) {
+                "http", "https" -> {
+                    val other = if (scheme == "http") "https" else "http"
+                    if (host.isNotBlank() && path.isNotBlank()) {
+                        result.add(
+                            "$other://$host$path" +
+                                if (query.isBlank()) "" else "?$query"
+                        )
+                    }
+                }
             }
         }
+
         return result.toList()
     }
 
     private fun tvPlaybackHeaderModes(
         episodeUrl: String
     ): List<Pair<String, Map<String, String>>> {
-        val httpEpisode = forceScheme(episodeUrl, "http")
-        val httpsEpisode = forceScheme(episodeUrl, "https")
+        val ua =
+            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+        val root = "$mainUrl/"
         return listOf(
-            httpsEpisode to tvHlsHeaders(httpsEpisode),
-            httpEpisode to tvHlsHeaders(httpEpisode),
-            httpsEpisode to tvHlsHeaders(httpsEpisode) + mapOf(
-                "X-Requested-With" to "XMLHttpRequest"
+            episodeUrl to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache",
+                "Origin" to mainUrl
+            ),
+            episodeUrl to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache"
+            ),
+            root to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache",
+                "Origin" to mainUrl
             )
-        ).distinctBy { it.first to it.second.entries.sortedBy { e -> e.key } }
+        )
     }
 
-    private data class TvPlaybackCandidate(
-        val url: String,
-        val referer: String,
-        val headers: Map<String, String>,
-        val score: Int,
-        val label: String
-    )
-
-    private suspend fun buildTvPlaybackCandidates(
+    /*
+     * Returns:
+     *   manifest URL, referer, headers
+     *
+     * The request itself is only used to verify that the manifest is reachable
+     * and actually looks like an HLS playlist. The returned URL is still sent
+     * directly to CloudStream; no proxy is introduced.
+     */
+    private suspend fun findPlayableTvManifest(
         sources: List<String>,
         episodeUrl: String
-    ): List<TvPlaybackCandidate> {
-        val candidates = linkedMapOf<String, TvPlaybackCandidate>()
-
-        fun add(
-            url: String,
-            referer: String,
-            headers: Map<String, String>,
-            score: Int,
-            label: String
-        ) {
-            val clean = cleanUrl(url)
-            if (!isCinePlexTvMediaUrl(clean)) return
-            candidates.putIfAbsent(
-                clean,
-                TvPlaybackCandidate(
-                    url = clean,
-                    referer = referer,
-                    headers = headers + ("Referer" to referer),
-                    score = score,
-                    label = label
-                )
-            )
-        }
-
-        fun addVariants(
-            url: String,
-            score: Int,
-            label: String
-        ) {
-            val clean = cleanUrl(url)
-            if (!isCinePlexTvMediaUrl(clean)) return
-
-            val httpsUrl = forceScheme(clean, "https")
-            val httpUrl = forceScheme(clean, "http")
-            val httpsEpisode = forceScheme(episodeUrl, "https")
-            val httpEpisode = forceScheme(episodeUrl, "http")
-
-            /*
-             * Cine Plex exposes the HLS URL as HTTP in its own player HTML.
-             * Keep the site-native HTTP variant first, then use HTTPS only as a
-             * fallback. This avoids making a protocol upgrade that the origin
-             * server may handle differently from the URL used by the website.
-             */
-            if (httpUrl.isNotBlank()) {
-                add(
-                    url = httpUrl,
-                    referer = httpEpisode,
-                    headers = tvHlsHeaders(httpEpisode),
-                    score = score + 30,
-                    label = "$label • HTTP"
-                )
-            }
-            if (httpsUrl.isNotBlank()) {
-                add(
-                    url = httpsUrl,
-                    referer = httpsEpisode,
-                    headers = tvHlsHeaders(httpsEpisode),
-                    score = score,
-                    label = "$label • HTTPS"
-                )
-            }
-        }
-
-        for (source in sources.map(::cleanUrl).filter(::isCinePlexTvMediaUrl).distinct()) {
-            val path = source.substringBefore('?')
-            val isMaster = path.endsWith("/master.m3u8", ignoreCase = true)
-
-            if (isMaster) {
-                for (audio in 1..4) {
-                    val child = path.replace(
-                        Regex("/master\\.m3u8$", RegexOption.IGNORE_CASE),
-                        "/index-v1-a$audio.m3u8"
-                    )
-                    addVariants(
-                        child,
-                        6000 - audio,
-                        "Cine Plex TV HLS • Direct a$audio"
-                    )
-                }
-            }
-
-            /* Always keep discovered source as a fallback. */
-            addVariants(
-                source,
-                if (isMaster) 900 else 5000,
-                if (isMaster) "Cine Plex TV HLS • Master" else "Cine Plex TV HLS • Playlist"
-            )
-
-            /* Expand a master into any child manifests actually advertised. */
-            for (manifest in tvManifestUrlVariants(source)) {
-                for ((ref, headers) in tvPlaybackHeaderModes(episodeUrl)) {
+    ): Triple<String, String, Map<String, String>>? {
+        for (source in sources) {
+            for (manifestUrl in tvManifestUrlVariants(source)) {
+                for ((referer, headers) in tvPlaybackHeaderModes(episodeUrl)) {
                     val response = runCatching {
                         app.get(
-                            manifest,
-                            headers = headers + mapOf("Referer" to ref)
+                            manifestUrl,
+                            headers = headers + mapOf(
+                                "Referer" to referer
+                            )
                         )
                     }.getOrNull() ?: continue
 
                     val body = response.text
                         .replace("\uFEFF", "")
-                        .trim()
+                        .trimStart()
 
-                    if (!looksLikeHlsManifest(body)) continue
-
-                    extractHlsChildPlaylists(body, manifest)
-                        .forEachIndexed { index, child ->
-                            addVariants(
-                                child,
-                                if (isMaster) 5500 - index else 5100 - index,
-                                "Cine Plex TV HLS • Child"
-                            )
-                        }
-                    break
+                    /*
+                     * A valid HLS manifest normally begins with #EXTM3U.
+                     * Master playlists additionally use EXT-X-STREAM-INF;
+                     * media playlists use EXTINF.
+                     */
+                    if (
+                        body.startsWith("#EXTM3U", ignoreCase = false) ||
+                        body.contains("#EXT-X-STREAM-INF", ignoreCase = true) ||
+                        body.contains("#EXTINF", ignoreCase = true)
+                    ) {
+                        return Triple(
+                            manifestUrl,
+                            referer,
+                            headers
+                        )
+                    }
                 }
             }
         }
 
-        return candidates.values.sortedWith(
-            compareByDescending<TvPlaybackCandidate> { it.score }
-                .thenBy { it.url }
-        )
-    }
-
-    private fun forceScheme(url: String, scheme: String): String {
-        val clean = cleanUrl(url)
-        if (clean.isBlank()) return clean
-        return runCatching {
-            val uri = URI(clean)
-            val host = uri.host.orEmpty()
-            if (host.isBlank()) return@runCatching clean
-            val port = if (uri.port >= 0) ":${uri.port}" else ""
-            val path = uri.rawPath.orEmpty()
-            val query = uri.rawQuery.orEmpty()
-            "$scheme://$host$port$path" + if (query.isBlank()) "" else "?$query"
-        }.getOrElse { clean }
-    }
-
-    private fun tvHlsHeaders(episodeUrl: String): Map<String, String> {
-        val ua =
-            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
-        val cleanEpisode = cleanUrl(episodeUrl)
-        /*
-         * Keep the HLS request headers intentionally minimal. The Cine Plex
-         * player itself supplies the manifest URL from the episode page, and
-         * a forced Origin/Sec-Fetch profile can turn an otherwise valid HLS
-         * request into a server-side HTTP error. Referer + User-Agent are the
-         * important same-site values here.
-         */
-        return mapOf(
-            "User-Agent" to ua,
-            "Accept" to "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-            "Cache-Control" to "no-cache, no-store, max-age=0",
-            "Pragma" to "no-cache",
-            "Referer" to cleanEpisode
-        )
-    }
-
-    private fun looksLikeHlsManifest(body: String): Boolean {
-        if (body.isBlank()) return false
-        return body.startsWith("#EXTM3U") ||
-            body.contains("#EXT-X-STREAM-INF", true) ||
-            body.contains("#EXTINF", true)
-    }
-
-    private fun extractHlsChildPlaylists(
-        manifestText: String,
-        baseUrl: String
-    ): List<String> {
-        val found = linkedSetOf<String>()
-
-        for (raw in manifestText.lines()) {
-            val line = raw.trim().trim('\"', '\'', '`', ',', ';', ')', ']', '}')
-            if (line.isBlank() || line.startsWith("#")) continue
-            if (!line.contains(".m3u8", true)) continue
-
-            val resolved = absoluteUrl(line, baseUrl)
-            if (isCinePlexTvMediaUrl(resolved)) found.add(resolved)
-        }
-
-        return found.toList()
+        return null
     }
 
     private fun buildTvEpisodePageCandidates(url: String): List<String> {
@@ -1591,78 +1268,6 @@ class CinePlexFTP : MainAPI() {
      *
      * Only a Cine Plex-hosted URL containing .m3u8 is accepted.
      */
-    /*
-     * Find the HLS parent directory itself.
-     *
-     * Example:
-     *   /hls/tr/.../Something.mp4/
-     *
-     * The site does not need to expose "master.m3u8" for us to use this.
-     * Once this directory is found, index-v1-a1..a8.m3u8 are generated.
-     */
-    private fun extractTvHlsDirectoryBases(
-        html: String,
-        baseUrl: String
-    ): List<String> {
-        if (html.isBlank()) return emptyList()
-
-        val normalized = html
-            .replace("\\/", "/")
-            .replace("\\x2F", "/")
-            .replace("\\u002F", "/")
-            .replace("\\u002f", "/")
-            .replace("\\u003A", ":")
-            .replace("\\u003a", ":")
-            .replace("&amp;", "&")
-
-        val found = linkedSetOf<String>()
-
-        fun add(raw: String?) {
-            if (raw.isNullOrBlank()) return
-
-            val candidate = raw
-                .trim()
-                .replace("\\/", "/")
-                .replace("\\x2F", "/")
-                .replace("\\u002F", "/")
-                .replace("\\u002f", "/")
-                .replace("&amp;", "&")
-                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
-                .trimEnd('/')
-
-            if (candidate.isBlank()) return
-
-            val absolute = absoluteUrl(candidate, baseUrl)
-            val clean = cleanUrl(absolute)
-            val path = runCatching { URI(clean).path.orEmpty() }
-                .getOrDefault("")
-
-            if (!path.contains("/hls/", true)) return
-
-            val marker = Regex("(?i)\\.mp4$")
-            if (!marker.containsMatchIn(path)) return
-
-            found.add(clean)
-        }
-
-        val patterns = listOf(
-            Regex(
-                """(?is)(?:https?:)?//[^"'<>\s\\]+/hls/[^"'<>\s\\]+?\.mp4(?=[/"'<>?\s\\]|$)"""
-            ),
-            Regex(
-                """(?is)/hls/[^"'<>\s\\]+?\.mp4(?=[/"'<>?\s\\]|$)"""
-            )
-        )
-
-        for (pattern in patterns) {
-            pattern.findAll(normalized).forEach { match ->
-                add(match.value)
-            }
-        }
-
-        return found.toList()
-    }
-
     private fun extractAnyCinePlexM3u8(
         html: String,
         baseUrl: String
@@ -1748,7 +1353,6 @@ class CinePlexFTP : MainAPI() {
     }
 
 
-
     private fun extractTvHlsSources(
         document: Document,
         html: String,
@@ -1816,6 +1420,125 @@ class CinePlexFTP : MainAPI() {
         return found.toList()
     }
 
+    /*
+     * Find ONLY the exact filename-backed HLS URLs that the user requested.
+     *
+     * Accepted examples:
+     *
+     *   /hls/tr/.../Episode.mp4/index-v1-a1.m3u8
+     *   /hls/tr/.../Episode.mkv/index-v1-a1.m3u8
+     *   /hls/tr/.../Episode.webm/foo.m3u8
+     *
+     * Requiring the video-file extension immediately before the next slash
+     * makes this independent of whether the playlist is called "master",
+     * "index-v1-a1", or something else.
+     */
+    private fun extractExactCinePlexHlsPlaylists(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val found = linkedSetOf<String>()
+
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val value = raw
+                .trim()
+                .replace("\\/", "/")
+                .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
+                .replace("\\u0026", "&")
+                .replace("\\u003A", ":")
+                .replace("&amp;", "&")
+                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
+
+            if (value.isBlank()) return
+
+            val absolute = absoluteUrl(value, baseUrl)
+            if (isExactCinePlexHlsUrl(absolute)) {
+                found.add(cleanUrl(absolute))
+            }
+        }
+
+        /*
+         * DOM first: use the exact value from <source src="..."> when available.
+         */
+        document.select(
+            "video source[src], video[src], source[src], " +
+                "[src], [data-src], [data-video], [data-source], " +
+                "[data-stream], [data-manifest], [data-playlist]"
+        ).forEach { element ->
+            add(element.attr("src"))
+            add(element.attr("data-src"))
+            add(element.attr("data-video"))
+            add(element.attr("data-source"))
+            add(element.attr("data-stream"))
+            add(element.attr("data-manifest"))
+            add(element.attr("data-playlist"))
+        }
+
+        /*
+         * Raw page scan. The playlist name is deliberately unrestricted:
+         * master.m3u8, index-v1-a1.m3u8, foo.m3u8, etc. all work.
+         */
+        val variants = linkedSetOf<String>()
+        variants.add(html)
+
+        val normalized = html
+            .replace("\\/", "/")
+            .replace("\\x2F", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+            .replace("&amp;", "&")
+
+        variants.add(normalized)
+
+        runCatching {
+            variants.add(
+                URLDecoder.decode(
+                    normalized,
+                    StandardCharsets.UTF_8.toString()
+                )
+            )
+        }
+
+        val exactPattern = Regex(
+            """(?is)(?:https?:)?//[^"'<>\s\\]+?/hls/[^"'<>\s\\]*?\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
+        )
+
+        val exactRelativePattern = Regex(
+            """(?is)/hls/[^"'<>\s\\]*?\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^"'<>\s\\]+?\.m3u8(?:\?[^"'<>\s\\]*)?"""
+        )
+
+        for (variant in variants) {
+            exactPattern.findAll(variant).forEach { match ->
+                add(match.value)
+            }
+            exactRelativePattern.findAll(variant).forEach { match ->
+                add(match.value)
+            }
+        }
+
+        return found.toList()
+    }
+
+    private fun isExactCinePlexHlsUrl(url: String): Boolean {
+        val cleaned = cleanUrl(url)
+        if (!isCinePlexTvMediaUrl(cleaned)) return false
+
+        val path = runCatching {
+            URI(cleaned).path.orEmpty()
+        }.getOrDefault("")
+
+        return Regex(
+            """(?i)/hls/[^/]*.*\.(?:mp4|mkv|webm|mov|m4v|avi|flv|ts)/[^/]+\.m3u8$"""
+        ).containsMatchIn(path)
+    }
+
     private fun isCinePlexTvMediaUrl(url: String): Boolean {
         val cleaned = cleanUrl(url)
         if (!isMediaUrl(cleaned)) return false
@@ -1834,7 +1557,7 @@ class CinePlexFTP : MainAPI() {
         val cineplexHost = host == "cineplexbd.net" ||
             host.endsWith(".cineplexbd.net")
 
-        return cineplexHost && path.startsWith("/hls/") && path.endsWith(".m3u8")
+        return cineplexHost && path.startsWith("/hls/tr/") && path.endsWith(".m3u8")
     }
 
     private fun isCinePlexFullMediaUrl(url: String): Boolean {
@@ -1907,8 +1630,7 @@ class CinePlexFTP : MainAPI() {
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit,
         referer: String,
-        headersOverride: Map<String, String>? = null,
-        sourceLabel: String = "Cine Plex TV HLS"
+        headersOverride: Map<String, String>? = null
     ) {
         val cleanMediaUrl = cleanUrl(mediaUrl).trim()
         if (!isCinePlexTvMediaUrl(cleanMediaUrl)) return
@@ -1954,7 +1676,7 @@ class CinePlexFTP : MainAPI() {
         callback(
             newExtractorLink(
                 source = name,
-                name = sourceLabel,
+                name = "Cine Plex TV HLS",
                 url = cleanMediaUrl,
                 type = ExtractorLinkType.M3U8
             ) {
