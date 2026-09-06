@@ -1083,7 +1083,7 @@ class CTGFTP : MainAPI() {
         val data = CachedItems(
             timestamp = System.currentTimeMillis(),
             items = items,
-            hasNext = hasNextPage(document, page = pageFromUrl(normalized))
+            hasNext = hasNextPage(document, currentPage = pageFromUrl(normalized))
         )
 
         pageCache[normalized] = data
