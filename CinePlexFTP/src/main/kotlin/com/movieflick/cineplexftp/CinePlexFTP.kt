@@ -759,90 +759,120 @@ class CinePlexFTP : MainAPI() {
             /*
              * TV SERIES ONLY.
              *
-             * 1) Open the exact Cine Plex episode page.
-             * 2) Crawl the returned HTML for the site's own /hls/tr/.../master.m3u8.
-             * 3) Send that exact M3U8 URL to CloudStream as an M3U8 ExtractorLink.
+             * Open the exact episode page and crawl that page for the REAL
+             * Cine Plex HLS manifest.  The website itself exposes the episode
+             * as /hls/tr/.../master.m3u8 in the player <source>.
              *
-             * No movie/player.php logic is involved here.
+             * Nothing from the movie/player.php path is used here.
              */
-            val tvResponse = runCatching {
-                app.get(
-                    input,
-                    headers = pageHeaders(input) + mapOf(
-                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Cache-Control" to "no-cache, no-store, max-age=0",
-                        "Pragma" to "no-cache"
+            val pageCandidates = linkedSetOf<String>()
+            pageCandidates.add(input)
+
+            runCatching {
+                val uri = URI(input)
+                val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
+                val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
+                val otherScheme = when (scheme) {
+                    "http" -> "https"
+                    "https" -> "http"
+                    else -> ""
+                }
+                if (otherScheme.isNotBlank() && host.isNotBlank()) {
+                    pageCandidates.add(
+                        "$otherScheme://$host" +
+                            (uri.rawPath ?: "") +
+                            (if (uri.rawQuery.isNullOrBlank()) "" else "?${uri.rawQuery}")
                     )
-                )
-            }.getOrNull() ?: return false
-
-            val tvSources = extractTvHlsSources(
-                tvResponse.document,
-                tvResponse.text,
-                input
-            )
-
-            /*
-             * Also scan raw HTML independently. This catches the source even if
-             * Jsoup normalizes part of the <source> tag differently.
-             */
-            val cleanedHtml = tvResponse.text
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-                .replace("\\u003A", ":")
-
-            val tvHlsRegex = Regex(
-                """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?)"""
-            )
-
-            val rawSources = tvHlsRegex.findAll(cleanedHtml)
-                .map { it.value.trim() }
-                .map { it.trim('"', '\'', '`', ',', ';', ')', ']', '}') }
-                .map { absoluteUrl(it, input) }
-                .filter { isCinePlexTvMediaUrl(it) }
-                .toList()
-
-            val allTvSources = (tvSources + rawSources)
-                .distinct()
-                .sortedWith(
-                    compareByDescending<String> {
-                        when {
-                            "master.m3u8" in it.lowercase(Locale.ROOT) -> 1000
-                            "/hls/tr/" in it.lowercase(Locale.ROOT) -> 900
-                            else -> 0
-                        }
-                    }.thenByDescending { it.length }
-                )
-
-            if (allTvSources.isEmpty()) return false
-
-            /*
-             * Give CloudStream the exact manifest URL.
-             *
-             * The TV player on Cine Plex is same-origin. Use the episode page
-             * as Referer, but do NOT inject a synthetic Origin header.
-             *
-             * Also provide a root-Referer fallback link because some hotlink
-             * rules accept only the site's root while others accept the exact
-             * watch page. Both links point to the SAME M3U8 manifest.
-             */
-            val primarySource = allTvSources.first()
-
-            emitTvMediaLink(
-                mediaUrl = primarySource,
-                callback = callback,
-                referer = input
-            )
-
-            val rootReferer = "$mainUrl/"
-            if (!rootReferer.equals(input, ignoreCase = true)) {
-                emitTvMediaLink(
-                    mediaUrl = primarySource,
-                    callback = callback,
-                    referer = rootReferer
-                )
+                }
             }
+
+            var tvSource: String? = null
+
+            for (episodePageUrl in pageCandidates) {
+                val pageResponse = runCatching {
+                    app.get(
+                        episodePageUrl,
+                        headers = pageHeaders(episodePageUrl) + mapOf(
+                            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Cache-Control" to "no-cache, no-store, max-age=0",
+                            "Pragma" to "no-cache"
+                        )
+                    )
+                }.getOrNull() ?: continue
+
+                val found = extractTvHlsSources(
+                    pageResponse.document,
+                    pageResponse.text,
+                    episodePageUrl
+                )
+
+                tvSource = found
+                    .sortedWith(
+                        compareByDescending<String> {
+                            val lower = it.lowercase(Locale.ROOT)
+                            when {
+                                "master.m3u8" in lower -> 1000
+                                "/hls/tr/" in lower -> 900
+                                else -> 0
+                            }
+                        }.thenByDescending { it.length }
+                    )
+                    .firstOrNull()
+
+                if (tvSource != null) break
+
+                /*
+                 * Last-resort raw crawl. Do not require isMediaUrl() here:
+                 * the only requirement for this TV branch is a real .m3u8
+                 * manifest hosted by Cine Plex.
+                 */
+                val cleanedHtml = pageResponse.text
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("\\u003A", ":")
+                    .replace("&amp;", "&")
+
+                val patterns = listOf(
+                    Regex("""(?is)(?:https?:)?//[^\"'<>\s]+/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+                    Regex("""(?is)/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+                    Regex("""(?is)(?:https?:)?//[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+                    Regex("""(?is)(?:src|source|file|url|video|videoUrl|stream|streamUrl)\s*[:=]\s*[\"']([^\"']+?\.m3u8(?:\?[^\"']*)?)[\"']""")
+                )
+
+                for (pattern in patterns) {
+                    val candidate = pattern.find(cleanedHtml)
+                        ?.let {
+                            val value = it.groupValues.getOrNull(1)
+                                ?.takeIf { g -> g.isNotBlank() }
+                                ?: it.value
+                            value
+                        }
+                        ?.trim()
+                        ?.trim('\"', '\'', '`', ',', ';', ')', ']', '}')
+                        ?.let { absoluteUrl(it, episodePageUrl) }
+                        ?.takeIf { isCinePlexTvMediaUrl(it) }
+
+                    if (candidate != null) {
+                        tvSource = candidate
+                        break
+                    }
+                }
+
+                if (tvSource != null) break
+            }
+
+            if (tvSource == null) return false
+
+            /*
+             * Send ONLY the exact M3U8 manifest found on the episode page.
+             * CloudStream's native M3U8 player will handle the stream.
+             * Keep the episode page as Referer.
+             */
+            emitTvMediaLink(
+                mediaUrl = tvSource!!,
+                callback = callback,
+                referer = input.substringBefore('#')
+            )
 
             return true
         }
@@ -1050,8 +1080,9 @@ class CinePlexFTP : MainAPI() {
                 .trim()
                 .replace("\\/", "/")
                 .replace("\\u0026", "&")
+                .replace("\\u003A", ":")
                 .replace("&amp;", "&")
-                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
+                .trim('\"', '\'', '`', ',', ';', ')', ']', '}')
 
             if (value.isBlank()) return
 
@@ -1061,15 +1092,11 @@ class CinePlexFTP : MainAPI() {
             }
         }
 
+        /* Actual player DOM. */
         document.select(
-            "video source[src], " +
-                "video[src], " +
-                "source[src], " +
-                "[data-src], " +
-                "[data-video], " +
-                "[data-source], " +
-                "[data-stream], " +
-                "[data-manifest]"
+            "video source[src], video[src], source[src], " +
+                "[data-src], [data-video], [data-source], [data-stream], " +
+                "[data-manifest], [data-playlist]"
         ).forEach { element ->
             add(element.attr("src"))
             add(element.attr("data-src"))
@@ -1077,6 +1104,7 @@ class CinePlexFTP : MainAPI() {
             add(element.attr("data-source"))
             add(element.attr("data-stream"))
             add(element.attr("data-manifest"))
+            add(element.attr("data-playlist"))
         }
 
         val cleanedHtml = html
@@ -1085,12 +1113,21 @@ class CinePlexFTP : MainAPI() {
             .replace("\\u003A", ":")
             .replace("&amp;", "&")
 
-        val regex = Regex(
-            """(?is)(?:(?:https?:)?//[^"'<>\s]+/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?|/hls/tr/[^"'<>\s]+\.m3u8(?:\?[^"'<>\s]*)?)"""
+        /* Scan every raw HLS URL, not only one specific HTML shape. */
+        val patterns = listOf(
+            Regex("""(?is)(?:https?:)?//[^\"'<>\s]+/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+            Regex("""(?is)/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+            Regex("""(?is)(?:https?:)?//[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
+            Regex("""(?is)(?:src|source|file|url|video|videoUrl|stream|streamUrl)\s*[:=]\s*[\"']([^\"']+?\.m3u8(?:\?[^\"']*)?)[\"']""")
         )
 
-        regex.findAll(cleanedHtml).forEach { match ->
-            add(match.value)
+        for (pattern in patterns) {
+            pattern.findAll(cleanedHtml).forEach { match ->
+                val value = match.groupValues.getOrNull(1)
+                    ?.takeIf { it.isNotBlank() }
+                    ?: match.value
+                add(value)
+            }
         }
 
         return found.toList()
