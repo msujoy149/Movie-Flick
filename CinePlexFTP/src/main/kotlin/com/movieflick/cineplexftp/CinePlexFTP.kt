@@ -757,44 +757,68 @@ class CinePlexFTP : MainAPI() {
          */
         if (input.contains("watch.php", true)) {
             /*
-             * TV PLAYBACK RECOVERY
+             * TV PLAYBACK — GENERIC HLS DISCOVERY
              *
-             * Cine Plex's real TV source is HLS. The site exposes a master
-             * playlist such as:
-             *   .../Episode.mp4/master.m3u8
-             * and the actual media playlist as:
+             * Do NOT depend on "master.m3u8".
+             *
+             * Cine Plex may expose the real playable playlist as:
+             *
              *   .../Episode.mp4/index-v1-a1.m3u8
+             *   .../Episode.mp4/index-v1-a2.m3u8
+             *   .../Episode.mp4/index-v1-a3.m3u8
              *
-             * CloudStream/ExoPlayer can return IO_BAD_HTTP_STATUS (2004) on
-             * the master while the child playlist remains directly playable.
-             * Therefore we generate and emit both, with HTTPS + HTTP variants,
-             * browser-like headers and the exact episode Referer.
+             * The filename before ".m3u8" is not important. The rule is:
+             * find a Cine Plex /hls/ URL that ends in .m3u8 and send the
+             * COMPLETE URL exactly as discovered. If the page exposes the
+             * parent HLS ".mp4" directory, synthesize index-v1-a1..a4 too.
              */
             val cleanEpisodeUrl = input.substringBefore('#').trim()
             if (cleanEpisodeUrl.isBlank()) return false
 
             val discovered = linkedSetOf<String>()
-            val pageCandidates = buildTvEpisodePageCandidates(cleanEpisodeUrl)
+            val hlsBases = linkedSetOf<String>()
 
-            for (episodePageUrl in pageCandidates) {
+            fun collectPage(
+                pageUrl: String,
+                responseText: String,
+                document: Document
+            ) {
+                extractTvHlsSources(
+                    document = document,
+                    html = responseText,
+                    baseUrl = pageUrl
+                ).forEach { discovered.add(it) }
+
+                extractAnyCinePlexM3u8(
+                    html = responseText,
+                    baseUrl = pageUrl
+                ).forEach { discovered.add(it) }
+
+                extractTvHlsDirectoryBases(
+                    html = responseText,
+                    baseUrl = pageUrl
+                ).forEach { hlsBases.add(it) }
+            }
+
+            for (episodePageUrl in buildTvEpisodePageCandidates(cleanEpisodeUrl)) {
                 for ((requestUrl, requestHeaders) in buildTvPageRequestVariants(episodePageUrl)) {
                     val pageResponse = runCatching {
                         app.get(requestUrl, headers = requestHeaders)
                     }.getOrNull() ?: continue
 
-                    extractTvHlsSources(
-                        pageResponse.document,
-                        pageResponse.text,
-                        requestUrl
-                    ).forEach { discovered.add(it) }
-
-                    extractAnyCinePlexM3u8(
-                        pageResponse.text,
-                        requestUrl
-                    ).forEach { discovered.add(it) }
+                    collectPage(
+                        pageUrl = requestUrl,
+                        responseText = pageResponse.text,
+                        document = pageResponse.document
+                    )
                 }
 
-                val metaUrl = appendQueryParameter(episodePageUrl, "meta", "1")
+                val metaUrl = appendQueryParameter(
+                    episodePageUrl,
+                    "meta",
+                    "1"
+                )
+
                 runCatching {
                     app.get(
                         metaUrl,
@@ -806,17 +830,84 @@ class CinePlexFTP : MainAPI() {
                         )
                     )
                 }.getOrNull()?.let { metaResponse ->
-                    extractAnyCinePlexM3u8(
-                        metaResponse.text,
-                        metaUrl
-                    ).forEach { discovered.add(it) }
+                    collectPage(
+                        pageUrl = metaUrl,
+                        responseText = metaResponse.text,
+                        document = metaResponse.document
+                    )
                 }
             }
 
-            if (discovered.isEmpty()) return false
+            /*
+             * For every discovered HLS URL:
+             *
+             *   ".../Something.mp4/master.m3u8"
+             *
+             * also create:
+             *
+             *   ".../Something.mp4/index-v1-a1.m3u8"
+             *   ".../Something.mp4/index-v1-a2.m3u8"
+             *   ".../Something.mp4/index-v1-a3.m3u8"
+             *   ".../Something.mp4/index-v1-a4.m3u8"
+             *
+             * More importantly, this same expansion is applied to ANY HLS
+             * directory ending in ".mp4/", even when "master.m3u8" was never
+             * present on the page.
+             */
+            val expanded = linkedSetOf<String>()
 
+            for (source in discovered) {
+                val clean = cleanUrl(source)
+                if (!isCinePlexTvMediaUrl(clean)) continue
+
+                val basePath = clean
+                    .substringBefore('?')
+                    .substringBeforeLast('/', "")
+                    .takeIf { it.isNotBlank() }
+
+                if (basePath != null && basePath.contains(".mp4", true)) {
+                    for (audio in 1..8) {
+                        expanded.add("$basePath/index-v1-a$audio.m3u8")
+                    }
+                }
+
+                expanded.add(clean)
+            }
+
+            /*
+             * Parent-directory discovery fallback:
+             *
+             *   /hls/tr/.../SomeEpisode.mp4/
+             *
+             * -> directly test likely index playlists.
+             *
+             * This is the important path for Cine Plex revisions where the
+             * HTML/JS exposes the video directory but never exposes
+             * "master.m3u8".
+             */
+            for (base in hlsBases) {
+                val cleanBase = cleanUrl(base)
+                    .substringBefore('?')
+                    .trimEnd('/')
+
+                if (cleanBase.isBlank()) continue
+
+                for (audio in 1..8) {
+                    expanded.add("$cleanBase/index-v1-a$audio.m3u8")
+                }
+            }
+
+            /*
+             * If no HLS source was found at all, derive a conservative
+             * candidate from the episode id by revisiting the exact watch page
+             * through the site's player markup. This does not invent a movie
+             * URL; it only searches the actual page again for /hls/ + .m3u8 or
+             * an .mp4-backed HLS directory.
+             */
             val candidates = buildTvPlaybackCandidates(
-                sources = discovered.toList(),
+                sources = expanded.toList()
+                    .filter { isCinePlexTvMediaUrl(it) }
+                    .distinct(),
                 episodeUrl = cleanEpisodeUrl
             )
 
@@ -825,8 +916,12 @@ class CinePlexFTP : MainAPI() {
             var emitted = false
             val emittedUrls = linkedSetOf<String>()
 
-            /* Keep direct child playlists first; master playlists are fallback. */
-            for (candidate in candidates.take(16)) {
+            /*
+             * Direct media playlists first. Master is allowed only as a last
+             * fallback because the user's confirmed playable form is the
+             * concrete index-v1-aN.m3u8 playlist.
+             */
+            for (candidate in candidates) {
                 if (!emittedUrls.add(candidate.url)) continue
 
                 emitTvMediaLink(
@@ -1224,13 +1319,6 @@ class CinePlexFTP : MainAPI() {
             "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
         val cleanEpisode = cleanUrl(episodeUrl)
-        val origin = runCatching {
-            val uri = URI(cleanEpisode)
-            val scheme = uri.scheme.orEmpty()
-            val host = uri.host.orEmpty()
-            if (scheme.isBlank() || host.isBlank()) "" else "$scheme://$host"
-        }.getOrElse { "" }
-
         /*
          * Keep the HLS request headers intentionally minimal. The Cine Plex
          * player itself supplies the manifest URL from the episode page, and
@@ -1365,6 +1453,78 @@ class CinePlexFTP : MainAPI() {
      *
      * Only a Cine Plex-hosted URL containing .m3u8 is accepted.
      */
+    /*
+     * Find the HLS parent directory itself.
+     *
+     * Example:
+     *   /hls/tr/.../Something.mp4/
+     *
+     * The site does not need to expose "master.m3u8" for us to use this.
+     * Once this directory is found, index-v1-a1..a8.m3u8 are generated.
+     */
+    private fun extractTvHlsDirectoryBases(
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        if (html.isBlank()) return emptyList()
+
+        val normalized = html
+            .replace("\\/", "/")
+            .replace("\\x2F", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+            .replace("&amp;", "&")
+
+        val found = linkedSetOf<String>()
+
+        fun add(raw: String?) {
+            if (raw.isNullOrBlank()) return
+
+            val candidate = raw
+                .trim()
+                .replace("\\/", "/")
+                .replace("\\x2F", "/")
+                .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
+                .replace("&amp;", "&")
+                .trim('"', '\'', '`', ',', ';', ')', ']', '}')
+                .trimEnd('/')
+
+            if (candidate.isBlank()) return
+
+            val absolute = absoluteUrl(candidate, baseUrl)
+            val clean = cleanUrl(absolute)
+            val path = runCatching { URI(clean).path.orEmpty() }
+                .getOrDefault("")
+
+            if (!path.contains("/hls/", true)) return
+
+            val marker = Regex("(?i)\\.mp4$")
+            if (!marker.containsMatchIn(path)) return
+
+            found.add(clean)
+        }
+
+        val patterns = listOf(
+            Regex(
+                """(?is)(?:https?:)?//[^"'<>\s\\]+/hls/[^"'<>\s\\]+?\.mp4(?=[/"'<>?\s\\]|$)"""
+            ),
+            Regex(
+                """(?is)/hls/[^"'<>\s\\]+?\.mp4(?=[/"'<>?\s\\]|$)"""
+            )
+        )
+
+        for (pattern in patterns) {
+            pattern.findAll(normalized).forEach { match ->
+                add(match.value)
+            }
+        }
+
+        return found.toList()
+    }
+
     private fun extractAnyCinePlexM3u8(
         html: String,
         baseUrl: String
