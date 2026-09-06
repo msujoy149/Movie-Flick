@@ -759,119 +759,115 @@ class CinePlexFTP : MainAPI() {
             /*
              * TV SERIES ONLY.
              *
-             * Open the exact episode page and crawl that page for the REAL
-             * Cine Plex HLS manifest.  The website itself exposes the episode
-             * as /hls/tr/.../master.m3u8 in the player <source>.
+             * The Cine Plex TV player exposes the real episode as an HLS
+             * master.m3u8.  We:
              *
-             * Nothing from the movie/player.php path is used here.
+             *  1. fetch the exact episode page;
+             *  2. crawl DOM + raw HTML/JS for every .m3u8;
+             *  3. try HTTP/HTTPS page variants;
+             *  4. try the site's metadata response when available;
+             *  5. validate the manifest itself;
+             *  6. send the exact manifest to CloudStream as M3U8.
+             *
+             * Nothing below this branch is involved in TV playback.
              */
-            val pageCandidates = linkedSetOf<String>()
-            pageCandidates.add(input)
+            val cleanEpisodeUrl = input
+                .substringBefore('#')
+                .trim()
 
-            runCatching {
-                val uri = URI(input)
-                val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
-                val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
-                val otherScheme = when (scheme) {
-                    "http" -> "https"
-                    "https" -> "http"
-                    else -> ""
-                }
-                if (otherScheme.isNotBlank() && host.isNotBlank()) {
-                    pageCandidates.add(
-                        "$otherScheme://$host" +
-                            (uri.rawPath ?: "") +
-                            (if (uri.rawQuery.isNullOrBlank()) "" else "?${uri.rawQuery}")
-                    )
-                }
-            }
+            if (cleanEpisodeUrl.isBlank()) return false
 
-            var tvSource: String? = null
+            val pageCandidates = buildTvEpisodePageCandidates(cleanEpisodeUrl)
+            val discovered = linkedSetOf<String>()
+            var discoveredReferer = cleanEpisodeUrl
 
             for (episodePageUrl in pageCandidates) {
-                val pageResponse = runCatching {
-                    app.get(
-                        episodePageUrl,
-                        headers = pageHeaders(episodePageUrl) + mapOf(
-                            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Cache-Control" to "no-cache, no-store, max-age=0",
-                            "Pragma" to "no-cache"
-                        )
-                    )
-                }.getOrNull() ?: continue
+                for ((requestUrl, requestHeaders) in buildTvPageRequestVariants(episodePageUrl)) {
+                    val pageResponse = runCatching {
+                        app.get(requestUrl, headers = requestHeaders)
+                    }.getOrNull() ?: continue
 
-                val found = extractTvHlsSources(
-                    pageResponse.document,
-                    pageResponse.text,
-                    episodePageUrl
-                )
+                    extractTvHlsSources(
+                        pageResponse.document,
+                        pageResponse.text,
+                        requestUrl
+                    ).forEach { discovered.add(it) }
 
-                tvSource = found
-                    .sortedWith(
-                        compareByDescending<String> {
-                            val lower = it.lowercase(Locale.ROOT)
-                            when {
-                                "master.m3u8" in lower -> 1000
-                                "/hls/tr/" in lower -> 900
-                                else -> 0
-                            }
-                        }.thenByDescending { it.length }
-                    )
-                    .firstOrNull()
-
-                if (tvSource != null) break
-
-                /*
-                 * Last-resort raw crawl. Do not require isMediaUrl() here:
-                 * the only requirement for this TV branch is a real .m3u8
-                 * manifest hosted by Cine Plex.
-                 */
-                val cleanedHtml = pageResponse.text
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                    .replace("\\u003A", ":")
-                    .replace("&amp;", "&")
-
-                val patterns = listOf(
-                    Regex("""(?is)(?:https?:)?//[^\"'<>\s]+/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
-                    Regex("""(?is)/hls/tr/[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
-                    Regex("""(?is)(?:https?:)?//[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?"""),
-                    Regex("""(?is)(?:src|source|file|url|video|videoUrl|stream|streamUrl)\s*[:=]\s*[\"']([^\"']+?\.m3u8(?:\?[^\"']*)?)[\"']""")
-                )
-
-                for (pattern in patterns) {
-                    val candidate = pattern.find(cleanedHtml)
-                        ?.let {
-                            val value = it.groupValues.getOrNull(1)
-                                ?.takeIf { g -> g.isNotBlank() }
-                                ?: it.value
-                            value
-                        }
-                        ?.trim()
-                        ?.trim('\"', '\'', '`', ',', ';', ')', ']', '}')
-                        ?.let { absoluteUrl(it, episodePageUrl) }
-                        ?.takeIf { isCinePlexTvMediaUrl(it) }
-
-                    if (candidate != null) {
-                        tvSource = candidate
-                        break
-                    }
+                    extractAnyCinePlexM3u8(
+                        pageResponse.text,
+                        requestUrl
+                    ).forEach { discovered.add(it) }
                 }
 
-                if (tvSource != null) break
+                /*
+                 * Cine Plex's own player script requests the same watch endpoint
+                 * with ?meta=1.  Crawl that response too because some revisions
+                 * expose player metadata only there.
+                 */
+                val metaUrl = appendQueryParameter(
+                    episodePageUrl,
+                    "meta",
+                    "1"
+                )
+
+                val metaResponse = runCatching {
+                    app.get(
+                        metaUrl,
+                        headers = pageHeaders(episodePageUrl) + mapOf(
+                            "Accept" to "application/json,text/plain,*/*",
+                            "Cache-Control" to "no-cache, no-store, max-age=0",
+                            "Pragma" to "no-cache",
+                            "X-Requested-With" to "XMLHttpRequest"
+                        )
+                    )
+                }.getOrNull()
+
+                if (metaResponse != null) {
+                    extractAnyCinePlexM3u8(
+                        metaResponse.text,
+                        metaUrl
+                    ).forEach { discovered.add(it) }
+                }
             }
 
-            if (tvSource == null) return false
+            val orderedSources = discovered
+                .filter { isCinePlexTvMediaUrl(it) }
+                .distinct()
+                .sortedWith(
+                    compareByDescending<String> {
+                        val lower = it.lowercase(Locale.ROOT)
+                        when {
+                            lower.contains("master.m3u8") -> 1000
+                            lower.contains("/hls/tr/") -> 950
+                            else -> 900
+                        }
+                    }.thenByDescending { it.length }
+                )
+
+            if (orderedSources.isEmpty()) return false
 
             /*
-             * Send ONLY the exact M3U8 manifest found on the episode page.
-             * CloudStream's native M3U8 player will handle the stream.
-             * Keep the episode page as Referer.
+             * IMPORTANT:
+             * ERROR_CODE_IO_BAD_HTTP_STATUS (2004) means the player received a
+             * non-success HTTP status from the HLS server.  Before emitting the
+             * link, test the exact manifest with the same types of headers the
+             * player will receive.  This lets us prefer a genuinely accessible
+             * manifest instead of simply finding a string ending in .m3u8.
              */
+            val playback = findPlayableTvManifest(
+                sources = orderedSources,
+                episodeUrl = cleanEpisodeUrl
+            )
+
+            val source = playback?.first ?: orderedSources.first()
+            val referer = playback?.second ?: discoveredReferer
+            val headersMode = playback?.third
+
             emitTvMediaLink(
-                mediaUrl = tvSource!!,
+                mediaUrl = source,
                 callback = callback,
-                referer = input.substringBefore('#')
+                referer = referer,
+                headersOverride = headersMode
             )
 
             return true
@@ -1066,6 +1062,119 @@ class CinePlexFTP : MainAPI() {
      * Crawl the exact Cine Plex watch page and collect the HLS manifest from
      * both the rendered <video>/<source> element and raw page HTML/JS.
      */
+    private fun tvManifestUrlVariants(url: String): List<String> {
+        val result = linkedSetOf<String>()
+        val clean = cleanUrl(url).trim()
+        if (clean.isBlank()) return emptyList()
+
+        result.add(clean)
+
+        runCatching {
+            val uri = URI(clean)
+            val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
+            val host = uri.host.orEmpty()
+            val path = uri.rawPath.orEmpty()
+            val query = uri.rawQuery.orEmpty()
+
+            when (scheme) {
+                "http", "https" -> {
+                    val other = if (scheme == "http") "https" else "http"
+                    if (host.isNotBlank() && path.isNotBlank()) {
+                        result.add(
+                            "$other://$host$path" +
+                                if (query.isBlank()) "" else "?$query"
+                        )
+                    }
+                }
+            }
+        }
+
+        return result.toList()
+    }
+
+    private fun tvPlaybackHeaderModes(
+        episodeUrl: String
+    ): List<Pair<String, Map<String, String>>> {
+        val ua =
+            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+        val root = "$mainUrl/"
+        return listOf(
+            episodeUrl to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache",
+                "Origin" to mainUrl
+            ),
+            episodeUrl to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache"
+            ),
+            root to mapOf(
+                "User-Agent" to ua,
+                "Accept" to "*/*",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache",
+                "Origin" to mainUrl
+            )
+        )
+    }
+
+    /*
+     * Returns:
+     *   manifest URL, referer, headers
+     *
+     * The request itself is only used to verify that the manifest is reachable
+     * and actually looks like an HLS playlist. The returned URL is still sent
+     * directly to CloudStream; no proxy is introduced.
+     */
+    private suspend fun findPlayableTvManifest(
+        sources: List<String>,
+        episodeUrl: String
+    ): Triple<String, String, Map<String, String>>? {
+        for (source in sources) {
+            for (manifestUrl in tvManifestUrlVariants(source)) {
+                for ((referer, headers) in tvPlaybackHeaderModes(episodeUrl)) {
+                    val response = runCatching {
+                        app.get(
+                            manifestUrl,
+                            headers = headers + mapOf(
+                                "Referer" to referer
+                            )
+                        )
+                    }.getOrNull() ?: continue
+
+                    val body = response.text
+                        .replace("\uFEFF", "")
+                        .trimStart()
+
+                    /*
+                     * A valid HLS manifest normally begins with #EXTM3U.
+                     * Master playlists additionally use EXT-X-STREAM-INF;
+                     * media playlists use EXTINF.
+                     */
+                    if (
+                        body.startsWith("#EXTM3U", ignoreCase = false) ||
+                        body.contains("#EXT-X-STREAM-INF", ignoreCase = true) ||
+                        body.contains("#EXTINF", ignoreCase = true)
+                    ) {
+                        return Triple(
+                            manifestUrl,
+                            referer,
+                            headers
+                        )
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
     private fun extractTvHlsSources(
         document: Document,
         html: String,
@@ -1223,7 +1332,8 @@ class CinePlexFTP : MainAPI() {
     private suspend fun emitTvMediaLink(
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit,
-        referer: String
+        referer: String,
+        headersOverride: Map<String, String>? = null
     ) {
         val cleanMediaUrl = cleanUrl(mediaUrl).trim()
         if (!isCinePlexTvMediaUrl(cleanMediaUrl)) return
@@ -1257,12 +1367,11 @@ class CinePlexFTP : MainAPI() {
          * Keep the request as close as possible to the website's actual
          * same-origin HLS GET. In particular, do not add an Origin header.
          */
-        val headers = mapOf(
+        val headers = headersOverride ?: mapOf(
             "User-Agent" to
                 "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
             "Accept" to "*/*",
-            "Accept-Language" to "en-US,en;q=0.9",
             "Cache-Control" to "no-cache",
             "Pragma" to "no-cache"
         )
