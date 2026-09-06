@@ -1132,7 +1132,7 @@ class OnlineMovies : MainAPI() {
             "vpaid",
             "bannerad",
             "banner_ad",
-            ""ad":",
+            "\"ad\":",
             "\"adurl\":",
             "trailer",
             "youtube.com",
