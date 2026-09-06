@@ -604,7 +604,377 @@ class OnlineMovies : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return false
+
+        val input = cleanUrlLocal(data)
+        if (input.isBlank()) return false
+
+        val visitedPages = linkedSetOf<String>()
+        val found = linkedMapOf<String, MediaCandidate>()
+
+        suspend fun crawlPage(pageUrl: String) {
+            val cleanPage = cleanUrlLocal(pageUrl)
+            if (cleanPage.isBlank()) return
+            if (!visitedPages.add(cleanPage)) return
+            if (visitedPages.size > MAX_PLAYBACK_PAGES) return
+
+            val response = runCatching {
+                app.get(
+                    cleanPage,
+                    headers = pageHeaders + ("Referer" to "$mainUrl/")
+                )
+            }.getOrNull() ?: return
+
+            val document = response.document
+            val html = response.text
+
+            extractMediaCandidates(
+                document = document,
+                html = html,
+                baseUrl = cleanPage
+            ).forEach { candidate ->
+                if (isPlayableMedia(candidate.url)) {
+                    found.putIfAbsent(
+                        candidate.url,
+                        candidate
+                    )
+                }
+            }
+
+            if (found.isNotEmpty()) return
+
+            val nestedPages = extractPlaybackPageCandidates(
+                document = document,
+                baseUrl = cleanPage
+            )
+
+            for (nested in nestedPages) {
+                crawlPage(nested)
+                if (found.size >= MAX_PLAYBACK_LINKS) break
+            }
+        }
+
+        crawlPage(input)
+
+        val sorted = found.values
+            .sortedWith(
+                compareByDescending<MediaCandidate> {
+                    qualityValue(it.quality)
+                }.thenBy { it.url.length }
+            )
+            .take(MAX_PLAYBACK_LINKS)
+
+        if (sorted.isEmpty()) return false
+
+        sorted.forEach { candidate ->
+            emitMediaLink(
+                candidate = candidate,
+                callback = callback
+            )
+        }
+
+        return true
+    }
+
+    /*
+     * ============================================================
+     * PLAYBACK DATA MODEL
+     * ============================================================
+     */
+    private data class MediaCandidate(
+        val url: String,
+        val quality: Int
+    )
+
+    /*
+     * ============================================================
+     * PLAYBACK CRAWLER HELPERS
+     * ============================================================
+     */
+    private fun extractMediaCandidates(
+        document: Document,
+        html: String,
+        baseUrl: String
+    ): List<MediaCandidate> {
+
+        val result = linkedMapOf<String, MediaCandidate>()
+
+        fun add(raw: String?, qualityHint: String? = null) {
+            if (raw.isNullOrBlank()) return
+
+            val absolute = absoluteUrlLocal(
+                raw.trim(),
+                baseUrl
+            )
+
+            val cleaned = cleanUrlLocal(absolute)
+            if (!isPlayableMedia(cleaned)) return
+
+            val quality = detectQuality(
+                qualityHint,
+                cleaned
+            )
+
+            result.putIfAbsent(
+                cleaned,
+                MediaCandidate(
+                    url = cleaned,
+                    quality = quality
+                )
+            )
+        }
+
+        document.select("video[src], video[data-src]").forEach { video ->
+            add(video.attr("src"), video.attr("data-quality"))
+            add(video.attr("data-src"), video.attr("data-quality"))
+        }
+
+        document.select("video source[src], video source[data-src]").forEach { source ->
+            val hint = source.attr("label")
+                .ifBlank { source.attr("res") }
+                .ifBlank { source.attr("data-quality") }
+                .ifBlank { source.attr("size") }
+
+            add(source.attr("src"), hint)
+            add(source.attr("data-src"), hint)
+        }
+
+        document.select(
+            "source[src], source[data-src], " +
+                "a[href], iframe[src], " +
+                "[data-src], [data-file], [data-video], " +
+                "[data-url], [data-hls], [data-m3u8], " +
+                "[data-mp4]"
+        ).forEach { element ->
+
+            val hint = element.attr("label")
+                .ifBlank { element.attr("title") }
+                .ifBlank { element.attr("data-quality") }
+                .ifBlank { element.attr("res") }
+                .ifBlank { element.attr("size") }
+                .ifBlank { element.text().trim() }
+
+            add(element.attr("src"), hint)
+            add(element.attr("href"), hint)
+            add(element.attr("data-src"), hint)
+            add(element.attr("data-file"), hint)
+            add(element.attr("data-video"), hint)
+            add(element.attr("data-url"), hint)
+            add(element.attr("data-hls"), hint)
+            add(element.attr("data-m3u8"), hint)
+            add(element.attr("data-mp4"), hint)
+        }
+
+        val mediaRegex = Regex(
+            """(?i)(https?:\/\/[^\s\"'<>]+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\s\"'<>]*)?)"""
+        )
+
+        mediaRegex.findAll(html).forEach { match ->
+            add(
+                match.value
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+            )
+        }
+
+        val quotedMediaRegex = Regex(
+            """(?i)[\"']([^\"']+?(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.webm|\.mov|\.m4v|\.avi|\.flv|\.ts)(?:\?[^\"']*)?)[\"']"""
+        )
+
+        quotedMediaRegex.findAll(html).forEach { match ->
+            add(
+                match.groupValues[1]
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+            )
+        }
+
+        return result.values.toList()
+    }
+
+    private fun extractPlaybackPageCandidates(
+        document: Document,
+        baseUrl: String
+    ): List<String> {
+
+        val result = linkedSetOf<String>()
+
+        document.select("a[href], iframe[src], embed[src]").forEach { element ->
+
+            val raw = when {
+                element.hasAttr("href") -> element.attr("href")
+                element.hasAttr("src") -> element.attr("src")
+                else -> ""
+            }.trim()
+
+            if (raw.isBlank()) return@forEach
+
+            val absolute = absoluteUrlLocal(
+                raw,
+                baseUrl
+            )
+
+            if (!isHttpUrl(absolute)) return@forEach
+            if (isPlayableMedia(absolute)) return@forEach
+
+            val lower = absolute.lowercase(Locale.ROOT)
+            val text = (
+                element.text() + " " +
+                    element.attr("title") + " " +
+                    element.attr("class") + " " +
+                    element.attr("id")
+                ).lowercase(Locale.ROOT)
+
+            val looksLikePlayer =
+                lower.contains("watch") ||
+                    lower.contains("player") ||
+                    lower.contains("stream") ||
+                    lower.contains("play") ||
+                    lower.contains("embed") ||
+                    lower.contains("video") ||
+                    lower.contains("download") ||
+                    text.contains("watch") ||
+                    text.contains("player") ||
+                    text.contains("play") ||
+                    text.contains("stream") ||
+                    text.contains("server") ||
+                    text.contains("download")
+
+            if (looksLikePlayer) {
+                result.add(absolute)
+            }
+        }
+
+        return result.toList().take(MAX_NESTED_PAGES)
+    }
+
+    private fun isPlayableMedia(
+        url: String
+    ): Boolean {
+
+        val lower = url.lowercase(Locale.ROOT)
+
+        return lower.contains(".m3u8") ||
+            lower.contains(".mpd") ||
+            lower.contains(".mp4") ||
+            lower.contains(".mkv") ||
+            lower.contains(".webm") ||
+            lower.contains(".mov") ||
+            lower.contains(".m4v") ||
+            lower.contains(".avi") ||
+            lower.contains(".flv") ||
+            lower.contains(".ts")
+    }
+
+    private fun isHttpUrl(
+        url: String
+    ): Boolean {
+        return url.startsWith("http://", true) ||
+            url.startsWith("https://", true)
+    }
+
+    private fun detectQuality(
+        hint: String?,
+        url: String
+    ): Int {
+
+        val source = (
+            (hint ?: "") + " " + url
+            ).lowercase(Locale.ROOT)
+
+        return when {
+            Regex("\\b2160p\\b").containsMatchIn(source) ||
+                "2160" in source ||
+                "4k" in source ||
+                "uhd" in source ->
+                Qualities.P2160.value
+
+            Regex("\\b1440p\\b").containsMatchIn(source) ||
+                "1440" in source ||
+                "2k" in source ->
+                Qualities.P1440.value
+
+            Regex("\\b1080p\\b").containsMatchIn(source) ||
+                "1080" in source ||
+                "fullhd" in source ||
+                "fhd" in source ->
+                Qualities.P1080.value
+
+            Regex("\\b720p\\b").containsMatchIn(source) ||
+                "720" in source ||
+                "hd" in source ->
+                Qualities.P720.value
+
+            Regex("\\b480p\\b").containsMatchIn(source) ||
+                "480" in source ||
+                "sd" in source ->
+                Qualities.P480.value
+
+            Regex("\\b360p\\b").containsMatchIn(source) ||
+                "360" in source ->
+                Qualities.P360.value
+
+            else ->
+                Qualities.Unknown.value
+        }
+    }
+
+    private fun qualityValue(
+        quality: Int
+    ): Int {
+        return when {
+            quality >= Qualities.P2160.value -> 2160
+            quality >= Qualities.P1440.value -> 1440
+            quality >= Qualities.P1080.value -> 1080
+            quality >= Qualities.P720.value -> 720
+            quality >= Qualities.P480.value -> 480
+            quality >= Qualities.P360.value -> 360
+            else -> 0
+        }
+    }
+
+    private suspend fun emitMediaLink(
+        candidate: MediaCandidate,
+        callback: (ExtractorLink) -> Unit
+    ) {
+
+        val mediaUrl = cleanUrlLocal(candidate.url)
+        if (!isPlayableMedia(mediaUrl)) return
+
+        val lower = mediaUrl.lowercase(Locale.ROOT)
+
+        val type = when {
+            lower.contains(".m3u8") ->
+                ExtractorLinkType.M3U8
+
+            lower.contains(".mpd") ->
+                ExtractorLinkType.DASH
+
+            else ->
+                ExtractorLinkType.VIDEO
+        }
+
+        val quality = candidate.quality
+
+        val label = when {
+            quality >= Qualities.P2160.value -> "Online Movies 2160p"
+            quality >= Qualities.P1440.value -> "Online Movies 1440p"
+            quality >= Qualities.P1080.value -> "Online Movies 1080p"
+            quality >= Qualities.P720.value -> "Online Movies 720p"
+            quality >= Qualities.P480.value -> "Online Movies 480p"
+            quality >= Qualities.P360.value -> "Online Movies 360p"
+            else -> "Online Movies Direct"
+        }
+
+        callback(
+            newExtractorLink(
+                source = name,
+                name = label,
+                url = mediaUrl,
+                type = type
+            ) {
+                this.quality = quality
+            }
+        )
     }
 
     /*
@@ -1962,6 +2332,12 @@ class OnlineMovies : MainAPI() {
      * ============================================================
      */
     private companion object {
+
+        const val MAX_PLAYBACK_PAGES = 6
+
+        const val MAX_NESTED_PAGES = 6
+
+        const val MAX_PLAYBACK_LINKS = 12
 
         const val MAX_ITEMS_PER_PAGE = 30
 
