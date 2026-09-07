@@ -1,4 +1,3 @@
-```kotlin
 package com.movieflick.mojaloss
 
 import com.lagradost.cloudstream3.*
@@ -1515,7 +1514,7 @@ class MojaLoss : MainAPI() {
             .replace("+", "%20")
     }
 
-    private fun emitMediaLink(
+    private suspend fun emitMediaLink(
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit,
         linkName: String
@@ -1810,4 +1809,3 @@ class MojaLoss : MainAPI() {
         } ?: ""
     }
 }
-```
