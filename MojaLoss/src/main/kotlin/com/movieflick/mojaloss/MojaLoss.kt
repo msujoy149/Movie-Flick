@@ -138,7 +138,7 @@ class MojaLoss : MainAPI() {
             .take(30)
 
         return newHomePageResponse(
-            request = request,
+            data = request.data,
             list = finalItems.map { it.toSearchResponse() },
             hasNext = hasNextPage(
                 request.data,
@@ -347,8 +347,8 @@ class MojaLoss : MainAPI() {
 
         return if (type == TvType.TvSeries) {
 
-            newTvSeriesSearchResponse(
-                title = title,
+            this@MojaLoss.newTvSeriesSearchResponse(
+                name = title,
                 url = url,
                 type = TvType.TvSeries
             ) {
@@ -357,8 +357,8 @@ class MojaLoss : MainAPI() {
 
         } else {
 
-            newMovieSearchResponse(
-                title = title,
+            this@MojaLoss.newMovieSearchResponse(
+                name = title,
                 url = url,
                 type = type
             ) {
