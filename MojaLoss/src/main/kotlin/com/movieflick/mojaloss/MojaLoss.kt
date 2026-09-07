@@ -138,7 +138,7 @@ class MojaLoss : MainAPI() {
             .take(30)
 
         return newHomePageResponse(
-            data = request.data,
+            request,
             list = finalItems.map { it.toSearchResponse() },
             hasNext = hasNextPage(
                 request.data,
