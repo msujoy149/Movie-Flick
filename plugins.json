@@ -96,11 +96,11 @@
     },
     {
         "iconUrl": "https://www.mojaloss.stream/favicon.png",
-        "jarFileSize": 146436,
-        "fileHash": "sha256-3017fc2ccf76ef2dd438cf1bb86ca222b10d9bce24fd38b5953f37aa4794f559",
+        "jarFileSize": 156419,
+        "fileHash": "sha256-4d5567b0f0e8b82c87283bdf8f762e1d1fdcaf30724f188b04ed14f180f096e6",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 38009,
+        "fileSize": 40013,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -117,7 +117,7 @@
         "description": "Moja Loss provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.cs3",
         "name": "MojaLoss",
-        "jarHash": "sha256-4bc5afc558f6f1a7f4d173848db0c9d21ffe0367e831c86a97acf064aa66c63a"
+        "jarHash": "sha256-d1e575dff659056a6432ab9a57a68add3eeae049c12dc3ac456aab05ebce9acf"
     },
     {
         "jarFileSize": 50729,
