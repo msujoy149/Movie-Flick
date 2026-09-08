@@ -84,12 +84,7 @@ class MojaLoss : MainAPI() {
             }
 
             "mojaloss://movies" -> {
-                mergeSources(
-                    listOf(
-                        makePagedCategoryUrl("movies", pageNumber),
-                        makePagedCategoryUrl("hindi", pageNumber)
-                    )
-                )
+                getMoviesSectionItems(pageNumber)
             }
 
             "mojaloss://international" -> {
@@ -173,6 +168,75 @@ class MojaLoss : MainAPI() {
          * Continue while populated pages are returned.
          */
         return page < 500
+    }
+
+    private companion object {
+        const val RECENT_MOVIE_EXCLUSION_LIMIT = 100
+        const val MOVIES_SECTION_BATCH_SIZE = 30
+        const val RECENT_SCAN_MAX_PAGES = 6
+        const val MOVIES_FILL_MAX_EXTRA_PAGES = 4
+    }
+
+    private suspend fun getMoviesSectionItems(page: Int): List<SiteItem> {
+        val excludedRecentMovieUrls = getRecentMovieExclusionUrls()
+
+        val merged = linkedMapOf<String, SiteItem>()
+        var sourcePage = page.coerceAtLeast(1)
+        var attempts = 0
+
+        while (merged.size < MOVIES_SECTION_BATCH_SIZE && attempts < MOVIES_FILL_MAX_EXTRA_PAGES) {
+            mergeSources(
+                listOf(
+                    makePagedCategoryUrl("movies", sourcePage),
+                    makePagedCategoryUrl("hindi", sourcePage)
+                )
+            ).forEach { item ->
+                if (item.type == TvType.Movie &&
+                    !excludedRecentMovieUrls.contains(canonicalPageKey(item.url))
+                ) {
+                    merged.putIfAbsent(canonicalPageKey(item.url), item)
+                }
+            }
+
+            sourcePage++
+            attempts++
+
+            if (attempts == 1 && merged.size >= MOVIES_SECTION_BATCH_SIZE) {
+                break
+            }
+        }
+
+        return merged.values.take(MOVIES_SECTION_BATCH_SIZE)
+    }
+
+    private suspend fun getRecentMovieExclusionUrls(): Set<String> {
+        val excluded = linkedSetOf<String>()
+        var scannedItems = 0
+
+        for (page in 1..RECENT_SCAN_MAX_PAGES) {
+            if (scannedItems >= RECENT_MOVIE_EXCLUSION_LIMIT) break
+
+            val recentItems = getPageItems("$mainUrl/page/$page/")
+            if (recentItems.isEmpty()) break
+
+            for (item in recentItems) {
+                if (scannedItems >= RECENT_MOVIE_EXCLUSION_LIMIT) break
+
+                if (item.type == TvType.Movie) {
+                    excluded.add(canonicalPageKey(item.url))
+                    scannedItems++
+                }
+            }
+        }
+
+        return excluded
+    }
+
+    private fun canonicalPageKey(url: String): String {
+        return url.substringBefore("#")
+            .trim()
+            .trimEnd('/')
+            .lowercase(Locale.ROOT)
     }
 
     private suspend fun mergeSources(
@@ -838,7 +902,7 @@ class MojaLoss : MainAPI() {
                 season.episodeFiles
                     .toSortedMap()
                     .forEach {
-                        (episode, _) ->
+                        (episode, filename) ->
 
                         val data =
                             buildEpisodeData(
@@ -847,12 +911,22 @@ class MojaLoss : MainAPI() {
                                 episode
                             )
 
+                        val cleanFilename =
+                            filename.substringBeforeLast(".", filename)
+                                .trim()
+
+                        val episodeLabel =
+                            if (cleanFilename.isNotBlank()) {
+                                "E$episode $cleanFilename"
+                            } else {
+                                "E$episode"
+                            }
+
                         result +=
                             newEpisode(
                                 data
                             ) {
-                                name =
-                                    "Episode $episode"
+                                name = episodeLabel
 
                                 this.season =
                                     season.number
