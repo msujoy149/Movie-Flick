@@ -10,6 +10,13 @@ import java.net.URLEncoder
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 
 /**
  * Movie Link BD CloudStream provider.
@@ -17,12 +24,12 @@ import kotlin.math.min
  * Design goals:
  * - Fast Home loading with real page-based lazy pagination.
  * - Stable six-category Home layout.
- * - Recently -> Ongoing -> Dual Audio priority/deduplication.
+ * - Recently / Ongoing / Dual Audio form an overlapping protected group.
+ * - Lower Home sections exclude content belonging to that protected group.
  * - Primary domain first, then exact-path mirror failover.
  * - Every Play action performs a fresh page/player-data request.
  * - Signed/tokenized CDN URLs are never cached by this provider.
- * - When mirrors publish different fresh CDN URLs, all fresh candidates can
- *   be offered to CloudStream.
+ * - Playback resolves only the first successful mirror in priority order.
  * - Direct media is returned; webpage advertisements/iframes are not loaded.
  * - Fuzzy, order-independent search with typo tolerance and local fallback.
  */
@@ -47,7 +54,11 @@ class MovieLinkBD : MainAPI() {
         // Priority cache is only for category deduplication, never for media URLs.
         const val PRIORITY_CACHE_MS = 120_000L
 
-        // Keep Home rows lightweight.
+        // Fast Home bootstrap: only this many cards are prepared per category
+        // before the first Home response is returned.
+        const val INITIAL_HOME_LIMIT = 6
+
+        // Normal lazy page size after the initial bootstrap.
         const val HOME_LIMIT = 25
 
         // Prevent unlimited scraping while still allowing useful pagination.
@@ -56,6 +67,9 @@ class MovieLinkBD : MainAPI() {
         const val SEARCH_RESULT_LIMIT = 50
         const val PRIORITY_SCAN_MAX_PAGES = 2000
         const val SEARCH_NATIVE_MAX_PAGES = 8
+
+        // Background indexing starts after the initial Home bootstrap.
+        const val BACKGROUND_PRIORITY_TTL_MS = 120_000L
 
         // Fuzzy-search cutoffs.
         const val STRONG_SEARCH_SCORE = 0.78
@@ -122,6 +136,17 @@ class MovieLinkBD : MainAPI() {
     private val ongoingKeys = linkedSetOf<String>()
     private val dualAudioKeys = linkedSetOf<String>()
 
+    // Fast Home cache: first 6 items for every Home category.
+    private val fastHomeCache = mutableMapOf<String, List<SiteItem>>()
+    private val fastHomeHasNext = mutableMapOf<String, Boolean>()
+    private var fastHomeWarmupAt = 0L
+
+    // Background priority indexing is deliberately detached from the initial
+    // Home response so the app can render immediately.
+    private val priorityScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var priorityIndexStarted = false
+
     // ---------------------------------------------------------------------
     // HOME
     // ---------------------------------------------------------------------
@@ -133,59 +158,87 @@ class MovieLinkBD : MainAPI() {
         val category = request.data
         val currentPage = page.coerceAtLeast(1)
 
-        refreshPriorityCachesIfNeeded()
+        /*
+         * IMPORTANT:
+         * Never perform a full protected-category scan before rendering Home.
+         * The old implementation could walk thousands of pages here and block
+         * the first screen for a very long time.
+         *
+         * We now:
+         *   1) warm the first 6 cards of all six categories in parallel;
+         *   2) immediately return the requested category;
+         *   3) start the complete priority index in the background.
+         *
+         * Later pages remain lazy and can progressively benefit from the
+         * background index as it fills.
+         */
+        if (currentPage == 1) {
+            warmInitialHomeInParallel()
+            startBackgroundPriorityIndex()
+        }
 
-        val result = when (category) {
-            RECENTLY -> loadRecently(currentPage)
+        val fastItems = fastHomeCache[category]
+        val fastNext = fastHomeHasNext[category] ?: false
 
-            MOVIES -> loadMergedCategory(
-                currentPage,
-                listOf(
-                    "/type/movies",
-                    "/bollywood",
-                    "/language/hindi-dubbed",
-                    "/genre/action"
+        val result = if (currentPage == 1 && fastItems != null) {
+            CategoryResult(
+                items = fastItems,
+                hasNext = fastNext
+            )
+        } else {
+            when (category) {
+                RECENTLY -> loadRecently(currentPage)
+
+                MOVIES -> loadMergedCategory(
+                    currentPage,
+                    listOf(
+                        "/type/movies",
+                        "/bollywood",
+                        "/language/hindi-dubbed",
+                        "/genre/action"
+                    )
                 )
-            )
 
-            DUAL_AUDIO -> loadMergedCategory(
-                currentPage,
-                listOf("/language/dual-audio")
-            )
-
-            ONGOING -> loadMergedCategory(
-                currentPage,
-                listOf("/ongoing")
-            )
-
-            TV_SHOW -> loadMergedCategory(
-                currentPage,
-                listOf(
-                    "/drama",
-                    "/type/series"
+                DUAL_AUDIO -> loadMergedCategory(
+                    currentPage,
+                    listOf("/language/dual-audio")
                 )
-            )
 
-            ANIME -> loadMergedCategory(
-                currentPage,
-                listOf(
-                    "/anime",
-                    "/genre/animation"
+                ONGOING -> loadMergedCategory(
+                    currentPage,
+                    listOf("/ongoing")
                 )
-            )
 
-            else -> CategoryResult(emptyList(), false)
+                TV_SHOW -> loadMergedCategory(
+                    currentPage,
+                    listOf(
+                        "/drama",
+                        "/type/series"
+                    )
+                )
+
+                ANIME -> loadMergedCategory(
+                    currentPage,
+                    listOf(
+                        "/anime",
+                        "/genre/animation"
+                    )
+                )
+
+                else -> CategoryResult(emptyList(), false)
+            }
         }
 
         val filtered = applyPriorityRules(category, result.items)
             .distinctBy { contentKey(it.url) }
-            .take(HOME_LIMIT)
+            .take(
+                if (currentPage == 1) {
+                    INITIAL_HOME_LIMIT
+                } else {
+                    HOME_LIMIT
+                }
+            )
 
-        /*
-         * True page-driven lazy loading:
-         * CloudStream only asks for another page when this page returned
-         * usable content and the source indicates another page may exist.
-         */
         val hasNext = result.hasNext && filtered.isNotEmpty()
 
         return newHomePageResponse(
@@ -193,6 +246,118 @@ class MovieLinkBD : MainAPI() {
             filtered.map { it.toSearchResponse() },
             hasNext
         )
+    }
+
+    private suspend fun warmInitialHomeInParallel() {
+        val now = System.currentTimeMillis()
+
+        if (
+            now - fastHomeWarmupAt < BACKGROUND_PRIORITY_TTL_MS &&
+            fastHomeCache.size >= mainPage.size
+        ) {
+            return
+        }
+
+        coroutineScope {
+            val jobs = listOf(
+                async {
+                    fetchInitialCategory(
+                        RECENTLY,
+                        listOf("/")
+                    )
+                },
+                async {
+                    fetchInitialCategory(
+                        MOVIES,
+                        listOf("/type/movies")
+                    )
+                },
+                async {
+                    fetchInitialCategory(
+                        DUAL_AUDIO,
+                        listOf("/language/dual-audio")
+                    )
+                },
+                async {
+                    fetchInitialCategory(
+                        ONGOING,
+                        listOf("/ongoing")
+                    )
+                },
+                async {
+                    fetchInitialCategory(
+                        TV_SHOW,
+                        listOf("/drama")
+                    )
+                },
+                async {
+                    fetchInitialCategory(
+                        ANIME,
+                        listOf("/anime")
+                    )
+                }
+            )
+
+            jobs.awaitAll()
+        }
+
+        fastHomeWarmupAt = now
+    }
+
+    private suspend fun fetchInitialCategory(
+        category: String,
+        routes: List<String>
+    ) {
+        val merged = linkedMapOf<String, SiteItem>()
+        var hasNext = false
+
+        for (route in routes) {
+            val result = getDocumentWithFallback(route) ?: continue
+
+            val cards = if (category == RECENTLY && route == "/") {
+                recentlyUpdatedCards(result.document)
+            } else {
+                result.document.select(
+                    ".movie-cards-container .movie-card"
+                )
+            }
+
+            val parsed = cards.mapNotNull(::parseCard)
+
+            parsed.forEach { item ->
+                merged.putIfAbsent(contentKey(item.url), item)
+            }
+
+            hasNext = hasNext ||
+                hasNextPage(result.document, 1) ||
+                parsed.size >= INITIAL_HOME_LIMIT
+
+            if (merged.size >= INITIAL_HOME_LIMIT) break
+        }
+
+        /*
+         * Cache only the small bootstrap set. This cache is intentionally
+         * separate from the large background priority index.
+         */
+        fastHomeCache[category] = merged.values
+            .take(INITIAL_HOME_LIMIT)
+
+        fastHomeHasNext[category] =
+            hasNext && fastHomeCache[category].orEmpty().isNotEmpty()
+    }
+
+    private fun startBackgroundPriorityIndex() {
+        if (priorityIndexStarted) return
+
+        priorityIndexStarted = true
+
+        priorityScope.launch {
+            try {
+                rebuildPriorityIndexInBackground()
+            } finally {
+                priorityIndexStarted = false
+            }
+        }
     }
 
     private fun SiteItem.toSearchResponse(): SearchResponse {
@@ -295,6 +460,10 @@ class MovieLinkBD : MainAPI() {
         category: String,
         items: List<SiteItem>
     ): List<SiteItem> {
+        val recent = synchronized(this) { recentlyKeys.toSet() }
+        val ongoing = synchronized(this) { ongoingKeys.toSet() }
+        val dual = synchronized(this) { dualAudioKeys.toSet() }
+
         return when (category) {
             // Recently Uploads is the highest-priority section.
             RECENTLY -> items
@@ -302,22 +471,22 @@ class MovieLinkBD : MainAPI() {
             // Ongoing may overlap with Dual Audio.
             // Only remove items already shown in Recently Uploads.
             ONGOING -> items.filter {
-                contentKey(it.url) !in recentlyKeys
+                contentKey(it.url) !in recent
             }
 
             // Dual Audio is an independent section and MAY overlap with Ongoing.
             // Only remove items already shown in Recently Uploads.
             DUAL_AUDIO -> items.filter {
-                contentKey(it.url) !in recentlyKeys
+                contentKey(it.url) !in recent
             }
 
             // Lower-priority sections stay clear of Recently, Ongoing and
             // Dual Audio so those dedicated sections retain their priority.
             MOVIES, TV_SHOW, ANIME -> items.filter {
                 val key = contentKey(it.url)
-                key !in recentlyKeys &&
-                    key !in ongoingKeys &&
-                    key !in dualAudioKeys
+                key !in recent &&
+                    key !in ongoing &&
+                    key !in dual
             }
 
             else -> items
@@ -1558,34 +1727,68 @@ class MovieLinkBD : MainAPI() {
     // PRIORITY CACHE
     // ---------------------------------------------------------------------
 
-    private suspend fun refreshPriorityCachesIfNeeded() {
+    private suspend fun rebuildPriorityIndexInBackground() {
         val now = System.currentTimeMillis()
 
-        if (now - priorityCacheAt < PRIORITY_CACHE_MS) return
+        synchronized(this) {
+            if (
+                now - priorityCacheAt < PRIORITY_CACHE_MS &&
+                (
+                    recentlyKeys.isNotEmpty() ||
+                    ongoingKeys.isNotEmpty() ||
+                    dualAudioKeys.isNotEmpty()
+                )
+            ) {
+                return
+            }
+        }
 
-        recentlyKeys.clear()
-        ongoingKeys.clear()
-        dualAudioKeys.clear()
+        /*
+         * Full indexing is intentionally done in the background. It can be
+         * expensive on a large site, but it must never block the first Home
+         * render.
+         *
+         * Recently, Ongoing and Dual Audio are indexed independently. Their
+         * sets are never merged into one another, because those three sections
+         * are allowed to overlap.
+         */
+        val recentDeferred = priorityScope.async {
+            collectAllCategoryKeys(
+                baseRoute = null,
+                recently = true
+            )
+        }
 
-        // Build the protected-group index from ALL available pages, not only
-        // page 1. This prevents lower sections from re-showing an item that
-        // exists deeper inside Recently, Ongoing, or Dual Audio.
-        collectAllCategoryKeys(
-            baseRoute = null,
-            recently = true
-        ).forEach { recentlyKeys += it }
+        val ongoingDeferred = priorityScope.async {
+            collectAllCategoryKeys(
+                baseRoute = "/ongoing",
+                recently = false
+            )
+        }
 
-        collectAllCategoryKeys(
-            baseRoute = "/ongoing",
-            recently = false
-        ).forEach { ongoingKeys += it }
+        val dualDeferred = priorityScope.async {
+            collectAllCategoryKeys(
+                baseRoute = "/language/dual-audio",
+                recently = false
+            )
+        }
 
-        collectAllCategoryKeys(
-            baseRoute = "/language/dual-audio",
-            recently = false
-        ).forEach { dualAudioKeys += it }
+        val recent = recentDeferred.await()
+        val ongoing = ongoingDeferred.await()
+        val dual = dualDeferred.await()
 
-        priorityCacheAt = now
+        synchronized(this) {
+            recentlyKeys.clear()
+            recentlyKeys.addAll(recent)
+
+            ongoingKeys.clear()
+            ongoingKeys.addAll(ongoing)
+
+            dualAudioKeys.clear()
+            dualAudioKeys.addAll(dual)
+
+            priorityCacheAt = System.currentTimeMillis()
+        }
     }
 
     private suspend fun collectAllCategoryKeys(
@@ -1596,39 +1799,36 @@ class MovieLinkBD : MainAPI() {
         var page = 1
 
         while (page <= PRIORITY_SCAN_MAX_PAGES) {
-            val routes = if (recently && page == 1) {
-                listOf("/")
+            val route = if (recently && page == 1) {
+                "/"
             } else {
-                val base = baseRoute ?: "/"
-                listOf(pageRoute(base, page))
+                pageRoute(baseRoute ?: "/", page)
             }
 
-            var gotItems = false
-            var hasNext = false
+            val result = getDocumentWithFallback(route) ?: break
 
-            for (route in routes) {
-                val result = getDocumentWithFallback(route) ?: continue
-                val cards = if (recently && page == 1) {
-                    recentlyUpdatedCards(result.document)
-                } else {
-                    result.document.select(
-                        ".movie-cards-container .movie-card"
-                    )
-                }
-
-                val parsed = cards.mapNotNull(::parseCard)
-                if (parsed.isNotEmpty()) gotItems = true
-
-                parsed.forEach { item ->
-                    keys += contentKey(item.url)
-                }
-
-                hasNext = hasNext ||
-                    hasNextPage(result.document, page) ||
-                    parsed.size >= HOME_LIMIT
+            val cards = if (recently && page == 1) {
+                recentlyUpdatedCards(result.document)
+            } else {
+                result.document.select(
+                    ".movie-cards-container .movie-card"
+                )
             }
 
-            if (!gotItems || !hasNext) break
+            val parsed = cards.mapNotNull(::parseCard)
+            if (parsed.isEmpty()) break
+
+            parsed.forEach { item ->
+                keys += contentKey(item.url)
+            }
+
+            if (
+                !hasNextPage(result.document, page) &&
+                parsed.size < HOME_LIMIT
+            ) {
+                break
+            }
+
             page++
         }
 
