@@ -684,8 +684,8 @@ class MojaLoss : MainAPI() {
 
                 result += newEpisode(data) {
                     name = label
-                    season = season.number
-                    episode = episodeNumber
+                    this.season = season.number
+                    this.episode = episodeNumber
                 }
             }
         }
@@ -750,8 +750,8 @@ class MojaLoss : MainAPI() {
 
                     result += newEpisode(data) {
                         name = label
-                        season = seasonNumber
-                        episode = episodeNumber
+                        this.season = seasonNumber
+                        this.episode = episodeNumber
                     }
                 }
         }
@@ -853,8 +853,8 @@ class MojaLoss : MainAPI() {
                     )
                 ) {
                     name = "Episode $episodeNumber"
-                    season = seasonNumber
-                    episode = episodeNumber
+                    this.season = seasonNumber
+                    this.episode = episodeNumber
                 }
             }
         }
