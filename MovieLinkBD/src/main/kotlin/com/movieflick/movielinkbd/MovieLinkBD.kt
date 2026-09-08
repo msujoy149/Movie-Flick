@@ -965,7 +965,7 @@ class MovieLinkBD : MainAPI() {
         return source.streamUrl.trim()
     }
 
-    private fun emitFreshSubtitles(
+    private suspend fun emitFreshSubtitles(
         pages: List<PageResult>,
         episodeId: String?,
         subtitleCallback: (SubtitleFile) -> Unit
