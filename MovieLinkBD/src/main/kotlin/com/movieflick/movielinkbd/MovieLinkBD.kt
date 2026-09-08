@@ -63,7 +63,7 @@ class MovieLinkBD : MainAPI() {
 
         // Prevent unlimited scraping while still allowing useful pagination.
         const val RECENTLY_MAX_PAGES = 12
-        const val SEARCH_SITEMAP_LIMIT = 4000
+        const val SEARCH_SITEMAP_LIMIT = 4000 // retained for legacy helpers; not used by fast search
         const val SEARCH_RESULT_LIMIT = 50
         const val PRIORITY_SCAN_MAX_PAGES = 2000
         const val SEARCH_NATIVE_MAX_PAGES = 8
@@ -502,19 +502,20 @@ class MovieLinkBD : MainAPI() {
         if (original.isBlank()) return emptyList()
 
         /*
-         * Mirror order is intentional:
-         *   1) .tv
-         *   2) .li
-         *   3) .one
+         * FAST MIRROR-FIRST SEARCH
          *
-         * We finish all search strategies for one mirror first. Only when that
-         * mirror produces no useful matches do we move to the next mirror.
+         * The mirrors are a failover chain, not three search targets that must
+         * all be scanned. We query .tv first and return immediately as soon as
+         * that mirror gives useful results. Only when .tv is unavailable or has
+         * no useful matches do we try .li, then .one.
          *
-         * This prevents the same title from being shown multiple times from
-         * multiple mirrors while still giving the search a real failover path.
+         * The previous implementation walked native search pages and then
+         * scanned large sitemap indexes (up to thousands of URLs) on every
+         * query. That made a simple search such as "pokemon" take a very long
+         * time even though /search?q=pokemon returns the site's results directly.
          */
         for (domain in DOMAINS) {
-            val results = searchSingleDomain(domain, original)
+            val results = fastSearchSingleMirror(domain, original)
             if (results.isNotEmpty()) {
                 return results
             }
@@ -523,70 +524,58 @@ class MovieLinkBD : MainAPI() {
         return emptyList()
     }
 
-    private suspend fun searchSingleDomain(
+    private suspend fun fastSearchSingleMirror(
         domain: String,
         original: String
     ): List<SearchResponse> {
-        val merged = linkedMapOf<String, SiteItem>()
-        val variants = buildSearchVariants(original)
+        /*
+         * First request: the site's real native search endpoint. This is the
+         * only request normally needed for a successful search.
+         */
+        val variants = buildSearchVariants(original).toList()
+        val attempts = linkedSetOf<String>()
 
-        // First, exhaust the site's native search on this mirror.
-        val home = fetchDocument(domain, "/")?.document
-        val routes = linkedSetOf<String>()
-        routes.addAll(discoverSearchRoutes(home, domain, variants))
+        // Exact user query always has first priority for speed.
+        attempts += original
 
-        for (variant in variants) {
-            val encoded = URLEncoder.encode(variant, "UTF-8")
-            routes += "/search?q=$encoded"
-            routes += "/search?query=$encoded"
-            routes += "/search?search=$encoded"
-            routes += "/search?s=$encoded"
+        // Only use a couple of lightweight fallbacks if the exact query returns
+        // no useful result on this mirror. Never crawl sitemap/search pages here.
+        variants.forEach { variant ->
+            if (attempts.size >= 3) return@forEach
+            attempts += variant
         }
 
-        for (route in routes) {
-            var page = 1
-            while (page <= SEARCH_NATIVE_MAX_PAGES) {
-                val result = fetchDocument(
-                    domain,
-                    searchPageRoute(route, page)
-                ) ?: break
+        for (variant in attempts) {
+            val encoded = URLEncoder.encode(variant, "UTF-8")
+            val result = fetchDocument(
+                domain = domain,
+                path = "/search?q=$encoded"
+            ) ?: continue
 
-                val cards = result.document.select(
-                    ".movie-cards-container .movie-card"
-                )
-                if (cards.isEmpty()) break
+            val cards = result.document.select(
+                ".movie-cards-container .movie-card"
+            )
 
-                cards.mapNotNull(::parseCard).forEach { item ->
-                    merged.putIfAbsent(contentKey(item.url), item)
-                }
+            if (cards.isEmpty()) continue
 
-                if (!hasNextPage(result.document, page)) break
-                page++
+            val parsed = cards
+                .mapNotNull(::parseCard)
+                .distinctBy { contentKey(it.url) }
+
+            if (parsed.isEmpty()) continue
+
+            val ranked = rankSearchResults(original, parsed)
+            return if (ranked.isNotEmpty()) {
+                ranked
+            } else {
+                // The website itself has already confirmed these as search matches.
+                // Do not waste time probing another mirror just because local
+                // fuzzy scoring was too strict for an unusual title spelling.
+                parsed.take(SEARCH_RESULT_LIMIT).map { it.toSearchResponse() }
             }
         }
 
-        // Global website fallback is ALWAYS evaluated on the same mirror before
-        // deciding that the mirror has no useful result. This prevents a weak
-        // native-search match from hiding a better match located in another
-        // site section.
-        val sitemapUrls = fetchSitemapUrls(domain)
-        val sitemapCandidates = discoverGlobalSearchCandidates(
-            domain = domain,
-            query = original,
-            sitemapUrls = sitemapUrls
-        )
-
-        for (path in sitemapCandidates) {
-            val result = fetchDocument(domain, path) ?: continue
-            val item = parseDetailAsSearchItem(
-                path = path,
-                document = result.document
-            ) ?: continue
-
-            merged.putIfAbsent(contentKey(item.url), item)
-        }
-
-        return rankSearchResults(original, merged.values.toList())
+        return emptyList()
     }
 
     private suspend fun fetchDocument(
