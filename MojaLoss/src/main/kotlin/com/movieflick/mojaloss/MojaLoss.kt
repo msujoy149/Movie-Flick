@@ -37,6 +37,7 @@ class MojaLoss : MainAPI() {
     override val mainPage = mainPageOf(
         "mojaloss://recent" to "Recently Released",
         "mojaloss://movies" to "Movies",
+        "mojaloss://ott" to "OTT",
         "mojaloss://international" to "International Movies",
         "mojaloss://tv" to "TV Show"
     )
@@ -51,6 +52,7 @@ class MojaLoss : MainAPI() {
     private data class TvConfig(
         val baseUrl: String,
         val mediaToken: String,
+        val showFolder: String?,
         val seasons: List<TvSeason>
     )
 
@@ -86,6 +88,10 @@ class MojaLoss : MainAPI() {
 
             "mojaloss://movies" -> {
                 getMoviesSectionItems(pageNumber)
+            }
+
+            "mojaloss://ott" -> {
+                getOttPageItems(pageNumber)
             }
 
             "mojaloss://international" -> {
@@ -142,6 +148,46 @@ class MojaLoss : MainAPI() {
                 items
             )
         )
+    }
+
+    private val ottProviders = listOf(
+        "netflix",
+        "hbo",
+        "hulu",
+        "apple",
+        "prime",
+        "disney"
+    )
+
+    private suspend fun getOttPageItems(
+        page: Int
+    ): List<SiteItem> {
+
+        val pageNumber = page.coerceAtLeast(1)
+        val result = mutableListOf<SiteItem>()
+
+        ottProviders.forEach { slug ->
+            getPageItems(
+                makePagedCategoryUrl(slug, pageNumber)
+            )
+                .filter {
+                    it.type == TvType.Movie ||
+                        it.type == TvType.TvSeries
+                }
+                .take(2)
+                .forEach {
+                    result += it
+                }
+        }
+
+        return result
+            .distinctBy { canonicalPageKey(it.url) }
+            .shuffled(
+                java.util.Random(
+                    0x4D4F4A41L +
+                        pageNumber.toLong() * 1_000_003L
+                )
+            )
     }
 
     private fun makePagedCategoryUrl(
@@ -962,7 +1008,8 @@ class MojaLoss : MainAPI() {
 
                 parseTvProgressEpisodes(
                     document,
-                    cleanUrl
+                    cleanUrl,
+                    tvConfig
                 ).forEach { episode ->
 
                     episodes.putIfAbsent(
@@ -977,6 +1024,22 @@ class MojaLoss : MainAPI() {
                 parseTvEpisodesFromRawHtml(
                     html,
                     cleanUrl
+                ).forEach { episode ->
+
+                    episodes.putIfAbsent(
+                        "${episode.season ?: 1}-${episode.episode ?: 0}",
+                        episode
+                    )
+                }
+            }
+
+            if (episodes.isEmpty()) {
+
+                parseTvSelectorEpisodes(
+                    document,
+                    html,
+                    cleanUrl,
+                    tvConfig
                 ).forEach { episode ->
 
                     episodes.putIfAbsent(
@@ -1020,11 +1083,25 @@ class MojaLoss : MainAPI() {
             }
         }
 
+        val moviePlayer =
+            extractMoviePlayerData(
+                document,
+                html
+            )
+
+        val movieData =
+            moviePlayer?.let {
+                buildMovieDataUrl(
+                    cleanUrl,
+                    it
+                )
+            } ?: cleanUrl
+
         return newMovieLoadResponse(
             pageTitle,
             cleanUrl,
             TvType.Movie,
-            cleanUrl
+            movieData
         ) {
             posterUrl = poster
         }
@@ -1239,7 +1316,8 @@ class MojaLoss : MainAPI() {
 
     private fun parseTvProgressEpisodes(
         document: Document,
-        detailUrl: String
+        detailUrl: String,
+        config: TvConfig? = null
     ): List<Episode> {
 
         val result =
@@ -1288,14 +1366,28 @@ class MojaLoss : MainAPI() {
                 val key =
                     "S$season-E$episode"
 
+                val seasonConfig =
+                    config?.seasons?.firstOrNull {
+                        it.number == season
+                    }
+
+                val episodeData =
+                    buildEpisodeData(
+                        detailUrl = detailUrl,
+                        season = season,
+                        episode = episode,
+                        folder = seasonConfig?.folder,
+                        filename = seasonConfig?.episodeFiles?.get(episode),
+                        baseUrl = config?.baseUrl,
+                        mediaToken = config?.mediaToken,
+                        showFolder = config?.showFolder,
+                        subtitleFilename = seasonConfig?.subtitleFiles?.get(episode)
+                    )
+
                 result.putIfAbsent(
                     key,
                     newEpisode(
-                        buildEpisodeData(
-                            detailUrl,
-                            season,
-                            episode
-                        )
+                        episodeData
                     ) {
                         name =
                             label.ifBlank {
@@ -1320,6 +1412,96 @@ class MojaLoss : MainAPI() {
                     ?: Int.MAX_VALUE
             }
         )
+    }
+
+    private fun parseTvSelectorEpisodes(
+        document: Document,
+        rawHtml: String,
+        detailUrl: String,
+        config: TvConfig?
+    ): List<Episode> {
+
+        val counts = linkedMapOf<Int, Int>()
+
+        document.select(
+            "#plyr-season-select option, " +
+                ".plyr-season-btn[data-season], " +
+                ".mj-tv-progress-row-wrap[data-mj-season], " +
+                "[data-mj-row-wrap][data-mj-season]"
+        ).forEach { element ->
+
+            val season =
+                findNumber(element.attr("value"))
+                    ?: findNumber(element.attr("data-season"))
+                    ?: findNumber(element.attr("data-mj-season"))
+                    ?: extractSeasonNumberFromText(element.text())
+                    ?: return@forEach
+
+            val count =
+                findNumber(element.attr("data-mj-season-total"))
+                    ?: Regex("(?i)(\\d+)\\s*episodes?\\b")
+                        .find(element.text())
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        ?.toIntOrNull()
+                    ?: 0
+
+            if (season > 0 && count > 0) {
+                counts[season] = maxOf(counts[season] ?: 0, count)
+            }
+        }
+
+        if (counts.isEmpty()) {
+            Regex(
+                "(?is)Season\\s*(\\d+)[^<]{0,100}?\\((\\d+)\\s*episodes?\\)"
+            ).findAll(normalizeTvHtml(rawHtml)).forEach { match ->
+                val season = match.groupValues.getOrNull(1)?.toIntOrNull()
+                    ?: return@forEach
+                val count = match.groupValues.getOrNull(2)?.toIntOrNull()
+                    ?: return@forEach
+                if (season > 0 && count > 0) {
+                    counts[season] = maxOf(counts[season] ?: 0, count)
+                }
+            }
+        }
+
+        if (counts.isEmpty()) {
+            config?.seasons?.forEach { season ->
+                val count = season.episodeFiles.keys.maxOrNull() ?: 0
+                if (count > 0) counts[season.number] = count
+            }
+        }
+
+        val result = mutableListOf<Episode>()
+
+        counts.toSortedMap().forEach { (seasonNumber, count) ->
+            val seasonConfig =
+                config?.seasons?.firstOrNull { it.number == seasonNumber }
+
+            for (episodeNumber in 1..count) {
+                val episodeData =
+                    buildEpisodeData(
+                        detailUrl = detailUrl,
+                        season = seasonNumber,
+                        episode = episodeNumber,
+                        folder = seasonConfig?.folder,
+                        filename = seasonConfig?.episodeFiles?.get(episodeNumber),
+                        baseUrl = config?.baseUrl,
+                        mediaToken = config?.mediaToken,
+                        showFolder = config?.showFolder,
+                        subtitleFilename =
+                            seasonConfig?.subtitleFiles?.get(episodeNumber)
+                    )
+
+                result += newEpisode(episodeData) {
+                    name = "Episode $episodeNumber"
+                    this.season = seasonNumber
+                    this.episode = episodeNumber
+                }
+            }
+        }
+
+        return result
     }
 
     private fun extractSeasonNumberFromText(
@@ -1374,9 +1556,15 @@ class MojaLoss : MainAPI() {
                         result +=
                             newEpisode(
                                 buildEpisodeData(
-                                    detailUrl,
-                                    season.number,
-                                    episode
+                                    detailUrl = detailUrl,
+                                    season = season.number,
+                                    episode = episode,
+                                    folder = season.folder,
+                                    filename = filename,
+                                    baseUrl = config.baseUrl,
+                                    mediaToken = config.mediaToken,
+                                    showFolder = config.showFolder,
+                                    subtitleFilename = season.subtitleFiles[episode]
                                 )
                             ) {
 
@@ -1398,19 +1586,50 @@ class MojaLoss : MainAPI() {
     private fun buildEpisodeData(
         detailUrl: String,
         season: Int,
-        episode: Int
+        episode: Int,
+        folder: String? = null,
+        filename: String? = null,
+        baseUrl: String? = null,
+        mediaToken: String? = null,
+        showFolder: String? = null,
+        subtitleFilename: String? = null
     ): String {
 
+        val queryParts = mutableListOf(
+            "mj_episode=1",
+            "mj_season=$season",
+            "mj_ep=$episode"
+        )
+
+        fun addEncoded(
+            key: String,
+            value: String?
+        ) {
+            value
+                ?.takeIf { it.isNotBlank() }
+                ?.let {
+                    queryParts +=
+                        "$key=" +
+                            URLEncoder.encode(
+                                it,
+                                StandardCharsets.UTF_8.toString()
+                            )
+                }
+        }
+
+        addEncoded("mj_folder", folder)
+        addEncoded("mj_file", filename)
+        addEncoded("mj_base", baseUrl)
+        addEncoded("mj_token", mediaToken)
+        addEncoded("mj_show", showFolder)
+        addEncoded("mj_sub", subtitleFilename)
+
         val separator =
-            if (detailUrl.contains("?")) {
-                "&"
-            } else {
-                "?"
-            }
+            if (detailUrl.contains("?")) "&" else "?"
 
         return detailUrl +
             separator +
-            "mj_episode=1&mj_season=$season&mj_ep=$episode"
+            queryParts.joinToString("&")
     }
 
     private fun parseEpisodeLinks(
@@ -1558,72 +1777,86 @@ class MojaLoss : MainAPI() {
          * TV EPISODE PLAYBACK
          */
         val episode =
-            parseEpisodeFragment(
-                input
-            )
+            parseEpisodeFragment(input)
 
         if (episode != null) {
 
             val detailUrl =
-                input.substringBefore("#")
+                input
+                    .substringBefore("#")
+                    .substringBefore("?mj_episode=")
 
             val response =
                 runCatching {
                     app.get(
                         detailUrl,
-                        headers =
-                            pageHeaders(
-                                detailUrl
-                            ),
+                        headers = pageHeaders(detailUrl),
                         timeout = 20_000
                     )
                 }.getOrNull()
-                    ?: return false
 
             val config =
-                extractTvConfig(
-                    response.document,
-                    response.text
-                )
+                response?.let {
+                    extractTvConfig(
+                        it.document,
+                        it.text
+                    )
+                }
+
+            val token =
+                config?.mediaToken
+                    ?.takeIf { it.isNotBlank() }
+                    ?: episode.mediaToken
                     ?: return false
 
+            val baseUrl =
+                config?.baseUrl
+                    ?.takeIf { it.isNotBlank() }
+                    ?: episode.baseUrl
+                    ?: return false
+
+            val showFolder =
+                config?.showFolder
+                    ?: episode.showFolder
+
             val season =
-                config.seasons.firstOrNull {
-                    it.number == episode.first
-                }
+                config?.seasons
+                    ?.firstOrNull {
+                        it.number == episode.season
+                    }
+
+            val folder =
+                season?.folder
+                    ?: episode.folder
                     ?: return false
 
             val filename =
-                season.episodeFiles[
-                    episode.second
-                ]
+                season?.episodeFiles?.get(episode.episode)
+                    ?: episode.filename
                     ?: return false
 
             val subtitleFilename =
-                season.subtitleFiles[
-                    episode.second
-                ]
+                season?.subtitleFiles?.get(episode.episode)
+                    ?: episode.subtitleFilename
 
             val media =
                 buildTvMedia(
-                    config.baseUrl,
-                    config.mediaToken,
-                    season.folder,
-                    filename,
-                    subtitleFilename
+                    baseUrl = baseUrl,
+                    token = token,
+                    showFolder = showFolder,
+                    folder = folder,
+                    filename = filename,
+                    subtitleFilename = subtitleFilename
                 )
                     ?: return false
 
             media.subtitleUrl
-                ?.takeIf {
-                    it.isNotBlank()
-                }
-                ?.let {
-
+                ?.takeIf { it.isNotBlank() }
+                ?.let { subtitleUrl ->
                     subtitleCallback(
                         SubtitleFile(
                             lang = "English",
-                            url = it
+                            url = subtitleUrl
                         )
                     )
                 }
@@ -1631,8 +1864,30 @@ class MojaLoss : MainAPI() {
             emitMediaLink(
                 media.mediaUrl,
                 callback,
-                "Moja Loss TV"
+                "Moja Loss TV CDN",
+                detailUrl
             )
+
+            val directTv =
+                buildTvDirectUrl(
+                    baseUrl = baseUrl,
+                    token = token,
+                    showFolder = showFolder,
+                    folder = folder,
+                    filename = filename
+                )
+
+            if (
+                directTv.isNotBlank() &&
+                directTv != media.mediaUrl
+            ) {
+                emitMediaLink(
+                    directTv,
+                    callback,
+                    "Moja Loss TV Direct",
+                    detailUrl
+                )
+            }
 
             return true
         }
@@ -1640,60 +1895,60 @@ class MojaLoss : MainAPI() {
         /*
          * MOVIE PLAYBACK
          *
-         * Fetch the detail page again when Play is pressed. MojaLoss
-         * generates a signed mediaToken in the page HTML, so using the
-         * current page response avoids stale playback URLs.
+         * Prefer a fresh token. Fall back to the token captured during load().
          */
+        val storedMovie =
+            parseMovieData(input)
+
+        val freshMovie =
+            getFreshMoviePlayerData(
+                input.substringBefore("#")
+            )
+
         val moviePlayer =
-            getFreshMoviePlayerData(input)
+            freshMovie?.takeIf {
+                !it.mediaToken.isNullOrBlank()
+            }
+                ?: storedMovie
+                ?: freshMovie
 
         if (moviePlayer != null) {
 
-            val media =
-                if (moviePlayer.mediaToken.isNullOrBlank()) {
-                    null
-                } else {
-                    buildMovieMedia(
-                        moviePlayer.defaultSource,
-                        moviePlayer.mediaToken.orEmpty(),
-                        moviePlayer.subtitleSource
-                    )
-                }
+            val candidates =
+                buildMovieMediaCandidates(
+                    moviePlayer
+                )
 
-            if (media != null) {
+            if (candidates.isNotEmpty()) {
 
-                media.subtitleUrl
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { subtitleUrl ->
+                candidates.forEachIndexed { index, media ->
 
-                        subtitleCallback(
-                            SubtitleFile(
-                                lang = "English",
-                                url = subtitleUrl
-                            )
-                        )
+                    if (index == 0) {
+                        media.subtitleUrl
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { subtitleUrl ->
+                                subtitleCallback(
+                                    SubtitleFile(
+                                        lang = "English",
+                                        url = subtitleUrl
+                                    )
+                                )
+                            }
                     }
 
-                emitMediaLink(
-                    media.mediaUrl,
-                    callback,
-                    "Moja Loss Direct"
-                )
+                    emitMediaLink(
+                        media.mediaUrl,
+                        callback,
+                        if (index == 0)
+                            "Moja Loss CDN"
+                        else
+                            "Moja Loss Direct",
+                        input.substringBefore("#")
+                    )
+                }
 
                 return true
             }
-
-            moviePlayer.alreadyPlayableSource
-                ?.let { directUrl ->
-
-                    emitMediaLink(
-                        directUrl,
-                        callback,
-                        "Moja Loss Direct"
-                    )
-
-                    return true
-                }
         }
 
         if (isMediaUrl(input)) {
@@ -1701,7 +1956,8 @@ class MojaLoss : MainAPI() {
             emitMediaLink(
                 input,
                 callback,
-                "Moja Loss Direct"
+                "Moja Loss Direct",
+                input.substringBefore("#")
             )
 
             return true
@@ -1717,6 +1973,134 @@ class MojaLoss : MainAPI() {
         val alreadyPlayableSource: String?
     )
 
+    private fun buildMovieDataUrl(
+        cleanUrl: String,
+        player: MoviePlayerData
+    ): String {
+
+        val parts = mutableListOf("mj_movie=1")
+
+        fun add(name: String, value: String?) {
+            value
+                ?.takeIf { it.isNotBlank() }
+                ?.let {
+                    parts += "$name=" +
+                        URLEncoder.encode(it, StandardCharsets.UTF_8.toString())
+                }
+        }
+
+        add("mj_src", player.defaultSource)
+        add("mj_token", player.mediaToken)
+        add("mj_sub", player.subtitleSource)
+
+        return cleanUrl + "#" + parts.joinToString("&")
+    }
+
+    private fun parseMovieData(input: String): MoviePlayerData? {
+
+        val fragment = runCatching {
+            URI(input).rawFragment.orEmpty()
+        }.getOrDefault("")
+
+        if (!fragment.contains("mj_movie=1")) return null
+
+        val source = fragment
+        val defaultSource = firstQueryString(source, "mj_src") ?: return null
+
+        return MoviePlayerData(
+            defaultSource = defaultSource,
+            mediaToken = firstQueryString(source, "mj_token"),
+            subtitleSource = firstQueryString(source, "mj_sub"),
+            alreadyPlayableSource = defaultSource.takeIf(::isAlreadyPlayableMediaUrl)
+        )
+    }
+
+    private fun buildMovieMediaCandidates(
+        player: MoviePlayerData
+    ): List<MediaResult> {
+
+        val token = player.mediaToken.orEmpty()
+
+        if (token.isBlank()) {
+            return player.defaultSource
+                .takeIf(::isAlreadyPlayableMediaUrl)
+                ?.let { listOf(MediaResult(it, player.subtitleSource)) }
+                ?: emptyList()
+        }
+
+        val direct = appendToken(player.defaultSource, token)
+        val cdn = normalizeDirectMediaUrl(direct)
+
+        val subDirect = player.subtitleSource
+            ?.takeIf { it.isNotBlank() }
+            ?.let { appendToken(it, token) }
+
+        val subCdn = subDirect?.let(::normalizeDirectMediaUrl)
+
+        return linkedMapOf<String, MediaResult>()
+            .apply {
+                put(cdn, MediaResult(cdn, subCdn))
+                put(direct, MediaResult(direct, subDirect))
+            }
+            .values
+            .toList()
+    }
+
+    private fun extractMoviePlayerData(
+        document: Document,
+        rawHtml: String
+    ): MoviePlayerData? {
+
+        val video =
+            document.selectFirst(
+                "video[data-default-src]"
+            )
+                ?: document.selectFirst(
+                    "#movie-video, video"
+                )
+
+        val defaultSource =
+            firstNonBlank(
+                video?.attr("data-default-src"),
+                video?.selectFirst("source[src]")?.attr("src"),
+                extractRawAttribute(rawHtml, "data-default-src"),
+                extractRawPlayableSource(rawHtml)
+            )
+                .let(::decodeHtmlEntities)
+                .trim()
+
+        if (defaultSource.isBlank()) {
+            return null
+        }
+
+        val mediaToken =
+            firstNonBlank(
+                video?.attr("data-media-token"),
+                extractRawAttribute(rawHtml, "data-media-token"),
+                extractRawJsonString(rawHtml, "mediaToken")
+            )
+                .let(::decodeHtmlEntities)
+                .trim()
+                .takeIf { it.isNotBlank() }
+
+        val subtitleSource =
+            firstNonBlank(
+                video?.attr("data-default-subtitle-src"),
+                extractRawAttribute(rawHtml, "data-default-subtitle-src")
+            )
+                .let(::decodeHtmlEntities)
+                .trim()
+                .takeIf { it.isNotBlank() }
+
+        return MoviePlayerData(
+            defaultSource = defaultSource,
+            mediaToken = mediaToken,
+            subtitleSource = subtitleSource,
+            alreadyPlayableSource =
+                defaultSource.takeIf(::isAlreadyPlayableMediaUrl)
+        )
+    }
+
     private suspend fun getFreshMoviePlayerData(
         detailUrl: String
     ): MoviePlayerData? {
@@ -1731,10 +2115,10 @@ class MojaLoss : MainAPI() {
         }
 
         val requestUrls =
-            linkedSetOf<String>()
-
-        requestUrls += addCacheBuster(cleanUrl)
-        requestUrls += cleanUrl
+            linkedSetOf(
+                addCacheBuster(cleanUrl),
+                cleanUrl
+            )
 
         for (requestUrl in requestUrls) {
 
@@ -1748,68 +2132,15 @@ class MojaLoss : MainAPI() {
                 }.getOrNull()
                     ?: continue
 
-            val document = response.document
-            val html = response.text
-
-            val video =
-                document.selectFirst(
-                    "video[data-default-src][data-media-token]"
-                ) ?: document.selectFirst(
-                    "#movie-video, video[data-default-src], video"
+            val player =
+                extractMoviePlayerData(
+                    response.document,
+                    response.text
                 )
 
-            val defaultSource =
-                firstNonBlank(
-                    video?.attr("data-default-src"),
-                    video?.selectFirst("source[src]")?.attr("src"),
-                    extractRawAttribute(
-                        html,
-                        "data-default-src"
-                    ),
-                    extractRawPlayableSource(html)
-                )
-                    .let(::decodeHtmlEntities)
-                    .trim()
-
-            if (defaultSource.isBlank()) {
-                continue
+            if (player != null) {
+                return player
             }
-
-            val mediaToken =
-                firstNonBlank(
-                    video?.attr("data-media-token"),
-                    extractRawAttribute(
-                        html,
-                        "data-media-token"
-                    )
-                )
-                    .let(::decodeHtmlEntities)
-                    .trim()
-                    .takeIf { it.isNotBlank() }
-
-            val subtitleSource =
-                firstNonBlank(
-                    video?.attr("data-default-subtitle-src"),
-                    extractRawAttribute(
-                        html,
-                        "data-default-subtitle-src"
-                    )
-                )
-                    .let(::decodeHtmlEntities)
-                    .trim()
-                    .takeIf { it.isNotBlank() }
-
-            val alreadyPlayable =
-                defaultSource.takeIf {
-                    isAlreadyPlayableMediaUrl(it)
-                }
-
-            return MoviePlayerData(
-                defaultSource = defaultSource,
-                mediaToken = mediaToken,
-                subtitleSource = subtitleSource,
-                alreadyPlayableSource = alreadyPlayable
-            )
         }
 
         return null
@@ -1848,6 +2179,24 @@ class MojaLoss : MainAPI() {
                     "\\s*=\\s*[\"']([^\"']+)[\"']"
             )
                 .find(html)
+                ?.groupValues
+                ?.getOrNull(1)
+                .orEmpty()
+        }.getOrDefault("")
+    }
+
+    private fun extractRawJsonString(
+        html: String,
+        key: String
+    ): String {
+
+        if (html.isBlank()) {
+            return ""
+        }
+
+        return runCatching {
+            Regex("(?is)[\"']$key[\"']\\s*:\\s*[\"']([^\"']+)[\"']")
+                .find(normalizeTvHtml(html))
                 ?.groupValues
                 ?.getOrNull(1)
                 .orEmpty()
@@ -2260,22 +2609,46 @@ class MojaLoss : MainAPI() {
         return TvConfig(
             baseUrl = baseUrl,
             mediaToken = mediaToken,
+            showFolder = objectJson.optString("showFolder").trim().takeIf { it.isNotBlank() },
             seasons = seasons
+        )
+    }
+
+    private fun buildTvDirectUrl(
+        baseUrl: String,
+        token: String,
+        showFolder: String?,
+        folder: String,
+        filename: String
+    ): String {
+
+        val parts = mutableListOf<String>()
+
+        showFolder
+            ?.takeIf { it.isNotBlank() }
+            ?.let { parts += encodePathPart(it) }
+
+        parts += encodePathPart(folder)
+        parts += encodePathPart(filename)
+
+        return appendToken(
+            baseUrl.trim().trimEnd('/') + "/" +
+                parts.joinToString("/"),
+            token
         )
     }
 
     private fun buildTvMedia(
         baseUrl: String,
         token: String,
+        showFolder: String?,
         folder: String,
         filename: String,
         subtitleFilename: String?
     ): MediaResult? {
 
         val cleanBase =
-            baseUrl
-                .trim()
-                .trimEnd('/')
+            baseUrl.trim().trimEnd('/')
 
         if (
             cleanBase.isBlank() ||
@@ -2286,44 +2659,57 @@ class MojaLoss : MainAPI() {
             return null
         }
 
-        val encodedFolder =
-            encodePathPart(
-                folder
-            )
+        val pathParts = mutableListOf<String>()
 
-        val encodedFilename =
-            encodePathPart(
-                filename
-            )
+        showFolder
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                pathParts += encodePathPart(it)
+            }
+
+        pathParts += encodePathPart(folder)
+        pathParts += encodePathPart(filename)
 
         val source =
-            "$cleanBase/$encodedFolder/$encodedFilename"
+            cleanBase + "/" +
+                pathParts.joinToString("/")
+
+        val directUrl =
+            appendToken(
+                source,
+                token
+            )
 
         val mediaUrl =
             normalizeDirectMediaUrl(
-                appendToken(
-                    source,
-                    token
-                )
+                directUrl
             )
 
         val subtitleUrl =
             subtitleFilename
-                ?.takeIf {
-                    it.isNotBlank()
-                }
-                ?.let {
+                ?.takeIf { it.isNotBlank() }
+                ?.let { subtitle ->
 
-                    val subtitleSource =
-                        "$cleanBase/" +
-                            "$encodedFolder/" +
-                            encodePathPart(
-                                it
-                            )
+                    val subtitleParts =
+                        mutableListOf<String>()
+
+                    showFolder
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let {
+                            subtitleParts +=
+                                encodePathPart(it)
+                        }
+
+                    subtitleParts +=
+                        encodePathPart(folder)
+
+                    subtitleParts +=
+                        encodePathPart(subtitle)
 
                     normalizeDirectMediaUrl(
                         appendToken(
-                            subtitleSource,
+                            cleanBase + "/" +
+                                subtitleParts.joinToString("/"),
                             token
                         )
                     )
@@ -2383,7 +2769,7 @@ class MojaLoss : MainAPI() {
 
         return url.replace(
             Regex(
-                "(?i)^https?://www\\.mojaloss\\.stream/directlink/"
+                "(?i)^https?://(?:www\\.)?mojaloss\\.stream/directlink/"
             ),
             "https://media.mojaloss.stream/dl/"
         )
@@ -2434,7 +2820,8 @@ class MojaLoss : MainAPI() {
         callback: (
             ExtractorLink
         ) -> Unit,
-        linkName: String
+        linkName: String,
+        referer: String? = null
     ) {
 
         val lower =
@@ -2493,27 +2880,43 @@ class MojaLoss : MainAPI() {
                     quality
 
                 this.referer =
-                    "$mainUrl/"
+                    referer?.takeIf { it.isNotBlank() }
+                        ?: "$mainUrl/"
+
+                this.headers = mapOf(
+                    "User-Agent" to
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                            "Chrome/131.0.0.0 Safari/537.36",
+                    "Accept" to "*/*"
+                )
             }
         )
     }
 
+    private data class EpisodeRequest(
+        val season: Int,
+        val episode: Int,
+        val folder: String?,
+        val filename: String?,
+        val baseUrl: String?,
+        val mediaToken: String?,
+        val showFolder: String?,
+        val subtitleFilename: String?
+    )
+
     private fun parseEpisodeFragment(
         url: String
-    ): Pair<Int, Int>? {
+    ): EpisodeRequest? {
 
         val query =
             runCatching {
-                URI(url)
-                    .rawQuery
-                    .orEmpty()
+                URI(url).rawQuery.orEmpty()
             }.getOrDefault("")
 
         val fragment =
             runCatching {
-                URI(url)
-                    .rawFragment
-                    .orEmpty()
+                URI(url).rawFragment.orEmpty()
             }.getOrDefault("")
 
         val source =
@@ -2526,41 +2929,64 @@ class MojaLoss : MainAPI() {
         }
 
         val season =
-            Regex(
-                "(?i)(?:^|&)mj_season=(\\d+)"
-            ).find(source)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
-            ?: Regex(
-                "(?i)(?:^|&)season=(\\d+)"
-            ).find(source)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
+            firstQueryInt(source, "mj_season")
+                ?: firstQueryInt(source, "season")
 
         val episode =
-            Regex(
-                "(?i)(?:^|&)mj_ep=(\\d+)"
-            ).find(source)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
-            ?: Regex(
-                "(?i)(?:^|&)episode=(\\d+)"
-            ).find(source)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
+            firstQueryInt(source, "mj_ep")
+                ?: firstQueryInt(source, "episode")
 
-        return if (
-            season != null &&
-            episode != null
-        ) {
-            season to episode
-        } else {
-            null
+        if (season == null || episode == null) {
+            return null
         }
+
+        return EpisodeRequest(
+            season = season,
+            episode = episode,
+            folder = firstQueryString(source, "mj_folder"),
+            filename = firstQueryString(source, "mj_file"),
+            baseUrl = firstQueryString(source, "mj_base"),
+            mediaToken = firstQueryString(source, "mj_token"),
+            showFolder = firstQueryString(source, "mj_show"),
+            subtitleFilename = firstQueryString(source, "mj_sub")
+        )
+    }
+
+    private fun firstQueryInt(
+        source: String,
+        key: String
+    ): Int? {
+
+        return Regex(
+            "(?i)(?:^|&)$key=(\\d+)"
+        )
+            .find(source)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+    }
+
+    private fun firstQueryString(
+        source: String,
+        key: String
+    ): String? {
+
+        val value =
+            Regex(
+                "(?i)(?:^|&)$key=([^&]*)"
+            )
+                .find(source)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.takeIf { it.isNotBlank() }
+                ?: return null
+
+        return runCatching {
+            URLDecoder.decode(
+                value,
+                StandardCharsets.UTF_8.toString()
+            )
+        }.getOrNull()
     }
 
     private fun findNumber(
