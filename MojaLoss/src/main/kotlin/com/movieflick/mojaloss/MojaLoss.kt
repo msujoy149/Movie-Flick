@@ -1811,7 +1811,7 @@ class MojaLoss : MainAPI() {
 
         val match =
             Regex(
-                "(?is)[\\"']mediaToken[\\"']\\s*:\\s*[\\"']([^\\"']+)[\\"']"
+                """(?is)["']mediaToken["']\s*:\s*["']([^"']+)["']"""
             ).find(normalized)
                 ?: return null
 
@@ -1832,7 +1832,7 @@ class MojaLoss : MainAPI() {
 
         val match =
             Regex(
-                "(?is)[\\"']baseUrl[\\"']\\s*:\\s*[\\"']([^\\"']+)[\\"']"
+                """(?is)["']baseUrl["']\s*:\s*["']([^"']+)["']"""
             ).find(normalized)
                 ?: return null
 
