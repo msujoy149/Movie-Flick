@@ -1730,8 +1730,7 @@ class MojaLoss : MainAPI() {
                     media.mediaUrl,
                     callback,
                     "Moja Loss Direct",
-                    input.substringBefore("#"),
-                    moviePlayer.requestHeaders
+                    input.substringBefore("#")
                 )
 
                 return true
@@ -1749,8 +1748,7 @@ class MojaLoss : MainAPI() {
                     directPlayable,
                     callback,
                     "Moja Loss Direct",
-                    input.substringBefore("#"),
-                    moviePlayer.requestHeaders
+                    input.substringBefore("#")
                 )
                 return true
             }
@@ -2266,22 +2264,20 @@ class MojaLoss : MainAPI() {
         subtitleSource: String?
     ): MediaResult? {
 
-        if (defaultSource.isBlank()) {
+        if (
+            defaultSource.isBlank() ||
+            token.isBlank()
+        ) {
             return null
         }
 
         val mediaUrl =
-            if (isAlreadyPlayableMovieUrl(defaultSource)) {
-                defaultSource.trim()
-            } else {
-                if (token.isBlank()) return null
-                normalizeDirectMediaUrl(
-                    appendToken(
-                        defaultSource,
-                        token
-                    )
+            normalizeDirectMediaUrl(
+                appendToken(
+                    defaultSource,
+                    token
                 )
-            }
+            )
 
         val subtitleUrl =
             subtitleSource
@@ -2308,8 +2304,7 @@ class MojaLoss : MainAPI() {
         val defaultSource: String,
         val mediaToken: String?,
         val subtitleSource: String?,
-        val alreadyPlayableSource: String?,
-        val requestHeaders: Map<String, String> = emptyMap()
+        val alreadyPlayableSource: String?
     )
 
     private suspend fun getFreshMoviePlayerData(
@@ -2319,37 +2314,22 @@ class MojaLoss : MainAPI() {
         val cleanUrl = detailUrl.substringBefore("#").trim()
         if (cleanUrl.isBlank()) return null
 
-        val cookieJar = linkedMapOf<String, String>()
-
-        val requestUrls = linkedSetOf(
-            "$mainUrl/",
-            cleanUrl,
-            addCacheBuster(cleanUrl)
-        )
+        val requestUrls = linkedSetOf<String>()
+        requestUrls += addCacheBuster(cleanUrl)
+        requestUrls += cleanUrl
 
         for (requestUrl in requestUrls) {
-            val referer = if (requestUrl == cleanUrl || requestUrl.startsWith(cleanUrl)) {
-                cleanUrl
-            } else {
-                "$mainUrl/"
-            }
-
-            val requestHeaders = pageHeaders(referer) + cookieHeaderMap(cookieJar)
-
             val response = runCatching {
                 app.get(
                     requestUrl,
-                    headers = requestHeaders,
+                    headers = pageHeaders(cleanUrl),
                     timeout = 20_000
                 )
             }.getOrNull() ?: continue
 
-            captureSetCookies(response.headers, cookieJar)
-
             val extracted = extractMoviePlayerData(
                 response.document,
-                response.text,
-                cookieHeaderMap(cookieJar)
+                response.text
             )
 
             if (extracted != null) return extracted
@@ -2362,153 +2342,69 @@ class MojaLoss : MainAPI() {
         url: String
     ): String {
 
-        val value =
-            System.currentTimeMillis()
-                .toString()
-
-        val separator =
-            if (url.contains("?")) {
-                "&"
-            } else {
-                "?"
-            }
-
+        val value = System.currentTimeMillis().toString()
+        val separator = if (url.contains("?")) "&" else "?"
         return "$url${separator}mj_cs_refresh=$value"
     }
 
     private fun extractMoviePlayerData(
         document: Document,
-        rawHtml: String,
-        cookieHeaders: Map<String, String> = emptyMap()
+        rawHtml: String
     ): MoviePlayerData? {
 
-        val video =
-            document.selectFirst(
-                "video[data-default-src], " +
-                    "video[data-media-token], " +
-                    "#movie-video"
-            )
-                ?: document.selectFirst(
-                    "video"
-                )
+        val video = document.selectFirst(
+            "video[data-default-src][data-media-token], video[data-default-src], #movie-video"
+        ) ?: document.selectFirst("video")
 
-        val defaultSourceFromDom =
-            video
-                ?.attr(
-                    "data-default-src"
-                )
-                ?.trim()
-                .orEmpty()
+        val defaultSourceFromDom = video
+            ?.attr("data-default-src")
+            ?.trim()
+            .orEmpty()
 
-        val tokenFromDom =
-            video
-                ?.attr(
-                    "data-media-token"
-                )
-                ?.trim()
-                ?.let {
-                    decodeHtmlEntities(
-                        it
-                    )
-                }
-                .orEmpty()
+        val tokenFromDom = video
+            ?.attr("data-media-token")
+            ?.trim()
+            ?.let(::decodeHtmlEntities)
+            .orEmpty()
 
-        val subtitleFromDom =
-            video
-                ?.attr(
-                    "data-default-subtitle-src"
-                )
-                ?.trim()
-                .orEmpty()
+        val subtitleFromDom = video
+            ?.attr("data-default-subtitle-src")
+            ?.trim()
+            .orEmpty()
 
-        val sourceFromNestedSource =
-            video
-                ?.selectFirst(
-                    "source[src]"
-                )
-                ?.attr(
-                    "src"
-                )
-                ?.trim()
-                .orEmpty()
+        val sourceFromNestedSource = video
+            ?.selectFirst("source[src]")
+            ?.attr("src")
+            ?.trim()
+            .orEmpty()
 
-        val defaultSource =
-            firstNonBlank(
-                defaultSourceFromDom,
-                extractRawAttribute(
-                    rawHtml,
-                    "data-default-src"
-                ),
-                sourceFromNestedSource,
-                extractRawPlayableSource(
-                    rawHtml
-                )
-            )
-                .let {
-                    decodeHtmlEntities(
-                        it
-                    )
-                }
-                .trim()
+        val defaultSource = firstNonBlank(
+            defaultSourceFromDom,
+            extractRawAttribute(rawHtml, "data-default-src"),
+            sourceFromNestedSource,
+            extractRawPlayableSource(rawHtml)
+        ).let(::decodeHtmlEntities).trim()
 
-        val mediaToken =
-            firstNonBlank(
-                tokenFromDom,
-                extractRawAttribute(
-                    rawHtml,
-                    "data-media-token"
-                ),
-                extractRawJsonString(
-                    rawHtml,
-                    "mediaToken"
-                )
-            )
-                .let {
-                    decodeHtmlEntities(
-                        it
-                    )
-                }
-                .trim()
-                .takeIf {
-                    it.isNotBlank()
-                }
+        val mediaToken = firstNonBlank(
+            tokenFromDom,
+            extractRawAttribute(rawHtml, "data-media-token"),
+            extractRawJsonString(rawHtml, "mediaToken")
+        ).let(::decodeHtmlEntities).trim().takeIf { it.isNotBlank() }
 
-        val subtitleSource =
-            firstNonBlank(
-                subtitleFromDom,
-                extractRawAttribute(
-                    rawHtml,
-                    "data-default-subtitle-src"
-                )
-            )
-                .let {
-                    decodeHtmlEntities(
-                        it
-                    )
-                }
-                .trim()
-                .takeIf {
-                    it.isNotBlank()
-                }
+        val subtitleSource = firstNonBlank(
+            subtitleFromDom,
+            extractRawAttribute(rawHtml, "data-default-subtitle-src")
+        ).let(::decodeHtmlEntities).trim().takeIf { it.isNotBlank() }
 
-        if (defaultSource.isBlank()) {
-            return null
-        }
+        if (defaultSource.isBlank()) return null
 
-        val alreadyPlayableSource =
-            defaultSource
-                .takeIf {
-                    isAlreadyPlayableMovieUrl(
-                        it
-                    )
-                }
+        val alreadyPlayableSource = defaultSource.takeIf(::isAlreadyPlayableMovieUrl)
 
         return MoviePlayerData(
             defaultSource = defaultSource,
             mediaToken = mediaToken,
             subtitleSource = subtitleSource,
-            alreadyPlayableSource = alreadyPlayableSource,
-            requestHeaders = cookieHeaders
+            alreadyPlayableSource = alreadyPlayableSource
         )
     }
 
@@ -2516,6 +2412,7 @@ class MojaLoss : MainAPI() {
         html: String,
         attribute: String
     ): String {
+
         if (html.isBlank()) return ""
 
         return runCatching {
@@ -2531,6 +2428,7 @@ class MojaLoss : MainAPI() {
         html: String,
         key: String
     ): String {
+
         if (html.isBlank()) return ""
 
         return runCatching {
@@ -2545,6 +2443,7 @@ class MojaLoss : MainAPI() {
     private fun extractRawPlayableSource(
         html: String
     ): String {
+
         if (html.isBlank()) return ""
 
         return runCatching {
@@ -2677,8 +2576,7 @@ class MojaLoss : MainAPI() {
             ExtractorLink
         ) -> Unit,
         linkName: String,
-        refererOverride: String? = null,
-        headersOverride: Map<String, String>? = null
+        refererOverride: String? = null
     ) {
 
         val lower =
@@ -2738,51 +2636,12 @@ class MojaLoss : MainAPI() {
 
                 this.referer =
                     refererOverride
-                        ?.takeIf { it.isNotBlank() }
+                        ?.takeIf {
+                            it.isNotBlank()
+                        }
                         ?: "$mainUrl/"
-
-                this.headers =
-                    linkedMapOf<String, String>().apply {
-                        put(
-                            "User-Agent",
-                            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
-                        )
-                        put("Accept", "*/*")
-                        put("Accept-Language", "en-US,en;q=0.9,bn;q=0.8")
-                        put("Cache-Control", "no-cache")
-                        put("Pragma", "no-cache")
-                        headersOverride
-                            ?.filter { it.key.isNotBlank() && it.value.isNotBlank() }
-                            ?.forEach { (key, value) -> put(key, value) }
-                    }
             }
         )
-    }
-
-    private fun cookieHeaderMap(
-        cookieJar: Map<String, String>
-    ): Map<String, String> {
-        val value = cookieJar.entries
-            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
-            .joinToString("; ") { "${it.key}=${it.value}" }
-        return if (value.isBlank()) emptyMap() else mapOf("Cookie" to value)
-    }
-
-    private fun captureSetCookies(
-        headers: Headers,
-        cookieJar: MutableMap<String, String>
-    ) {
-        headers.values("Set-Cookie").forEach { raw ->
-            val pair = raw.substringBefore(';').trim()
-            val separator = pair.indexOf('=')
-            if (separator <= 0) return@forEach
-            val key = pair.substring(0, separator).trim()
-            val value = pair.substring(separator + 1).trim()
-            if (key.isNotBlank() && value.isNotBlank()) {
-                cookieJar[key] = value
-            }
-        }
     }
 
     private data class EpisodeRequest(
