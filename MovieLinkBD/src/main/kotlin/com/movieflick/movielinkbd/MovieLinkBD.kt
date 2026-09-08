@@ -78,20 +78,20 @@ class MovieLinkBD : MainAPI() {
         val poster: String?,
         val type: TvType,
         val priority: Int = Int.MAX_VALUE
-    ) {
-        fun toSearchResponse(): SearchResponse {
-            return when (type) {
-                TvType.TvSeries -> newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                    posterUrl = poster
-                }
+    )
 
-                TvType.Anime -> newMovieSearchResponse(title, url, TvType.Anime) {
-                    posterUrl = poster
-                }
+    private fun SiteItem.toSearchResponse(): SearchResponse {
+        return when (type) {
+            TvType.TvSeries -> newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                posterUrl = poster
+            }
 
-                else -> newMovieSearchResponse(title, url, TvType.Movie) {
-                    posterUrl = poster
-                }
+            TvType.Anime -> newMovieSearchResponse(title, url, TvType.Anime) {
+                posterUrl = poster
+            }
+
+            else -> newMovieSearchResponse(title, url, TvType.Movie) {
+                posterUrl = poster
             }
         }
     }
