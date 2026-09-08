@@ -29,6 +29,8 @@ class MovieLinkBD : MainAPI() {
     override var name: String = "Movie Link BD"
     override var mainUrl: String = PRIMARY
     override var lang: String = "bn"
+    override val hasMainPage = true
+    override val hasQuickSearch = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     override val mainPage = mainPageOf(
