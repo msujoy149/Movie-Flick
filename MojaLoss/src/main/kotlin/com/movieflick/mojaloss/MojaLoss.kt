@@ -1682,90 +1682,87 @@ class MojaLoss : MainAPI() {
         }
 
         /*
-         * MOVIE PLAYBACK
+         * MOVIE PLAYBACK — FRESH TOKEN / FRESH PLAYABLE URL
+         *
+         * Every time the user presses Play, request the movie detail page again.
+         * A cache-busting query parameter is used first so a CDN/browser cache
+         * cannot hand us an older mediaToken. If the site does not like the
+         * cache-busting parameter, we fall back to the clean URL.
+         *
+         * We intentionally read both the parsed DOM and the original response HTML.
+         * The player is rendered from HTML data attributes on Moja Loss, but the
+         * exact response shape can vary between requests.
          */
-        val document =
-            getDocument(input)
-                ?: return false
-
-        val video =
-            document.selectFirst(
-                "video[data-default-src][data-media-token]"
+        val moviePlayer =
+            getFreshMoviePlayerData(
+                input
             )
 
-        if (video != null) {
+        if (moviePlayer != null) {
 
-            val defaultSource =
-                video.attr(
-                    "data-default-src"
-                ).trim()
-
-            val mediaToken =
-                video.attr(
-                    "data-media-token"
+            val media =
+                buildMovieMedia(
+                    moviePlayer.defaultSource,
+                    moviePlayer.mediaToken.orEmpty(),
+                    moviePlayer.subtitleSource
                 )
-                    .trim()
-                    .replace(
-                        "&amp;",
-                        "&"
-                    )
 
-            if (
-                defaultSource.isNotBlank() &&
-                mediaToken.isNotBlank()
-            ) {
+            if (media != null) {
 
-                val subtitleSource =
-                    video.attr(
-                        "data-default-subtitle-src"
-                    )
-                        .trim()
-                        .takeIf {
-                            it.isNotBlank()
-                        }
-
-                val media =
-                    buildMovieMedia(
-                        defaultSource,
-                        mediaToken,
-                        subtitleSource
-                    )
-
-                if (media != null) {
-
-                    media.subtitleUrl
-                        ?.takeIf {
-                            it.isNotBlank()
-                        }
-                        ?.let {
-
-                            subtitleCallback(
-                                SubtitleFile(
-                                    lang = "English",
-                                    url = it
-                                )
+                media.subtitleUrl
+                    ?.takeIf {
+                        it.isNotBlank()
+                    }
+                    ?.let { subtitleUrl ->
+                        subtitleCallback(
+                            SubtitleFile(
+                                lang = "English",
+                                url = subtitleUrl
                             )
-                        }
+                        )
+                    }
 
-                    emitMediaLink(
-                        media.mediaUrl,
-                        callback,
-                        "Moja Loss Direct"
-                    )
+                /*
+                 * Use the actual movie detail URL as Referer. This is closer to the
+                 * browser request than always sending only the site root.
+                 */
+                emitMediaLink(
+                    media.mediaUrl,
+                    callback,
+                    "Moja Loss Direct",
+                    input.substringBefore("#")
+                )
 
-                    return true
-                }
+                return true
+            }
+
+            /*
+             * Some pages may expose an already-complete playable URL. Preserve that
+             * as a last-resort candidate instead of returning No Links Found.
+             */
+            val directPlayable =
+                moviePlayer.alreadyPlayableSource
+
+            if (directPlayable != null) {
+                emitMediaLink(
+                    directPlayable,
+                    callback,
+                    "Moja Loss Direct",
+                    input.substringBefore("#")
+                )
+                return true
             }
         }
 
+        /*
+         * Final fallback for callers that pass a direct media URL to this provider.
+         */
         if (isMediaUrl(input)) {
-
             emitMediaLink(
                 input,
                 callback,
                 "Moja Loss Direct"
             )
-
             return true
         }
 
@@ -2303,16 +2300,349 @@ class MojaLoss : MainAPI() {
         )
     }
 
+    private data class MoviePlayerData(
+        val defaultSource: String,
+        val mediaToken: String?,
+        val subtitleSource: String?,
+        val alreadyPlayableSource: String?
+    )
+
+    private suspend fun getFreshMoviePlayerData(
+        detailUrl: String
+    ): MoviePlayerData? {
+
+        val cleanUrl =
+            detailUrl
+                .substringBefore("#")
+                .trim()
+
+        if (cleanUrl.isBlank()) {
+            return null
+        }
+
+        val requestUrls =
+            linkedSetOf<String>()
+
+        requestUrls +=
+            addCacheBuster(
+                cleanUrl
+            )
+
+        requestUrls +=
+            cleanUrl
+
+        for (requestUrl in requestUrls) {
+
+            val response =
+                runCatching {
+                    app.get(
+                        requestUrl,
+                        headers =
+                            pageHeaders(
+                                cleanUrl
+                            ),
+                        timeout = 20_000
+                    )
+                }.getOrNull()
+                    ?: continue
+
+            val extracted =
+                extractMoviePlayerData(
+                    response.document,
+                    response.text
+                )
+
+            if (extracted != null) {
+                return extracted
+            }
+        }
+
+        return null
+    }
+
+    private fun addCacheBuster(
+        url: String
+    ): String {
+
+        val value =
+            System.currentTimeMillis()
+                .toString()
+
+        val separator =
+            if (url.contains("?")) {
+                "&"
+            } else {
+                "?"
+            }
+
+        return "$url${separator}mj_cs_refresh=$value"
+    }
+
+    private fun extractMoviePlayerData(
+        document: Document,
+        rawHtml: String
+    ): MoviePlayerData? {
+
+        val video =
+            document.selectFirst(
+                "video[data-default-src], " +
+                    "video[data-media-token], " +
+                    "#movie-video"
+            )
+                ?: document.selectFirst(
+                    "video"
+                )
+
+        val defaultSourceFromDom =
+            video
+                ?.attr(
+                    "data-default-src"
+                )
+                ?.trim()
+                .orEmpty()
+
+        val tokenFromDom =
+            video
+                ?.attr(
+                    "data-media-token"
+                )
+                ?.trim()
+                ?.let {
+                    decodeHtmlEntities(
+                        it
+                    )
+                }
+                .orEmpty()
+
+        val subtitleFromDom =
+            video
+                ?.attr(
+                    "data-default-subtitle-src"
+                )
+                ?.trim()
+                .orEmpty()
+
+        val sourceFromNestedSource =
+            video
+                ?.selectFirst(
+                    "source[src]"
+                )
+                ?.attr(
+                    "src"
+                )
+                ?.trim()
+                .orEmpty()
+
+        val defaultSource =
+            firstNonBlank(
+                defaultSourceFromDom,
+                extractRawAttribute(
+                    rawHtml,
+                    "data-default-src"
+                ),
+                sourceFromNestedSource,
+                extractRawPlayableSource(
+                    rawHtml
+                )
+            )
+                .let {
+                    decodeHtmlEntities(
+                        it
+                    )
+                }
+                .trim()
+
+        val mediaToken =
+            firstNonBlank(
+                tokenFromDom,
+                extractRawAttribute(
+                    rawHtml,
+                    "data-media-token"
+                ),
+                extractRawJsonString(
+                    rawHtml,
+                    "mediaToken"
+                )
+            )
+                .let {
+                    decodeHtmlEntities(
+                        it
+                    )
+                }
+                .trim()
+                .takeIf {
+                    it.isNotBlank()
+                }
+
+        val subtitleSource =
+            firstNonBlank(
+                subtitleFromDom,
+                extractRawAttribute(
+                    rawHtml,
+                    "data-default-subtitle-src"
+                )
+            )
+                .let {
+                    decodeHtmlEntities(
+                        it
+                    )
+                }
+                .trim()
+                .takeIf {
+                    it.isNotBlank()
+                }
+
+        if (defaultSource.isBlank()) {
+            return null
+        }
+
+        val alreadyPlayableSource =
+            defaultSource
+                .takeIf {
+                    isAlreadyPlayableMovieUrl(
+                        it
+                    )
+                }
+
+        return MoviePlayerData(
+            defaultSource = defaultSource,
+            mediaToken = mediaToken,
+            subtitleSource = subtitleSource,
+            alreadyPlayableSource = alreadyPlayableSource
+        )
+    }
+
+    private fun extractRawAttribute(
+        html: String,
+        attribute: String
+    ): String {
+
+        if (html.isBlank()) {
+            return ""
+        }
+
+        return runCatching {
+            Regex(
+                """(?is)\\b$attribute\\s*=\\s*["']([^"']+)["']"""
+            )
+                .find(
+                    html
+                )
+                ?.groupValues
+                ?.getOrNull(1)
+                .orEmpty()
+        }.getOrDefault("")
+    }
+
+    private fun extractRawJsonString(
+        html: String,
+        key: String
+    ): String {
+
+        if (html.isBlank()) {
+            return ""
+        }
+
+        return runCatching {
+            Regex(
+                """(?is)["']$key["']\\s*:\\s*["']([^"']+)["']"""
+            )
+                .find(
+                    html
+                )
+                ?.groupValues
+                ?.getOrNull(1)
+                .orEmpty()
+        }.getOrDefault("")
+    }
+
+    private fun extractRawPlayableSource(
+        html: String
+    ): String {
+
+        if (html.isBlank()) {
+            return ""
+        }
+
+        return runCatching {
+            Regex(
+                """(?is)https?://(?:www\\.)?mojaloss\\.stream/directlink/[^"'<>\\s]+\\.(?:mp4|mkv|webm)(?:\\?[^"'<>\\s]*)?"""
+            )
+                .find(
+                    html
+                )
+                ?.value
+                .orEmpty()
+        }.getOrDefault("")
+    }
+
+    private fun decodeHtmlEntities(
+        value: String
+    ): String {
+
+        return value
+            .replace(
+                "&amp;",
+                "&"
+            )
+            .replace(
+                "&#38;",
+                "&"
+            )
+            .replace(
+                "&#x26;",
+                "&"
+            )
+            .replace(
+                "\\/",
+                "/"
+            )
+            .replace(
+                "\\u002F",
+                "/"
+            )
+            .replace(
+                "\\u002f",
+                "/"
+            )
+    }
+
+    private fun isAlreadyPlayableMovieUrl(
+        url: String
+    ): Boolean {
+
+        val lower =
+            url.lowercase(
+                Locale.ROOT
+            )
+
+        return (
+            lower.contains(
+                "media.mojaloss.stream/dl/"
+            ) &&
+                (
+                    ".mp4" in lower ||
+                        ".mkv" in lower ||
+                        ".webm" in lower ||
+                        ".m3u8" in lower ||
+                        ".mpd" in lower
+                ) &&
+                lower.contains("?")
+            )
+    }
+
     private fun normalizeDirectMediaUrl(
         url: String
     ): String {
 
-        return url.replace(
-            Regex(
-                "(?i)^https?://www\\.mojaloss\\.stream/directlink/"
-            ),
-            "https://media.mojaloss.stream/dl/"
-        )
+        return url
+            .trim()
+            .replace(
+                Regex(
+                    "(?i)^https?://(?:www\\.)?mojaloss\\.stream/directlink/"
+                ),
+                "https://media.mojaloss.stream/dl/"
+            )
     }
 
     private fun appendToken(
@@ -2360,7 +2690,8 @@ class MojaLoss : MainAPI() {
         callback: (
             ExtractorLink
         ) -> Unit,
-        linkName: String
+        linkName: String,
+        refererOverride: String? = null
     ) {
 
         val lower =
@@ -2419,7 +2750,11 @@ class MojaLoss : MainAPI() {
                     quality
 
                 this.referer =
-                    "$mainUrl/"
+                    refererOverride
+                        ?.takeIf {
+                            it.isNotBlank()
+                        }
+                        ?: "$mainUrl/"
             }
         )
     }
