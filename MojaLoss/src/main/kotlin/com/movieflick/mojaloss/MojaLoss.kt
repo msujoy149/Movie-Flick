@@ -37,6 +37,7 @@ class MojaLoss : MainAPI() {
     override val mainPage = mainPageOf(
         "mojaloss://recent" to "Recently Released",
         "mojaloss://movies" to "Movies",
+        "mojaloss://ott" to "OTT",
         "mojaloss://international" to "International Movies",
         "mojaloss://tv" to "TV Show"
     )
@@ -86,6 +87,10 @@ class MojaLoss : MainAPI() {
 
             "mojaloss://movies" -> {
                 getMoviesSectionItems(pageNumber)
+            }
+
+            "mojaloss://ott" -> {
+                getOttPageItems(pageNumber)
             }
 
             "mojaloss://international" -> {
@@ -172,6 +177,57 @@ class MojaLoss : MainAPI() {
         const val MOVIES_SECTION_BATCH_SIZE = 30
         const val RECENT_SCAN_MAX_PAGES = 6
         const val MOVIES_FILL_MAX_EXTRA_PAGES = 4
+    }
+
+    private val ottProviders = listOf(
+        "netflix" to "Netflix",
+        "hbo" to "HBO",
+        "hulu" to "Hulu",
+        "apple" to "Apple TV+",
+        "prime" to "Prime",
+        "disney" to "Disney+"
+    )
+
+    private suspend fun getOttPageItems(page: Int): List<SiteItem> {
+        val pageNumber = page.coerceAtLeast(1)
+        val perProvider = 2
+
+        val providerItems = mutableListOf<Pair<String, List<SiteItem>>>()
+
+        ottProviders.forEach { (slug, _) ->
+            val providerPageUrl =
+                makePagedCategoryUrl(
+                    slug,
+                    pageNumber
+                )
+
+            val items =
+                getPageItems(providerPageUrl)
+                    .filter {
+                        it.type == TvType.Movie ||
+                            it.type == TvType.TvSeries
+                    }
+                    .take(perProvider)
+
+            providerItems += slug to items
+        }
+
+        val mixed = mutableListOf<SiteItem>()
+        providerItems
+            .filter { it.second.isNotEmpty() }
+            .forEach { (_, items) ->
+                mixed.addAll(items)
+            }
+
+        // Shuffle only the already-fetched page slice. Each scroll/page gets a
+        // new server request, while the current loaded page remains unchanged.
+        return mixed
+            .shuffled(
+                java.util.Random(
+                    0x4D4F4A41L +
+                        pageNumber.toLong() * 1_000_003L
+                )
+            )
     }
 
     private suspend fun getMoviesSectionItems(page: Int): List<SiteItem> {
