@@ -816,34 +816,50 @@ class MojaLoss : MainAPI() {
                 document
             )
 
-        if (
-            tvConfig != null ||
-            looksLikeTvPage(
-                document
-            )
-        ) {
+        /*
+         * TV detection is intentionally driven by the page itself, not only by
+         * the JSON config parser. MojaLoss marks TV pages with og:type=video.tv_show
+         * and also renders #plyr-tv-config / .plyr-tv-container. If JSON parsing ever
+         * fails, the page must still remain a TV series instead of falling through to
+         * a Movie response.
+         */
+        val isTvPage =
+            looksLikeTvPage(document)
+
+        if (isTvPage) {
 
             val episodes =
-                tvConfig?.let {
-                    buildEpisodes(
-                        it,
+                tvConfig
+                    ?.let {
+                        buildEpisodes(
+                            it,
+                            cleanUrl
+                        )
+                    }
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: parseTvProgressEpisodes(
+                        document,
                         cleanUrl
                     )
-                } ?: parseEpisodeLinks(
-                    document,
-                    cleanUrl
-                )
+                    .ifEmpty {
+                        parseEpisodeLinks(
+                            document,
+                            cleanUrl
+                        )
+                    }
 
-            if (episodes.isNotEmpty()) {
-
-                return newTvSeriesLoadResponse(
-                    pageTitle,
-                    cleanUrl,
-                    TvType.TvSeries,
-                    episodes
-                ) {
-                    posterUrl = poster
-                }
+            /*
+             * Always return a TvSeries response for a real TV page.
+             * CloudStream otherwise shows the same page as a Movie when a parser
+             * temporarily misses the episode JSON.
+             */
+            return newTvSeriesLoadResponse(
+                pageTitle,
+                cleanUrl,
+                TvType.TvSeries,
+                episodes
+            ) {
+                posterUrl = poster
             }
         }
 
@@ -863,7 +879,7 @@ class MojaLoss : MainAPI() {
 
         if (
             document.select(
-                "#plyr-tv-config"
+                "#plyr-tv-config, script#plyr-tv-config"
             ).isNotEmpty()
         ) {
             return true
@@ -877,12 +893,98 @@ class MojaLoss : MainAPI() {
                 .orEmpty()
                 .lowercase(Locale.ROOT)
 
-        return (
-            ogType.contains("tv_show") ||
+        if (ogType.contains("tv_show")) {
+            return true
+        }
+
+        if (
             document.select(
-                ".plyr-tv-container"
+                ".plyr-tv-container, .mj-tv-progress-row-wrap, .mj-tv-progress-ep"
             ).isNotEmpty()
-        )
+        ) {
+            return true
+        }
+
+        /*
+         * Last-resort HTML fingerprinting. This protects TV detection against
+         * minor markup/type-attribute changes while keeping the movie path intact.
+         */
+        val html = document.html()
+            .lowercase(Locale.ROOT)
+
+        return html.contains("id=\"plyr-tv-config\"") ||
+            html.contains("video.tv_show") ||
+            html.contains("class=\"plyr-tv-container")
+    }
+
+    private fun parseTvProgressEpisodes(
+        document: Document,
+        detailUrl: String
+    ): List<Episode> {
+
+        val result =
+            linkedMapOf<String, Episode>()
+
+        document.select(
+            ".mj-tv-progress-row-wrap[data-mj-season]"
+        ).forEach { seasonRow ->
+
+            val season =
+                findNumber(
+                    seasonRow.attr("data-mj-season")
+                )
+                    ?: 1
+
+            seasonRow.select(
+                ".mj-tv-progress-ep[data-mj-ep]"
+            ).forEach { episodeButton ->
+
+                val episode =
+                    findNumber(
+                        episodeButton.attr("data-mj-ep")
+                    )
+                        ?: return@forEach
+
+                val label =
+                    firstNonBlank(
+                        episodeButton.attr("aria-label"),
+                        episodeButton.text()
+                    )
+                        .trim()
+
+                val data =
+                    buildEpisodeData(
+                        detailUrl,
+                        season,
+                        episode
+                    )
+
+                val key =
+                    "S$season-E$episode"
+
+                result.putIfAbsent(
+                    key,
+                    newEpisode(data) {
+                        name =
+                            label.ifBlank {
+                                "S$season E$episode"
+                            }
+
+                        this.season = season
+                        this.episode = episode
+                    }
+                )
+            }
+        }
+
+        return result.values
+            .sortedWith(
+                compareBy<Episode> {
+                    it.season ?: 1
+                }.thenBy {
+                    it.episode ?: Int.MAX_VALUE
+                }
+            )
     }
 
     private fun buildEpisodes(
