@@ -296,17 +296,23 @@ class MovieLinkBD : MainAPI() {
         items: List<SiteItem>
     ): List<SiteItem> {
         return when (category) {
+            // Recently Uploads is the highest-priority section.
             RECENTLY -> items
 
+            // Ongoing may overlap with Dual Audio.
+            // Only remove items already shown in Recently Uploads.
             ONGOING -> items.filter {
                 contentKey(it.url) !in recentlyKeys
             }
 
+            // Dual Audio is an independent section and MAY overlap with Ongoing.
+            // Only remove items already shown in Recently Uploads.
             DUAL_AUDIO -> items.filter {
-                val key = contentKey(it.url)
-                key !in recentlyKeys && key !in ongoingKeys
+                contentKey(it.url) !in recentlyKeys
             }
 
+            // Lower-priority sections stay clear of Recently, Ongoing and
+            // Dual Audio so those dedicated sections retain their priority.
             MOVIES, TV_SHOW, ANIME -> items.filter {
                 val key = contentKey(it.url)
                 key !in recentlyKeys &&
@@ -1142,7 +1148,7 @@ class MovieLinkBD : MainAPI() {
         }
     }
 
-    private fun emitPlayableSources(
+    private suspend fun emitPlayableSources(
         sources: List<FreshSource>,
         callback: (ExtractorLink) -> Unit
     ) {
