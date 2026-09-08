@@ -52,8 +52,10 @@ class MovieLinkBD : MainAPI() {
 
         // Prevent unlimited scraping while still allowing useful pagination.
         const val RECENTLY_MAX_PAGES = 12
-        const val SEARCH_SCAN_PAGES = 3
+        const val SEARCH_SITEMAP_LIMIT = 4000
+        const val SEARCH_PAGE_FETCH_LIMIT = 80
         const val SEARCH_RESULT_LIMIT = 50
+        const val SEARCH_NATIVE_MAX_PAGES = 8
 
         // Fuzzy-search cutoffs.
         const val STRONG_SEARCH_SCORE = 0.78
@@ -324,108 +326,412 @@ class MovieLinkBD : MainAPI() {
         val original = query.trim()
         if (original.isBlank()) return emptyList()
 
-        val variants = buildSearchVariants(original)
+        /*
+         * Mirror order is intentional:
+         *   1) .tv
+         *   2) .li
+         *   3) .one
+         *
+         * We finish all search strategies for one mirror first. Only when that
+         * mirror produces no useful matches do we move to the next mirror.
+         *
+         * This prevents the same title from being shown multiple times from
+         * multiple mirrors while still giving the search a real failover path.
+         */
+        for (domain in DOMAINS) {
+            val results = searchSingleDomain(domain, original)
+            if (results.isNotEmpty()) {
+                return results
+            }
+        }
+
+        return emptyList()
+    }
+
+    private suspend fun searchSingleDomain(
+        domain: String,
+        original: String
+    ): List<SearchResponse> {
         val merged = linkedMapOf<String, SiteItem>()
+        val variants = buildSearchVariants(original)
 
         /*
-         * Phase 1: use the site's own search with several equivalent query
-         * shapes. Do not stop at the first non-empty result; merge all useful
-         * native responses so one search endpoint quirk cannot hide content.
+         * 1) Discover the site's own search form.
+         * This is preferred over assuming a fixed query parameter.
+         */
+        val home = fetchDocument(domain, "/")?.document
+        val formRoutes = discoverSearchRoutes(home, domain, variants)
+
+        val routes = linkedSetOf<String>()
+        routes.addAll(formRoutes)
+
+        /*
+         * Keep the known endpoint variants as compatibility fallbacks.
          */
         for (variant in variants) {
             val encoded = URLEncoder.encode(variant, "UTF-8")
+            routes += "/search?q=$encoded"
+            routes += "/search?query=$encoded"
+            routes += "/search?search=$encoded"
+            routes += "/search?s=$encoded"
+        }
 
-            val routes = listOf(
-                "/search?q=$encoded",
-                "/search?query=$encoded",
-                "/search?search=$encoded"
-            )
+        /*
+         * Native search is paginated on some site versions. Read the first
+         * useful pages, but stay on THIS mirror only.
+         */
+        for (route in routes.take(variants.size * 8)) {
+            var page = 1
+            while (page <= SEARCH_NATIVE_MAX_PAGES) {
+                val pageRoute = searchPageRoute(route, page)
+                val result = fetchDocument(domain, pageRoute) ?: break
 
-            for (route in routes) {
-                val result = getDocumentWithFallback(route) ?: continue
-
-                result.document
+                val cards = result.document
                     .select(".movie-cards-container .movie-card")
-                    .mapNotNull(::parseCard)
-                    .forEach { item ->
-                        merged.putIfAbsent(contentKey(item.url), item)
-                    }
+
+                if (cards.isEmpty()) break
+
+                cards.mapNotNull(::parseCard).forEach { item ->
+                    merged.putIfAbsent(contentKey(item.url), item)
+                }
+
+                if (!hasNextPage(result.document, page)) break
+                page++
             }
         }
 
-        val bestNativeScore = merged.values
-            .maxOfOrNull { searchScore(original, it.title) }
-            ?: 0.0
+        val rankedNative = rankSearchResults(original, merged.values.toList())
+        if (rankedNative.isNotEmpty()) {
+            return rankedNative
+        }
 
         /*
-         * Phase 2: bounded local fallback.
-         *
-         * This is what makes approximate searches useful when the site's
-         * native search is too strict. We deliberately scan only a few pages
-         * of the principal feeds to keep search responsive.
+         * Global fallback:
+         * use sitemap URLs, not just the six Home categories. This lets the
+         * provider discover content published under additional site sections
+         * that are not exposed in the Home menu.
          */
-        if (merged.isEmpty() || bestNativeScore < STRONG_SEARCH_SCORE) {
-            val scanRoutes = listOf(
-                "/type/movies",
-                "/bollywood",
-                "/language/hindi-dubbed",
-                "/language/dual-audio",
-                "/ongoing",
-                "/drama",
-                "/type/series",
-                "/anime",
-                "/genre/animation"
+        val sitemapCandidates = discoverGlobalSearchCandidates(
+            domain = domain,
+            query = original,
+            sitemapUrls = fetchSitemapUrls(domain)
+        )
+
+        if (sitemapCandidates.isNotEmpty()) {
+            val fallbackMerged = linkedMapOf<String, SiteItem>()
+
+            for (path in sitemapCandidates.take(SEARCH_PAGE_FETCH_LIMIT)) {
+                val result = fetchDocument(domain, path) ?: continue
+                val item = parseDetailAsSearchItem(
+                    path = path,
+                    document = result.document
+                ) ?: continue
+
+                fallbackMerged.putIfAbsent(
+                    contentKey(item.url),
+                    item
+                )
+            }
+
+            val rankedFallback = rankSearchResults(
+                original,
+                fallbackMerged.values.toList()
             )
 
-            for (base in scanRoutes) {
-                for (page in 1..SEARCH_SCAN_PAGES) {
-                    val result = getDocumentWithFallback(
-                        pageRoute(base, page)
-                    ) ?: break
-
-                    val cards = result.document
-                        .select(".movie-cards-container .movie-card")
-
-                    if (cards.isEmpty()) break
-
-                    cards.mapNotNull(::parseCard).forEach { item ->
-                        val score = searchScore(original, item.title)
-
-                        /*
-                         * Keep reasonably close titles immediately.
-                         * All candidates are still ranked below.
-                         */
-                        if (score >= NORMAL_SEARCH_SCORE) {
-                            merged.putIfAbsent(
-                                contentKey(item.url),
-                                item
-                            )
-                        }
-                    }
-
-                    if (!hasNextPage(result.document, page)) break
-                }
+            if (rankedFallback.isNotEmpty()) {
+                return rankedFallback
             }
         }
 
-        /*
-         * Phase 3: fuzzy ranking.
-         *
-         * Results are not required to contain the query verbatim. Token
-         * overlap, token similarity, phrase containment, compact matching
-         * and year matching are combined.
-         */
-        return merged.values
+        return emptyList()
+    }
+
+    private suspend fun fetchDocument(
+        domain: String,
+        path: String
+    ): PageResult? {
+        val normalized = normalizePath(path)
+
+        return try {
+            val response = app.get(
+                domain + normalized,
+                headers = browserHeaders(domain + "/")
+            )
+
+            if (response.code !in 200..399) {
+                null
+            } else {
+                PageResult(
+                    domain = domain,
+                    path = normalized,
+                    document = response.document
+                )
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun discoverSearchRoutes(
+        home: Document?,
+        domain: String,
+        variants: Set<String>
+    ): List<String> {
+        if (home == null) return emptyList()
+
+        val routes = linkedSetOf<String>()
+
+        home.select("form").forEach { form ->
+            val action = firstNonBlank(
+                form.attr("action"),
+                "/search"
+            ) ?: return@forEach
+
+            val method = form.attr("method")
+                .trim()
+                .uppercase(Locale.ROOT)
+
+            /*
+             * CloudStream provider search is easiest through GET. If the site
+             * exposes a POST form, we keep the fixed compatibility routes
+             * below rather than attempting a guessed POST contract.
+             */
+            if (method.isNotBlank() && method != "GET") {
+                return@forEach
+            }
+
+            val inputNames = form.select(
+                "input[name], textarea[name]"
+            ).mapNotNull { input ->
+                input.attr("name").trim().takeIf { it.isNotBlank() }
+            }
+
+            val queryName = inputNames.firstOrNull {
+                it.equals("q", true) ||
+                    it.equals("query", true) ||
+                    it.equals("search", true) ||
+                    it.equals("s", true) ||
+                    it.contains("search", true)
+            } ?: "q"
+
+            for (variant in variants) {
+                val encoded = URLEncoder.encode(variant, "UTF-8")
+                val separator = if (action.contains("?")) "&" else "?"
+                val route = normalizePath(
+                    action.removePrefix(domain)
+                )
+
+                routes += "$route$separator$queryName=$encoded"
+            }
+        }
+
+        return routes.toList()
+    }
+
+    private fun searchPageRoute(
+        route: String,
+        page: Int
+    ): String {
+        if (page <= 1) return route
+
+        return if (route.contains("?")) {
+            "$route&page=$page"
+        } else {
+            "$route?page=$page"
+        }
+    }
+
+    private fun rankSearchResults(
+        original: String,
+        items: List<SiteItem>
+    ): List<SearchResponse> {
+        return items
             .map { item ->
                 item to searchScore(original, item.title)
             }
             .filter { it.second >= NORMAL_SEARCH_SCORE }
             .sortedWith(
                 compareByDescending<Pair<SiteItem, Double>> { it.second }
-                    .thenBy { it.first.title.lowercase(Locale.ROOT) }
+                    .thenBy {
+                        it.first.title.lowercase(Locale.ROOT)
+                    }
             )
             .take(SEARCH_RESULT_LIMIT)
             .map { it.first.toSearchResponse() }
+    }
+
+    private suspend fun fetchSitemapUrls(
+        domain: String
+    ): List<String> {
+        val sitemapCandidates = listOf(
+            "/sitemap.xml",
+            "/sitemap_index.xml",
+            "/sitemap-index.xml"
+        )
+
+        val discovered = linkedSetOf<String>()
+
+        for (rootPath in sitemapCandidates) {
+            val response = try {
+                app.get(
+                    domain + rootPath,
+                    headers = browserHeaders(domain + "/")
+                )
+            } catch (_: Throwable) {
+                continue
+            }
+
+            if (response.code !in 200..399) continue
+
+            val document = response.document
+
+            /*
+             * Standard XML sitemap:
+             *   <loc>https://host/path</loc>
+             */
+            document.select("loc").forEach { loc ->
+                val value = loc.text().trim()
+                if (!isHttpUrl(value)) return@forEach
+
+                val path = pathFromUrl(value)
+                if (isContentPath(path)) {
+                    discovered += normalizePath(path)
+                } else if (
+                    path.endsWith(".xml", true) ||
+                    path.contains("sitemap", true)
+                ) {
+                    /*
+                     * A sitemap index may point to child sitemaps. We collect
+                     * those paths and fetch them below.
+                     */
+                    discovered += "@@SITEMAP@@$path"
+                }
+            }
+
+            if (discovered.isNotEmpty()) break
+        }
+
+        val nested = discovered
+            .filter { it.startsWith("@@SITEMAP@@") }
+            .map { it.removePrefix("@@SITEMAP@@") }
+
+        val result = linkedSetOf<String>()
+        result.addAll(
+            discovered.filterNot { it.startsWith("@@SITEMAP@@") }
+        )
+
+        for (nestedPath in nested.take(20)) {
+            val response = try {
+                app.get(
+                    domain + normalizePath(nestedPath),
+                    headers = browserHeaders(domain + "/")
+                )
+            } catch (_: Throwable) {
+                continue
+            }
+
+            if (response.code !in 200..399) continue
+
+            response.document.select("loc").forEach { loc ->
+                val value = loc.text().trim()
+                if (!isHttpUrl(value)) return@forEach
+
+                val path = pathFromUrl(value)
+                if (isContentPath(path)) {
+                    result += normalizePath(path)
+                }
+            }
+
+            if (result.size >= SEARCH_SITEMAP_LIMIT) break
+        }
+
+        return result.take(SEARCH_SITEMAP_LIMIT)
+    }
+
+    private fun discoverGlobalSearchCandidates(
+        domain: String,
+        query: String,
+        sitemapUrls: List<String>
+    ): List<String> {
+        val normalizedQuery = normalizeSearch(query)
+        val tokens = normalizedQuery
+            .split(' ')
+            .filter { it.length >= 2 }
+
+        if (tokens.isEmpty()) return emptyList()
+
+        return sitemapUrls
+            .asSequence()
+            .filter { isContentPath(it) }
+            .map { path ->
+                val slug = normalizeSearch(
+                    path.substringAfterLast('/')
+                )
+
+                val compactSlug = slug.replace(" ", "")
+
+                val score = when {
+                    slug.contains(normalizedQuery) -> 1.0
+                    tokens.all { slug.contains(it) } -> 0.95
+                    tokens.any { slug.contains(it) } -> 0.72
+                    compactSlug.contains(
+                        normalizedQuery.replace(" ", "")
+                    ) -> 0.90
+                    else -> 0.0
+                }
+
+                path to score
+            }
+            .filter { it.second >= 0.72 }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .distinct()
+            .toList()
+    }
+
+    private fun parseDetailAsSearchItem(
+        path: String,
+        document: Document
+    ): SiteItem? {
+        val title = cleanTitle(
+            parsePlayerJson(document)
+                ?.optString("title")
+                ?.trim()
+                .takeUnless { it.isNullOrBlank() }
+                ?: document.selectFirst("h1")?.text()?.trim()
+                ?: document.selectFirst(
+                    "meta[property=og:title]"
+                )?.attr("content")?.trim()
+                ?: document.title().substringBefore("•").trim()
+        )
+
+        if (title.isBlank()) return null
+
+        val poster = firstUsefulUrl(
+            parsePlayerJson(document)
+                ?.optString("poster"),
+            document.selectFirst(
+                "meta[property=og:image]"
+            )?.attr("content"),
+            document.selectFirst(
+                "meta[name=twitter:image]"
+            )?.attr("content")
+        )
+
+        val lowerPath = path.lowercase(Locale.ROOT)
+        val type = when {
+            lowerPath.startsWith("/anime/") -> TvType.Anime
+            lowerPath.startsWith("/series/") ||
+                lowerPath.startsWith("/drama/") -> TvType.TvSeries
+            else -> TvType.Movie
+        }
+
+        return SiteItem(
+            title = title,
+            url = canonicalPrimaryUrl(path),
+            poster = poster,
+            type = type
+        )
     }
 
     private fun buildSearchVariants(query: String): LinkedHashSet<String> {
@@ -713,74 +1019,134 @@ class MovieLinkBD : MainAPI() {
         if (path.isBlank()) return false
 
         /*
-         * CRITICAL:
+         * Playback failover is deliberately sequential.
          *
-         * We intentionally do NOT cache the playable URL.
-         * Every Play action comes through here and forces a fresh request to
-         * the MovieLinkBD page(s), so newly generated tokenized CDN URLs can
-         * be picked up immediately.
+         * .tv -> fresh playable source found -> STOP
+         * .tv -> no playable source        -> try .li
+         * .li -> no playable source        -> try .one
          *
-         * We also query all mirrors in priority order. Therefore:
-         * .tv works -> use its fresh source
-         * .tv works but publishes a different/bad source -> .li/.one are also
-         * checked for fresh candidates.
-         * .tv is down -> .li -> .one.
+         * We never collect sources from multiple mirrors for one Play action.
+         * The playable URL is always obtained from a fresh page request.
          */
-        val freshPages = getFreshPlayerPages(path)
+        for ((mirrorIndex, domain) in DOMAINS.withIndex()) {
+            val page = fetchPlaybackPage(
+                domain = domain,
+                path = path
+            ) ?: continue
 
-        if (freshPages.isEmpty()) return false
+            val freshSources = extractPlayableSourcesForEpisode(
+                page = page,
+                episodeId = episodeId,
+                mirrorIndex = mirrorIndex
+            )
 
-        val freshSources = linkedMapOf<String, FreshSource>()
-
-        for ((mirrorIndex, page) in freshPages.withIndex()) {
-            val json = parsePlayerJson(page.document)
+            if (freshSources.isEmpty()) {
+                continue
+            }
 
             /*
-             * Primary authoritative source: published JSON player data.
+             * Only this mirror is emitted. As soon as one mirror gives a valid
+             * source, later mirrors are not queried.
              */
-            if (json != null) {
-                extractJsonSources(
-                    json = json,
-                    episodeId = episodeId,
-                    page = page,
-                    mirrorIndex = mirrorIndex
-                ).forEach { source ->
-                    freshSources.putIfAbsent(
-                        sourceDedupKey(source),
-                        source
+            emitPlayableSources(
+                sources = freshSources,
+                callback = callback
+            )
+
+            emitFreshSubtitles(
+                pages = listOf(page),
+                episodeId = episodeId,
+                subtitleCallback = subtitleCallback
+            )
+
+            return true
+        }
+
+        return false
+    }
+
+    private suspend fun fetchPlaybackPage(
+        domain: String,
+        path: String
+    ): PageResult? {
+        val normalized = normalizePath(path)
+        val pageUrl = domain + normalized
+
+        return try {
+            /*
+             * no-cache headers make every Play attempt re-read the current
+             * player page instead of reusing an expired tokenized response.
+             */
+            val response = app.get(
+                pageUrl,
+                headers = browserHeaders(domain + "/")
+            )
+
+            if (response.code !in 200..399) {
+                null
+            } else {
+                val document = response.document
+
+                if (!isUsablePlaybackDocument(document)) {
+                    null
+                } else {
+                    PageResult(
+                        domain = domain,
+                        path = normalized,
+                        document = document
                     )
                 }
             }
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
-            /*
-             * Defensive fallback:
-             * if a future site revision changes the JSON shape, scan the
-             * actual page for direct media candidates instead of returning
-             * nothing.
-             */
-            if (json == null || freshSources.isEmpty()) {
-                extractFallbackMediaSources(
-                    page.document,
-                    page.absoluteUrl(),
-                    mirrorIndex
-                ).forEach { source ->
-                    if (episodeId.isNullOrBlank() || episodeId == source.sourceName) {
-                        freshSources.putIfAbsent(
-                            sourceDedupKey(source),
-                            source
-                        )
-                    }
-                }
+    private fun extractPlayableSourcesForEpisode(
+        page: PageResult,
+        episodeId: String?,
+        mirrorIndex: Int
+    ): List<FreshSource> {
+        val json = parsePlayerJson(page.document)
+
+        /*
+         * First choice: the current player JSON, because that is where
+         * MovieLinkBD publishes the current tokenized source.
+         */
+        if (json != null) {
+            val jsonSources = extractJsonSources(
+                json = json,
+                episodeId = episodeId,
+                page = page,
+                mirrorIndex = mirrorIndex
+            )
+
+            if (jsonSources.isNotEmpty()) {
+                return jsonSources
+                    .distinctBy { sourceDedupKey(it) }
             }
         }
 
-        if (freshSources.isEmpty()) return false
-
         /*
-         * Emit every distinct fresh candidate. CloudStream can then use the
-         * available working source without us persisting an expired token.
+         * Defensive fallback for markup revisions that expose the current
+         * playable URL directly in the document.
          */
-        for (source in freshSources.values) {
+        return extractFallbackMediaSources(
+            document = page.document,
+            baseUrl = page.absoluteUrl(),
+            mirrorIndex = mirrorIndex
+        ).filter { source ->
+            episodeId.isNullOrBlank() ||
+                episodeId == source.sourceName ||
+                source.sourceName.isBlank()
+        }
+    }
+
+    private fun emitPlayableSources(
+        sources: List<FreshSource>,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        for (source in sources.distinctBy { sourceDedupKey(it) }) {
             val linkName = buildString {
                 append(source.provider)
 
@@ -793,15 +1159,6 @@ class MovieLinkBD : MainAPI() {
 
                 if (source.audio.isNotBlank()) {
                     append(" - ${source.audio}")
-                }
-
-                /*
-                 * Only distinguish mirrors when there is more than one domain
-                 * candidate. This makes troubleshooting easier without
-                 * changing the actual source URL.
-                 */
-                if (freshPages.size > 1) {
-                    append(" - Mirror ${source.mirrorIndex + 1}")
                 }
             }
 
@@ -817,61 +1174,6 @@ class MovieLinkBD : MainAPI() {
                 }
             )
         }
-
-        /*
-         * Subtitles are also resolved fresh from the same current player JSON.
-         */
-        emitFreshSubtitles(
-            freshPages,
-            episodeId,
-            subtitleCallback
-        )
-
-        return true
-    }
-
-    private suspend fun getFreshPlayerPages(
-        path: String
-    ): List<PageResult> {
-        val normalized = normalizePath(path)
-        val result = ArrayList<PageResult>()
-
-        /*
-         * We intentionally do not store the returned PageResult in any cache.
-         * This method is called on every playback attempt.
-         */
-        for (domain in DOMAINS) {
-            val pageUrl = domain + normalized
-
-            try {
-                val response = app.get(
-                    pageUrl,
-                    headers = browserHeaders(
-                        referer = domain + "/"
-                    )
-                )
-
-                if (response.code !in 200..399) continue
-
-                val document = response.document
-
-                /*
-                 * Detail pages need player JSON. Some pages can still be
-                 * useful without it if a direct media element exists.
-                 */
-                if (isUsablePlaybackDocument(document)) {
-                    result += PageResult(
-                        domain = domain,
-                        path = normalized,
-                        document = document
-                    )
-                }
-            } catch (_: Throwable) {
-                // Continue with the next mirror.
-            }
-        }
-
-        return result
     }
 
     private fun extractJsonSources(
