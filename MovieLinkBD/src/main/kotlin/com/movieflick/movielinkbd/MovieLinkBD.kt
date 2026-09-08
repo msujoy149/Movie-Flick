@@ -34,12 +34,12 @@ class MovieLinkBD : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     override val mainPage = mainPageOf(
-        "Recently Uploads" to RECENTLY,
-        "Movies" to MOVIES,
-        "Dual Audio" to DUAL_AUDIO,
-        "Ongoing Series" to ONGOING,
-        "TV Show" to TV_SHOW,
-        "Anime" to ANIME
+        RECENTLY to "Recently Uploads",
+        MOVIES to "Movies",
+        DUAL_AUDIO to "Dual Audio",
+        ONGOING to "Ongoing Series",
+        TV_SHOW to "Tv Show",
+        ANIME to "Anime"
     )
 
     private var priorityCacheTime = 0L
@@ -51,11 +51,22 @@ class MovieLinkBD : MainAPI() {
         val category = request.data
         val routes = when (category) {
             RECENTLY -> listOf(if (page <= 1) "/" else "/page/$page/")
-            MOVIES -> listOf("/type/movies", "/bollywood", "/language/hindi-dubbed", "/genre/action")
-            DUAL_AUDIO -> listOf("/language/dual-audio")
-            ONGOING -> listOf("/ongoing")
-            TV_SHOW -> listOf("/drama", "/type/series")
-            ANIME -> listOf("/anime", "/genre/animation")
+            MOVIES -> listOf(
+                pageRoute("/type/movies", page),
+                pageRoute("/bollywood", page),
+                pageRoute("/language/hindi-dubbed", page),
+                pageRoute("/genre/action", page)
+            )
+            DUAL_AUDIO -> listOf(pageRoute("/language/dual-audio", page))
+            ONGOING -> listOf(pageRoute("/ongoing", page))
+            TV_SHOW -> listOf(
+                pageRoute("/drama", page),
+                pageRoute("/type/series", page)
+            )
+            ANIME -> listOf(
+                pageRoute("/anime", page),
+                pageRoute("/genre/animation", page)
+            )
             else -> emptyList()
         }
 
@@ -92,7 +103,12 @@ class MovieLinkBD : MainAPI() {
             else -> merged.values.toList()
         }
 
-        return newHomePageResponse(request.name, filtered, hasNext = true)
+        val hasNext = filtered.isNotEmpty() && when (category) {
+            RECENTLY -> page <= 1
+            else -> true
+        }
+
+        return newHomePageResponse(request, filtered, hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -236,8 +252,12 @@ class MovieLinkBD : MainAPI() {
 
         val url = absolutePrimary(href)
         val poster = card.selectFirst("img")?.let {
-            it.attr("data-src").ifBlank { it.attr("src") }
-        }?.takeIf { it.isNotBlank() }
+            it.attr("data-src")
+                .ifBlank { it.attr("data-lazy-src") }
+                .ifBlank { it.attr("src") }
+        }?.takeIf { it.isNotBlank() }?.let {
+            absoluteResourceUrl(it)
+        }
 
         val path = pathFromUrl(url)
         return when {
@@ -388,6 +408,29 @@ class MovieLinkBD : MainAPI() {
         if (clean.isBlank()) return "/"
         if (clean.startsWith("http://") || clean.startsWith("https://")) return pathFromUrl(clean)
         return if (clean.startsWith("/")) clean else "/$clean"
+    }
+
+    private fun absoluteResourceUrl(value: String): String {
+        val clean = value.trim()
+        if (clean.isBlank()) return clean
+        if (clean.startsWith("http://", true) || clean.startsWith("https://", true)) {
+            return clean
+        }
+        if (clean.startsWith("//")) return "https:$clean"
+        return try {
+            URI(PRIMARY + "/").resolve(clean).toString()
+        } catch (_: Throwable) {
+            absolutePrimary(clean)
+        }
+    }
+
+    private fun pageRoute(route: String, page: Int): String {
+        if (page <= 1) return route
+        return if (route.contains("?")) {
+            "$route&page=$page"
+        } else {
+            "$route?page=$page"
+        }
     }
 
     private fun absolutePrimary(href: String): String =
