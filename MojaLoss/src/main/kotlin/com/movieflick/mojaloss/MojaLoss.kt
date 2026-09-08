@@ -1730,7 +1730,8 @@ class MojaLoss : MainAPI() {
                     media.mediaUrl,
                     callback,
                     "Moja Loss Direct",
-                    input.substringBefore("#")
+                    input.substringBefore("#"),
+                    moviePlayer.requestHeaders
                 )
 
                 return true
@@ -1748,7 +1749,8 @@ class MojaLoss : MainAPI() {
                     directPlayable,
                     callback,
                     "Moja Loss Direct",
-                    input.substringBefore("#")
+                    input.substringBefore("#"),
+                    moviePlayer.requestHeaders
                 )
                 return true
             }
@@ -2264,20 +2266,22 @@ class MojaLoss : MainAPI() {
         subtitleSource: String?
     ): MediaResult? {
 
-        if (
-            defaultSource.isBlank() ||
-            token.isBlank()
-        ) {
+        if (defaultSource.isBlank()) {
             return null
         }
 
         val mediaUrl =
-            normalizeDirectMediaUrl(
-                appendToken(
-                    defaultSource,
-                    token
+            if (isAlreadyPlayableMovieUrl(defaultSource)) {
+                defaultSource.trim()
+            } else {
+                if (token.isBlank()) return null
+                normalizeDirectMediaUrl(
+                    appendToken(
+                        defaultSource,
+                        token
+                    )
                 )
-            )
+            }
 
         val subtitleUrl =
             subtitleSource
@@ -2304,57 +2308,51 @@ class MojaLoss : MainAPI() {
         val defaultSource: String,
         val mediaToken: String?,
         val subtitleSource: String?,
-        val alreadyPlayableSource: String?
+        val alreadyPlayableSource: String?,
+        val requestHeaders: Map<String, String> = emptyMap()
     )
 
     private suspend fun getFreshMoviePlayerData(
         detailUrl: String
     ): MoviePlayerData? {
 
-        val cleanUrl =
-            detailUrl
-                .substringBefore("#")
-                .trim()
+        val cleanUrl = detailUrl.substringBefore("#").trim()
+        if (cleanUrl.isBlank()) return null
 
-        if (cleanUrl.isBlank()) {
-            return null
-        }
+        val cookieJar = linkedMapOf<String, String>()
 
-        val requestUrls =
-            linkedSetOf<String>()
-
-        requestUrls +=
-            addCacheBuster(
-                cleanUrl
-            )
-
-        requestUrls +=
-            cleanUrl
+        val requestUrls = linkedSetOf(
+            "$mainUrl/",
+            cleanUrl,
+            addCacheBuster(cleanUrl)
+        )
 
         for (requestUrl in requestUrls) {
-
-            val response =
-                runCatching {
-                    app.get(
-                        requestUrl,
-                        headers =
-                            pageHeaders(
-                                cleanUrl
-                            ),
-                        timeout = 20_000
-                    )
-                }.getOrNull()
-                    ?: continue
-
-            val extracted =
-                extractMoviePlayerData(
-                    response.document,
-                    response.text
-                )
-
-            if (extracted != null) {
-                return extracted
+            val referer = if (requestUrl == cleanUrl || requestUrl.startsWith(cleanUrl)) {
+                cleanUrl
+            } else {
+                "$mainUrl/"
             }
+
+            val requestHeaders = pageHeaders(referer) + cookieHeaderMap(cookieJar)
+
+            val response = runCatching {
+                app.get(
+                    requestUrl,
+                    headers = requestHeaders,
+                    timeout = 20_000
+                )
+            }.getOrNull() ?: continue
+
+            captureSetCookies(response.headers, cookieJar)
+
+            val extracted = extractMoviePlayerData(
+                response.document,
+                response.text,
+                cookieHeaderMap(cookieJar)
+            )
+
+            if (extracted != null) return extracted
         }
 
         return null
@@ -2380,7 +2378,8 @@ class MojaLoss : MainAPI() {
 
     private fun extractMoviePlayerData(
         document: Document,
-        rawHtml: String
+        rawHtml: String,
+        cookieHeaders: Map<String, String> = emptyMap()
     ): MoviePlayerData? {
 
         val video =
@@ -2508,7 +2507,8 @@ class MojaLoss : MainAPI() {
             defaultSource = defaultSource,
             mediaToken = mediaToken,
             subtitleSource = subtitleSource,
-            alreadyPlayableSource = alreadyPlayableSource
+            alreadyPlayableSource = alreadyPlayableSource,
+            requestHeaders = cookieHeaders
         )
     }
 
@@ -2516,18 +2516,11 @@ class MojaLoss : MainAPI() {
         html: String,
         attribute: String
     ): String {
-
-        if (html.isBlank()) {
-            return ""
-        }
+        if (html.isBlank()) return ""
 
         return runCatching {
-            Regex(
-                """(?is)\\b$attribute\\s*=\\s*["']([^"']+)["']"""
-            )
-                .find(
-                    html
-                )
+            Regex("""(?is)\b$attribute\s*=\s*["']([^"']+)["']""")
+                .find(html)
                 ?.groupValues
                 ?.getOrNull(1)
                 .orEmpty()
@@ -2538,18 +2531,11 @@ class MojaLoss : MainAPI() {
         html: String,
         key: String
     ): String {
-
-        if (html.isBlank()) {
-            return ""
-        }
+        if (html.isBlank()) return ""
 
         return runCatching {
-            Regex(
-                """(?is)["']$key["']\\s*:\\s*["']([^"']+)["']"""
-            )
-                .find(
-                    html
-                )
+            Regex("""(?is)["']$key["']\s*:\s*["']([^"']+)["']""")
+                .find(html)
                 ?.groupValues
                 ?.getOrNull(1)
                 .orEmpty()
@@ -2559,20 +2545,20 @@ class MojaLoss : MainAPI() {
     private fun extractRawPlayableSource(
         html: String
     ): String {
-
-        if (html.isBlank()) {
-            return ""
-        }
+        if (html.isBlank()) return ""
 
         return runCatching {
-            Regex(
-                """(?is)https?://(?:www\\.)?mojaloss\\.stream/directlink/[^"'<>\\s]+\\.(?:mp4|mkv|webm)(?:\\?[^"'<>\\s]*)?"""
-            )
-                .find(
-                    html
-                )
-                ?.value
-                .orEmpty()
+            val direct = Regex(
+                """(?is)https?://(?:www\.)?mojaloss\.stream/directlink/[^"'<>\s]+\.(?:mp4|mkv|webm)(?:\?[^"'<>\s]*)?"""
+            ).find(html)?.value.orEmpty()
+
+            if (direct.isNotBlank()) {
+                direct
+            } else {
+                Regex(
+                    """(?is)https?://media\.mojaloss\.stream/dl/[^"'<>\s]+\.(?:mp4|mkv|webm)(?:\?[^"'<>\s]*)?"""
+                ).find(html)?.value.orEmpty()
+            }
         }.getOrDefault("")
     }
 
@@ -2691,7 +2677,8 @@ class MojaLoss : MainAPI() {
             ExtractorLink
         ) -> Unit,
         linkName: String,
-        refererOverride: String? = null
+        refererOverride: String? = null,
+        headersOverride: Map<String, String>? = null
     ) {
 
         val lower =
@@ -2751,12 +2738,51 @@ class MojaLoss : MainAPI() {
 
                 this.referer =
                     refererOverride
-                        ?.takeIf {
-                            it.isNotBlank()
-                        }
+                        ?.takeIf { it.isNotBlank() }
                         ?: "$mainUrl/"
+
+                this.headers =
+                    linkedMapOf<String, String>().apply {
+                        put(
+                            "User-Agent",
+                            "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+                                "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                        )
+                        put("Accept", "*/*")
+                        put("Accept-Language", "en-US,en;q=0.9,bn;q=0.8")
+                        put("Cache-Control", "no-cache")
+                        put("Pragma", "no-cache")
+                        headersOverride
+                            ?.filter { it.key.isNotBlank() && it.value.isNotBlank() }
+                            ?.forEach { (key, value) -> put(key, value) }
+                    }
             }
         )
+    }
+
+    private fun cookieHeaderMap(
+        cookieJar: Map<String, String>
+    ): Map<String, String> {
+        val value = cookieJar.entries
+            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+            .joinToString("; ") { "${it.key}=${it.value}" }
+        return if (value.isBlank()) emptyMap() else mapOf("Cookie" to value)
+    }
+
+    private fun captureSetCookies(
+        headers: Headers,
+        cookieJar: MutableMap<String, String>
+    ) {
+        headers.values("Set-Cookie").forEach { raw ->
+            val pair = raw.substringBefore(';').trim()
+            val separator = pair.indexOf('=')
+            if (separator <= 0) return@forEach
+            val key = pair.substring(0, separator).trim()
+            val value = pair.substring(separator + 1).trim()
+            if (key.isNotBlank() && value.isNotBlank()) {
+                cookieJar[key] = value
+            }
+        }
     }
 
     private data class EpisodeRequest(
