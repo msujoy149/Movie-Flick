@@ -145,11 +145,11 @@
     },
     {
         "iconUrl": "https://movielinkbd.tv/favicon.png",
-        "jarFileSize": 259439,
-        "fileHash": "sha256-acbfd76822a21ac7aea691228d196633f5e93fc42d1c796f76f7a63f84a23372",
+        "jarFileSize": 258515,
+        "fileHash": "sha256-25d5741f9a850e9d2561e0d97fdd81e1db63aa2424076bcda389bb6d63181796",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 59980,
+        "fileSize": 59412,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -166,7 +166,7 @@
         "description": "Movie Link BD provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.cs3",
         "name": "MovieLinkBD",
-        "jarHash": "sha256-c612d28ddbff900f24d59ea1fe2ab748116f3fdb0793dc7ea80da60e0edd1dca"
+        "jarHash": "sha256-145cc3860ae017149841b1bfa55c09b690d460d2748840d80de422f5339740a3"
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/main/OnlineMovies/icon.png",
