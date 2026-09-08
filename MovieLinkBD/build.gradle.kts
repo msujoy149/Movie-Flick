@@ -38,6 +38,10 @@ android {
 dependencies {
     implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
     implementation(kotlin("stdlib"))
+
+    // Required by MovieLinkBD.kt for parallel Home loading
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+
     implementation("com.github.Blatzar:NiceHttp:0.4.11")
     implementation("org.jsoup:jsoup:1.18.3")
 }
