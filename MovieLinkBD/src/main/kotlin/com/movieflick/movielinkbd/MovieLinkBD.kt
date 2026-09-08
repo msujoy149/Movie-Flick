@@ -53,8 +53,8 @@ class MovieLinkBD : MainAPI() {
         // Prevent unlimited scraping while still allowing useful pagination.
         const val RECENTLY_MAX_PAGES = 12
         const val SEARCH_SITEMAP_LIMIT = 4000
-        const val SEARCH_PAGE_FETCH_LIMIT = 80
         const val SEARCH_RESULT_LIMIT = 50
+        const val PRIORITY_SCAN_MAX_PAGES = 2000
         const val SEARCH_NATIVE_MAX_PAGES = 8
 
         // Fuzzy-search cutoffs.
@@ -361,19 +361,11 @@ class MovieLinkBD : MainAPI() {
         val merged = linkedMapOf<String, SiteItem>()
         val variants = buildSearchVariants(original)
 
-        /*
-         * 1) Discover the site's own search form.
-         * This is preferred over assuming a fixed query parameter.
-         */
+        // First, exhaust the site's native search on this mirror.
         val home = fetchDocument(domain, "/")?.document
-        val formRoutes = discoverSearchRoutes(home, domain, variants)
-
         val routes = linkedSetOf<String>()
-        routes.addAll(formRoutes)
+        routes.addAll(discoverSearchRoutes(home, domain, variants))
 
-        /*
-         * Keep the known endpoint variants as compatibility fallbacks.
-         */
         for (variant in variants) {
             val encoded = URLEncoder.encode(variant, "UTF-8")
             routes += "/search?q=$encoded"
@@ -382,19 +374,17 @@ class MovieLinkBD : MainAPI() {
             routes += "/search?s=$encoded"
         }
 
-        /*
-         * Native search is paginated on some site versions. Read the first
-         * useful pages, but stay on THIS mirror only.
-         */
-        for (route in routes.take(variants.size * 8)) {
+        for (route in routes) {
             var page = 1
             while (page <= SEARCH_NATIVE_MAX_PAGES) {
-                val pageRoute = searchPageRoute(route, page)
-                val result = fetchDocument(domain, pageRoute) ?: break
+                val result = fetchDocument(
+                    domain,
+                    searchPageRoute(route, page)
+                ) ?: break
 
-                val cards = result.document
-                    .select(".movie-cards-container .movie-card")
-
+                val cards = result.document.select(
+                    ".movie-cards-container .movie-card"
+                )
                 if (cards.isEmpty()) break
 
                 cards.mapNotNull(::parseCard).forEach { item ->
@@ -406,50 +396,28 @@ class MovieLinkBD : MainAPI() {
             }
         }
 
-        val rankedNative = rankSearchResults(original, merged.values.toList())
-        if (rankedNative.isNotEmpty()) {
-            return rankedNative
-        }
-
-        /*
-         * Global fallback:
-         * use sitemap URLs, not just the six Home categories. This lets the
-         * provider discover content published under additional site sections
-         * that are not exposed in the Home menu.
-         */
+        // Global website fallback is ALWAYS evaluated on the same mirror before
+        // deciding that the mirror has no useful result. This prevents a weak
+        // native-search match from hiding a better match located in another
+        // site section.
+        val sitemapUrls = fetchSitemapUrls(domain)
         val sitemapCandidates = discoverGlobalSearchCandidates(
             domain = domain,
             query = original,
-            sitemapUrls = fetchSitemapUrls(domain)
+            sitemapUrls = sitemapUrls
         )
 
-        if (sitemapCandidates.isNotEmpty()) {
-            val fallbackMerged = linkedMapOf<String, SiteItem>()
+        for (path in sitemapCandidates) {
+            val result = fetchDocument(domain, path) ?: continue
+            val item = parseDetailAsSearchItem(
+                path = path,
+                document = result.document
+            ) ?: continue
 
-            for (path in sitemapCandidates.take(SEARCH_PAGE_FETCH_LIMIT)) {
-                val result = fetchDocument(domain, path) ?: continue
-                val item = parseDetailAsSearchItem(
-                    path = path,
-                    document = result.document
-                ) ?: continue
-
-                fallbackMerged.putIfAbsent(
-                    contentKey(item.url),
-                    item
-                )
-            }
-
-            val rankedFallback = rankSearchResults(
-                original,
-                fallbackMerged.values.toList()
-            )
-
-            if (rankedFallback.isNotEmpty()) {
-                return rankedFallback
-            }
+            merged.putIfAbsent(contentKey(item.url), item)
         }
 
-        return emptyList()
+        return rankSearchResults(original, merged.values.toList())
     }
 
     private suspend fun fetchDocument(
@@ -660,11 +628,7 @@ class MovieLinkBD : MainAPI() {
         sitemapUrls: List<String>
     ): List<String> {
         val normalizedQuery = normalizeSearch(query)
-        val tokens = normalizedQuery
-            .split(' ')
-            .filter { it.length >= 2 }
-
-        if (tokens.isEmpty()) return emptyList()
+        if (normalizedQuery.isBlank()) return emptyList()
 
         return sitemapUrls
             .asSequence()
@@ -673,22 +637,9 @@ class MovieLinkBD : MainAPI() {
                 val slug = normalizeSearch(
                     path.substringAfterLast('/')
                 )
-
-                val compactSlug = slug.replace(" ", "")
-
-                val score = when {
-                    slug.contains(normalizedQuery) -> 1.0
-                    tokens.all { slug.contains(it) } -> 0.95
-                    tokens.any { slug.contains(it) } -> 0.72
-                    compactSlug.contains(
-                        normalizedQuery.replace(" ", "")
-                    ) -> 0.90
-                    else -> 0.0
-                }
-
-                path to score
+                path to searchScore(normalizedQuery, slug)
             }
-            .filter { it.second >= 0.72 }
+            .filter { it.second >= NORMAL_SEARCH_SCORE }
             .sortedByDescending { it.second }
             .map { it.first }
             .distinct()
@@ -1040,11 +991,19 @@ class MovieLinkBD : MainAPI() {
                 path = path
             ) ?: continue
 
-            val freshSources = extractPlayableSourcesForEpisode(
+            val extractedSources = extractPlayableSourcesForEpisode(
                 page = page,
                 episodeId = episodeId,
                 mirrorIndex = mirrorIndex
             )
+
+            // A URL is not considered successful merely because it looks like
+            // media. Verify the fresh URL against the current mirror first.
+            // If every candidate fails, the next mirror gets its own fresh
+            // chance.
+            val freshSources = extractedSources.filter { source ->
+                isPlayableSource(source)
+            }
 
             if (freshSources.isEmpty()) {
                 continue
@@ -1145,6 +1104,32 @@ class MovieLinkBD : MainAPI() {
             episodeId.isNullOrBlank() ||
                 episodeId == source.sourceName ||
                 source.sourceName.isBlank()
+        }
+    }
+
+    private suspend fun isPlayableSource(
+        source: FreshSource
+    ): Boolean {
+        return try {
+            val response = app.get(
+                source.streamUrl,
+                headers = mapOf(
+                    "User-Agent" to (
+                        "Mozilla/5.0 (Linux; Android 13; Mobile) " +
+                            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                            "Chrome/131.0.0.0 Mobile Safari/537.36"
+                    ),
+                    "Accept" to "*/*",
+                    "Range" to "bytes=0-1",
+                    "Referer" to source.referer,
+                    "Cache-Control" to "no-cache, no-store, max-age=0",
+                    "Pragma" to "no-cache"
+                )
+            )
+
+            response.code in 200..399
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -1582,35 +1567,72 @@ class MovieLinkBD : MainAPI() {
         ongoingKeys.clear()
         dualAudioKeys.clear()
 
-        getDocumentWithFallback("/")?.document?.let { document ->
-            recentlyUpdatedCards(document)
-                .mapNotNull(::parseCard)
-                .forEach {
-                    recentlyKeys += contentKey(it.url)
-                }
-        }
+        // Build the protected-group index from ALL available pages, not only
+        // page 1. This prevents lower sections from re-showing an item that
+        // exists deeper inside Recently, Ongoing, or Dual Audio.
+        collectAllCategoryKeys(
+            baseRoute = null,
+            recently = true
+        ).forEach { recentlyKeys += it }
 
-        getDocumentWithFallback("/ongoing")?.document?.let { document ->
-            document
-                .select(".movie-cards-container .movie-card")
-                .mapNotNull(::parseCard)
-                .forEach {
-                    ongoingKeys += contentKey(it.url)
-                }
-        }
+        collectAllCategoryKeys(
+            baseRoute = "/ongoing",
+            recently = false
+        ).forEach { ongoingKeys += it }
 
-        getDocumentWithFallback(
-            "/language/dual-audio"
-        )?.document?.let { document ->
-            document
-                .select(".movie-cards-container .movie-card")
-                .mapNotNull(::parseCard)
-                .forEach {
-                    dualAudioKeys += contentKey(it.url)
-                }
-        }
+        collectAllCategoryKeys(
+            baseRoute = "/language/dual-audio",
+            recently = false
+        ).forEach { dualAudioKeys += it }
 
         priorityCacheAt = now
+    }
+
+    private suspend fun collectAllCategoryKeys(
+        baseRoute: String?,
+        recently: Boolean
+    ): Set<String> {
+        val keys = linkedSetOf<String>()
+        var page = 1
+
+        while (page <= PRIORITY_SCAN_MAX_PAGES) {
+            val routes = if (recently && page == 1) {
+                listOf("/")
+            } else {
+                val base = baseRoute ?: "/"
+                listOf(pageRoute(base, page))
+            }
+
+            var gotItems = false
+            var hasNext = false
+
+            for (route in routes) {
+                val result = getDocumentWithFallback(route) ?: continue
+                val cards = if (recently && page == 1) {
+                    recentlyUpdatedCards(result.document)
+                } else {
+                    result.document.select(
+                        ".movie-cards-container .movie-card"
+                    )
+                }
+
+                val parsed = cards.mapNotNull(::parseCard)
+                if (parsed.isNotEmpty()) gotItems = true
+
+                parsed.forEach { item ->
+                    keys += contentKey(item.url)
+                }
+
+                hasNext = hasNext ||
+                    hasNextPage(result.document, page) ||
+                    parsed.size >= HOME_LIMIT
+            }
+
+            if (!gotItems || !hasNext) break
+            page++
+        }
+
+        return keys
     }
 
     // ---------------------------------------------------------------------
