@@ -14,7 +14,7 @@ class MovieBox : MainAPI() {
 
     override var mainUrl = "https://movieboxonline.net"
     override var name = "MovieBox"
-    override var lang = "en"
+    override var lang = "hi"
 
     override val hasMainPage = true
     override val hasQuickSearch = true
@@ -801,7 +801,7 @@ class MovieBox : MainAPI() {
         return emitted
     }
 
-    private fun emitSource(
+    private suspend fun emitSource(
         source: MediaSource,
         callback: (ExtractorLink) -> Unit
     ) {
@@ -919,8 +919,8 @@ class MovieBox : MainAPI() {
         }
 
         val decoded = html
-            .replace("\/", "/")
-            .replace("\u0026", "&")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
             .replace("&amp;", "&")
 
         Regex(
