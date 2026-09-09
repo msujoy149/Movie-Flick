@@ -18,7 +18,10 @@ cloudstream {
     language = "bn"
     iconUrl = "https://movielinkbd.tv/favicon.png"
     isCrossPlatform = true
-    setRepo(System.getenv("GITHUB_REPOSITORY") ?: "msujoy149/Movie-Flick")
+    setRepo(
+        System.getenv("GITHUB_REPOSITORY")
+            ?: "msujoy149/Movie-Flick"
+    )
 }
 
 android {
@@ -36,12 +39,18 @@ android {
 }
 
 dependencies {
-    implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
     implementation(kotlin("stdlib"))
 
     // Required by MovieLinkBD.kt for parallel Home loading
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation(
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0"
+    )
 
-    implementation("com.github.Blatzar:NiceHttp:0.4.11")
-    implementation("org.jsoup:jsoup:1.18.3")
+    implementation(
+        "com.github.Blatzar:NiceHttp:0.4.11"
+    )
+
+    implementation(
+        "org.jsoup:jsoup:1.18.3"
+    )
 }
