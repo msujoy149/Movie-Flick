@@ -592,31 +592,50 @@ class MovieBox : MainAPI() {
         val path =
             pathFromUrl(url)
 
-        val page =
+        var page =
             fetchMirrorPage(path)
-                ?: return null
 
-        val document =
-            page.document
+        /*
+         * Movie detail pages can occasionally fail independently of the
+         * player page. MovieBox uses the same content slug/id on /play/...,
+         * so use that route as a metadata fallback instead of returning a
+         * CloudStream "Error loading" screen.
+         */
+        if (page == null && path.startsWith("/film/")) {
+            val playerPath = derivedPlayPath(path)
+            if (playerPath != null) {
+                page = fetchMirrorPage(playerPath)
+            }
+        }
+
+        val document = page?.document
+
+        /*
+         * Last metadata fallback: keep the item loadable even when the
+         * website temporarily refuses the HTML request. Playback will make
+         * its own fresh requests from the original content URL.
+         */
 
         val title =
             cleanTitle(
                 firstNonBlank(
-                    document.selectFirst(
+                    document?.selectFirst(
                         "meta[property=og:title]"
                     )?.attr("content"),
 
-                    document.selectFirst(
+                    document?.selectFirst(
                         "h1"
                     )?.text(),
 
-                    document.selectFirst(
+                    document?.selectFirst(
                         ".film-name"
                     )?.text(),
 
-                    document.title()
+                    document?.title()
                 ).orEmpty()
-            )
+            ).ifBlank {
+                titleFromContentPath(path)
+            }
 
         if (title.isBlank()) {
             return null
@@ -624,15 +643,15 @@ class MovieBox : MainAPI() {
 
         val poster =
             firstUsefulUrl(
-                document.selectFirst(
+                document?.selectFirst(
                     "meta[property=og:image]"
                 )?.attr("content"),
 
-                document.selectFirst(
+                document?.selectFirst(
                     "meta[name=twitter:image]"
                 )?.attr("content"),
 
-                document.selectFirst(
+                document?.selectFirst(
                     ".film-poster img, " +
                         ".movie-card img, " +
                         "img"
@@ -643,11 +662,11 @@ class MovieBox : MainAPI() {
 
         val plot =
             firstNonBlank(
-                document.selectFirst(
+                document?.selectFirst(
                     "meta[property=og:description]"
                 )?.attr("content"),
 
-                document.selectFirst(
+                document?.selectFirst(
                     ".description, " +
                         ".film-description, " +
                         ".description-content"
@@ -655,10 +674,14 @@ class MovieBox : MainAPI() {
             )
 
         val year =
-            extractYear(
-                title,
-                document
-            )
+            if (document != null) {
+                extractYear(title, document)
+            } else {
+                Regex("""\b(19|20)\d{2}\b""")
+                    .find(title)
+                    ?.value
+                    ?.toIntOrNull()
+            }
 
         val type =
             typeFromPath(path)
@@ -668,11 +691,16 @@ class MovieBox : MainAPI() {
             type == TvType.Anime
         ) {
 
+            val playbackUrl =
+                derivedPlayPath(path)
+                    ?.let(::canonicalUrl)
+                    ?: canonicalUrl(path)
+
             return newMovieLoadResponse(
                 name = title,
                 url = canonicalUrl(path),
                 type = type,
-                dataUrl = canonicalUrl(path)
+                dataUrl = playbackUrl
             ) {
                 posterUrl = poster
                 this.plot = plot
@@ -681,9 +709,13 @@ class MovieBox : MainAPI() {
         }
 
         val episodes =
-            parseEpisodes(
-                document = document
-            )
+            if (document != null) {
+                parseEpisodes(
+                    document = document
+                )
+            } else {
+                emptyList()
+            }
 
         return newTvSeriesLoadResponse(
             name = title,
@@ -812,6 +844,14 @@ class MovieBox : MainAPI() {
                 playUrls += absoluteUrl(
                     match.groupValues[1]
                 )
+            }
+
+            /*
+             * Deterministic MovieBox player route:
+             * /film/<slug-id> -> /play/<slug-id>
+             */
+            derivedPlayPath(pagePath)?.let { derived ->
+                playUrls += canonicalUrl(derived)
             }
 
             for (playUrl in playUrls) {
@@ -2196,6 +2236,41 @@ class MovieBox : MainAPI() {
             value.startsWith(
                 "/animated-series/"
             )
+    }
+
+    private fun derivedPlayPath(
+        contentPath: String
+    ): String? {
+        val normalized = normalizePath(contentPath)
+        if (!normalized.startsWith("/film/")) return null
+
+        val slug = normalized
+            .removePrefix("/film/")
+            .substringBefore('?')
+            .substringBefore('#')
+            .trim()
+
+        if (slug.isBlank()) return null
+
+        return "/play/$slug"
+    }
+
+    private fun titleFromContentPath(
+        contentPath: String
+    ): String {
+        val slug = normalizePath(contentPath)
+            .substringAfterLast('/')
+            .substringBefore('?')
+            .substringBefore('#')
+
+        return slug
+            .replace(
+                Regex("-[A-Za-z0-9]{8,}$"),
+                ""
+            )
+            .replace('-', ' ')
+            .replace('_', ' ')
+            .trim()
     }
 
     private fun pathFromUrl(
