@@ -742,10 +742,6 @@ class MovieBox : MainAPI() {
 
         repeat(maxAttempts) { attempt ->
 
-            if (attempt > 0) {
-                kotlinx.coroutines.delay(250L * attempt)
-            }
-
             val detailResponse = runCatching {
                 app.get(
                     canonicalUrl(addCacheBuster(pagePath)),
