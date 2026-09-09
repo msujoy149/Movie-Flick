@@ -26,9 +26,11 @@ class MovieBox : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
+        "$mainUrl" to FEATURED,
+        "$mainUrl" to RECENTLY,
         "$mainUrl/film" to "Movies",
-        "$mainUrl/tv-series" to "Tv Show",
-        "$mainUrl/animated-series" to "Anime"
+        "$mainUrl/tv-series" to TV_SHOW,
+        "$mainUrl/animated-series" to ANIME
     )
 
     /*
@@ -43,11 +45,14 @@ class MovieBox : MainAPI() {
     private companion object {
         const val HOME_INITIAL_LIMIT = 6
         const val HOME_PAGE_LIMIT = 10
+        const val HOME_FEATURED_LIMIT = 1
         const val SEARCH_NATIVE_PAGES = 2
         const val SEARCH_RESULT_LIMIT = 50
         const val SITEMAP_RESULT_LIMIT = 80
         const val SITEMAP_MAX_BYTES = 2_000_000
 
+        const val FEATURED = "Featured"
+        const val RECENTLY = "Recently Uploads"
         const val TV_SHOW = "Tv Show"
         const val ANIME = "Anime"
     }
@@ -106,8 +111,45 @@ class MovieBox : MainAPI() {
     ): HomePageResponse {
 
         val currentPage = page.coerceAtLeast(1)
+        val section = request.name
 
-        val basePath = when (request.name) {
+        if (section == FEATURED || section == RECENTLY) {
+            val result = fetchMirrorPage("/") ?: return newHomePageResponse(
+                data = request,
+                list = emptyList(),
+                hasNext = false
+            )
+
+            val allItems = parseNuxtListing(
+                result.document,
+                null
+            )
+
+            val ranked = sortHomeItems(allItems)
+
+            val limit = if (section == FEATURED) {
+                HOME_FEATURED_LIMIT
+            } else if (currentPage == 1) {
+                HOME_INITIAL_LIMIT
+            } else {
+                HOME_PAGE_LIMIT
+            }
+
+            val start = if (section == FEATURED) 0 else if (currentPage == 1) 0 else (HOME_INITIAL_LIMIT + (currentPage - 2) * HOME_PAGE_LIMIT)
+            val pageItems = if (section == FEATURED) {
+                ranked.take(limit)
+            } else {
+                ranked.drop(start).take(limit)
+            }
+
+            return newHomePageResponse(
+                data = request,
+                list = pageItems.map { it.toSearchResponse() },
+                hasNext = if (section == FEATURED) false else ranked.size > start + pageItems.size
+            )
+        }
+
+        val basePath = when (section) {
             TV_SHOW -> "/tv-series"
             ANIME -> "/animated-series"
             else -> "/film"
@@ -116,7 +158,7 @@ class MovieBox : MainAPI() {
         for (route in pageRoutes(basePath, currentPage)) {
             val result = fetchMirrorPage(route) ?: continue
 
-            val forcedType = when (request.name) {
+            val forcedType = when (section) {
                 TV_SHOW -> TvType.TvSeries
                 ANIME -> TvType.Anime
                 else -> TvType.Movie
@@ -129,21 +171,13 @@ class MovieBox : MainAPI() {
 
             if (items.isEmpty()) continue
 
+            val sortedItems = sortHomeItems(items)
+            val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
+
             return newHomePageResponse(
                 data = request,
-                list = items
-                    .take(
-                        if (currentPage == 1) {
-                            HOME_INITIAL_LIMIT
-                        } else {
-                            HOME_PAGE_LIMIT
-                        }
-                    )
-                    .map { it.toSearchResponse() },
-                hasNext = detectHasNext(
-                    result.document,
-                    currentPage
-                )
+                list = sortedItems.take(limit).map { it.toSearchResponse() },
+                hasNext = detectHasNext(result.document, currentPage) || sortedItems.size > limit
             )
         }
 
@@ -152,6 +186,10 @@ class MovieBox : MainAPI() {
             list = emptyList(),
             hasNext = false
         )
+    }
+
+    private fun sortHomeItems(items: List<SiteItem>): List<SiteItem> {
+        return items.sortedBy { it.languageRank }
     }
 
     /*
@@ -280,25 +318,27 @@ class MovieBox : MainAPI() {
                         )
                     ) ?: break
 
-                val cards =
-                    result.document.select(
+                val nuxtResults = parseNuxtListing(
+                    result.document,
+                    null
+                )
+
+                if (nuxtResults.isNotEmpty()) {
+                    results.addAll(nuxtResults)
+                } else {
+                    val cards = result.document.select(
                         ".movie-card, " +
                             ".flw-item, " +
                             ".film-poster-ahref, " +
                             ".film_list-wrap .flw-item"
                     )
 
-                if (cards.isEmpty()) break
+                    if (cards.isEmpty()) break
 
-                cards.mapNotNull(
-                    ::parseSearchCard
-                ).forEach { item ->
-                    /*
-                     * Do not deduplicate search results.
-                     * Hindi/English/Bangla variants are allowed to
-                     * remain as separate results.
-                     */
-                    results += item
+                    cards.mapNotNull(::parseSearchCard).forEach { item ->
+                        // Do not deduplicate search results.
+                        results += item
+                    }
                 }
 
                 if (
@@ -673,196 +713,197 @@ class MovieBox : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
 
-        val rawData =
-            data.trim()
+        val rawData = data.trim()
+        if (rawData.isBlank()) return false
 
-        if (rawData.isBlank()) {
-            return false
+        val separator = rawData.indexOf("||")
+        val pageUrl = if (separator >= 0) rawData.substring(0, separator) else rawData
+        val pagePath = pathFromUrl(pageUrl)
+        if (pagePath.isBlank()) return false
+
+        val freshHeaders = browserHeaders(mainUrl + pagePath) +
+            ("X-Requested-With" to "XMLHttpRequest")
+
+        val detailResponse = runCatching {
+            app.get(
+                canonicalUrl(pagePath),
+                headers = freshHeaders
+            )
+        }.getOrNull() ?: return false
+
+        val detailHtml = detailResponse.text
+        val detailDocument = detailResponse.document
+
+        val candidatePlayUrls = linkedSetOf<String>()
+        candidatePlayUrls += extractJsonLdUrls(detailHtml)
+
+        val directCandidates = extractMediaSources(
+            document = detailDocument,
+            pageUrl = canonicalUrl(pagePath),
+            html = detailHtml
+        )
+
+        var emitted = false
+
+        // Prefer fresh direct media from the current page.
+        for (source in directCandidates) {
+            if (!looksLikePlayableMedia(source.url)) continue
+            emitSource(source, callback)
+            emitted = true
         }
 
-        val separator =
-            rawData.indexOf("||")
-
-        val pageUrl =
-            if (separator >= 0) {
-                rawData.substring(
-                    0,
-                    separator
+        // Then follow the site's own freshly generated /play/... URL.
+        for (playUrl in candidatePlayUrls) {
+            val watch = runCatching {
+                app.get(
+                    playUrl,
+                    headers = browserHeaders(pageUrl) + ("Referer" to canonicalUrl(pagePath))
                 )
-            } else {
-                rawData
+            }.getOrNull() ?: continue
+
+            val sources = extractMediaSources(
+                document = watch.document,
+                pageUrl = playUrl,
+                html = watch.text
+            )
+
+            for (source in sources) {
+                if (!looksLikePlayableMedia(source.url)) continue
+                emitSource(source, callback)
+                emitted = true
             }
 
-        val episodeId =
-            if (separator >= 0) {
-                rawData.substring(
-                    separator + 2
-                ).trim()
-                    .takeIf {
-                        it.isNotBlank()
-                    }
-            } else {
-                null
+            extractSubtitles(watch.document).forEach { subtitle ->
+                subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
             }
-
-        val path =
-            pathFromUrl(pageUrl)
-
-        if (path.isBlank()) {
-            return false
         }
 
-        for (domain in domains) {
+        // Final fallback: some MovieBox pages expose a public `contentUrl`
+        // in JSON-LD. Use the freshly fetched value only when the player page
+        // did not expose a better playable source.
+        if (!emitted) {
+            extractJsonLdMedia(
+                html = detailHtml,
+                pageUrl = canonicalUrl(pagePath)
+            ).forEach { source ->
+                if (!looksLikePlayableMedia(source.url)) return@forEach
+                emitSource(source, callback)
+                emitted = true
+            }
+        }
 
-            /*
-             * This request is fresh for every Play.
-             * We deliberately do not reuse a saved page/token.
-             */
-            val page =
-                getDocument(
-                    domain,
-                    path
-                ) ?: continue
+        if (!emitted) {
+            extractSubtitles(detailDocument).forEach { subtitle ->
+                subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
+            }
+        }
 
-            val sources =
-                extractMediaSources(
-                    document = page.document,
-                    pageUrl = page.absoluteUrl(),
-                    episodeId = episodeId
-                )
+        return emitted
+    }
 
-            val playable =
-                sources.filter {
-                    looksLikePlayableMedia(
-                        it.url
+    private fun emitSource(
+        source: MediaSource,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        callback(
+            newExtractorLink(
+                "MovieBox",
+                source.label,
+                source.url,
+                ExtractorLinkType.VIDEO
+            ) {
+                quality = source.quality
+                referer = source.referer
+            }
+        )
+    }
+
+    private fun extractJsonLdUrls(
+        html: String
+    ): List<String> {
+        val result = linkedSetOf<String>()
+        val scriptRegex = Regex(
+            """(?is)<script[^>]*application/ld\+json[^>]*>(.*?)</script>"""
+        )
+
+        scriptRegex.findAll(html).forEach { match ->
+            val block = match.groupValues[1]
+
+            Regex(
+                """(?i)"(?:embedUrl|target|url)"\s*:\s*"(https?://[^"]+/play/[^"]+)"""
+            ).findAll(block).forEach { m ->
+                result += m.groupValues[1].replace("\\/", "/")
+            }
+        }
+
+        val directPlay = Regex(
+            """(?i)https?://[^\"'<>\s]+/play/[^\"'<>\s]+"""
+        )
+        directPlay.findAll(html).forEach { m ->
+            result += m.value.replace("\\/", "/")
+        }
+
+        Regex(
+            """(?i)"(/play/[^\"]+)"""
+        ).findAll(html).forEach { m ->
+            result += absoluteUrl(m.groupValues[1])
+        }
+
+        return result.toList()
+    }
+
+    private fun extractJsonLdMedia(
+        html: String,
+        pageUrl: String
+    ): List<MediaSource> {
+        val found = linkedMapOf<String, MediaSource>()
+        val scriptRegex = Regex(
+            """(?is)<script[^>]*application/ld\+json[^>]*>(.*?)</script>"""
+        )
+
+        scriptRegex.findAll(html).forEach { match ->
+            val block = match.groupValues[1]
+            Regex(
+                """(?i)"contentUrl"\s*:\s*"([^"]+)"""
+            ).findAll(block).forEach { media ->
+                val url = normalizeMediaUrl(media.groupValues[1], pageUrl) ?: return@forEach
+                found.putIfAbsent(
+                    url,
+                    MediaSource(
+                        url = url,
+                        quality = qualityFromText(url),
+                        label = "MovieBox Stream",
+                        referer = pageUrl
                     )
-                }
-
-            if (playable.isEmpty()) {
-                continue
-            }
-
-            playable.forEach { source ->
-
-                callback(
-                    newExtractorLink(
-                        "MovieBox",
-                        source.label,
-                        source.url,
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        quality =
-                            source.quality
-
-                        referer =
-                            source.referer
-                    }
                 )
             }
-
-            extractSubtitles(
-                page.document
-            ).forEach { subtitle ->
-
-                subtitleCallback(
-                    newSubtitleFile(
-                        subtitle.first,
-                        subtitle.second
-                    )
-                )
-            }
-
-            return true
         }
 
-        return false
+        return found.values.toList()
     }
 
     private fun extractMediaSources(
         document: Document,
         pageUrl: String,
-        episodeId: String?
+        html: String = document.html()
     ): List<MediaSource> {
+        val found = linkedMapOf<String, MediaSource>()
 
-        val found =
-            linkedMapOf<
-                String,
-                MediaSource
-            >()
-
-        fun add(
-            raw: String?,
-            label: String
-        ) {
-
-            if (raw.isNullOrBlank()) {
-                return
-            }
-
-            val url =
-                normalizeMediaUrl(
-                    raw,
-                    pageUrl
-                ) ?: return
-
-            if (
-                url.contains(
-                    "youtube.com",
-                    true
-                ) ||
-                url.contains(
-                    "youtu.be",
-                    true
-                )
-            ) {
-                return
-            }
-
+        fun add(raw: String?, label: String) {
+            if (raw.isNullOrBlank()) return
+            val url = normalizeMediaUrl(raw, pageUrl) ?: return
+            if (url.contains("youtube.com", true) || url.contains("youtu.be", true)) return
             found.putIfAbsent(
                 url,
-                MediaSource(
-                    url = url,
-                    quality =
-                        qualityFromText(
-                            url
-                        ),
-                    label = label,
-                    referer = pageUrl
-                )
+                MediaSource(url, qualityFromText(url), label, pageUrl)
             )
         }
 
-        /*
-         * Known direct media elements.
-         */
-        document.select(
-            "video[src], " +
-                "video source[src], " +
-                "source[src]"
-        ).forEach { element ->
-
-            add(
-                firstNonBlank(
-                    element.attr("src"),
-                    element.attr("data-src")
-                ),
-                "MovieBox Direct"
-            )
+        document.select("video[src], video source[src], source[src]").forEach { element ->
+            add(firstNonBlank(element.attr("src"), element.attr("data-src")), "MovieBox Direct")
         }
 
-        /*
-         * Lazy media attributes.
-         */
-        document.select(
-            "[data-src], " +
-                "[data-file], " +
-                "[data-video], " +
-                "[data-url], " +
-                "[data-source], " +
-                "[data-stream], " +
-                "[data-hls]"
-        ).forEach { element ->
-
+        document.select("[data-src], [data-file], [data-video], [data-url], [data-source], [data-stream], [data-hls]").forEach { element ->
             add(
                 firstNonBlank(
                     element.attr("data-src"),
@@ -877,56 +918,21 @@ class MovieBox : MainAPI() {
             )
         }
 
-        /*
-         * Known data attributes may contain JSON/URLs. The raw HTML
-         * pass below catches direct .m3u8/.mp4 family URLs.
-         */
-        val html =
-            document.html()
-                .replace("\\/", "/")
-                .replace(
-                    "\\u0026",
-                    "&"
-                )
-                .replace(
-                    "&amp;",
-                    "&"
-                )
+        val decoded = html
+            .replace("\/", "/")
+            .replace("\u0026", "&")
+            .replace("&amp;", "&")
 
         Regex(
-            """https?://[^"'<>\s\\]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"'<>\s\\]*)?""",
+            """https?://[^"'<>\s]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"'<>\s]*)?""",
             RegexOption.IGNORE_CASE
-        ).findAll(html).forEach { match ->
+        ).findAll(decoded).forEach { add(it.value, "MovieBox Direct") }
 
-            add(
-                match.value,
-                "MovieBox Direct"
-            )
-        }
-
-        /*
-         * The current MovieBox pages also expose media-related fields
-         * such as sourceUrl/sniffUrl/url inside serialized page state.
-         * Extract those absolute URLs as candidates too. Non-media
-         * URLs are discarded later by looksLikePlayableMedia().
-         */
+        // Serialized SSR state can carry the current source URL.
         Regex(
-            """(?i)"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|file|url)"\s*:\s*"((?:https?:)?//[^"]+)"""
-        ).findAll(html).forEach { match ->
-            add(
-                match.groupValues[1],
-                "MovieBox State"
-            )
-        }
+            """(?i)\"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl)\"\s*:\s*\"((?:https?:)?//[^\"]+)\""""
+        ).findAll(decoded).forEach { add(it.groupValues[1], "MovieBox State") }
 
-        /*
-         * episodeId is carried through the CloudStream episode data.
-         * When a page exposes multiple direct media candidates, we
-         * use the page/episode request itself as the fresh resolver.
-         *
-         * This provider intentionally does not cache or persist any
-         * tokenized URL.
-         */
         return found.values.toList()
     }
 
@@ -1016,7 +1022,7 @@ class MovieBox : MainAPI() {
 
     private fun parseNuxtListing(
         document: Document,
-        forcedType: TvType
+        forcedType: TvType?
     ): List<SiteItem> {
 
         val source = document.html()
@@ -1091,73 +1097,54 @@ class MovieBox : MainAPI() {
         source: String,
         payloadStart: Int,
         title: String,
-        forcedType: TvType
+        forcedType: TvType?
     ): SiteItem? {
 
-        val escapedTitle =
-            title
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-
-        val titleToken = "\"$escapedTitle\""
-
+        val titleToken = "\"${title.replace("\"", "\\\"")}\""
         var searchFrom = payloadStart
         var best: SiteItem? = null
         var bestScore = -1.0
 
         while (true) {
-            val titleIndex =
-                source.indexOf(
-                    titleToken,
-                    searchFrom
-                )
-
+            val titleIndex = source.indexOf(titleToken, searchFrom)
             if (titleIndex < 0) break
 
-            val windowStart =
-                max(payloadStart, titleIndex - 5000)
+            val windowStart = max(payloadStart, titleIndex - 8000)
+            val windowEnd = min(source.length, titleIndex + titleToken.length + 8000)
+            val window = source.substring(windowStart, windowEnd)
 
-            val window =
-                source.substring(
-                    windowStart,
-                    titleIndex
+            val routeMatch = Regex(
+                """(?i)/(?:film|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._~%=&\-]*)?"""
+            ).find(window)
+
+            val candidatePath = routeMatch?.value
+                ?: findBestDetailPath(window, title)?.third?.let { "/film/$it" }
+
+            if (candidatePath != null) {
+                val detailType = forcedType ?: typeFromPath(candidatePath)
+                val slugTitle = candidatePath
+                    .substringAfterLast('/')
+                    .replace('-', ' ')
+                    .replace('_', ' ')
+                val score = max(
+                    searchScore(title, slugTitle),
+                    searchScore(title, cleanTitle(candidatePath))
                 )
+                val poster = findNearestPoster(source, windowStart, titleIndex)
 
-            val detailCandidate =
-                findBestDetailPath(
-                    window,
-                    title
-                )
-
-            if (detailCandidate != null) {
-                val detailIndex =
-                    windowStart + detailCandidate.first
-
-                val poster =
-                    findNearestPoster(
-                        source,
-                        windowStart,
-                        detailIndex
-                    )
-
-                val score = detailCandidate.second
-
-                if (score > bestScore) {
+                if (score >= 0.20 && (best == null || score > bestScore)) {
                     bestScore = score
                     best = SiteItem(
                         title = title,
-                        url = canonicalUrl(
-                            "/film/${detailCandidate.third}"
-                        ),
+                        url = canonicalUrl(candidatePath),
                         poster = poster,
-                        type = forcedType,
+                        type = detailType,
                         languageRank = languageRank(title)
                     )
                 }
             }
 
-            searchFrom =
-                titleIndex + titleToken.length
+            searchFrom = titleIndex + titleToken.length
         }
 
         return best
@@ -1355,11 +1342,7 @@ class MovieBox : MainAPI() {
             val episode: Int?
         )
 
-        val found =
-            linkedMapOf<
-                String,
-                EpisodeInfo
-            >()
+        val found = linkedMapOf<String, EpisodeInfo>()
 
         document.select(
             "a[href*='episode'], " +
@@ -1368,84 +1351,59 @@ class MovieBox : MainAPI() {
                 ".ep-item a[href], " +
                 "[class*='episode'] a[href]"
         ).forEach { anchor ->
+            val href = anchor.attr("href").trim()
+            if (href.isBlank()) return@forEach
 
-            val href =
-                anchor.attr("href").trim()
-
-            if (href.isBlank()) {
-                return@forEach
-            }
-
-            val url =
-                absoluteUrl(href)
-
-            val label =
-                cleanTitle(
-                    firstNonBlank(
-                        anchor.text(),
-                        anchor.attr(
-                            "title"
-                        )
-                    ).orEmpty()
-                )
-
-            val episodeNumber =
-                Regex(
-                    """(?i)(?:episode|ep)[\s._-]*(\d+)"""
-                ).find(
-                    "$label $url"
-                )?.groupValues
-                    ?.getOrNull(1)
-                    ?.toIntOrNull()
-
-            val seasonNumber =
-                Regex(
-                    """(?i)(?:season|s)[\s._-]*(\d+)"""
-                ).find(
-                    "$label $url"
-                )?.groupValues
-                    ?.getOrNull(1)
-                    ?.toIntOrNull()
-
-            val key =
-                "$url|${seasonNumber ?: 1}|${episodeNumber ?: 0}"
+            val url = absoluteUrl(href)
+            val label = cleanTitle(
+                firstNonBlank(
+                    anchor.text(),
+                    anchor.attr("title")
+                ).orEmpty()
+            )
+            val episodeNumber = Regex(
+                """(?i)(?:episode|ep|e)[\s._-]*(\d+)"""
+            ).find("$label $url")?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val seasonNumber = Regex(
+                """(?i)(?:season|s)[\s._-]*(\d+)"""
+            ).find("$label $url")?.groupValues?.getOrNull(1)?.toIntOrNull()
 
             found.putIfAbsent(
-                key,
+                "$url|${seasonNumber ?: 1}|${episodeNumber ?: found.size + 1}",
                 EpisodeInfo(
-                    url = url,
-                    title =
-                        label.ifBlank {
-                            "Episode ${
-                                episodeNumber
-                                    ?: found.size + 1
-                            }"
-                        },
-                    season = seasonNumber,
-                    episode = episodeNumber
+                    url,
+                    label.ifBlank { "Episode ${episodeNumber ?: found.size + 1}" },
+                    seasonNumber,
+                    episodeNumber
                 )
             )
         }
 
-        return found.values
-            .sortedWith(
-                compareBy<
-                    EpisodeInfo
-                > {
-                    it.season ?: 1
-                }.thenBy {
-                    it.episode
-                        ?: Int.MAX_VALUE
-                }
+        // Nuxt SSR often serializes the episode list without rendering <a> tags.
+        // Capture explicit /play/... URLs together with nearby episode numbers.
+        val html = document.html()
+        val playRegex = Regex(
+            """(?i)(/play/[A-Za-z0-9._-]+(?:\?[^\"'<>\s]*)?)"""
+        )
+        playRegex.findAll(html).forEach { match ->
+            val url = absoluteUrl(match.groupValues[1])
+            val before = html.substring(max(0, match.range.first - 600), match.range.first)
+            val after = html.substring(match.range.last + 1, min(html.length, match.range.last + 601))
+            val context = before + after
+            val episodeNumber = Regex("""(?i)(?:episode|ep|e)[\s._-]*(\d+)""").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val seasonNumber = Regex("""(?i)(?:season|s)[\s._-]*(\d+)""").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val title = "Episode ${episodeNumber ?: found.size + 1}"
+            found.putIfAbsent(
+                "$url|${seasonNumber ?: 1}|${episodeNumber ?: found.size + 1}",
+                EpisodeInfo(url, title, seasonNumber, episodeNumber)
             )
-            .map { info ->
+        }
 
+        return found.values
+            .sortedWith(compareBy<EpisodeInfo> { it.season ?: 1 }.thenBy { it.episode ?: Int.MAX_VALUE })
+            .map { info ->
                 newEpisode(
-                    data = info.url +
-                        "||" +
-                        info.episode
-                            ?.toString()
-                            .orEmpty()
+                    data = info.url + "||" + (info.episode?.toString().orEmpty())
                 ) {
                     name = info.title
                     season = info.season
