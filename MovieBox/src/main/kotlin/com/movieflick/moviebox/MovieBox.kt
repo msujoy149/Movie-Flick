@@ -50,6 +50,8 @@ class MovieBox : MainAPI() {
         const val SEARCH_RESULT_LIMIT = 50
         const val SITEMAP_RESULT_LIMIT = 80
         const val SITEMAP_MAX_BYTES = 2_000_000
+        const val MOVIE_DETAIL_ENDPOINT = "http://wefeed-h5-bff.wefeed-prod/detail"
+        const val MAX_PLAYBACK_ATTEMPTS = 10
 
         const val FEATURED = "Featured"
         const val RECENTLY = "Recently Uploads"
@@ -589,32 +591,59 @@ class MovieBox : MainAPI() {
         url: String
     ): LoadResponse? {
 
-        val path =
-            pathFromUrl(url)
-
-        var page =
-            fetchMirrorPage(path)
+        val path = pathFromUrl(url)
 
         /*
-         * Movie detail pages can occasionally fail independently of the
-         * player page. MovieBox uses the same content slug/id on /play/...,
-         * so use that route as a metadata fallback instead of returning a
-         * CloudStream "Error loading" screen.
+         * MovieBox currently exposes the content slug/id in the page SSR
+         * payload and also uses a backend detail endpoint. The public web
+         * route can be /film/... or /movies/... depending on the page/version.
+         *
+         * Keep the CloudStream item URL as-is, but use every known public
+         * detail route as a read-only fallback so a stale web route does not
+         * make the title unloadable.
          */
-        if (page == null && path.startsWith("/film/")) {
-            val playerPath = derivedPlayPath(path)
-            if (playerPath != null) {
-                page = fetchMirrorPage(playerPath)
+        val candidatePaths = linkedSetOf<String>().apply {
+            add(path)
+
+            if (path.startsWith("/film/")) {
+                add("/movies/" + path.removePrefix("/film/"))
+                derivedPlayPath(path)?.let(::add)
+            } else if (path.startsWith("/movies/")) {
+                add("/film/" + path.removePrefix("/movies/"))
+                add("/play/" + path.removePrefix("/movies/"))
+            } else if (path.startsWith("/play/")) {
+                val slug = path.removePrefix("/play/")
+                if (slug.isNotBlank()) {
+                    add("/film/$slug")
+                    add("/movies/$slug")
+                }
             }
         }
 
-        val document = page?.document
+        var page: MirrorPage? = null
+
+        for (candidate in candidatePaths) {
+            page = fetchMirrorPage(candidate)
+            if (page != null) break
+        }
+
+        var document = page?.document
 
         /*
-         * Last metadata fallback: keep the item loadable even when the
-         * website temporarily refuses the HTML request. Playback will make
-         * its own fresh requests from the original content URL.
+         * Public MovieBox SSR data also exposes a backend detail URL of the
+         * form:
+         *
+         *   /detail/<slug-id>
+         *
+         * Fetch that page as an additional public metadata source when the
+         * normal website route is unavailable or incomplete.
          */
+        if (document == null) {
+            val slug = contentSlug(path)
+            if (!slug.isNullOrBlank()) {
+                document = fetchBackendDetailDocument(slug)
+            }
+        }
 
         val title =
             cleanTitle(
@@ -683,24 +712,22 @@ class MovieBox : MainAPI() {
                     ?.toIntOrNull()
             }
 
-        val type =
-            typeFromPath(path)
+        val type = typeFromPath(path)
 
         if (
             type == TvType.Movie ||
             type == TvType.Anime
         ) {
-
-            val playbackUrl =
-                derivedPlayPath(path)
-                    ?.let(::canonicalUrl)
-                    ?: canonicalUrl(path)
-
+            /*
+             * Pass the original item URL into loadLinks. loadLinks will
+             * independently resolve the current public player/media route
+             * on every Play action.
+             */
             return newMovieLoadResponse(
                 name = title,
                 url = canonicalUrl(path),
                 type = type,
-                dataUrl = playbackUrl
+                dataUrl = canonicalUrl(path)
             ) {
                 posterUrl = poster
                 this.plot = plot
@@ -748,161 +775,244 @@ class MovieBox : MainAPI() {
         val rawData = data.trim()
         if (rawData.isBlank()) return false
 
-        val separator = rawData.indexOf("||")
         val pageUrl =
-            if (separator >= 0) {
-                rawData.substring(0, separator)
-            } else {
-                rawData
-            }
+            rawData.substringBefore("||").trim()
 
         val pagePath = pathFromUrl(pageUrl)
         if (pagePath.isBlank()) return false
 
         /*
-         * MovieBox generates/serves media information dynamically.
+         * Every Play action starts from scratch.
          *
-         * Do not keep a media URL or token in provider state.
-         * Every playback attempt starts again from the current detail page,
-         * discovers the current /play/... page and extracts the current media
-         * URL from that fresh response.
-         *
-         * A few retries are intentional because the first request can race
-         * the site's player/session generation.
+         * We deliberately do not persist a tokenized media URL. The site may
+         * return a new signed CDN URL on every request.
          */
-        val maxAttempts = 8
+        repeat(MAX_PLAYBACK_ATTEMPTS) { attempt ->
 
-        repeat(maxAttempts) { attempt ->
+            val candidateUrls = linkedSetOf<String>()
 
-            val detailResponse = runCatching {
+            candidateUrls += canonicalUrl(pagePath)
+
+            if (pagePath.startsWith("/film/")) {
+                candidateUrls += canonicalUrl(
+                    "/movies/" + pagePath.removePrefix("/film/")
+                )
+            }
+
+            if (pagePath.startsWith("/movies/")) {
+                candidateUrls += canonicalUrl(
+                    "/film/" + pagePath.removePrefix("/movies/")
+                )
+            }
+
+            contentSlug(pagePath)?.let { slug ->
+                candidateUrls += "$MOVIE_DETAIL_ENDPOINT/$slug"
+                candidateUrls += canonicalUrl("/play/$slug")
+            }
+
+            derivedPlayPath(pagePath)?.let { playPath ->
+                candidateUrls += canonicalUrl(playPath)
+            }
+
+            for (candidateUrl in candidateUrls) {
+                if (
+                    resolveMovieCandidate(
+                        candidateUrl = candidateUrl,
+                        sourcePageUrl = pageUrl,
+                        subtitleCallback = subtitleCallback,
+                        callback = callback
+                    )
+                ) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private suspend fun resolveMovieCandidate(
+        candidateUrl: String,
+        sourcePageUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+
+        val response =
+            runCatching {
                 app.get(
-                    canonicalUrl(addCacheBuster(pagePath)),
+                    addCacheBuster(candidateUrl),
                     headers = browserHeaders(
-                        canonicalUrl(pagePath)
+                        sourcePageUrl
                     ) + mapOf(
+                        "Referer" to sourcePageUrl,
                         "X-Requested-With" to "XMLHttpRequest",
+                        "Accept" to (
+                            "text/html,application/xhtml+xml," +
+                                "application/json,text/plain,*/*;q=0.8"
+                            ),
                         "Cache-Control" to "no-cache",
                         "Pragma" to "no-cache"
                     )
                 )
-            }.getOrNull() ?: return@repeat
+            }.getOrNull()
+                ?: return false
 
-            if (detailResponse.code !in 200..399) {
-                return@repeat
-            }
+        if (response.code !in 200..399) {
+            return false
+        }
 
-            val detailHtml = detailResponse.text
-            val detailDocument = detailResponse.document
-            val detailUrl = canonicalUrl(pagePath)
+        val html = response.text
+        val document = response.document
+        val mediaCandidates =
+            linkedMapOf<String, MediaSource>()
 
-            val mediaCandidates = linkedMapOf<String, MediaSource>()
+        fun collect(source: MediaSource) {
+            if (!looksLikePlayableMedia(source.url)) return
+            mediaCandidates.putIfAbsent(
+                source.url,
+                source
+            )
+        }
 
-            fun collect(source: MediaSource) {
-                if (!looksLikePlayableMedia(source.url)) return
-                mediaCandidates.putIfAbsent(source.url, source)
-            }
+        /*
+         * 1. Direct media / serialized state from the current response.
+         */
+        extractJsonLdMedia(
+            html = html,
+            pageUrl = candidateUrl
+        ).forEach(::collect)
 
-            /*
-             * 1) The page's own JSON-LD can expose contentUrl/embedUrl.
-             * 2) The SSR/Nuxt payload can expose the current video URL.
-             * 3) The rendered HTML can contain direct .mp4/.m3u8 links.
-             */
-            extractJsonLdMedia(
-                html = detailHtml,
-                pageUrl = detailUrl
-            ).forEach(::collect)
+        extractMediaSources(
+            document = document,
+            pageUrl = candidateUrl,
+            html = html
+        ).forEach(::collect)
 
-            extractMediaSources(
-                document = detailDocument,
-                pageUrl = detailUrl,
-                html = detailHtml
-            ).forEach(::collect)
+        /*
+         * 2. The current response may expose a fresh /play/... URL.
+         */
+        val playUrls =
+            linkedSetOf<String>()
 
-            /*
-             * The site also exposes its own /play/... route. Fetch that
-             * fresh on every attempt, then inspect that fresh player page.
-             */
-            val playUrls = linkedSetOf<String>()
-            playUrls += extractJsonLdUrls(detailHtml)
+        playUrls +=
+            extractJsonLdUrls(
+                html
+            )
 
-            Regex(
-                """(?i)https?://[^"'<>\s]+/play/[^"'<>\s]+"""
-            ).findAll(
-                detailHtml
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
-            ).forEach { match ->
-                playUrls += match.value
-            }
+        val decodedHtml =
+            html
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
 
-            Regex(
-                """(?i)"(/play/[^"]+)"""
-            ).findAll(
-                detailHtml
-            ).forEach { match ->
-                playUrls += absoluteUrl(
+        Regex(
+            """(?i)https?://[^"'<>\s]+/play/[^"'<>\s]+"""
+        ).findAll(
+            decodedHtml
+        ).forEach { match ->
+            playUrls += match.value
+        }
+
+        Regex(
+            """(?i)"(/play/[^"]+)"""
+        ).findAll(
+            decodedHtml
+        ).forEach { match ->
+            playUrls +=
+                absoluteUrl(
                     match.groupValues[1]
                 )
+        }
+
+        /*
+         * 3. If this is the MovieBox backend detail route, derive the
+         * corresponding public player route from the same slug/id.
+         */
+        if (
+            candidateUrl.startsWith(
+                MOVIE_DETAIL_ENDPOINT,
+                true
+            )
+        ) {
+            val slug =
+                contentSlug(
+                    sourcePageUrl
+                )
+                    ?: contentSlug(
+                        candidateUrl
+                    )
+
+            if (!slug.isNullOrBlank()) {
+                playUrls +=
+                    canonicalUrl(
+                        "/play/$slug"
+                    )
             }
+        }
 
-            /*
-             * Deterministic MovieBox player route:
-             * /film/<slug-id> -> /play/<slug-id>
-             */
-            derivedPlayPath(pagePath)?.let { derived ->
-                playUrls += canonicalUrl(derived)
-            }
-
-            for (playUrl in playUrls) {
-
-                val watchResponse = runCatching {
+        /*
+         * 4. Fetch every discovered /play route fresh and inspect it.
+         */
+        for (playUrl in playUrls) {
+            val watchResponse =
+                runCatching {
                     app.get(
                         addCacheBuster(playUrl),
-                        headers = browserHeaders(detailUrl) + mapOf(
-                            "Referer" to detailUrl,
+                        headers = browserHeaders(
+                            candidateUrl
+                        ) + mapOf(
+                            "Referer" to candidateUrl,
                             "X-Requested-With" to "XMLHttpRequest",
+                            "Accept" to (
+                                "text/html,application/xhtml+xml," +
+                                    "application/json,text/plain,*/*;q=0.8"
+                                ),
                             "Cache-Control" to "no-cache",
                             "Pragma" to "no-cache"
                         )
                     )
-                }.getOrNull() ?: continue
+                }.getOrNull()
+                    ?: continue
 
-                if (watchResponse.code !in 200..399) {
-                    continue
-                }
-
-                val watchHtml = watchResponse.text
-
-                extractJsonLdMedia(
-                    html = watchHtml,
-                    pageUrl = playUrl
-                ).forEach(::collect)
-
-                extractMediaSources(
-                    document = watchResponse.document,
-                    pageUrl = playUrl,
-                    html = watchHtml
-                ).forEach(::collect)
-
-                extractSubtitles(
-                    watchResponse.document
-                ).forEach { subtitle ->
-                    subtitleCallback(
-                        newSubtitleFile(
-                            subtitle.first,
-                            subtitle.second
-                        )
-                    )
-                }
+            if (watchResponse.code !in 200..399) {
+                continue
             }
 
-            /*
-             * Prefer higher quality. In case several fresh URLs are found,
-             * emit all valid candidates once, best quality first.
-             */
-            val orderedCandidates =
-                mediaCandidates.values.sortedWith(
+            val watchHtml =
+                watchResponse.text
+
+            extractJsonLdMedia(
+                html = watchHtml,
+                pageUrl = playUrl
+            ).forEach(::collect)
+
+            extractMediaSources(
+                document = watchResponse.document,
+                pageUrl = playUrl,
+                html = watchHtml
+            ).forEach(::collect)
+
+            extractSubtitles(
+                watchResponse.document
+            ).forEach { subtitle ->
+                subtitleCallback(
+                    newSubtitleFile(
+                        subtitle.first,
+                        subtitle.second
+                    )
+                )
+            }
+        }
+
+        val orderedCandidates =
+            mediaCandidates.values
+                .filter {
+                    looksLikePlayableMedia(
+                        it.url
+                    )
+                }
+                .sortedWith(
                     compareByDescending<MediaSource> {
                         it.quality
                     }.thenBy {
@@ -910,24 +1020,24 @@ class MovieBox : MainAPI() {
                     }
                 )
 
-            if (orderedCandidates.isNotEmpty()) {
-                for (source in orderedCandidates) {
-                    emitSource(
-                        source,
-                        callback
-                    )
-                }
-
-                return true
-            }
+        if (orderedCandidates.isEmpty()) {
+            /*
+             * A response can contain player configuration that points to
+             * another public page but not yet contain the signed CDN URL.
+             * Returning false here causes the caller to continue trying other
+             * candidate routes / fresh attempts.
+             */
+            return false
         }
 
-        /*
-         * Do not send an empty/invalid link to CloudStream.
-         * Returning false lets the host show the normal loading error
-         * instead of pretending that a source was resolved successfully.
-         */
-        return false
+        for (source in orderedCandidates) {
+            emitSource(
+                source,
+                callback
+            )
+        }
+
+        return true
     }
 
     private suspend fun emitSource(
@@ -1262,11 +1372,40 @@ class MovieBox : MainAPI() {
             val window = source.substring(windowStart, windowEnd)
 
             val routeMatch = Regex(
-                """(?i)/(?:film|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._~%=&\-]*)?"""
+                """(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
             ).find(window)
 
-            val candidatePath = routeMatch?.value
-                ?: findBestDetailPath(window, title)?.third?.let { "/film/$it" }
+            val backendMatch = Regex(
+                """(?i)https?://wefeed-h5-bff\.wefeed-prod/detail/([A-Za-z0-9._~%\-]+)"""
+            ).find(window)
+
+            val candidatePath =
+                routeMatch?.value
+                    ?: backendMatch?.groupValues
+                        ?.getOrNull(1)
+                        ?.let { slug ->
+                            when (forcedType) {
+                                TvType.TvSeries ->
+                                    "/tv-series/$slug"
+                                TvType.Anime ->
+                                    "/animated-series/$slug"
+                                else ->
+                                    "/film/$slug"
+                            }
+                        }
+                    ?: findBestDetailPath(
+                        window,
+                        title
+                    )?.third?.let {
+                        when (forcedType) {
+                            TvType.TvSeries ->
+                                "/tv-series/$it"
+                            TvType.Anime ->
+                                "/animated-series/$it"
+                            else ->
+                                "/film/$it"
+                        }
+                    }
 
             if (candidatePath != null) {
                 val detailType = forcedType ?: typeFromPath(candidatePath)
@@ -2236,6 +2375,69 @@ class MovieBox : MainAPI() {
             value.startsWith(
                 "/animated-series/"
             )
+    }
+
+    private fun contentSlug(
+        contentPath: String
+    ): String? {
+
+        val value = contentPath
+            .substringBefore('?')
+            .substringBefore('#')
+            .trimEnd('/')
+
+        if (value.isBlank()) return null
+
+        val path =
+            runCatching {
+                URI(value).rawPath.orEmpty()
+            }.getOrElse {
+                value
+            }
+
+        val slug =
+            path.substringAfterLast('/')
+                .trim()
+
+        return slug
+            .takeIf {
+                it.isNotBlank() &&
+                    !it.equals("film", true) &&
+                    !it.equals("movies", true) &&
+                    !it.equals("play", true) &&
+                    !it.equals("detail", true)
+            }
+    }
+
+    private suspend fun fetchBackendDetailDocument(
+        slug: String
+    ): Document? {
+
+        val endpoint =
+            "$MOVIE_DETAIL_ENDPOINT/$slug"
+
+        return runCatching {
+            val response =
+                app.get(
+                    endpoint,
+                    headers = browserHeaders(
+                        mainUrl + "/"
+                    ) + mapOf(
+                        "Accept" to (
+                            "text/html,application/json," +
+                                "text/plain,*/*;q=0.8"
+                            ),
+                        "Cache-Control" to "no-cache",
+                        "Pragma" to "no-cache"
+                    )
+                )
+
+            if (response.code in 200..399) {
+                response.document
+            } else {
+                null
+            }
+        }.getOrNull()
     }
 
     private fun derivedPlayPath(
