@@ -17,7 +17,7 @@ cloudstream {
         "Anime"
     )
 
-    language = "en"
+    language = "hi"
     isCrossPlatform = false
 
     setRepo(
