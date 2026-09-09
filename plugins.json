@@ -2,7 +2,7 @@
     {
         "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
         "jarFileSize": 234664,
-        "fileHash": "sha256-dadb60ac2257fc072d90f3ca0fc3f8f5c1459becf502ad1f4ec547cef7b465e0",
+        "fileHash": "sha256-0cfd98b7f0860736cf85627bc78fb340fb43d48eb9b25379d8521de2325b241d",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
         "fileSize": 66371,
@@ -22,15 +22,15 @@
         "description": "Cine Plex FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.cs3",
         "name": "CinePlexFTP",
-        "jarHash": "sha256-b91a949ea7b89e3427620f4da576f8fb1ef77a429e4a50118176d43f16394134"
+        "jarHash": "sha256-e69c2a8c845ed0eb8892fbc39c30ec7f2659c7a1e5d8c537dd5af78e6e84a710"
     },
     {
         "iconUrl": "https://flagcdn.com/w320/bd.png",
         "jarFileSize": 151926,
-        "fileHash": "sha256-4d346e037b098bb18ed270cf0a12e918194bf84a04cb25a06185387465b4f866",
+        "fileHash": "sha256-f83ca60be77529ba2ebdaaa2fa8d1347dfcf8a3c4e5bce475c58042768e25e67",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 44917,
+        "fileSize": 44918,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -47,13 +47,13 @@
         "description": "CTG FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.cs3",
         "name": "CTGFTP",
-        "jarHash": "sha256-fcd1395c108131eec1591779cb259446e13440a3d3c9ea9253c14572d55b8f84"
+        "jarHash": "sha256-3ff76b1899ad20e007d5cd4a437a4d70041051542982886bbdb776faec387500"
     },
     {
-        "fileHash": "sha256-e49e97da93bb8523db8be41335a21a58b2ed92dbc4eb8b169cae98c1b0e81954",
+        "fileHash": "sha256-3a5b56b5f58d72ba0cc22d5e393389b8a0f89970d816d1c28d513234b607f2c6",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 26775,
+        "fileSize": 26776,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -72,10 +72,10 @@
     },
     {
         "jarFileSize": 110432,
-        "fileHash": "sha256-44427911eefc4746d1aa58006a5449a3fcdfdce295f90d4f5ff34dfedf7fb235",
+        "fileHash": "sha256-aed9a374f0e18880b91a63b0e2e7f52dca21798944ac6d17982f9f40a549cea0",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 32623,
+        "fileSize": 32634,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -92,15 +92,15 @@
         "description": "Khulna Plex provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.cs3",
         "name": "KhulnaPlex",
-        "jarHash": "sha256-d73b8b997fff7d5973bfbd693fa055b1a6c290a6d42fa91d2c7d26b98f029b43"
+        "jarHash": "sha256-75e8f5a738d7a2c55daf3112033a1a71db8715cc0cd5da840d2cf6b6f499c091"
     },
     {
         "iconUrl": "https://www.mojaloss.stream/favicon.png",
         "jarFileSize": 211467,
-        "fileHash": "sha256-2db3e27811b5df2185a4ff47aae497859ed78fb35793391d46ae216e17782f1e",
+        "fileHash": "sha256-b99916097ad331d0d3c300cbf55123f2084cfca81981747acd9906fd145aed15",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 52985,
+        "fileSize": 52986,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -117,14 +117,13 @@
         "description": "Moja Loss provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.cs3",
         "name": "MojaLoss",
-        "jarHash": "sha256-c2594a5b7fc7bc84b249ae081c4283ac9fc5a383a83b3848439f7aab41311f9d"
+        "jarHash": "sha256-811760aa816306acea1878bd51c9584c2856ffab0e73c7e5f9667c7693ded828"
     },
     {
-        "jarFileSize": 50729,
-        "fileHash": "sha256-6164db1f0614cef676d8316dced60e867fa8060b33369ab5b833aa78d4ff3ef8",
+        "fileHash": "sha256-59c770982719a2c0e4d82d2cc1e5b7b196e816f7994f20821d41bf6580b13d01",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 15416,
+        "fileSize": 39430,
         "status": 1,
         "language": "en",
         "authors": [
@@ -137,19 +136,17 @@
         ],
         "version": 1,
         "internalName": "MovieBox",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.jar",
         "description": "MovieBox provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
-        "name": "MovieBox",
-        "jarHash": "sha256-efaf3611a572fc41205d99a39bfffc42128c897d746d33b6acb83a33f9a61516"
+        "name": "MovieBox"
     },
     {
         "iconUrl": "https://movielinkbd.tv/favicon.png",
         "jarFileSize": 258515,
-        "fileHash": "sha256-25d5741f9a850e9d2561e0d97fdd81e1db63aa2424076bcda389bb6d63181796",
+        "fileHash": "sha256-31140e13fe71ed04506e5eda9acba250c77e5bd38ee184a5f8b7fbe2eec362c9",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 59412,
+        "fileSize": 59402,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -166,14 +163,14 @@
         "description": "Movie Link BD provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.cs3",
         "name": "MovieLinkBD",
-        "jarHash": "sha256-145cc3860ae017149841b1bfa55c09b690d460d2748840d80de422f5339740a3"
+        "jarHash": "sha256-ce84b1c9511281d1c38451e86d484a8e26d35a1655bc597f13c62c7d38db42f4"
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/main/OnlineMovies/icon.png",
-        "fileHash": "sha256-671eb161f6267578a92f2d9c8794eb27b317e10fbbddaae8cd8a7164ae139a1a",
+        "fileHash": "sha256-ffca730811bb5b3a71303d1118d2b3c4fda9f0c3149741af7412857566064258",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 43591,
+        "fileSize": 43598,
         "status": 3,
         "authors": [
             
@@ -185,10 +182,10 @@
     },
     {
         "jarFileSize": 502502,
-        "fileHash": "sha256-4144c9e14548a19162aca1795f47f905e4eff0ab7af458da47f299ce90d0fc51",
+        "fileHash": "sha256-36009fb290dae24da8d7e611b4fec9198bea4abf380d2309724286ae02aae7a4",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 77058,
+        "fileSize": 77046,
         "status": 1,
         "language": "hi",
         "authors": [
@@ -205,15 +202,15 @@
         "description": "YouTube provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
         "name": "YouTube",
-        "jarHash": "sha256-ba7e28bcb8b9126843aad244e360e257f039a462a75bcd6b3c6d8a179c9dff0e"
+        "jarHash": "sha256-6e23e7ce5e048372fa2e9b813184b780feced98bd430890cb599cb2ace75ba49"
     },
     {
         "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
-        "jarFileSize": 285559,
-        "fileHash": "sha256-58650c9488330cf76a9fb12983d5fb0febabadda172bfadcd430a2586df42f99",
+        "jarFileSize": 285569,
+        "fileHash": "sha256-94cb0d143b971c0c81d7c2ad152ce200e453ce3e5e82599ef6040134434b7f06",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 62794,
+        "fileSize": 62809,
         "status": 1,
         "language": "bn-IN",
         "authors": [
@@ -229,6 +226,6 @@
         "description": "Bengali India YouTube Kids provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.cs3",
         "name": "YouTubeKids",
-        "jarHash": "sha256-0e15369cbd03288370fb051f363b9574fe45557c7c8427ab32f1b1d6e1bb3f36"
+        "jarHash": "sha256-7f6e3aa78f8f4560c2383300ddb853487a4a084ecebffb866edfc12635839750"
     }
 ]
