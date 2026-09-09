@@ -120,13 +120,12 @@
         "jarHash": "sha256-811760aa816306acea1878bd51c9584c2856ffab0e73c7e5f9667c7693ded828"
     },
     {
-        "jarFileSize": 152527,
-        "fileHash": "sha256-08c6f9c8b999bfe9cbf0d0e5022edc2d2e644960e4b54e9ca3d917525601ae10",
+        "fileHash": "sha256-7ccc8a5c98c3c92ba15ba49d49d9a2946a987b864931773306154bb64d737daa",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 42694,
+        "fileSize": 49913,
         "status": 1,
-        "language": "en",
+        "language": "hi",
         "authors": [
             "Movie-Flick"
         ],
@@ -137,11 +136,9 @@
         ],
         "version": 1,
         "internalName": "MovieBox",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.jar",
         "description": "MovieBox provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
-        "name": "MovieBox",
-        "jarHash": "sha256-b0c7820b6df2f3e10ecc0c5fcb8237f8bfa0a79ac6974d0840a2285f83b421a4"
+        "name": "MovieBox"
     },
     {
         "iconUrl": "https://movielinkbd.tv/favicon.png",
