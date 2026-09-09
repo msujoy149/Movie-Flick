@@ -1044,7 +1044,7 @@ class MovieBox : MainAPI() {
 
         val titleRegex =
             Regex(
-                """\\<div class=\"video-item[^>]*>.*?\\<span class=\"line-1\">(.*?)\\</span>""",
+                """<div class="video-item[^>]*>.*?<span class="line-1">(.*?)</span>""",
                 setOf(RegexOption.DOT_MATCHES_ALL)
             )
 
@@ -1170,7 +1170,7 @@ class MovieBox : MainAPI() {
 
         val regex =
             Regex(
-                """\"([A-Za-z0-9][A-Za-z0-9._-]{3,}-[A-Za-z0-9]{8,})\""" 
+                "\"([A-Za-z0-9][A-Za-z0-9._-]{3,}-[A-Za-z0-9]{8,})\"" 
             )
 
         var best: Triple<Int, Double, String>? = null
@@ -1219,7 +1219,7 @@ class MovieBox : MainAPI() {
 
         val regex =
             Regex(
-                """https?(?:\\:|:)(?:\\/|/){2}[^\"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^\"'\s]*)?""",
+                """https?:(?:/|\\/){2}[^"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s]*)?""",
                 RegexOption.IGNORE_CASE
             )
 
