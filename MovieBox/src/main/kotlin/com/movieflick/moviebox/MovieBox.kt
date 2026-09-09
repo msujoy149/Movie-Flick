@@ -889,7 +889,7 @@ class MovieBox : MainAPI() {
         if (node.isObject) {
             val hasTitle = node.has("title") || node.has("name")
             val hasId = node.has("subjectId") || node.has("id")
-            if (hasTitle && hasId) out += node
+            if (hasTitle && hasId) out.add(node)
             node.fields().forEachRemaining { (_, child) ->
                 collectJsonObjects(child, out)
             }
@@ -900,26 +900,36 @@ class MovieBox : MainAPI() {
 
     private fun firstUrlFromJsonNode(node: JsonNode?): String? {
         if (node == null) return null
+
         if (node.isTextual) {
             val value = node.asText().trim()
-            if (value.startsWith("http://", true) || value.startsWith("https://", true)) {
-                return value
+            return value.takeIf {
+                it.startsWith("http://", true) || it.startsWith("https://", true)
             }
-            return null
         }
+
         if (node.isObject) {
             val direct = nodeText(node, "url", "src", "href", "path")
-            if (!direct.isNullOrBlank()) {
-                direct.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }?.let { return it }
+            if (!direct.isNullOrBlank() &&
+                (direct.startsWith("http://", true) || direct.startsWith("https://", true))
+            ) {
+                return direct
             }
-            node.fields().forEachRemaining { (_, child) ->
-                firstUrlFromJsonNode(child)?.let { return it }
+
+            val fields = node.fields()
+            while (fields.hasNext()) {
+                val child = fields.next().value
+                val found = firstUrlFromJsonNode(child)
+                if (found != null) return found
             }
         } else if (node.isArray) {
-            node.forEach { child ->
-                firstUrlFromJsonNode(child)?.let { return it }
+            val iterator = node.elements()
+            while (iterator.hasNext()) {
+                val found = firstUrlFromJsonNode(iterator.next())
+                if (found != null) return found
             }
         }
+
         return null
     }
 
@@ -1294,26 +1304,38 @@ class MovieBox : MainAPI() {
         }
     }
 
-    private fun collectApiSubtitles(
+    private suspend fun collectApiSubtitles(
         node: JsonNode?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        fun walk(value: JsonNode?) {
+        suspend fun walk(value: JsonNode?) {
             if (value == null) return
+
             if (value.isObject) {
                 val url = nodeText(value, "url", "subtitleUrl", "src")
                 val language = nodeText(value, "lanName", "language", "name", "lang")
-                if (!url.isNullOrBlank() && (url.contains(".srt", true) || url.contains(".vtt", true))) {
+
+                if (!url.isNullOrBlank() &&
+                    (url.contains(".srt", true) || url.contains(".vtt", true))
+                ) {
                     val absolute = normalizeMediaUrl(url, mainUrl)
                     if (absolute != null) {
                         subtitleCallback(newSubtitleFile(language ?: "Subtitle", absolute))
                     }
                 }
-                value.fields().forEachRemaining { (_, child) -> walk(child) }
+
+                val fields = value.fields()
+                while (fields.hasNext()) {
+                    walk(fields.next().value)
+                }
             } else if (value.isArray) {
-                value.forEach(::walk)
+                val iterator = value.elements()
+                while (iterator.hasNext()) {
+                    walk(iterator.next())
+                }
             }
         }
+
         walk(node)
     }
 
@@ -2026,9 +2048,9 @@ class MovieBox : MainAPI() {
             val height = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
             val width = match.groupValues[3].toIntOrNull() ?: return@mapNotNull null
             val url = match.groupValues[2]
-                .replace("\/", "/")
-                .replace("\:", ":")
-                .replace("\\", "\")
+                .replace("\\/", "/")
+                .replace("\\:", ":")
+                .replace("\\\\", "\\")
             if (url.contains("logo", true) || url.contains("icon", true) || url.contains("avatar", true)) return@mapNotNull null
             val score = when {
                 url.contains("/media/vone/", true) -> 30
@@ -2049,7 +2071,7 @@ class MovieBox : MainAPI() {
         return Regex(
             """https?:(?:/|\\/){2}[^"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s]*)?""",
             RegexOption.IGNORE_CASE
-        ).find(window)?.value?.replace("\/", "/")
+        ).find(window)?.value?.replace("\\/", "/")
     }
 
     private fun unescapeSsrText(
