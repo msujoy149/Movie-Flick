@@ -1,7 +1,6 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    id("com.lagradost.cloudstream3.gradle")
 }
 
 android {
@@ -35,6 +34,5 @@ cloudstream {
 }
 
 dependencies {
-    implementation("com.github.Blatzar:NiceHttp:0.4.11")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
