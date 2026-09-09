@@ -970,6 +970,25 @@ class MovieBox : MainAPI() {
         forcedType: TvType
     ): List<SiteItem> {
 
+        /*
+         * Current MovieBox is a Nuxt SSR application. Its visible cards
+         * are emitted as escaped `video-item` HTML inside __NUXT_DATA__.
+         * The old .movie-card/.flw-item selectors therefore return an
+         * empty list on the current website.
+         *
+         * Parse the current SSR structure first. Keep the legacy CSS
+         * parser as a fallback for older layouts/mirrors.
+         */
+        val nuxtItems =
+            parseNuxtListing(
+                document,
+                forcedType
+            )
+
+        if (nuxtItems.isNotEmpty()) {
+            return nuxtItems
+        }
+
         val selectors =
             listOf(
                 ".movie-card",
@@ -981,9 +1000,7 @@ class MovieBox : MainAPI() {
         return selectors
             .asSequence()
             .flatMap {
-                document.select(
-                    it
-                ).asSequence()
+                document.select(it).asSequence()
             }
             .distinctBy {
                 it.outerHtml()
@@ -995,6 +1012,239 @@ class MovieBox : MainAPI() {
                 )
             }
             .toList()
+    }
+
+    private fun parseNuxtListing(
+        document: Document,
+        forcedType: TvType
+    ): List<SiteItem> {
+
+        val source = document.html()
+        if (source.isBlank()) return emptyList()
+
+        val payloadMarkers =
+            listOf(
+                "id=\"__NUXT_DATA__\"",
+                "id=\"\\_\\_NUXT_DATA\\_\\_\""
+            )
+
+        val payloadStart =
+            payloadMarkers
+                .map { marker ->
+                    source.indexOf(
+                        marker,
+                        ignoreCase = true
+                    )
+                }
+                .filter { it >= 0 }
+                .minOrNull()
+                ?: -1
+
+        if (payloadStart < 0) return emptyList()
+
+        val titleRegex =
+            Regex(
+                """\\<div class=\"video-item[^>]*>.*?\\<span class=\"line-1\">(.*?)\\</span>""",
+                setOf(RegexOption.DOT_MATCHES_ALL)
+            )
+
+        val domTitles =
+            document
+                .select(
+                    "div.video-item span.line-1"
+                )
+                .mapNotNull { element ->
+                    cleanTitle(
+                        element.text()
+                    ).takeIf { it.isNotBlank() }
+                }
+
+        val titles =
+            if (domTitles.isNotEmpty()) {
+                domTitles
+            } else {
+                titleRegex
+                    .findAll(source)
+                    .mapNotNull { match ->
+                        cleanTitle(
+                            unescapeSsrText(
+                                match.groupValues[1]
+                            )
+                        ).takeIf { it.isNotBlank() }
+                    }
+                    .toList()
+            }
+
+        if (titles.isEmpty()) return emptyList()
+
+        return titles.mapNotNull { title ->
+            resolveNuxtSiteItem(
+                source,
+                payloadStart,
+                title,
+                forcedType
+            )
+        }
+    }
+
+    private fun resolveNuxtSiteItem(
+        source: String,
+        payloadStart: Int,
+        title: String,
+        forcedType: TvType
+    ): SiteItem? {
+
+        val escapedTitle =
+            title
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+
+        val titleToken = "\"$escapedTitle\""
+
+        var searchFrom = payloadStart
+        var best: SiteItem? = null
+        var bestScore = -1.0
+
+        while (true) {
+            val titleIndex =
+                source.indexOf(
+                    titleToken,
+                    searchFrom
+                )
+
+            if (titleIndex < 0) break
+
+            val windowStart =
+                max(payloadStart, titleIndex - 5000)
+
+            val window =
+                source.substring(
+                    windowStart,
+                    titleIndex
+                )
+
+            val detailCandidate =
+                findBestDetailPath(
+                    window,
+                    title
+                )
+
+            if (detailCandidate != null) {
+                val detailIndex =
+                    windowStart + detailCandidate.first
+
+                val poster =
+                    findNearestPoster(
+                        source,
+                        windowStart,
+                        detailIndex
+                    )
+
+                val score = detailCandidate.second
+
+                if (score > bestScore) {
+                    bestScore = score
+                    best = SiteItem(
+                        title = title,
+                        url = canonicalUrl(
+                            "/film/${detailCandidate.third}"
+                        ),
+                        poster = poster,
+                        type = forcedType,
+                        languageRank = languageRank(title)
+                    )
+                }
+            }
+
+            searchFrom =
+                titleIndex + titleToken.length
+        }
+
+        return best
+    }
+
+    private fun findBestDetailPath(
+        window: String,
+        title: String
+    ): Triple<Int, Double, String>? {
+
+        val regex =
+            Regex(
+                """\"([A-Za-z0-9][A-Za-z0-9._-]{3,}-[A-Za-z0-9]{8,})\""" 
+            )
+
+        var best: Triple<Int, Double, String>? = null
+
+        for (match in regex.findAll(window)) {
+            val candidate = match.groupValues[1]
+
+            if (candidate.startsWith("http", true)) continue
+
+            val slugBase =
+                candidate
+                    .replace(
+                        Regex("-[A-Za-z0-9]{8,}$"),
+                        ""
+                    )
+                    .replace('-', ' ')
+                    .replace('_', ' ')
+
+            val score = searchScore(title, slugBase)
+            if (score < 0.70) continue
+
+            val result =
+                Triple(
+                    match.range.first,
+                    score,
+                    candidate
+                )
+
+            if (best == null || score > best!!.second) {
+                best = result
+            }
+        }
+
+        return best
+    }
+
+    private fun findNearestPoster(
+        source: String,
+        start: Int,
+        end: Int
+    ): String? {
+
+        if (end <= start) return null
+
+        val window = source.substring(start, end)
+
+        val regex =
+            Regex(
+                """https?(?:\\:|:)(?:\\/|/){2}[^\"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^\"'\s]*)?""",
+                RegexOption.IGNORE_CASE
+            )
+
+        val match =
+            regex.findAll(window)
+                .lastOrNull()
+                ?.value
+                ?: return null
+
+        return match
+            .replace("\\/", "/")
+            .replace("\\:", ":")
+            .replace("\\\\", "\\")
+    }
+
+    private fun unescapeSsrText(
+        value: String
+    ): String {
+        return value
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("\\/", "/")
     }
 
     private fun parseSearchCard(
