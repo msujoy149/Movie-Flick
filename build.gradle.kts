@@ -80,10 +80,6 @@ subprojects {
     dependencies {
         val implementation by configurations
 
-        implementation(
-            "com.github.recloudstream.cloudstream:library:-SNAPSHOT"
-        )
-
         implementation(kotlin("stdlib"))
 
         implementation(
