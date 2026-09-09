@@ -1,4 +1,3 @@
-```kotlin
 package com.movieflick.moviebox
 
 import android.content.Context
@@ -11,4 +10,3 @@ class MovieBoxPlugin : Plugin() {
         registerMainAPI(MovieBox())
     }
 }
-```
