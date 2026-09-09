@@ -26,7 +26,7 @@ class MovieBox : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/ranking-list?id=997144265920760504&page_from=more_SUBJECTS_MOVIE" to POPULAR,
+        "$mainUrl" to POPULAR,
         "$mainUrl/film" to MOVIES,
         "$mainUrl/tv-series" to TV_SHOW,
         "$mainUrl/animated-series" to ANIME
@@ -79,7 +79,9 @@ class MovieBox : MainAPI() {
         val url: String,
         val quality: Int,
         val label: String,
-        val referer: String
+        val referer: String,
+        val declaredSize: Long = -1L,
+        val declaredDurationSeconds: Long = -1L
     )
 
     private fun browserHeaders(
@@ -135,12 +137,35 @@ class MovieBox : MainAPI() {
             }
 
             val sortedItems = sortHomeItems(rankingItems)
-            val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
+
+            val pageItems =
+                if (currentPage == 1) {
+                    interleaveBySourceType(
+                        sortedItems
+                    ).take(
+                        HOME_INITIAL_LIMIT
+                    )
+                } else {
+                    sortedItems
+                        .drop(
+                            (currentPage - 1) *
+                                HOME_PAGE_LIMIT
+                        )
+                        .take(
+                            HOME_PAGE_LIMIT
+                        )
+                }
 
             return newHomePageResponse(
                 data = request,
-                list = sortedItems.take(limit).map { it.toSearchResponse() },
-                hasNext = sortedItems.size > limit
+                list = pageItems.map { it.toSearchResponse() },
+                hasNext = rankingItems.size > (
+                    if (currentPage == 1) {
+                        HOME_INITIAL_LIMIT
+                    } else {
+                        currentPage * HOME_PAGE_LIMIT
+                    }
+                )
             )
         }
 
@@ -182,6 +207,68 @@ class MovieBox : MainAPI() {
     private fun sortHomeItems(items: List<SiteItem>): List<SiteItem> {
         // Keep the website ranking/order intact on home/category pages.
         return items
+    }
+
+    private fun interleaveBySourceType(
+        items: List<SiteItem>
+    ): List<SiteItem> {
+        if (items.size < 2) return items
+
+        val movies =
+            items.filter {
+                it.type == TvType.Movie || it.type == TvType.Anime
+            }
+
+        val series =
+            items.filter {
+                it.type == TvType.TvSeries
+            }
+
+        if (movies.isEmpty() || series.isEmpty()) {
+            return items
+        }
+
+        val result = ArrayList<SiteItem>(
+            min(
+                items.size,
+                HOME_INITIAL_LIMIT * 2
+            )
+        )
+
+        var movieIndex = 0
+        var seriesIndex = 0
+
+        while (
+            movieIndex < movies.size ||
+            seriesIndex < series.size
+        ) {
+            repeat(2) {
+                if (movieIndex < movies.size) {
+                    result += movies[movieIndex++]
+                }
+            }
+
+            if (seriesIndex < series.size) {
+                result += series[seriesIndex++]
+            }
+
+            if (result.size >= items.size) break
+        }
+
+        val used =
+            result.mapTo(
+                HashSet()
+            ) {
+                contentKey(it.url)
+            }
+
+        items.forEach { item ->
+            if (used.add(contentKey(item.url))) {
+                result += item
+            }
+        }
+
+        return result
     }
 
     /*
@@ -885,10 +972,31 @@ class MovieBox : MainAPI() {
 
         fun collect(source: MediaSource) {
             if (!looksLikePlayableMedia(source.url)) return
-            mediaCandidates.putIfAbsent(
-                source.url,
-                source
-            )
+
+            val existing = mediaCandidates[source.url]
+            if (existing == null) {
+                mediaCandidates[source.url] = source
+            } else {
+                val betterSize =
+                    if (source.declaredSize > existing.declaredSize) {
+                        source.declaredSize
+                    } else {
+                        existing.declaredSize
+                    }
+
+                val betterDuration =
+                    if (source.declaredDurationSeconds > existing.declaredDurationSeconds) {
+                        source.declaredDurationSeconds
+                    } else {
+                        existing.declaredDurationSeconds
+                    }
+
+                mediaCandidates[source.url] =
+                    existing.copy(
+                        declaredSize = betterSize,
+                        declaredDurationSeconds = betterDuration
+                    )
+            }
         }
 
         /*
@@ -1028,15 +1136,24 @@ class MovieBox : MainAPI() {
                         it.url
                     )
                 }
-                .sortedWith(
-                    compareByDescending<MediaSource> {
-                        it.quality
-                    }.thenBy {
-                        it.label
-                    }
-                )
+                .filterNot {
+                    isObviousTrailerOrPreview(it.url)
+                }
+                .toList()
 
-        if (orderedCandidates.isEmpty()) {
+        val usableCandidates =
+            if (orderedCandidates.isNotEmpty()) {
+                orderedCandidates
+            } else {
+                mediaCandidates.values
+                    .filter {
+                        looksLikePlayableMedia(
+                            it.url
+                        )
+                    }
+            }
+
+        if (usableCandidates.isEmpty()) {
             /*
              * A response can contain player configuration that points to
              * another public page but not yet contain the signed CDN URL.
@@ -1046,12 +1163,46 @@ class MovieBox : MainAPI() {
             return false
         }
 
-        for (source in orderedCandidates) {
-            emitSource(
-                source,
-                callback
-            )
-        }
+        /*
+         * IMPORTANT:
+         * MovieBox pages can expose several media files. Some are previews,
+         * low-definition clips, or alternate resources. We do not emit all
+         * candidates anymore.
+         *
+         * Prefer the resource with the largest declared file size. On
+         * MovieBox's Nuxt/devalue payload, videoAddress resources expose
+         * duration and size alongside the media URL. Duration is only a
+         * secondary tie-breaker so a larger full file wins over a small
+         * preview/trailer.
+         *
+         * We intentionally do not download media just to measure it.
+         */
+        val rankedCandidates =
+            usableCandidates
+                .sortedWith(
+                    compareByDescending<MediaSource> {
+                        it.declaredSize
+                    }
+                        .thenByDescending {
+                            it.declaredDurationSeconds
+                        }
+                        .thenByDescending {
+                            it.quality
+                        }
+                        .thenBy {
+                            it.url
+                        }
+                )
+
+        val best =
+            rankedCandidates
+                .firstOrNull()
+                ?: return false
+
+        emitSource(
+            best,
+            callback
+        )
 
         return true
     }
@@ -1071,6 +1222,26 @@ class MovieBox : MainAPI() {
                 referer = source.referer
             }
         )
+    }
+
+    private fun isObviousTrailerOrPreview(
+        url: String
+    ): Boolean {
+        val value =
+            url.lowercase(
+                Locale.ROOT
+            )
+
+        return listOf(
+            "trailer",
+            "teaser",
+            "preview",
+            "sample",
+            "clip",
+            "promo"
+        ).any {
+            value.contains(it)
+        }
     }
 
     private fun extractJsonLdUrls(
@@ -1119,9 +1290,42 @@ class MovieBox : MainAPI() {
         scriptRegex.findAll(html).forEach { match ->
             val block = match.groupValues[1]
             Regex(
+                """(?is)"contentUrl"\s*:\s*"([^"]+)".{0,900}?"duration"\s*:\s*"?(?:PT)?(\d+(?:\.\d+)?)"""
+            ).findAll(block).forEach { media ->
+                val url =
+                    normalizeMediaUrl(
+                        media.groupValues[1],
+                        pageUrl
+                    ) ?: return@forEach
+
+                val duration =
+                    media.groupValues
+                        .getOrNull(2)
+                        ?.toDoubleOrNull()
+                        ?.toLong()
+                        ?: -1L
+
+                found.putIfAbsent(
+                    url,
+                    MediaSource(
+                        url = url,
+                        quality = qualityFromText(url),
+                        label = "MovieBox Stream",
+                        referer = pageUrl,
+                        declaredDurationSeconds = duration
+                    )
+                )
+            }
+
+            Regex(
                 """(?i)"contentUrl"\s*:\s*"([^"]+)"""
             ).findAll(block).forEach { media ->
-                val url = normalizeMediaUrl(media.groupValues[1], pageUrl) ?: return@forEach
+                val url =
+                    normalizeMediaUrl(
+                        media.groupValues[1],
+                        pageUrl
+                    ) ?: return@forEach
+
                 found.putIfAbsent(
                     url,
                     MediaSource(
@@ -1144,18 +1348,69 @@ class MovieBox : MainAPI() {
     ): List<MediaSource> {
         val found = linkedMapOf<String, MediaSource>()
 
-        fun add(raw: String?, label: String) {
+        fun add(
+            raw: String?,
+            label: String,
+            sourceContext: String = ""
+        ) {
             if (raw.isNullOrBlank()) return
-            val url = normalizeMediaUrl(raw, pageUrl) ?: return
-            if (url.contains("youtube.com", true) || url.contains("youtu.be", true)) return
+
+            val url =
+                normalizeMediaUrl(
+                    raw,
+                    pageUrl
+                ) ?: return
+
+            if (
+                url.contains("youtube.com", true) ||
+                url.contains("youtu.be", true)
+            ) {
+                return
+            }
+
+            val nearby =
+                if (sourceContext.isBlank()) {
+                    ""
+                } else {
+                    sourceContext
+                }
+
+            val declaredSize =
+                Regex(
+                    """(?i)"(?:size|fileSize|contentLength)"\s*:\s*(\d{4,})"""
+                )
+                    .find(nearby)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toLongOrNull()
+                    ?: -1L
+
+            val declaredDuration =
+                Regex(
+                    """(?i)"duration(?:Seconds)?"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"""
+                )
+                    .find(nearby)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toDoubleOrNull()
+                    ?.toLong()
+                    ?: -1L
+
             found.putIfAbsent(
                 url,
-                MediaSource(url, qualityFromText(url), label, pageUrl)
+                MediaSource(
+                    url = url,
+                    quality = qualityFromText(url),
+                    label = label,
+                    referer = pageUrl,
+                    declaredSize = declaredSize,
+                    declaredDurationSeconds = declaredDuration
+                )
             )
         }
 
         document.select("video[src], video source[src], source[src]").forEach { element ->
-            add(firstNonBlank(element.attr("src"), element.attr("data-src")), "MovieBox Direct")
+            add(firstNonBlank(element.attr("src"), element.attr("data-src")), "MovieBox Direct", element.parent()?.parent()?.outerHtml().orEmpty())
         }
 
         document.select("[data-src], [data-file], [data-video], [data-url], [data-source], [data-stream], [data-hls]").forEach { element ->
@@ -1181,15 +1436,40 @@ class MovieBox : MainAPI() {
         Regex(
             """https?://[^"'<>\s]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"'<>\s]*)?""",
             RegexOption.IGNORE_CASE
-        ).findAll(decoded).forEach { add(it.value, "MovieBox Direct") }
+        ).findAll(decoded).forEach { match ->
+            val context =
+                decoded.substring(
+                    max(0, match.range.first - 900),
+                    min(
+                        decoded.length,
+                        match.range.last + 900
+                    )
+                )
+
+            add(
+                match.value,
+                "MovieBox Direct",
+                context
+            )
+        }
 
         // Serialized SSR state can carry the current source URL.
         Regex(
             """(?i)\"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|contentUrl|mediaUrl|url)\"\s*:\s*\"((?:https?:)?//[^\"]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"]*)?)\""""
         ).findAll(decoded).forEach { match ->
+            val context =
+                decoded.substring(
+                    max(0, match.range.first - 900),
+                    min(
+                        decoded.length,
+                        match.range.last + 900
+                    )
+                )
+
             add(
                 match.groupValues[1],
-                "MovieBox State"
+                "MovieBox State",
+                context
             )
         }
 
@@ -1201,10 +1481,118 @@ class MovieBox : MainAPI() {
         Regex(
             """https?://[^"'<>\s]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"'<>\s]*)?"""
         ).findAll(decoded).forEach { match ->
+            val context =
+                decoded.substring(
+                    max(0, match.range.first - 1400),
+                    min(
+                        decoded.length,
+                        match.range.last + 1400
+                    )
+                )
+
             add(
                 match.value,
-                "MovieBox CDN"
+                "MovieBox CDN",
+                context
             )
+        }
+
+        /*
+         * Devalue/Nuxt serialization often places:
+         * videoId, definition, url, duration, width, height, size...
+         * together in one object. The absolute-URL scan above finds the media
+         * URL; this supplemental pass enriches that exact URL with duration
+         * and size when the surrounding serialized object exposes them.
+         */
+        Regex(
+            """(?is)\{"videoId":[^}]{0,1200}?"url":"(https?://[^"]+?\.(?:mp4|m3u8|m4v|webm|mov|mkv|ts)(?:\?[^"]*)?)"[^}]{0,1200}?("duration":\s*\d+(?:\.\d+)?)?[^}]{0,300}?"size":\s*(\d+)"""
+        ).findAll(decoded).forEach { match ->
+            val url =
+                normalizeMediaUrl(
+                    match.groupValues[1],
+                    pageUrl
+                ) ?: return@forEach
+
+            val duration =
+                Regex(
+                    """(?i)"duration"\s*:\s*([0-9]+(?:\.[0-9]+)?)"""
+                )
+                    .find(match.value)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toDoubleOrNull()
+                    ?.toLong()
+                    ?: -1L
+
+            val size =
+                match.groupValues
+                    .getOrNull(3)
+                    ?.toLongOrNull()
+                    ?: -1L
+
+            found[url] =
+                MediaSource(
+                    url = url,
+                    quality = qualityFromText(url),
+                    label = "MovieBox Resource",
+                    referer = pageUrl,
+                    declaredSize = size,
+                    declaredDurationSeconds = duration
+                )
+        }
+
+        /*
+         * Current MovieBox SSR uses devalue-style references. A typical
+         * videoAddress resource is serialized as:
+         *
+         * {"videoId":...,"definition":...,"url":...,"duration":...,
+         *  "width":...,"height":...,"size":...},"video-id",
+         *  "https://...mp4",94,640,360,2368261
+         *
+         * The media URL is immediately followed by its duration/size values.
+         * Capture those values so we can select the full-size resource instead
+         * of accidentally returning a short preview.
+         */
+        Regex(
+            """(?is)\{"videoId":\d+,"definition":\d+,"url":\d+,"duration":\d+,"width":\d+,"height":\d+,"size":\d+[^}]*\},"[^"]*","(https?://[^"]+?\.(?:m3u8|mp4|m4v|webm|mov|mkv|ts)(?:\?[^"]*)?)",(\d+),(\d+),(\d+),(\d+)"""
+        ).findAll(decoded).forEach { match ->
+            val url =
+                normalizeMediaUrl(
+                    match.groupValues[1],
+                    pageUrl
+                ) ?: return@forEach
+
+            val duration =
+                match.groupValues[2]
+                    .toLongOrNull()
+                    ?: -1L
+
+            val size =
+                match.groupValues[5]
+                    .toLongOrNull()
+                    ?: -1L
+
+            val existing =
+                found[url]
+
+            found[url] =
+                (existing ?: MediaSource(
+                    url = url,
+                    quality = qualityFromText(url),
+                    label = "MovieBox Resource",
+                    referer = pageUrl
+                )).copy(
+                    declaredSize =
+                        max(
+                            existing?.declaredSize ?: -1L,
+                            size
+                        ),
+                    declaredDurationSeconds =
+                        max(
+                            existing?.declaredDurationSeconds ?: -1L,
+                            duration
+                        )
+                )
         }
 
         return found.values.toList()
@@ -1387,13 +1775,44 @@ class MovieBox : MainAPI() {
             val windowEnd = min(source.length, titleIndex + titleToken.length + 8000)
             val window = source.substring(windowStart, windowEnd)
 
-            val routeMatch = Regex(
-                """(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            ).find(window)
+            val routePatterns =
+                when (forcedType) {
+                    TvType.TvSeries -> listOf(
+                        Regex("""(?i)/tv-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
 
-            val backendMatch = Regex(
-                """(?i)https?://wefeed-h5-bff\.wefeed-prod/detail/([A-Za-z0-9._~%\-]+)"""
-            ).find(window)
+                    TvType.Anime -> listOf(
+                        Regex("""(?i)/animated-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    TvType.Movie -> listOf(
+                        Regex("""(?i)/film/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""),
+                        Regex("""(?i)/movies/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    null -> listOf(
+                        Regex("""(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    else -> emptyList()
+                }
+
+            val routeMatch =
+                routePatterns
+                    .asSequence()
+                    .mapNotNull { pattern ->
+                        pattern.find(window)
+                    }
+                    .firstOrNull()
+
+            val backendMatch =
+                if (forcedType == null) {
+                    Regex(
+                        """(?i)https?://wefeed-h5-bff\.wefeed-prod/detail/([A-Za-z0-9._~%\-]+)"""
+                    ).find(window)
+                } else {
+                    null
+                }
 
             val candidatePath =
                 routeMatch?.value
@@ -1403,8 +1822,10 @@ class MovieBox : MainAPI() {
                             when (forcedType) {
                                 TvType.TvSeries ->
                                     "/tv-series/$slug"
+
                                 TvType.Anime ->
                                     "/animated-series/$slug"
+
                                 else ->
                                     "/film/$slug"
                             }
@@ -1425,6 +1846,16 @@ class MovieBox : MainAPI() {
 
             if (candidatePath != null) {
                 val detailType = forcedType ?: typeFromPath(candidatePath)
+
+                if (
+                    forcedType != null &&
+                    detailType != forcedType
+                ) {
+                    searchFrom =
+                        titleIndex + titleToken.length
+                    continue
+                }
+
                 val slugTitle = candidatePath
                     .substringAfterLast('/')
                     .replace('-', ' ')
@@ -1503,26 +1934,176 @@ class MovieBox : MainAPI() {
         end: Int
     ): String? {
 
-        if (end <= start) return null
+        val windowStart =
+            max(
+                0,
+                start - 9000
+            )
 
-        val window = source.substring(start, end)
+        val windowEnd =
+            min(
+                source.length,
+                end + 3500
+            )
 
+        if (windowEnd <= windowStart) return null
+
+        val window =
+            source.substring(
+                windowStart,
+                windowEnd
+            )
+
+        data class PosterCandidate(
+            val url: String,
+            val width: Int,
+            val height: Int,
+            val assetScore: Int,
+            val distance: Int
+        )
+
+        /*
+         * MovieBox's Nuxt/devalue media objects commonly serialize the poster
+         * dimensions around the image URL:
+         *
+         * "jpg",HEIGHT,SIZE,"URL",WIDTH
+         *
+         * This lets us prefer a true portrait cover over a landscape banner or
+         * thumbnail, which is what was causing the first Movie/TV cards to
+         * render shorter than the other poster cards.
+         */
+        val dimensionRegex =
+            Regex(
+                """(?is)"(?:jpg|jpeg|png|webp)",(\d{3,5}),\d{2,10},"(https?://[^"]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)",(\d{3,5})"""
+            )
+
+        val dimensionCandidates =
+            dimensionRegex
+                .findAll(window)
+                .mapNotNull { match ->
+                    val height =
+                        match.groupValues[1]
+                            .toIntOrNull()
+                            ?: return@mapNotNull null
+
+                    val width =
+                        match.groupValues[3]
+                            .toIntOrNull()
+                            ?: return@mapNotNull null
+
+                    val rawUrl =
+                        match.groupValues[2]
+
+                    val url =
+                        rawUrl
+                            .replace("\\/", "/")
+                            .replace("\\:", ":")
+                            .replace("\\\\", "\\")
+
+                    if (
+                        url.contains("logo", true) ||
+                        url.contains("icon", true) ||
+                        url.contains("avatar", true)
+                    ) {
+                        return@mapNotNull null
+                    }
+
+                    val assetScore =
+                        when {
+                            url.contains("/media/vone/", true) -> 30
+                            url.contains("/image/", true) -> 20
+                            else -> 10
+                        }
+
+                    PosterCandidate(
+                        url = url,
+                        width = width,
+                        height = height,
+                        assetScore = assetScore,
+                        distance =
+                            kotlin.math.abs(
+                                (windowStart + match.range.first) - end
+                            )
+                    )
+                }
+                .toList()
+
+        if (dimensionCandidates.isNotEmpty()) {
+            return dimensionCandidates
+                .sortedWith(
+                    compareByDescending<PosterCandidate> {
+                        when {
+                            it.height >= it.width * 1.05 -> 40
+                            it.height >= it.width -> 25
+                            else -> 5
+                        }
+                    }
+                        .thenByDescending {
+                            it.assetScore
+                        }
+                        .thenBy {
+                            it.distance
+                        }
+                )
+                .first()
+                .url
+        }
+
+        /*
+         * Fallback for pages where dimension metadata is not serialized.
+         */
         val regex =
             Regex(
-                """https?:(?:/|\\/){2}[^"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s]*)?""",
+                """https?:(?:/|\\/){2}[^"'<>\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'<>\s]*)?""",
                 RegexOption.IGNORE_CASE
             )
 
-        val match =
+        val candidates =
             regex.findAll(window)
-                .lastOrNull()
-                ?.value
-                ?: return null
+                .map { match ->
+                    val raw = match.value
 
-        return match
-            .replace("\\/", "/")
-            .replace("\\:", ":")
-            .replace("\\\\", "\\")
+                    val normalized =
+                        raw
+                            .replace("\\/", "/")
+                            .replace("\\:", ":")
+                            .replace("\\\\", "\\")
+
+                    val score =
+                        when {
+                            normalized.contains("/media/vone/", true) -> 30
+                            normalized.contains("/image/", true) -> 20
+                            else -> 10
+                        }
+
+                    PosterCandidate(
+                        url = normalized,
+                        width = 0,
+                        height = 0,
+                        assetScore = score,
+                        distance =
+                            kotlin.math.abs(
+                                (windowStart + match.range.first) - end
+                            )
+                    )
+                }
+                .filter {
+                    !it.url.contains("logo", true) &&
+                        !it.url.contains("icon", true) &&
+                        !it.url.contains("avatar", true)
+                }
+                .toList()
+
+        return candidates
+            .sortedWith(
+                compareByDescending<PosterCandidate> {
+                    it.assetScore
+                }.thenBy {
+                    it.distance
+                }
+            )
+            .firstOrNull()
+            ?.url
     }
 
     private fun unescapeSsrText(
@@ -2150,11 +2731,19 @@ class MovieBox : MainAPI() {
                 add(normalized)
 
                 /*
-                 * Force a fresh HTML response as well. This is important for
-                 * MovieBox because the page may contain newly generated
-                 * playback/session information.
+                 * Listing pages should load quickly and may be cached safely.
+                 * Fresh cache-busting is reserved for player/detail flows, where
+                 * session/media state can change.
                  */
-                add(addCacheBuster(normalized))
+                if (
+                    normalized.contains("/play/", true) ||
+                    normalized.startsWith("/film/", true) ||
+                    normalized.startsWith("/movies/", true) ||
+                    normalized.startsWith("/tv-series/", true) ||
+                    normalized.startsWith("/animated-series/", true)
+                ) {
+                    add(addCacheBuster(normalized))
+                }
 
                 if (
                     normalized != "/" &&
