@@ -1,12 +1,12 @@
 package com.movieflick.moviebox
 
-import com.lagradost.cloudstream3.plugins.BasePlugin
+import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class MovieBoxPlugin : BasePlugin() {
-
-    override fun load() {
+class MovieBoxPlugin : Plugin() {
+    override fun load(context: Context) {
         registerMainAPI(MovieBox())
     }
 }
