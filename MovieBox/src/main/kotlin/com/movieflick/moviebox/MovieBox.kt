@@ -717,88 +717,181 @@ class MovieBox : MainAPI() {
         if (rawData.isBlank()) return false
 
         val separator = rawData.indexOf("||")
-        val pageUrl = if (separator >= 0) rawData.substring(0, separator) else rawData
+        val pageUrl =
+            if (separator >= 0) {
+                rawData.substring(0, separator)
+            } else {
+                rawData
+            }
+
         val pagePath = pathFromUrl(pageUrl)
         if (pagePath.isBlank()) return false
 
-        val freshHeaders = browserHeaders(mainUrl + pagePath) +
-            ("X-Requested-With" to "XMLHttpRequest")
+        /*
+         * MovieBox generates/serves media information dynamically.
+         *
+         * Do not keep a media URL or token in provider state.
+         * Every playback attempt starts again from the current detail page,
+         * discovers the current /play/... page and extracts the current media
+         * URL from that fresh response.
+         *
+         * A few retries are intentional because the first request can race
+         * the site's player/session generation.
+         */
+        val maxAttempts = 8
 
-        val detailResponse = runCatching {
-            app.get(
-                canonicalUrl(pagePath),
-                headers = freshHeaders
-            )
-        }.getOrNull() ?: return false
+        repeat(maxAttempts) { attempt ->
 
-        val detailHtml = detailResponse.text
-        val detailDocument = detailResponse.document
+            if (attempt > 0) {
+                kotlinx.coroutines.delay(250L * attempt)
+            }
 
-        val candidatePlayUrls = linkedSetOf<String>()
-        candidatePlayUrls += extractJsonLdUrls(detailHtml)
-
-        val directCandidates = extractMediaSources(
-            document = detailDocument,
-            pageUrl = canonicalUrl(pagePath),
-            html = detailHtml
-        )
-
-        var emitted = false
-
-        // Prefer fresh direct media from the current page.
-        for (source in directCandidates) {
-            if (!looksLikePlayableMedia(source.url)) continue
-            emitSource(source, callback)
-            emitted = true
-        }
-
-        // Then follow the site's own freshly generated /play/... URL.
-        for (playUrl in candidatePlayUrls) {
-            val watch = runCatching {
+            val detailResponse = runCatching {
                 app.get(
-                    playUrl,
-                    headers = browserHeaders(pageUrl) + ("Referer" to canonicalUrl(pagePath))
+                    canonicalUrl(addCacheBuster(pagePath)),
+                    headers = browserHeaders(
+                        canonicalUrl(pagePath)
+                    ) + mapOf(
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Cache-Control" to "no-cache",
+                        "Pragma" to "no-cache"
+                    )
                 )
-            }.getOrNull() ?: continue
+            }.getOrNull() ?: return@repeat
 
-            val sources = extractMediaSources(
-                document = watch.document,
-                pageUrl = playUrl,
-                html = watch.text
-            )
-
-            for (source in sources) {
-                if (!looksLikePlayableMedia(source.url)) continue
-                emitSource(source, callback)
-                emitted = true
+            if (detailResponse.code !in 200..399) {
+                return@repeat
             }
 
-            extractSubtitles(watch.document).forEach { subtitle ->
-                subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
-            }
-        }
+            val detailHtml = detailResponse.text
+            val detailDocument = detailResponse.document
+            val detailUrl = canonicalUrl(pagePath)
 
-        // Final fallback: some MovieBox pages expose a public `contentUrl`
-        // in JSON-LD. Use the freshly fetched value only when the player page
-        // did not expose a better playable source.
-        if (!emitted) {
+            val mediaCandidates = linkedMapOf<String, MediaSource>()
+
+            fun collect(source: MediaSource) {
+                if (!looksLikePlayableMedia(source.url)) return
+                mediaCandidates.putIfAbsent(source.url, source)
+            }
+
+            /*
+             * 1) The page's own JSON-LD can expose contentUrl/embedUrl.
+             * 2) The SSR/Nuxt payload can expose the current video URL.
+             * 3) The rendered HTML can contain direct .mp4/.m3u8 links.
+             */
             extractJsonLdMedia(
                 html = detailHtml,
-                pageUrl = canonicalUrl(pagePath)
-            ).forEach { source ->
-                if (!looksLikePlayableMedia(source.url)) return@forEach
-                emitSource(source, callback)
-                emitted = true
+                pageUrl = detailUrl
+            ).forEach(::collect)
+
+            extractMediaSources(
+                document = detailDocument,
+                pageUrl = detailUrl,
+                html = detailHtml
+            ).forEach(::collect)
+
+            /*
+             * The site also exposes its own /play/... route. Fetch that
+             * fresh on every attempt, then inspect that fresh player page.
+             */
+            val playUrls = linkedSetOf<String>()
+            playUrls += extractJsonLdUrls(detailHtml)
+
+            Regex(
+                """(?i)https?://[^"'<>\s]+/play/[^"'<>\s]+"""
+            ).findAll(
+                detailHtml
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+            ).forEach { match ->
+                playUrls += match.value
+            }
+
+            Regex(
+                """(?i)"(/play/[^"]+)"""
+            ).findAll(
+                detailHtml
+            ).forEach { match ->
+                playUrls += absoluteUrl(
+                    match.groupValues[1]
+                )
+            }
+
+            for (playUrl in playUrls) {
+
+                val watchResponse = runCatching {
+                    app.get(
+                        addCacheBuster(playUrl),
+                        headers = browserHeaders(detailUrl) + mapOf(
+                            "Referer" to detailUrl,
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Cache-Control" to "no-cache",
+                            "Pragma" to "no-cache"
+                        )
+                    )
+                }.getOrNull() ?: continue
+
+                if (watchResponse.code !in 200..399) {
+                    continue
+                }
+
+                val watchHtml = watchResponse.text
+
+                extractJsonLdMedia(
+                    html = watchHtml,
+                    pageUrl = playUrl
+                ).forEach(::collect)
+
+                extractMediaSources(
+                    document = watchResponse.document,
+                    pageUrl = playUrl,
+                    html = watchHtml
+                ).forEach(::collect)
+
+                extractSubtitles(
+                    watchResponse.document
+                ).forEach { subtitle ->
+                    subtitleCallback(
+                        newSubtitleFile(
+                            subtitle.first,
+                            subtitle.second
+                        )
+                    )
+                }
+            }
+
+            /*
+             * Prefer higher quality. In case several fresh URLs are found,
+             * emit all valid candidates once, best quality first.
+             */
+            val orderedCandidates =
+                mediaCandidates.values.sortedWith(
+                    compareByDescending<MediaSource> {
+                        it.quality
+                    }.thenBy {
+                        it.label
+                    }
+                )
+
+            if (orderedCandidates.isNotEmpty()) {
+                for (source in orderedCandidates) {
+                    emitSource(
+                        source,
+                        callback
+                    )
+                }
+
+                return true
             }
         }
 
-        if (!emitted) {
-            extractSubtitles(detailDocument).forEach { subtitle ->
-                subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
-            }
-        }
-
-        return emitted
+        /*
+         * Do not send an empty/invalid link to CloudStream.
+         * Returning false lets the host show the normal loading error
+         * instead of pretending that a source was resolved successfully.
+         */
+        return false
     }
 
     private suspend fun emitSource(
@@ -930,8 +1023,27 @@ class MovieBox : MainAPI() {
 
         // Serialized SSR state can carry the current source URL.
         Regex(
-            """(?i)\"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl)\"\s*:\s*\"((?:https?:)?//[^\"]+)\""""
-        ).findAll(decoded).forEach { add(it.groupValues[1], "MovieBox State") }
+            """(?i)\"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|contentUrl|mediaUrl|url)\"\s*:\s*\"((?:https?:)?//[^\"]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"]*)?)\""""
+        ).findAll(decoded).forEach { match ->
+            add(
+                match.groupValues[1],
+                "MovieBox State"
+            )
+        }
+
+        /*
+         * Nuxt/devalue payloads can place the actual video URL away from
+         * the field name. Scan every absolute HTTP(S) URL that clearly
+         * points to a supported media file, including signed CDN URLs.
+         */
+        Regex(
+            """https?://[^"'<>\s]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"'<>\s]*)?"""
+        ).findAll(decoded).forEach { match ->
+            add(
+                match.value,
+                "MovieBox CDN"
+            )
+        }
 
         return found.values.toList()
     }
@@ -1795,34 +1907,80 @@ class MovieBox : MainAPI() {
         val normalized =
             normalizePath(path)
 
-        return try {
+        val requestPaths =
+            linkedSetOf<String>().apply {
+                add(normalized)
 
-            val response =
-                app.get(
-                    domain + normalized,
-                    headers =
-                        browserHeaders(
-                            domain + "/"
+                /*
+                 * Force a fresh HTML response as well. This is important for
+                 * MovieBox because the page may contain newly generated
+                 * playback/session information.
+                 */
+                add(addCacheBuster(normalized))
+
+                if (
+                    normalized != "/" &&
+                    !normalized.endsWith("/")
+                ) {
+                    add("$normalized/")
+                    add(
+                        addCacheBuster(
+                            "$normalized/"
                         )
-                )
-
-            if (
-                response.code !in
-                    200..399
-            ) {
-                null
-            } else {
-                MirrorPage(
-                    domain = domain,
-                    path = normalized,
-                    document =
-                        response.document
-                )
+                    )
+                }
             }
 
-        } catch (_: Throwable) {
-            null
+        for (requestPath in requestPaths) {
+
+            val requestUrl =
+                domain.trimEnd('/') +
+                    requestPath
+
+            val referer =
+                if (
+                    normalized == "/"
+                ) {
+                    domain.trimEnd('/') + "/"
+                } else {
+                    domain.trimEnd('/') +
+                        normalized
+                }
+
+            val response =
+                runCatching {
+                    app.get(
+                        requestUrl,
+                        headers = browserHeaders(
+                            referer
+                        ) + mapOf(
+                            "Accept-Language" to
+                                "en-US,en;q=0.9,hi;q=0.8,bn;q=0.7",
+                            "Sec-Fetch-Dest" to "document",
+                            "Sec-Fetch-Mode" to "navigate",
+                            "Sec-Fetch-Site" to "same-origin",
+                            "Upgrade-Insecure-Requests" to "1",
+                            "Cache-Control" to "no-cache",
+                            "Pragma" to "no-cache"
+                        )
+                    )
+                }.getOrNull()
+                    ?: continue
+
+            if (
+                response.code !in 200..399
+            ) {
+                continue
+            }
+
+            return MirrorPage(
+                domain = domain,
+                path = normalized,
+                document = response.document
+            )
         }
+
+        return null
     }
 
     /*
