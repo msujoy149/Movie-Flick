@@ -41,7 +41,8 @@ class MovieBox : MainAPI() {
     )
 
     private companion object {
-        const val HOME_LIMIT = 30
+        const val HOME_INITIAL_LIMIT = 6
+        const val HOME_PAGE_LIMIT = 10
         const val SEARCH_NATIVE_PAGES = 2
         const val SEARCH_RESULT_LIMIT = 50
         const val SITEMAP_RESULT_LIMIT = 80
@@ -131,7 +132,13 @@ class MovieBox : MainAPI() {
             return newHomePageResponse(
                 data = request,
                 list = items
-                    .take(HOME_LIMIT)
+                    .take(
+                        if (currentPage == 1) {
+                            HOME_INITIAL_LIMIT
+                        } else {
+                            HOME_PAGE_LIMIT
+                        }
+                    )
                     .map { it.toSearchResponse() },
                 hasNext = detectHasNext(
                     result.document,
@@ -170,25 +177,47 @@ class MovieBox : MainAPI() {
         if (original.isBlank()) return emptyList()
 
         for (domain in domains) {
-
-            val nativeResults =
+            val nativeItems =
                 searchNative(
                     domain,
                     original
                 )
 
-            if (nativeResults.isNotEmpty()) {
-                return nativeResults
-            }
-
-            val fallbackResults =
-                searchSitemap(
-                    domain,
-                    original
+            /*
+             * Native search is the fast path.
+             *
+             * If it already returned a useful amount of content, we
+             * avoid the heavier sitemap scan. Otherwise sitemap search
+             * augments it so search can cover the whole site.
+             */
+            val combined =
+                ArrayList<SiteItem>(
+                    nativeItems.size +
+                        SITEMAP_RESULT_LIMIT
                 )
 
-            if (fallbackResults.isNotEmpty()) {
-                return fallbackResults
+            combined.addAll(nativeItems)
+
+            if (
+                nativeItems.size <
+                    SEARCH_RESULT_LIMIT / 2
+            ) {
+                combined.addAll(
+                    searchSitemap(
+                        domain,
+                        original
+                    )
+                )
+            }
+
+            val ranked =
+                rankSearchResults(
+                    original,
+                    combined
+                )
+
+            if (ranked.isNotEmpty()) {
+                return ranked
             }
         }
 
@@ -198,7 +227,7 @@ class MovieBox : MainAPI() {
     private suspend fun searchNative(
         domain: String,
         query: String
-    ): List<SearchResponse> {
+    ): List<SiteItem> {
 
         val home =
             getDocument(domain, "/")?.document
@@ -235,8 +264,8 @@ class MovieBox : MainAPI() {
                 "/search?s=$encoded"
         }
 
-        val merged =
-            linkedMapOf<String, SiteItem>()
+        val results =
+            ArrayList<SiteItem>()
 
         for (route in routes) {
 
@@ -256,8 +285,7 @@ class MovieBox : MainAPI() {
                         ".movie-card, " +
                             ".flw-item, " +
                             ".film-poster-ahref, " +
-                            ".film_list-wrap .flw-item, " +
-                            ".flw-item"
+                            ".film_list-wrap .flw-item"
                     )
 
                 if (cards.isEmpty()) break
@@ -265,11 +293,12 @@ class MovieBox : MainAPI() {
                 cards.mapNotNull(
                     ::parseSearchCard
                 ).forEach { item ->
-
-                    merged.putIfAbsent(
-                        contentKey(item.url),
-                        item
-                    )
+                    /*
+                     * Do not deduplicate search results.
+                     * Hindi/English/Bangla variants are allowed to
+                     * remain as separate results.
+                     */
+                    results += item
                 }
 
                 if (
@@ -280,13 +309,24 @@ class MovieBox : MainAPI() {
                 ) {
                     break
                 }
+
+                if (
+                    results.size >=
+                        SEARCH_RESULT_LIMIT * 2
+                ) {
+                    break
+                }
+            }
+
+            if (
+                results.size >=
+                    SEARCH_RESULT_LIMIT * 2
+            ) {
+                break
             }
         }
 
-        return rankSearchResults(
-            query,
-            merged.values.toList()
-        )
+        return results
     }
 
     /*
@@ -300,7 +340,7 @@ class MovieBox : MainAPI() {
     private suspend fun searchSitemap(
         domain: String,
         query: String
-    ): List<SearchResponse> {
+    ): List<SiteItem> {
 
         val sitemapPaths =
             listOf(
@@ -318,9 +358,10 @@ class MovieBox : MainAPI() {
                 runCatching {
                     app.get(
                         domain + sitemapPath,
-                        headers = browserHeaders(
-                            domain + "/"
-                        )
+                        headers =
+                            browserHeaders(
+                                domain + "/"
+                            )
                     )
                 }.getOrNull()
                     ?: continue
@@ -368,55 +409,50 @@ class MovieBox : MainAPI() {
             return emptyList()
         }
 
-        val scored =
-            allPaths
-                .map { path ->
+        return allPaths
+            .map { path ->
 
-                    val slug =
-                        path
-                            .substringAfterLast('/')
-                            .substringBefore('?')
-                            .replace('-', ' ')
-                            .replace('_', ' ')
+                val slug =
+                    path
+                        .substringAfterLast('/')
+                        .substringBefore('?')
+                        .replace('-', ' ')
+                        .replace('_', ' ')
 
-                    val title =
-                        cleanTitle(slug)
+                val title =
+                    cleanTitle(slug)
 
-                    Triple(
-                        path,
-                        title,
-                        searchScore(
-                            query,
-                            title
-                        )
+                SiteItem(
+                    title = title,
+                    url = canonicalUrl(path),
+                    poster = null,
+                    type = typeFromPath(path),
+                    languageRank =
+                        languageRank(title)
+                ) to
+                    searchScore(
+                        query,
+                        title
                     )
+            }
+            .filter {
+                it.second >= 0.50
+            }
+            .sortedWith(
+                compareBy<
+                    Pair<SiteItem, Double>
+                > {
+                    it.first.languageRank
+                }.thenByDescending {
+                    it.second
                 }
-                .filter {
-                    it.third >= 0.50
-                }
-                .sortedByDescending {
-                    it.third
-                }
-                .take(
-                    SITEMAP_RESULT_LIMIT
-                )
-
-        return scored.map { hit ->
-
-            SiteItem(
-                title = hit.second,
-                url = canonicalUrl(hit.first),
-                poster = null,
-                type = typeFromPath(
-                    hit.first
-                ),
-                languageRank = languageRank(
-                    hit.second
-                )
             )
-        }.map {
-            it.toSearchResponse()
-        }
+            .take(
+                SITEMAP_RESULT_LIMIT
+            )
+            .map {
+                it.first
+            }
     }
 
     private fun discoverSearchForms(
@@ -869,6 +905,21 @@ class MovieBox : MainAPI() {
         }
 
         /*
+         * The current MovieBox pages also expose media-related fields
+         * such as sourceUrl/sniffUrl/url inside serialized page state.
+         * Extract those absolute URLs as candidates too. Non-media
+         * URLs are discarded later by looksLikePlayableMedia().
+         */
+        Regex(
+            """(?i)"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|file|url)"\s*:\s*"((?:https?:)?//[^"]+)"""
+        ).findAll(html).forEach { match ->
+            add(
+                match.groupValues[1],
+                "MovieBox State"
+            )
+        }
+
+        /*
          * episodeId is carried through the CloudStream episode data.
          * When a page exposes multiple direct media candidates, we
          * use the page/episode request itself as the fresh resolver.
@@ -1158,7 +1209,7 @@ class MovieBox : MainAPI() {
      * SEARCH RANKING
      * ------------------------------------------------------------
      *
-     * Hindi > Bangla > English > Other.
+     * Hindi > English > Bangla > Other.
      *
      * No duplicate filtering is applied.
      */
@@ -1176,27 +1227,33 @@ class MovieBox : MainAPI() {
                         item.title
                     )
 
-                val total =
-                    score +
-                        languageBonus(
-                            item.languageRank
-                        )
-
                 Triple(
                     item,
                     score,
-                    total
+                    item.languageRank
                 )
             }
             .filter {
                 it.second >= 0.42
             }
             .sortedWith(
-                compareByDescending<
+                /*
+                 * Language priority is absolute:
+                 *
+                 * 1 = Hindi
+                 * 2 = English
+                 * 3 = Bangla
+                 * 4 = Other
+                 *
+                 * Relevance is used only inside the same language
+                 * group. This guarantees Hindi appears before English
+                 * and Bangla when matching results exist.
+                 */
+                compareBy<
                     Triple<
                         SiteItem,
                         Double,
-                        Double
+                        Int
                     >
                 > {
                     it.third
@@ -1224,27 +1281,24 @@ class MovieBox : MainAPI() {
         val normalized =
             normalizeSearch(text)
 
+        /*
+         * Hindi
+         */
         if (
             Regex(
                 """\b(hindi|hindi dubbed|hindi audio|dubbed in hindi)\b"""
             ).containsMatchIn(
                 normalized
-            )
+            ) ||
+            text.contains("हिन्दी") ||
+            text.contains("हिंदी")
         ) {
             return 1
         }
 
-        if (
-            Regex(
-                """\b(bangla|bengali)\b"""
-            ).containsMatchIn(
-                normalized
-            ) ||
-            text.contains("বাংলা")
-        ) {
-            return 2
-        }
-
+        /*
+         * English
+         */
         if (
             Regex(
                 """\b(english|eng|english audio)\b"""
@@ -1252,21 +1306,26 @@ class MovieBox : MainAPI() {
                 normalized
             )
         ) {
+            return 2
+        }
+
+        /*
+         * Bangla
+         */
+        if (
+            Regex(
+                """\b(bangla|bengali|bangla dubbed|bangla audio)\b"""
+            ).containsMatchIn(
+                normalized
+            ) ||
+            text.contains("বাংলা") ||
+            text.contains("বাঙ্গালী")
+        ) {
             return 3
         }
 
         return 4
     }
-
-    private fun languageBonus(
-        rank: Int
-    ): Double =
-        when (rank) {
-            1 -> 0.20
-            2 -> 0.12
-            3 -> 0.06
-            else -> 0.0
-        }
 
     private fun searchScore(
         query: String,
@@ -2110,6 +2169,22 @@ class MovieBox : MainAPI() {
             document.text()
         )?.value
             ?.toIntOrNull()
+    }
+
+    private fun addCacheBuster(
+        path: String
+    ): String {
+        val separator =
+            if (path.contains("?")) {
+                "&"
+            } else {
+                "?"
+            }
+
+        return path +
+            separator +
+            "_cb=" +
+            System.currentTimeMillis()
     }
 
     private fun domainRoot(
