@@ -2,6 +2,7 @@ package com.movieflick.moviebox
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -42,18 +43,6 @@ class MovieBox : MainAPI() {
         mainUrl
     )
 
-    private val mobileApiHosts = listOf(
-        "https://api6.aoneroom.com",
-        "https://api5.aoneroom.com",
-        "https://api4.aoneroom.com",
-        "https://api4sg.aoneroom.com",
-        "https://api3.aoneroom.com",
-        "https://api6sg.aoneroom.com",
-        "https://api.inmoviebox.com"
-    )
-
-    private val jsonMapper = ObjectMapper()
-
     private companion object {
         const val HOME_INITIAL_LIMIT = 6
         const val HOME_PAGE_LIMIT = 10
@@ -62,11 +51,7 @@ class MovieBox : MainAPI() {
         const val SITEMAP_RESULT_LIMIT = 80
         const val SITEMAP_MAX_BYTES = 2_000_000
         const val MOVIE_DETAIL_ENDPOINT = "http://wefeed-h5-bff.wefeed-prod/detail"
-        const val MAX_PLAYBACK_ATTEMPTS = 8
-        const val SEARCH_API_PAGE_SIZE = 20
-        const val API_RETRY_ATTEMPTS = 3
-        const val MAX_EPISODES_PER_SEASON = 500
-        const val MOBILE_VERSION = "16.2.1"
+        const val MAX_PLAYBACK_ATTEMPTS = 10
 
         const val MOVIES = "Movies"
         const val TV_SHOW = "Tv Show"
@@ -78,8 +63,7 @@ class MovieBox : MainAPI() {
         val url: String,
         val poster: String?,
         val type: TvType,
-        val languageRank: Int = 4,
-        val subjectId: String? = null
+        val languageRank: Int = 4
     )
 
     private data class MirrorPage(
@@ -128,44 +112,53 @@ class MovieBox : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-
         val currentPage = page.coerceAtLeast(1)
         val section = request.name
 
         val basePath = when (section) {
+            MOVIES -> "/film"
             TV_SHOW -> "/tv-series"
             ANIME -> "/animated-series"
-            else -> "/film"
+            else -> return newHomePageResponse(
+                data = request,
+                list = emptyList(),
+                hasNext = false
+            )
+        }
+
+        val forcedType = when (section) {
+            TV_SHOW -> TvType.TvSeries
+            ANIME -> TvType.Anime
+            else -> TvType.Movie
         }
 
         for (route in pageRoutes(basePath, currentPage)) {
             val result = fetchMirrorPage(route) ?: continue
+            val items = parseListing(result.document, forcedType)
+            if (items.isEmpty()) continue
 
-            val forcedType = when (section) {
-                TV_SHOW -> TvType.TvSeries
-                ANIME -> TvType.Anime
-                else -> TvType.Movie
-            }
-
-            val parsedItems = parseListing(
-                result.document,
-                forcedType
-            )
-            if (parsedItems.isEmpty()) continue
-
-            val items = repairPosters(
-                parsedItems
-            )
-            val sortedItems = sortHomeItems(items)
             val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
-
             return newHomePageResponse(
                 data = request,
-                list = sortedItems.take(limit).map { it.toSearchResponse() },
-                hasNext = detectHasNext(
-                    result.document,
-                    currentPage
-                ) || sortedItems.size > limit
+                list = items.take(limit).map { it.toSearchResponse() },
+                hasNext = detectHasNext(result.document, currentPage) || items.size > limit
+            )
+        }
+
+        // API listing fallback. The public BFF is queried only when the HTML
+        // listing did not yield usable cards. No authentication bypass or
+        // private signing secret is used here.
+        val apiItems = fetchApiCatalog(
+            section = section,
+            page = currentPage
+        )
+
+        if (apiItems.isNotEmpty()) {
+            val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
+            return newHomePageResponse(
+                data = request,
+                list = apiItems.take(limit).map { it.toSearchResponse() },
+                hasNext = apiItems.size > limit
             )
         }
 
@@ -179,6 +172,68 @@ class MovieBox : MainAPI() {
     private fun sortHomeItems(items: List<SiteItem>): List<SiteItem> {
         // Keep the website ranking/order intact on home/category pages.
         return items
+    }
+
+    private fun interleaveBySourceType(
+        items: List<SiteItem>
+    ): List<SiteItem> {
+        if (items.size < 2) return items
+
+        val movies =
+            items.filter {
+                it.type == TvType.Movie
+            }
+
+        val series =
+            items.filter {
+                it.type == TvType.TvSeries
+            }
+
+        if (movies.isEmpty() || series.isEmpty()) {
+            return items
+        }
+
+        val result = ArrayList<SiteItem>(
+            min(
+                items.size,
+                HOME_INITIAL_LIMIT * 2
+            )
+        )
+
+        var movieIndex = 0
+        var seriesIndex = 0
+
+        while (
+            movieIndex < movies.size ||
+            seriesIndex < series.size
+        ) {
+            repeat(2) {
+                if (movieIndex < movies.size) {
+                    result.add(movies[movieIndex++])
+                }
+            }
+
+            if (seriesIndex < series.size) {
+                result.add(series[seriesIndex++])
+            }
+
+            if (result.size >= items.size) break
+        }
+
+        val used =
+            result.mapTo(
+                HashSet()
+            ) {
+                contentKey(it.url)
+            }
+
+        items.forEach { item ->
+            if (used.add(contentKey(item.url))) {
+                result.add(item)
+            }
+        }
+
+        return result
     }
 
     /*
@@ -201,15 +256,13 @@ class MovieBox : MainAPI() {
      * We use the site's native search fast path here and keep the same
      * language ranking used by full search.
      */
-    override suspend fun quickSearch(
-        query: String
-    ): List<SearchResponse>? {
+    override suspend fun quickSearch(query: String): List<SearchResponse>? {
         val value = query.trim()
         if (value.isBlank()) return emptyList()
 
-        val apiItems = searchMobileApi(value)
-        if (apiItems.isNotEmpty()) {
-            return rankSearchResults(value, apiItems).take(8)
+        val api = searchApi(value, 1, 12)
+        if (api.isNotEmpty()) {
+            return rankSearchResults(value, api).take(8)
         }
 
         return runCatching {
@@ -220,221 +273,62 @@ class MovieBox : MainAPI() {
         }.getOrDefault(emptyList())
     }
 
-    override suspend fun search(
-        query: String
-    ): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         val original = query.trim()
         if (original.isBlank()) return emptyList()
 
-        val apiItems = searchMobileApi(original)
-        if (apiItems.isNotEmpty()) {
-            return rankSearchResults(original, apiItems)
+        val apiResults = searchApi(original, 1, SEARCH_RESULT_LIMIT)
+        if (apiResults.isNotEmpty()) {
+            return rankSearchResults(original, apiResults)
         }
 
         for (domain in domains) {
             val nativeItems = searchNative(domain, original)
-            val combined = ArrayList<SiteItem>(nativeItems.size + SITEMAP_RESULT_LIMIT)
-            combined.addAll(nativeItems)
-
-            if (nativeItems.size < SEARCH_RESULT_LIMIT / 2) {
-                combined.addAll(searchSitemap(domain, original))
+            if (nativeItems.isNotEmpty()) {
+                return rankSearchResults(original, nativeItems)
             }
-
-            val ranked = rankSearchResults(original, combined)
-            if (ranked.isNotEmpty()) return ranked
         }
 
         return emptyList()
     }
 
-    private suspend fun searchMobileApi(
+    private suspend fun searchNative(
+        domain: String,
         query: String
     ): List<SiteItem> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
+        val home = getDocument(domain, "/")?.document
+        val variants = buildSearchVariants(query)
+        val routes = linkedSetOf<String>()
 
-        for (host in mobileApiHosts) {
-            repeat(API_RETRY_ATTEMPTS) {
-                val response = runCatching {
-                    app.get(
-                        "$host/wefeed-mobile-bff/subject-api/search?q=$encoded&page=1&pageSize=$SEARCH_API_PAGE_SIZE",
-                        headers = mobileApiHeaders(host)
-                    )
-                }.getOrNull() ?: return@repeat
+        discoverSearchForms(home, variants, routes)
 
-                if (response.code !in 200..399) return@repeat
-
-                val items = parseMobileSearchResponse(response.text)
-                if (items.isNotEmpty()) return items
-            }
+        for (variant in variants) {
+            val encoded = URLEncoder.encode(variant, "UTF-8")
+            routes.add("/search?q=$encoded")
+            routes.add("/search?query=$encoded")
+            routes.add("/search?keyword=$encoded")
+            routes.add("/search?s=$encoded")
         }
 
-        return emptyList()
-    }
-
-    private fun parseMobileSearchResponse(
-        body: String
-    ): List<SiteItem> {
-        val root = runCatching {
-            jsonMapper.readTree(body)
-        }.getOrNull() ?: return emptyList()
-
-        val arrays = mutableListOf<JsonNode>()
-
-        fun walk(node: JsonNode) {
-            if (node.isObject) {
-                node.fields().forEachRemaining { entry ->
-                    if (
-                        entry.value.isArray &&
-                        (
-                            entry.key.equals("items", true) ||
-                                entry.key.equals("results", true) ||
-                                entry.key.equals("subjects", true) ||
-                                entry.key.equals("data", true)
-                        )
-                    ) {
-                        arrays += entry.value
-                    }
-                    walk(entry.value)
+        val results = ArrayList<SiteItem>()
+        for (route in routes) {
+            for (page in 1..SEARCH_NATIVE_PAGES) {
+                val result = getDocument(domain, addPageParameter(route, page)) ?: break
+                val nuxtResults = parseNuxtListing(result.document, null)
+                if (nuxtResults.isNotEmpty()) {
+                    results.addAll(nuxtResults)
+                } else {
+                    result.document.select(
+                        ".movie-card, .flw-item, .film-poster-ahref, .film_list-wrap .flw-item"
+                    ).mapNotNull(::parseSearchCard).forEach { results.add(it) }
                 }
-            } else if (node.isArray) {
-                node.forEach(::walk)
+                if (!detectHasNext(result.document, page) || results.size >= SEARCH_RESULT_LIMIT * 2) break
             }
+            if (results.size >= SEARCH_RESULT_LIMIT * 2) break
         }
-
-        walk(root)
-
-        val source = arrays
-            .asSequence()
-            .maxByOrNull { it.size() }
-            ?: return emptyList()
-
-        return source.mapNotNull { item ->
-            val title = cleanTitle(
-                firstJsonText(item, "title", "name").orEmpty()
-            )
-            if (title.isBlank()) return@mapNotNull null
-
-            val subjectId = firstJsonText(
-                item,
-                "subjectId",
-                "id"
-            )?.takeIf {
-                it.matches(Regex("""\d{8,}"""))
-            } ?: return@mapNotNull null
-
-            val detailPath = firstJsonText(
-                item,
-                "detailPath",
-                "detailUrl",
-                "url"
-            ).orEmpty()
-
-            val type = when {
-                detailPath.contains(
-                    "/animated-series/",
-                    true
-                ) -> TvType.Anime
-
-                detailPath.contains(
-                    "/tv-series/",
-                    true
-                ) -> TvType.TvSeries
-
-                firstJsonText(
-                    item,
-                    "subjectType"
-                ) == "2" -> TvType.TvSeries
-
-                firstJsonText(
-                    item,
-                    "type"
-                )?.equals("tv", true) == true -> TvType.TvSeries
-
-                else -> TvType.Movie
-            }
-
-            val path = when {
-                detailPath.startsWith("http", true) ->
-                    pathFromUrl(detailPath)
-
-                detailPath.startsWith("/") ->
-                    detailPath
-
-                else ->
-                    when (type) {
-                        TvType.TvSeries ->
-                            "/tv-series/${slugifyForUrl(title)}-$subjectId"
-
-                        TvType.Anime ->
-                            "/animated-series/${slugifyForUrl(title)}-$subjectId"
-
-                        else ->
-                            "/film/${slugifyForUrl(title)}-$subjectId"
-                    }
-            }
-
-            if (!isLikelyContentPath(path)) return@mapNotNull null
-
-            val poster = firstUsefulUrl(
-                firstJsonText(item, "poster"),
-                firstJsonText(item, "cover"),
-                firstJsonText(item, "image"),
-                firstJsonText(item, "thumbnail")
-            )
-
-            SiteItem(
-                title = title,
-                url = canonicalUrl(path),
-                poster = poster,
-                type = type,
-                languageRank = languageRank(title),
-                subjectId = subjectId
-            )
-        }
+        return results
     }
 
-private fun firstJsonText(
-        node: JsonNode,
-        vararg names: String
-    ): String? {
-        for (name in names) {
-            val value = node.get(name) ?: continue
-            if (value.isTextual) return value.asText()
-            if (value.isNumber) return value.asText()
-            if (value.isBoolean) return value.asText()
-        }
-        return null
-    }
-
-    private fun slugifyForUrl(title: String): String {
-        return normalizeSearch(title)
-            .replace(" ", "-")
-            .replace(Regex("[^a-z0-9\\-]"), "")
-            .trim('-')
-            .ifBlank { "title" }
-    }
-
-    private fun mobileApiHeaders(
-        host: String
-    ): Map<String, String> {
-        return browserHeaders("$host/") + mapOf(
-            "Accept" to "application/json",
-            "Content-Type" to "application/json;charset=UTF-8",
-            "X-M-Version" to MOBILE_VERSION,
-            "X-Play-Mode" to "2",
-            "Origin" to mainUrl,
-            "Referer" to mainUrl + "/"
-        )
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * SEARCH FALLBACK
-     * ------------------------------------------------------------
-     *
-     * Sitemap is used only after native search produced no useful
-     * result on the current mirror.
-     */
     private suspend fun searchSitemap(
         domain: String,
         query: String
@@ -491,10 +385,11 @@ private fun firstJsonText(
                         path
                     )
                 ) {
-                    allPaths +=
+                    allPaths.add(
                         normalizePath(
                             path
                         )
+                    )
                 }
             }
 
@@ -632,8 +527,9 @@ private fun firstJsonText(
                         "?"
                     }
 
-                routes +=
+                routes.add(
                     "$actionPath$separator$queryName=$encoded"
+                )
             }
         }
     }
@@ -643,34 +539,27 @@ private fun firstJsonText(
      * LOAD
      * ------------------------------------------------------------
      */
-    override suspend fun load(
-        url: String
-    ): LoadResponse? {
+    override suspend fun load(url: String): LoadResponse? {
         val path = pathFromUrl(url)
         if (path.isBlank()) return null
 
         val candidatePaths = linkedSetOf<String>().apply {
             add(path)
-
             when {
                 path.startsWith("/film/") -> {
                     add("/movies/" + path.removePrefix("/film/"))
                     derivedPlayPath(path)?.let(::add)
                 }
-
                 path.startsWith("/movies/") -> {
                     add("/film/" + path.removePrefix("/movies/"))
                     add("/play/" + path.removePrefix("/movies/"))
                 }
-
-                path.startsWith("/tv-series/") ||
-                    path.startsWith("/animated-series/") -> {
+                path.startsWith("/tv-series/") || path.startsWith("/animated-series/") -> {
                     val slug = path.substringAfterLast('/')
                     if (slug.isNotBlank()) {
                         add("/play/$slug")
                     }
                 }
-
                 path.startsWith("/play/") -> {
                     val slug = path.removePrefix("/play/")
                     if (slug.isNotBlank()) {
@@ -691,9 +580,7 @@ private fun firstJsonText(
 
         var document = page?.document
         if (document == null) {
-            contentSlug(path)?.let {
-                document = fetchBackendDetailDocument(it)
-            }
+            contentSlug(path)?.let { document = fetchBackendDetailDocument(it) }
         }
 
         val title = cleanTitle(
@@ -703,65 +590,31 @@ private fun firstJsonText(
                 document?.selectFirst(".film-name")?.text(),
                 document?.title()
             ).orEmpty()
-        ).ifBlank {
-            titleFromContentPath(path)
-        }
+        ).ifBlank { titleFromContentPath(path) }
 
         if (title.isBlank()) return null
-
-        val type = typeFromPath(path)
-
-        var resolvedSubjectId =
-            findSubjectIdFromPage(document, title)
-
-        if (resolvedSubjectId.isNullOrBlank()) {
-            val apiMatches = searchMobileApi(title)
-            resolvedSubjectId = apiMatches
-                .asSequence()
-                .filter {
-                    when (type) {
-                        TvType.TvSeries -> it.type == TvType.TvSeries
-                        TvType.Anime -> it.type == TvType.Anime
-                        else -> it.type == TvType.Movie
-                    }
-                }
-                .map {
-                    it to searchScore(title, it.title)
-                }
-                .filter { it.second >= 0.50 }
-                .maxByOrNull { it.second }
-                ?.first
-                ?.subjectId
-        }
 
         val poster = firstUsefulUrl(
             document?.selectFirst("meta[property=og:image]")?.attr("content"),
             document?.selectFirst("meta[name=twitter:image]")?.attr("content"),
-            document?.selectFirst(
-                ".film-poster img, .movie-card img, img"
-            )?.let(::extractImageUrl)
+            document?.selectFirst(".film-poster img, .movie-card img, img")?.let(::extractImageUrl)
         )
 
         val plot = firstNonBlank(
             document?.selectFirst("meta[property=og:description]")?.attr("content"),
-            document?.selectFirst(
-                ".description, .film-description, .description-content"
-            )?.text()
+            document?.selectFirst(".description, .film-description, .description-content")?.text()
         )
 
-        val year = document?.let {
-            extractYear(title, it)
-        } ?: Regex("""\b(19|20)\d{2}\b""")
-            .find(title)
-            ?.value
-            ?.toIntOrNull()
+        val year = document?.let { extractYear(title, it) }
+        val type = typeFromPath(path)
 
         if (type == TvType.TvSeries) {
-            val episodes = resolveMobileEpisodes(
-                subjectId = resolvedSubjectId,
-                title = title,
-                fallbackDocument = document
-            )
+            val subjectId = findApiSubjectId(title)
+            val episodes = if (!subjectId.isNullOrBlank()) {
+                fetchApiEpisodes(subjectId, title)
+            } else {
+                emptyList()
+            }
 
             return newTvSeriesLoadResponse(
                 name = title,
@@ -779,11 +632,7 @@ private fun firstJsonText(
             name = title,
             url = canonicalUrl(path),
             type = type,
-            dataUrl = if (!resolvedSubjectId.isNullOrBlank()) {
-                "MBMV|$resolvedSubjectId|${canonicalUrl(path)}"
-            } else {
-                canonicalUrl(path)
-            }
+            dataUrl = canonicalUrl(path)
         ) {
             posterUrl = poster
             this.plot = plot
@@ -791,990 +640,94 @@ private fun firstJsonText(
         }
     }
 
+    /*
+     * ------------------------------------------------------------
+     * PLAYBACK
+     * ------------------------------------------------------------
+     *
+     * Fresh request every time.
+     *
+     * No token/media URL is cached by this provider.
+     */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-
         val rawData = data.trim()
         if (rawData.isBlank()) return false
 
-        val pageUrl =
-            rawData.substringBefore("||").trim()
+        if (rawData.startsWith("mbxepisode||")) {
+            val parts = rawData.split("||")
+            if (parts.size >= 4) {
+                val subjectId = parts[1]
+                val season = parts[2].toIntOrNull() ?: 1
+                val episode = parts[3].toIntOrNull() ?: 1
+                return resolveApiPlayback(subjectId, season, episode, subtitleCallback, callback)
+            }
+        }
 
+        // Movie/anime public-page fallback. Signed media is only used when it is
+        // already exposed by the public player response; no private signing
+        // secret or authentication bypass is generated here.
+        val pageUrl = rawData.substringBefore("||").trim()
         val pagePath = pathFromUrl(pageUrl)
         if (pagePath.isBlank()) return false
 
-        /*
-         * Every Play action starts from scratch.
-         *
-         * We deliberately do not persist a tokenized media URL. The site may
-         * return a new signed CDN URL on every request.
-         */
-        repeat(MAX_PLAYBACK_ATTEMPTS) { attempt ->
-
+        repeat(MAX_PLAYBACK_ATTEMPTS) {
             val candidateUrls = linkedSetOf<String>()
-
-            candidateUrls += canonicalUrl(pagePath)
-
+            candidateUrls.add(canonicalUrl(pagePath))
             if (pagePath.startsWith("/film/")) {
-                candidateUrls += canonicalUrl(
-                    "/movies/" + pagePath.removePrefix("/film/")
-                )
+                candidateUrls.add(canonicalUrl("/movies/" + pagePath.removePrefix("/film/")))
             }
-
-            if (pagePath.startsWith("/movies/")) {
-                candidateUrls += canonicalUrl(
-                    "/film/" + pagePath.removePrefix("/movies/")
-                )
-            }
-
             contentSlug(pagePath)?.let { slug ->
-                candidateUrls += "$MOVIE_DETAIL_ENDPOINT/$slug"
-                candidateUrls += canonicalUrl("/play/$slug")
+                candidateUrls.add(canonicalUrl("/play/$slug"))
             }
-
-            derivedPlayPath(pagePath)?.let { playPath ->
-                candidateUrls += canonicalUrl(playPath)
-            }
-
             for (candidateUrl in candidateUrls) {
-                if (
-                    resolveMovieCandidate(
-                        candidateUrl = candidateUrl,
-                        sourcePageUrl = pageUrl,
-                        subtitleCallback = subtitleCallback,
-                        callback = callback
-                    )
-                ) {
+                if (resolvePublicPageCandidate(candidateUrl, pageUrl, subtitleCallback, callback)) {
                     return true
                 }
             }
         }
-
         return false
     }
 
-    private suspend fun resolveMovieCandidate(
+    private suspend fun resolvePublicPageCandidate(
         candidateUrl: String,
         sourcePageUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-
-        val response =
-            runCatching {
-                app.get(
-                    addCacheBuster(candidateUrl),
-                    headers = browserHeaders(
-                        sourcePageUrl
-                    ) + mapOf(
-                        "Referer" to sourcePageUrl,
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept" to (
-                            "text/html,application/xhtml+xml," +
-                                "application/json,text/plain,*/*;q=0.8"
-                            ),
-                        "Cache-Control" to "no-cache",
-                        "Pragma" to "no-cache"
-                    )
-                )
-            }.getOrNull()
-                ?: return false
-
-        if (response.code !in 200..399) {
-            return false
-        }
-
-        val html = response.text
-        val document = response.document
-        val mediaCandidates =
-            linkedMapOf<String, MediaSource>()
-
-        fun collect(source: MediaSource) {
-            if (!looksLikePlayableMedia(source.url)) return
-            mediaCandidates.putIfAbsent(
-                source.url,
-                source
-            )
-        }
-
-        /*
-         * 1. Direct media / serialized state from the current response.
-         */
-        extractJsonLdMedia(
-            html = html,
-            pageUrl = candidateUrl
-        ).forEach(::collect)
-
-        extractMediaSources(
-            document = document,
-            pageUrl = candidateUrl,
-            html = html
-        ).forEach(::collect)
-
-        /*
-         * 2. The current response may expose a fresh /play/... URL.
-         */
-        val playUrls =
-            linkedSetOf<String>()
-
-        playUrls +=
-            extractJsonLdUrls(
-                html
-            )
-
-        val decodedHtml =
-            html
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-
-        Regex(
-            """(?i)https?://[^"'<>\s]+/play/[^"'<>\s]+"""
-        ).findAll(
-            decodedHtml
-        ).forEach { match ->
-            playUrls += match.value
-        }
-
-        Regex(
-            """(?i)"(/play/[^"]+)"""
-        ).findAll(
-            decodedHtml
-        ).forEach { match ->
-            playUrls +=
-                absoluteUrl(
-                    match.groupValues[1]
-                )
-        }
-
-        /*
-         * 3. If this is the MovieBox backend detail route, derive the
-         * corresponding public player route from the same slug/id.
-         */
-        if (
-            candidateUrl.startsWith(
-                MOVIE_DETAIL_ENDPOINT,
-                true
-            )
-        ) {
-            val slug =
-                contentSlug(
-                    sourcePageUrl
-                )
-                    ?: contentSlug(
-                        candidateUrl
-                    )
-
-            if (!slug.isNullOrBlank()) {
-                playUrls +=
-                    canonicalUrl(
-                        "/play/$slug"
-                    )
-            }
-        }
-
-        /*
-         * 4. Fetch every discovered /play route fresh and inspect it.
-         */
-        for (playUrl in playUrls) {
-            val watchResponse =
-                runCatching {
-                    app.get(
-                        addCacheBuster(playUrl),
-                        headers = browserHeaders(
-                            candidateUrl
-                        ) + mapOf(
-                            "Referer" to candidateUrl,
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to (
-                                "text/html,application/xhtml+xml," +
-                                    "application/json,text/plain,*/*;q=0.8"
-                                ),
-                            "Cache-Control" to "no-cache",
-                            "Pragma" to "no-cache"
-                        )
-                    )
-                }.getOrNull()
-                    ?: continue
-
-            if (watchResponse.code !in 200..399) {
-                continue
-            }
-
-            val watchHtml =
-                watchResponse.text
-
-            extractJsonLdMedia(
-                html = watchHtml,
-                pageUrl = playUrl
-            ).forEach(::collect)
-
-            extractMediaSources(
-                document = watchResponse.document,
-                pageUrl = playUrl,
-                html = watchHtml
-            ).forEach(::collect)
-
-            extractSubtitles(
-                watchResponse.document
-            ).forEach { subtitle ->
-                subtitleCallback(
-                    newSubtitleFile(
-                        subtitle.first,
-                        subtitle.second
-                    )
-                )
-            }
-        }
-
-        val orderedCandidates =
-            mediaCandidates.values
-                .filter {
-                    looksLikePlayableMedia(
-                        it.url
-                    )
-                }
-                .sortedWith(
-                    compareByDescending<MediaSource> {
-                        it.quality
-                    }.thenBy {
-                        it.label
-                    }
-                )
-
-        if (orderedCandidates.isEmpty()) {
-            /*
-             * A response can contain player configuration that points to
-             * another public page but not yet contain the signed CDN URL.
-             * Returning false here causes the caller to continue trying other
-             * candidate routes / fresh attempts.
-             */
-            return false
-        }
-
-        for (source in orderedCandidates) {
-            emitSource(
-                source,
-                callback
-            )
-        }
-
-        return true
-    }
-
-
-
-private suspend fun resolveMobilePlayInfo(
-        subjectId: String,
-        season: Int,
-        episode: Int,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val found = linkedMapOf<String, MediaSource>()
-
-        suspend fun requestEndpoint(
-            endpoint: String,
-            params: Map<String, String>
-        ) {
-            val query = params.entries.joinToString("&") {
-                "${URLEncoder.encode(it.key, "UTF-8")}=" +
-                    URLEncoder.encode(it.value, "UTF-8")
-            }
-
-            for (host in mobileApiHosts) {
-                val response = runCatching {
-                    app.get(
-                        addCacheBuster(
-                            "$host$endpoint?$query"
-                        ),
-                        headers = mobileApiHeaders(host)
-                    )
-                }.getOrNull() ?: continue
-
-                if (response.code !in 200..399) continue
-
-                parsePlayInfoResponse(
-                    response.text,
-                    host
-                ).forEach { source ->
-                    val current = found[source.url]
-                    if (
-                        current == null ||
-                        compareMediaSources(
-                            source,
-                            current
-                        ) > 0
-                    ) {
-                        found[source.url] = source
-                    }
-                }
-
-                extractJsonSubtitles(
-                    response.text
-                ).forEach {
-                    subtitleCallback(
-                        newSubtitleFile(
-                            it.first,
-                            it.second
-                        )
-                    )
-                }
-            }
-        }
-
-        val qualities = listOf(
-            1080 to "1080p",
-            720 to "720p",
-            480 to "480p"
-        )
-
-        // Ask explicitly for each resolution. The upstream resource system is
-        // resolution-filtered, so one request is not enough to discover all
-        // available quality variants.
-        for ((resolution, quality) in qualities) {
-            requestEndpoint(
-                ApiConfig.JSON_PLAY_INFO,
-                linkedMapOf(
-                    "subjectId" to subjectId,
-                    "se" to season.toString(),
-                    "ep" to episode.toString(),
-                    "quality" to quality,
-                    "resolution" to resolution.toString()
+        val response = runCatching {
+            app.get(
+                addCacheBuster(candidateUrl),
+                headers = browserHeaders(sourcePageUrl) + mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8",
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
                 )
             )
+        }.getOrNull() ?: return false
 
-            // Some deployments expose the underlying resource endpoint rather
-            // than returning everything from play-info.
-            requestEndpoint(
-                "${ApiConfig.API_PREFIX}/resource",
-                linkedMapOf(
-                    "subjectId" to subjectId,
-                    "se" to season.toString(),
-                    "ep" to episode.toString(),
-                    "resolution" to resolution.toString(),
-                    "perPage" to "10",
-                    "page" to "1"
-                )
-            )
+        if (response.code !in 200..399) return false
+
+        val sources = extractMediaSources(response.document, candidateUrl, response.text)
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+
+        if (sources.isEmpty()) return false
+
+        val best = sources.maxWithOrNull(
+            compareBy<MediaSource> { it.declaredSize }
+                .thenBy { it.declaredDurationSeconds }
+                .thenBy { it.quality }
+        ) ?: return false
+
+        emitSource(best, callback)
+        for (subtitle in extractSubtitles(response.document)) {
+            subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
         }
-
-        // If the resolver returned nothing, try the page's known resource groups
-        // and re-query each quality. This remains ordinary public GET traffic.
-        if (found.isEmpty()) {
-            val detail = apiGetJson(
-                ApiConfig.JSON_GET,
-                mapOf(
-                    "subjectId" to subjectId,
-                    "host" to mainUrl
-                )
-            )
-
-            val resourceIds = LinkedHashSet<String>()
-            collectResourceIds(
-                detail,
-                resourceIds
-            )
-
-            for (resourceId in resourceIds.take(8)) {
-                for ((resolution, quality) in qualities) {
-                    requestEndpoint(
-                        ApiConfig.JSON_PLAY_INFO,
-                        linkedMapOf(
-                            "subjectId" to subjectId,
-                            "se" to season.toString(),
-                            "ep" to episode.toString(),
-                            "quality" to quality,
-                            "resolution" to resolution.toString(),
-                            "resourceId" to resourceId
-                        )
-                    )
-                }
-            }
-        }
-
-        val playable = found.values
-            .filter {
-                looksLikePlayableMedia(
-                    it.url
-                )
-            }
-            .filterNot {
-                isObviousTrailerOrPreview(
-                    it.url
-                )
-            }
-
-        if (playable.isEmpty()) return false
-
-        val selected = playable
-            .groupBy {
-                when {
-                    it.quality in setOf(480, 720, 1080) ->
-                        it.quality
-
-                    else ->
-                        0
-                }
-            }
-            .mapNotNull { (_, candidates) ->
-                candidates.maxWithOrNull(
-                    compareBy<MediaSource> {
-                        it.declaredDurationSeconds
-                    }.thenBy {
-                        it.declaredSize
-                    }.thenBy {
-                        it.quality
-                    }.thenBy {
-                        it.url
-                    }
-                )
-            }
-            .sortedByDescending {
-                it.quality
-            }
-
-        if (selected.isEmpty()) return false
-
-        selected.forEach {
-            emitSource(
-                it,
-                callback
-            )
-        }
-
-        return true
-    }
-
-private fun parsePlayInfoResponse(
-        body: String,
-        host: String
-    ): List<MediaSource> {
-        val root = runCatching {
-            jsonMapper.readTree(body)
-        }.getOrNull() ?: return emptyList()
-
-        val result = linkedMapOf<String, MediaSource>()
-
-        fun parseDuration(value: String?): Long {
-            if (value.isNullOrBlank()) return -1L
-
-            value.toLongOrNull()?.let { raw ->
-                return if (raw > 100_000L) raw / 1000L else raw
-            }
-
-            Regex(
-                """(?i)^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$"""
-            ).matchEntire(value.trim())?.let { m ->
-                val h = m.groupValues.getOrNull(1)?.toLongOrNull() ?: 0L
-                val min = m.groupValues.getOrNull(2)?.toLongOrNull() ?: 0L
-                val sec = m.groupValues.getOrNull(3)?.toDoubleOrNull()?.toLong() ?: 0L
-                return h * 3600L + min * 60L + sec
-            }
-
-            Regex(
-                """^(\d{1,2}):(\d{2})(?::(\d{2}))?$"""
-            ).matchEntire(value.trim())?.let { m ->
-                val a = m.groupValues[1].toLong()
-                val b = m.groupValues[2].toLong()
-                val c = m.groupValues.getOrNull(3)?.toLongOrNull()
-                return if (c != null) a * 3600L + b * 60L + c else a * 60L + b
-            }
-
-            return -1L
-        }
-
-        fun parseSize(node: JsonNode): Long {
-            firstJsonLong(
-                node,
-                "size",
-                "fileSize",
-                "contentLength",
-                "totalSize"
-            )?.let { return it }
-
-            val value = firstJsonText(
-                node,
-                "size",
-                "fileSize",
-                "contentLength"
-            ) ?: return -1L
-
-            val m = Regex(
-                """(?i)([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)"""
-            ).find(value) ?: return -1L
-
-            val amount = m.groupValues[1].toDoubleOrNull() ?: return -1L
-            return when (m.groupValues[2].uppercase(Locale.ROOT)) {
-                "GB" -> (amount * 1024 * 1024 * 1024).toLong()
-                "MB" -> (amount * 1024 * 1024).toLong()
-                else -> (amount * 1024).toLong()
-            }
-        }
-
-        fun walk(
-            node: JsonNode?,
-            inheritedQuality: String = "",
-            inheritedSize: Long = -1L,
-            inheritedDuration: Long = -1L,
-            inheritedName: String = ""
-        ) {
-            if (node == null) return
-
-            if (node.isObject) {
-                val localQuality = firstJsonText(
-                    node,
-                    "quality",
-                    "qualityName",
-                    "resolution",
-                    "definition",
-                    "label",
-                    "name"
-                ).orEmpty()
-
-                val localName = firstJsonText(
-                    node,
-                    "name",
-                    "title",
-                    "label"
-                ).orEmpty()
-
-                val localSize = maxOf(
-                    inheritedSize,
-                    parseSize(node)
-                )
-
-                val localDuration = maxOf(
-                    inheritedDuration,
-                    parseDuration(
-                        firstJsonText(
-                            node,
-                            "duration",
-                            "durationSeconds",
-                            "length"
-                        )
-                    )
-                )
-
-                val disposition = firstJsonText(
-                    node,
-                    "contentDisposition",
-                    "content-disposition",
-                    "filename",
-                    "fileName"
-                ).orEmpty()
-
-                val contextText = listOf(
-                    inheritedQuality,
-                    inheritedName,
-                    localQuality,
-                    localName,
-                    disposition
-                ).filter { it.isNotBlank() }.joinToString(" ")
-
-                val url = firstJsonText(
-                    node,
-                    "url",
-                    "playUrl",
-                    "streamUrl",
-                    "videoUrl",
-                    "contentUrl",
-                    "src"
-                )
-
-                if (
-                    !url.isNullOrBlank() &&
-                    looksLikePlayableMedia(url)
-                ) {
-                    val normalized = normalizeMediaUrl(
-                        url,
-                        host + "/"
-                    )
-
-                    if (normalized != null) {
-                        val quality = qualityFromText(
-                            "$contextText $normalized"
-                        )
-
-                        val source = MediaSource(
-                            url = normalized,
-                            quality = quality,
-                            label = if (quality > 0) {
-                                "${quality}p"
-                            } else {
-                                "MovieBox Stream"
-                            },
-                            referer = mainUrl + "/",
-                            declaredSize = localSize,
-                            declaredDurationSeconds = localDuration
-                        )
-
-                        val old = result[normalized]
-                        if (
-                            old == null ||
-                            compareMediaSources(source, old) > 0
-                        ) {
-                            result[normalized] = source
-                        }
-                    }
-                }
-
-                node.fields().forEachRemaining { (_, child) ->
-                    walk(
-                        child,
-                        inheritedQuality = contextText,
-                        inheritedSize = localSize,
-                        inheritedDuration = localDuration,
-                        inheritedName = if (localName.isBlank()) inheritedName else localName
-                    )
-                }
-            } else if (node.isArray) {
-                node.forEach { child ->
-                    walk(
-                        child,
-                        inheritedQuality,
-                        inheritedSize,
-                        inheritedDuration,
-                        inheritedName
-                    )
-                }
-            }
-        }
-
-        walk(root)
-        return result.values.toList()
-    }
-
-private fun firstJsonLong(
-        node: JsonNode,
-        vararg names: String
-    ): Long? {
-        for (name in names) {
-            val value = node.get(name) ?: continue
-            if (value.isNumber) return value.asLong()
-            if (value.isTextual) {
-                val cleaned = value.asText().trim().replace(Regex("(?i)(mb|gb|kb)"), "")
-                cleaned.toDoubleOrNull()?.let {
-                    return when {
-                        value.asText().contains("gb", true) -> (it * 1024 * 1024 * 1024).toLong()
-                        value.asText().contains("mb", true) -> (it * 1024 * 1024).toLong()
-                        value.asText().contains("kb", true) -> (it * 1024).toLong()
-                        else -> it.toLong()
-                    }
-                }
-            }
-        }
-        return null
-    }
-
-    private fun compareMediaSources(a: MediaSource, b: MediaSource): Int {
-        return mediaSourceComparator().compare(a, b)
-    }
-
-    private fun mediaSourceComparator(): Comparator<MediaSource> {
-        return compareByDescending<MediaSource> { it.declaredSize }
-            .thenByDescending { it.declaredDurationSeconds }
-            .thenByDescending { it.quality }
-    }
-
-    private fun extractJsonSubtitles(
-        body: String
-    ): List<Pair<String, String>> {
-        val root = runCatching { jsonMapper.readTree(body) }.getOrNull() ?: return emptyList()
-        val result = linkedMapOf<String, Pair<String, String>>()
-
-        fun walk(node: JsonNode) {
-            if (node.isObject) {
-                val url = firstJsonText(node, "url", "src", "subtitleUrl", "captionUrl", "file")
-                val looksSubtitle = node.fieldNames().asSequence().any { it.contains("sub", true) || it.contains("caption", true) }
-                if (looksSubtitle && !url.isNullOrBlank() && (url.contains(".srt", true) || url.contains(".vtt", true))) {
-                    val label = firstJsonText(node, "langName", "language", "lang", "label", "name") ?: "Subtitle"
-                    result[url] = label to url
-                }
-                node.fields().forEachRemaining { walk(it.value) }
-            } else if (node.isArray) {
-                node.forEach(::walk)
-            }
-        }
-
-        walk(root)
-        return result.values.toList()
-    }
-
-    private suspend fun resolveMovieCandidate(
-        candidateUrl: String,
-        sourcePageUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-
-        val response =
-            runCatching {
-                app.get(
-                    addCacheBuster(candidateUrl),
-                    headers = browserHeaders(
-                        sourcePageUrl
-                    ) + mapOf(
-                        "Referer" to sourcePageUrl,
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept" to (
-                            "text/html,application/xhtml+xml," +
-                                "application/json,text/plain,*/*;q=0.8"
-                            ),
-                        "Cache-Control" to "no-cache",
-                        "Pragma" to "no-cache"
-                    )
-                )
-            }.getOrNull()
-                ?: return false
-
-        if (response.code !in 200..399) {
-            return false
-        }
-
-        val html = response.text
-        val document = response.document
-        val mediaCandidates =
-            linkedMapOf<String, MediaSource>()
-
-        fun collect(source: MediaSource) {
-            if (!looksLikePlayableMedia(source.url)) return
-
-            val existing = mediaCandidates[source.url]
-            if (existing == null) {
-                mediaCandidates[source.url] = source
-            } else {
-                val betterSize =
-                    if (source.declaredSize > existing.declaredSize) {
-                        source.declaredSize
-                    } else {
-                        existing.declaredSize
-                    }
-
-                val betterDuration =
-                    if (source.declaredDurationSeconds > existing.declaredDurationSeconds) {
-                        source.declaredDurationSeconds
-                    } else {
-                        existing.declaredDurationSeconds
-                    }
-
-                mediaCandidates[source.url] =
-                    existing.copy(
-                        declaredSize = betterSize,
-                        declaredDurationSeconds = betterDuration
-                    )
-            }
-        }
-
-        /*
-         * 1. Direct media / serialized state from the current response.
-         */
-        extractJsonLdMedia(
-            html = html,
-            pageUrl = candidateUrl
-        ).forEach(::collect)
-
-        extractMediaSources(
-            document = document,
-            pageUrl = candidateUrl,
-            html = html
-        ).forEach(::collect)
-
-        /*
-         * 2. The current response may expose a fresh /play/... URL.
-         */
-        val playUrls =
-            linkedSetOf<String>()
-
-        playUrls +=
-            extractJsonLdUrls(
-                html
-            )
-
-        val decodedHtml =
-            html
-                .replace("\\/", "/")
-                .replace("\\u0026", "&")
-                .replace("&amp;", "&")
-
-        Regex(
-            """(?i)https?://[^"'<>\s]+/play/[^"'<>\s]+"""
-        ).findAll(
-            decodedHtml
-        ).forEach { match ->
-            playUrls += match.value
-        }
-
-        Regex(
-            """(?i)"(/play/[^"]+)"""
-        ).findAll(
-            decodedHtml
-        ).forEach { match ->
-            playUrls +=
-                absoluteUrl(
-                    match.groupValues[1]
-                )
-        }
-
-        /*
-         * 3. If this is the MovieBox backend detail route, derive the
-         * corresponding public player route from the same slug/id.
-         */
-        if (
-            candidateUrl.startsWith(
-                MOVIE_DETAIL_ENDPOINT,
-                true
-            )
-        ) {
-            val slug =
-                contentSlug(
-                    sourcePageUrl
-                )
-                    ?: contentSlug(
-                        candidateUrl
-                    )
-
-            if (!slug.isNullOrBlank()) {
-                playUrls +=
-                    canonicalUrl(
-                        "/play/$slug"
-                    )
-            }
-        }
-
-        /*
-         * 4. Fetch every discovered /play route fresh and inspect it.
-         */
-        for (playUrl in playUrls) {
-            val watchResponse =
-                runCatching {
-                    app.get(
-                        addCacheBuster(playUrl),
-                        headers = browserHeaders(
-                            candidateUrl
-                        ) + mapOf(
-                            "Referer" to candidateUrl,
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to (
-                                "text/html,application/xhtml+xml," +
-                                    "application/json,text/plain,*/*;q=0.8"
-                                ),
-                            "Cache-Control" to "no-cache",
-                            "Pragma" to "no-cache"
-                        )
-                    )
-                }.getOrNull()
-                    ?: continue
-
-            if (watchResponse.code !in 200..399) {
-                continue
-            }
-
-            val watchHtml =
-                watchResponse.text
-
-            extractJsonLdMedia(
-                html = watchHtml,
-                pageUrl = playUrl
-            ).forEach(::collect)
-
-            extractMediaSources(
-                document = watchResponse.document,
-                pageUrl = playUrl,
-                html = watchHtml
-            ).forEach(::collect)
-
-            extractSubtitles(
-                watchResponse.document
-            ).forEach { subtitle ->
-                subtitleCallback(
-                    newSubtitleFile(
-                        subtitle.first,
-                        subtitle.second
-                    )
-                )
-            }
-        }
-
-        val orderedCandidates =
-            mediaCandidates.values
-                .filter {
-                    looksLikePlayableMedia(
-                        it.url
-                    )
-                }
-                .filterNot {
-                    isObviousTrailerOrPreview(it.url)
-                }
-                .toList()
-
-        val usableCandidates =
-            if (orderedCandidates.isNotEmpty()) {
-                orderedCandidates
-            } else {
-                mediaCandidates.values
-                    .filter {
-                        looksLikePlayableMedia(
-                            it.url
-                        )
-                    }
-            }
-
-        if (usableCandidates.isEmpty()) {
-            /*
-             * A response can contain player configuration that points to
-             * another public page but not yet contain the signed CDN URL.
-             * Returning false here causes the caller to continue trying other
-             * candidate routes / fresh attempts.
-             */
-            return false
-        }
-
-        /*
-         * IMPORTANT:
-         * MovieBox pages can expose several media files. Some are previews,
-         * low-definition clips, or alternate resources. We do not emit all
-         * candidates anymore.
-         *
-         * Prefer the resource with the largest declared file size. On
-         * MovieBox's Nuxt/devalue payload, videoAddress resources expose
-         * duration and size alongside the media URL. Duration is only a
-         * secondary tie-breaker so a larger full file wins over a small
-         * preview/trailer.
-         *
-         * We intentionally do not download media just to measure it.
-         */
-        val rankedCandidates =
-            usableCandidates
-                .sortedWith(
-                    compareByDescending<MediaSource> {
-                        it.declaredSize
-                    }
-                        .thenByDescending {
-                            it.declaredDurationSeconds
-                        }
-                        .thenByDescending {
-                            it.quality
-                        }
-                        .thenBy {
-                            it.url
-                        }
-                )
-
-        val best =
-            rankedCandidates
-                .firstOrNull()
-                ?: return false
-
-        emitSource(
-            best,
-            callback
-        )
-
         return true
     }
 
@@ -1782,12 +735,39 @@ private fun firstJsonLong(
         source: MediaSource,
         callback: (ExtractorLink) -> Unit
     ) {
+        val displayName = when {
+            source.url.contains(".m3u8", true) ||
+                source.url.contains(".mpd", true) ->
+                "Auto / Multi-Quality"
+
+            source.quality == 1080 ->
+                "1080p"
+
+            source.quality == 720 ->
+                "720p"
+
+            source.quality == 480 ->
+                "480p"
+
+            source.quality > 0 ->
+                "${source.quality}p"
+
+            else ->
+                source.label
+        }
+
+        val sourceType = when {
+            source.url.contains(".m3u8", true) -> ExtractorLinkType.M3U8
+            source.url.contains(".mpd", true) -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
+
         callback(
             newExtractorLink(
                 "MovieBox",
-                source.label,
+                displayName,
                 source.url,
-                ExtractorLinkType.VIDEO
+                sourceType
             ) {
                 quality = source.quality
                 referer = source.referer
@@ -1815,6 +795,552 @@ private fun firstJsonLong(
         }
     }
 
+    /*
+     * ------------------------------------------------------------
+     * PUBLIC BFF API FALLBACK
+     * ------------------------------------------------------------
+     *
+     * The website is backed by public MovieBox/WeFeed BFF routes. We use only
+     * ordinary GET requests with normal client headers here. No application
+     * secret, cryptographic gateway key, or private authentication token is
+     * embedded in the provider.
+     */
+    private object ApiConfig {
+        const val API_BASE_1 = "https://api6.aoneroom.com"
+        const val API_BASE_2 = "https://api5.aoneroom.com"
+        const val API_PREFIX = "/wefeed-mobile-bff/subject-api"
+        const val JSON_SEARCH = "$API_PREFIX/search"
+        const val JSON_SUGGEST = "$API_PREFIX/search-suggest"
+        const val JSON_GET = "$API_PREFIX/get"
+        const val JSON_SEASON_INFO = "$API_PREFIX/season-info"
+        const val JSON_EPISODE_LIST = "$API_PREFIX/episode-list"
+        const val JSON_PLAY_INFO = "$API_PREFIX/play-info"
+    }
+
+    private val jsonMapper by lazy { ObjectMapper() }
+
+    private fun apiHeaders() = mapOf(
+        "Accept" to "application/json,text/plain,*/*;q=0.8",
+        "User-Agent" to (browserHeaders()["User-Agent"] ?: "Mozilla/5.0"),
+        "Accept-Language" to "en-US,en;q=0.9,hi;q=0.8,bn;q=0.7",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
+        "Referer" to "$mainUrl/"
+    )
+
+    private suspend fun apiGetJson(
+        path: String,
+        params: Map<String, String>
+    ): JsonNode? {
+        val query = params.entries.joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+
+        for (base in listOf(ApiConfig.API_BASE_1, ApiConfig.API_BASE_2)) {
+            val url = if (query.isBlank()) {
+                "$base$path"
+            } else {
+                "$base$path?$query"
+            }
+
+            val response = runCatching {
+                app.get(addCacheBuster(url), headers = apiHeaders())
+            }.getOrNull() ?: continue
+
+            if (response.code !in 200..399) continue
+
+            return runCatching {
+                jsonMapper.readTree(response.text)
+            }.getOrNull()
+        }
+
+        return null
+    }
+
+    private fun nodeText(node: JsonNode?, vararg names: String): String? {
+        if (node == null || !node.isObject) return null
+        for (name in names) {
+            val value = node.get(name) ?: continue
+            if (!value.isNull) {
+                val text = when {
+                    value.isTextual -> value.asText()
+                    value.isNumber -> value.numberValue().toString()
+                    else -> value.toString()
+                }
+                if (text.isNotBlank() && text != "null") return text
+            }
+        }
+        return null
+    }
+
+    private fun nodeLong(node: JsonNode?, vararg names: String): Long {
+        if (node == null || !node.isObject) return -1L
+        for (name in names) {
+            val value = node.get(name) ?: continue
+            if (value.isNumber) return value.asLong()
+            value.asText().toLongOrNull()?.let { return it }
+        }
+        return -1L
+    }
+
+    private fun collectJsonObjects(
+        node: JsonNode?,
+        out: MutableList<JsonNode>
+    ) {
+        if (node == null) return
+        if (node.isObject) {
+            val hasTitle = node.has("title") || node.has("name")
+            val hasId = node.has("subjectId") || node.has("id")
+            if (hasTitle && hasId) out.add(node)
+            node.fields().forEachRemaining { (_, child) ->
+                collectJsonObjects(child, out)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectJsonObjects(child, out) }
+        }
+    }
+
+    private fun firstUrlFromJsonNode(node: JsonNode?): String? {
+        if (node == null) return null
+
+        if (node.isTextual) {
+            val value = node.asText().trim()
+            return value.takeIf {
+                it.startsWith("http://", true) || it.startsWith("https://", true)
+            }
+        }
+
+        if (node.isObject) {
+            val direct = nodeText(node, "url", "src", "href", "path")
+            if (!direct.isNullOrBlank() &&
+                (direct.startsWith("http://", true) || direct.startsWith("https://", true))
+            ) {
+                return direct
+            }
+
+            val fields = node.fields()
+            while (fields.hasNext()) {
+                val child = fields.next().value
+                val found = firstUrlFromJsonNode(child)
+                if (found != null) return found
+            }
+        } else if (node.isArray) {
+            val iterator = node.elements()
+            while (iterator.hasNext()) {
+                val found = firstUrlFromJsonNode(iterator.next())
+                if (found != null) return found
+            }
+        }
+
+        return null
+    }
+
+    private fun apiItemFromNode(node: JsonNode, forcedType: TvType? = null): SiteItem? {
+        val title = cleanTitle(
+            nodeText(node, "title", "name").orEmpty()
+        )
+        if (title.isBlank()) return null
+
+        val detailPath = nodeText(
+            node,
+            "detailPath", "detailUrl", "url"
+        ).orEmpty()
+
+        val typeValue = nodeText(node, "type", "subjectType")
+        val type = forcedType ?: when {
+            typeValue.equals("2", true) -> TvType.TvSeries
+            typeValue.equals("tv", true) -> TvType.TvSeries
+            typeValue.equals("series", true) -> TvType.TvSeries
+            typeValue.equals("7", true) -> TvType.Anime
+            detailPath.contains("animated-series", true) -> TvType.Anime
+            detailPath.contains("tv-series", true) -> TvType.TvSeries
+            else -> TvType.Movie
+        }
+
+        val id = nodeText(node, "subjectId", "id")
+        val slug = when {
+            detailPath.startsWith("http", true) -> pathFromUrl(detailPath)
+            detailPath.startsWith("/") -> detailPath
+            !id.isNullOrBlank() -> when (type) {
+                TvType.TvSeries -> "/tv-series/${detailPath.substringAfterLast('/').ifBlank { id }}"
+                TvType.Anime -> "/animated-series/${detailPath.substringAfterLast('/').ifBlank { id }}"
+                else -> "/film/${detailPath.substringAfterLast('/').ifBlank { id }}"
+            }
+            else -> null
+        } ?: return null
+
+        val poster = firstUsefulUrl(
+            firstUrlFromJsonNode(node.get("poster")),
+            firstUrlFromJsonNode(node.get("cover")),
+            firstUrlFromJsonNode(node.get("image")),
+            firstUrlFromJsonNode(node.get("thumbnail")),
+            nodeText(node, "poster", "cover", "image", "thumbnail")
+        )
+
+        return SiteItem(
+            title = title,
+            url = canonicalUrl(slug),
+            poster = poster,
+            type = type,
+            languageRank = languageRank(title)
+        )
+    }
+
+    private suspend fun fetchApiCatalog(
+        section: String,
+        page: Int
+    ): List<SiteItem> {
+        val query = when (section) {
+            TV_SHOW -> "tv"
+            ANIME -> "anime"
+            else -> "movie"
+        }
+
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to query,
+                "page" to page.toString(),
+                "pageSize" to HOME_PAGE_LIMIT.toString()
+            )
+        ) ?: return emptyList()
+
+        val forcedType = when (section) {
+            TV_SHOW -> TvType.TvSeries
+            ANIME -> TvType.Anime
+            else -> TvType.Movie
+        }
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+        return nodes
+            .mapNotNull { apiItemFromNode(it) }
+            .filter { it.type == forcedType }
+    }
+
+    private suspend fun searchApi(
+        query: String,
+        page: Int,
+        pageSize: Int
+    ): List<SiteItem> {
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to query,
+                "page" to page.toString(),
+                "pageSize" to pageSize.toString()
+            )
+        ) ?: return emptyList()
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+
+        val result = nodes.mapNotNull { apiItemFromNode(it) }
+        if (result.isNotEmpty()) return result
+
+        val suggest = apiGetJson(
+            ApiConfig.JSON_SUGGEST,
+            mapOf("q" to query)
+        ) ?: return emptyList()
+
+        nodes.clear()
+        collectJsonObjects(suggest, nodes)
+        return nodes.mapNotNull { apiItemFromNode(it) }
+    }
+
+    private suspend fun findApiSubjectId(title: String): String? {
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to title,
+                "page" to "1",
+                "pageSize" to "20"
+            )
+        ) ?: return null
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+
+        return nodes
+            .mapNotNull { node ->
+                val id = nodeText(node, "subjectId") ?: return@mapNotNull null
+                val nodeTitle = nodeText(node, "title", "name").orEmpty()
+                Triple(id, nodeTitle, searchScore(title, nodeTitle))
+            }
+            .filter { it.third >= 0.55 }
+            .maxByOrNull { it.third }
+            ?.first
+    }
+
+    private fun episodeCountFromSeasonNode(node: JsonNode): Int {
+        return nodeLong(
+            node,
+            "episodesAvailable",
+            "totalEpisode",
+            "episodeCount",
+            "maxEp",
+            "allEp"
+        ).toInt().coerceAtLeast(0)
+    }
+
+    private suspend fun fetchApiEpisodes(
+        subjectId: String,
+        seriesTitle: String
+    ): List<Episode> {
+        val requests = listOf(
+            ApiConfig.JSON_SEASON_INFO to mapOf("subjectId" to subjectId),
+            ApiConfig.JSON_EPISODE_LIST to mapOf("subjectId" to subjectId)
+        )
+
+        val episodes = LinkedHashMap<String, EpisodeInfoHolder>()
+
+        for ((endpoint, params) in requests) {
+            val json = apiGetJson(endpoint, params) ?: continue
+            collectEpisodeObjects(json, episodes)
+        }
+
+        if (episodes.isEmpty()) return emptyList()
+
+        return episodes.values
+            .sortedWith(compareBy<EpisodeInfoHolder> { it.season }.thenBy { it.episode })
+            .map { info ->
+                newEpisode(
+                    data = "mbxepisode||$subjectId||${info.season}||${info.episode}"
+                ) {
+                    name = info.title.ifBlank { "Episode ${info.episode}" }
+                    season = info.season
+                    episode = info.episode
+                }
+            }
+    }
+
+    private data class EpisodeInfoHolder(
+        val season: Int,
+        val episode: Int,
+        val title: String = ""
+    )
+
+    private fun collectEpisodeObjects(
+        node: JsonNode?,
+        out: MutableMap<String, EpisodeInfoHolder>,
+        inheritedSeason: Int = 1
+    ) {
+        if (node == null) return
+
+        if (node.isObject) {
+            val season = nodeLong(node, "season", "seasonNumber", "se").toInt().let {
+                if (it > 0) it else inheritedSeason
+            }
+
+            val episode = nodeLong(
+                node,
+                "episode",
+                "episodeNumber",
+                "ep",
+                "epNum"
+            ).toInt()
+
+            if (episode > 0) {
+                val key = "$season-$episode"
+                out[key] = EpisodeInfoHolder(
+                    season = season,
+                    episode = episode,
+                    title = nodeText(node, "title", "name", "episodeTitle").orEmpty()
+                )
+            }
+
+            val count = episodeCountFromSeasonNode(node)
+            if (count > 0 && (node.has("season") || node.has("seasonNumber") || node.has("se"))) {
+                for (ep in 1..count) {
+                    val key = "$season-$ep"
+                    out.putIfAbsent(key, EpisodeInfoHolder(season, ep))
+                }
+            }
+
+            node.fields().forEachRemaining { (_, child) ->
+                collectEpisodeObjects(child, out, season)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectEpisodeObjects(child, out, inheritedSeason) }
+        }
+    }
+
+    private suspend fun resolveApiPlayback(
+        subjectId: String,
+        season: Int,
+        episode: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val qualities = listOf("1080p", "720p", "480p")
+        val found = linkedMapOf<String, MediaSource>()
+
+        suspend fun requestPlayback(resourceId: String? = null, quality: String? = null) {
+            val params = linkedMapOf(
+                "subjectId" to subjectId,
+                "se" to season.toString(),
+                "ep" to episode.toString()
+            )
+            if (!quality.isNullOrBlank()) params["quality"] = quality
+            if (!resourceId.isNullOrBlank()) params["resourceId"] = resourceId
+
+            val json = apiGetJson(ApiConfig.JSON_PLAY_INFO, params) ?: return
+            collectStreamSources(json, found)
+            collectApiSubtitles(json, subtitleCallback)
+        }
+
+        // First use the normal public resolver.
+        for (quality in qualities) {
+            requestPlayback(quality = quality)
+        }
+
+        // If the public resolver requires a resourceId (dub/source group),
+        // discover resourceIds from the public metadata endpoint and retry each
+        // quality with those ids. No application secrets are generated here.
+        if (found.isEmpty()) {
+            val detail = apiGetJson(
+                ApiConfig.JSON_GET,
+                mapOf(
+                    "subjectId" to subjectId,
+                    "host" to mainUrl
+                )
+            )
+            val resourceIds = LinkedHashSet<String>()
+            collectResourceIds(detail, resourceIds)
+
+            for (resourceId in resourceIds.take(6)) {
+                for (quality in qualities) {
+                    requestPlayback(resourceId = resourceId, quality = quality)
+                }
+            }
+        }
+
+        if (found.isEmpty()) {
+            requestPlayback()
+        }
+
+        val playable = found.values
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+
+        if (playable.isEmpty()) return false
+
+        val explicit = playable
+            .filter { it.quality in setOf(480, 720, 1080) }
+            .groupBy { it.quality }
+            .values
+            .mapNotNull { list ->
+                list.maxWithOrNull(
+                    compareBy<MediaSource> { it.declaredSize }
+                        .thenBy { it.declaredDurationSeconds }
+                        .thenBy { it.url }
+                )
+            }
+
+        val selected = if (explicit.isNotEmpty()) {
+            explicit.sortedByDescending { it.quality }
+        } else {
+            playable.maxWithOrNull(
+                compareBy<MediaSource> { it.declaredSize }
+                    .thenBy { it.declaredDurationSeconds }
+                    .thenBy { it.quality }
+            )?.let(::listOf) ?: emptyList()
+        }
+
+        selected.forEach { emitSource(it, callback) }
+        return selected.isNotEmpty()
+    }
+
+    private fun collectResourceIds(
+        node: JsonNode?,
+        out: MutableSet<String>
+    ) {
+        if (node == null) return
+        if (node.isObject) {
+            val resourceId = nodeText(node, "resourceId", "rid")
+            if (!resourceId.isNullOrBlank()) out.add(resourceId)
+            node.fields().forEachRemaining { (_, child) ->
+                collectResourceIds(child, out)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectResourceIds(child, out) }
+        }
+    }
+
+    private fun collectStreamSources(
+        node: JsonNode?,
+        out: MutableMap<String, MediaSource>,
+        context: String = ""
+    ) {
+        if (node == null) return
+
+        if (node.isObject) {
+            val localQuality = nodeText(
+                node,
+                "quality", "definition", "resolution", "name", "label"
+            ).orEmpty()
+            val localSize = nodeLong(node, "size", "fileSize", "contentLength")
+            val localDuration = nodeLong(node, "duration", "durationSeconds")
+
+            node.fields().forEachRemaining { (key, child) ->
+                if (child.isTextual && looksLikePlayableMedia(child.asText())) {
+                    val url = normalizeMediaUrl(child.asText(), mainUrl) ?: return@forEachRemaining
+                    val quality = qualityFromText("$localQuality $context $url")
+                    out[url] = MediaSource(
+                        url = url,
+                        quality = quality,
+                        label = if (quality > 0) "${quality}p" else "MovieBox Stream",
+                        referer = mainUrl,
+                        declaredSize = maxOf(out[url]?.declaredSize ?: -1L, localSize),
+                        declaredDurationSeconds = maxOf(
+                            out[url]?.declaredDurationSeconds ?: -1L,
+                            localDuration
+                        )
+                    )
+                } else {
+                    collectStreamSources(child, out, "$context $key $localQuality")
+                }
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectStreamSources(child, out, context) }
+        }
+    }
+
+    private suspend fun collectApiSubtitles(
+        node: JsonNode?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        suspend fun walk(value: JsonNode?) {
+            if (value == null) return
+
+            if (value.isObject) {
+                val url = nodeText(value, "url", "subtitleUrl", "src")
+                val language = nodeText(value, "lanName", "language", "name", "lang")
+
+                if (!url.isNullOrBlank() &&
+                    (url.contains(".srt", true) || url.contains(".vtt", true))
+                ) {
+                    val absolute = normalizeMediaUrl(url, mainUrl)
+                    if (absolute != null) {
+                        subtitleCallback(newSubtitleFile(language ?: "Subtitle", absolute))
+                    }
+                }
+
+                val fields = value.fields()
+                while (fields.hasNext()) {
+                    walk(fields.next().value)
+                }
+            } else if (value.isArray) {
+                val iterator = value.elements()
+                while (iterator.hasNext()) {
+                    walk(iterator.next())
+                }
+            }
+        }
+
+        walk(node)
+    }
+
     private fun extractJsonLdUrls(
         html: String
     ): List<String> {
@@ -1829,7 +1355,7 @@ private fun firstJsonLong(
             Regex(
                 """(?i)"(?:embedUrl|target|url)"\s*:\s*"(https?://[^"]+/play/[^"]+)"""
             ).findAll(block).forEach { m ->
-                result += m.groupValues[1].replace("\\/", "/")
+                result.add(m.groupValues[1].replace("\\/", "/"))
             }
         }
 
@@ -1837,13 +1363,13 @@ private fun firstJsonLong(
             """(?i)https?://[^\"'<>\s]+/play/[^\"'<>\s]+"""
         )
         directPlay.findAll(html).forEach { m ->
-            result += m.value.replace("\\/", "/")
+            result.add(m.value.replace("\\/", "/"))
         }
 
         Regex(
             """(?i)"(/play/[^\"]+)"""
         ).findAll(html).forEach { m ->
-            result += absoluteUrl(m.groupValues[1])
+            result.add(absoluteUrl(m.groupValues[1]))
         }
 
         return result.toList()
@@ -2026,7 +1552,7 @@ private fun firstJsonLong(
 
         // Serialized SSR state can carry the current source URL.
         Regex(
-            """(?i)\"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|contentUrl|mediaUrl|url)\"\s*:\s*\"((?:https?:)?//[^\"]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"]*)?)\""""
+            """(?i)"(?:sourceUrl|sniffUrl|playUrl|streamUrl|videoUrl|contentUrl|mediaUrl|url)"\s*:\s*"((?:https?:)?//[^"\s]+(?:\.m3u8|\.mp4|\.m4v|\.webm|\.mov|\.mkv|\.ts)(?:\?[^"\s]*)?)"""
         ).findAll(decoded).forEach { match ->
             val context =
                 decoded.substring(
@@ -2208,267 +1734,52 @@ private fun firstJsonLong(
         document: Document,
         forcedType: TvType
     ): List<SiteItem> {
-        // The live website is Nuxt SSR and the most reliable pairing is always
-        // title + href + image from the same rendered/serialized card.
-        val directItems = parseVisibleVideoItems(
-            document,
-            forcedType
-        )
-        if (directItems.isNotEmpty()) {
-            return directItems
-        }
 
-        val serializedItems = parseSerializedRouteItems(
-            document,
-            forcedType
-        )
-        if (serializedItems.isNotEmpty()) {
-            return serializedItems
-        }
+        /*
+         * Current MovieBox is a Nuxt SSR application. Its visible cards
+         * are emitted as escaped `video-item` HTML inside __NUXT_DATA__.
+         * The old .movie-card/.flw-item selectors therefore return an
+         * empty list on the current website.
+         *
+         * Parse the current SSR structure first. Keep the legacy CSS
+         * parser as a fallback for older layouts/mirrors.
+         */
+        val nuxtItems =
+            parseNuxtListing(
+                document,
+                forcedType
+            )
 
-        val nuxtItems = parseNuxtListing(
-            document,
-            forcedType
-        )
         if (nuxtItems.isNotEmpty()) {
             return nuxtItems
         }
 
-        val selectors = listOf(
-            ".movie-card",
-            ".flw-item",
-            ".film_list-wrap .flw-item",
-            "[class*='movie-card']"
-        )
+        val selectors =
+            listOf(
+                ".movie-card",
+                ".flw-item",
+                ".film_list-wrap .flw-item",
+                "[class*='movie-card']"
+            )
 
         return selectors
             .asSequence()
-            .flatMap { document.select(it).asSequence() }
-            .distinctBy { it.outerHtml() }
-            .mapNotNull { parseCard(it, forcedType) }
+            .flatMap {
+                document.select(it).asSequence()
+            }
+            .distinctBy {
+                it.outerHtml()
+            }
+            .mapNotNull {
+                parseCard(
+                    it,
+                    forcedType
+                )
+            }
             .toList()
     }
 
-private fun parseVisibleVideoItems(
-        document: Document,
-        forcedType: TvType?
-    ): List<SiteItem> {
-        val cards = document.select("div.video-item, .video-item")
-        if (cards.isEmpty()) return emptyList()
-
-        return cards.mapNotNull { card ->
-            val anchor = card.selectFirst("a[href]")
-            val href = anchor?.attr("href")?.trim() ?: return@mapNotNull null
-            val path = pathFromUrl(absoluteUrl(href))
-            if (!isLikelyContentPath(path)) return@mapNotNull null
-
-            val title = cleanTitle(
-                firstNonBlank(
-                    card.selectFirst(".line-1, .film-name, h2, h3")?.text(),
-                    anchor.attr("title"),
-                    card.selectFirst("img")?.attr("alt")
-                ).orEmpty()
-            )
-            if (title.isBlank()) return@mapNotNull null
-
-            SiteItem(
-                title = title,
-                url = canonicalUrl(path),
-                poster = firstUsefulUrl(
-                    card.selectFirst("img")?.attr("data-src"),
-                    card.selectFirst("img")?.attr("data-original"),
-                    card.selectFirst("img")?.attr("src")
-                ),
-                type = forcedType ?: typeFromPath(path),
-                languageRank = languageRank(title)
-            )
-        }
-    }
-
-    
-    private fun parseSerializedRouteItems(
-        document: Document,
-        forcedType: TvType
-    ): List<SiteItem> {
-        val source = document.html()
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-            .replace("&quot;", "\"")
-            .replace("&amp;", "&")
-
-        if (source.isBlank()) return emptyList()
-
-        val routeRegex = when (forcedType) {
-            TvType.Movie -> Regex(
-                """(?i)/(?:film|movies)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            TvType.TvSeries -> Regex(
-                """(?i)/tv-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            TvType.Anime -> Regex(
-                """(?i)/animated-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            else -> return emptyList()
-        }
-
-        val seen = HashSet<String>()
-        val result = ArrayList<SiteItem>()
-
-        for (match in routeRegex.findAll(source)) {
-            val path = normalizePath(match.value)
-            if (!seen.add(path.lowercase(Locale.ROOT))) continue
-
-            val center = match.range.first
-            val start = max(0, center - 1800)
-            val end = min(source.length, match.range.last + 1800)
-            val window = source.substring(start, end)
-
-            val title = extractLocalSerializedTitle(
-                window,
-                path
-            ).ifBlank {
-                cleanTitle(
-                    path.substringAfterLast('/')
-                        .substringBefore('?')
-                        .replace(Regex("-[A-Za-z0-9]{8,}$"), "")
-                        .replace('-', ' ')
-                        .replace('_', ' ')
-                )
-            }
-
-            if (title.isBlank()) continue
-
-            val poster = extractBestLocalPoster(
-                window
-            )
-
-            result += SiteItem(
-                title = title,
-                url = canonicalUrl(path),
-                poster = poster,
-                type = forcedType,
-                languageRank = languageRank(title)
-            )
-        }
-
-        return result
-    }
-
-    private fun extractLocalSerializedTitle(
-        window: String,
-        path: String
-    ): String {
-        val patterns = listOf(
-            Regex(
-                """(?is)<span[^>]*class=["'][^"']*line-1[^"']*["'][^>]*>(.*?)</span>"""
-            ),
-            Regex(
-                """(?is)class=["'][^"']*line-1[^"']*["'][^>]*>(.*?)<"""
-            ),
-            Regex(
-                """(?i)"title"\s*:\s*"([^"]{2,180})"""
-            ),
-            Regex(
-                """(?i)"name"\s*:\s*"([^"]{2,180})"""
-            )
-        )
-
-        for (pattern in patterns) {
-            pattern.find(window)?.groupValues?.getOrNull(1)?.let {
-                val value = cleanTitle(
-                    unescapeSsrText(it)
-                )
-                if (
-                    value.isNotBlank() &&
-                    !value.contains("MovieBoxOnline", true)
-                ) {
-                    return value
-                }
-            }
-        }
-
-        return ""
-    }
-
-    private fun extractBestLocalPoster(
-        window: String
-    ): String? {
-        data class Candidate(
-            val url: String,
-            val portrait: Boolean,
-            val score: Int
-        )
-
-        val regex = Regex(
-            """(?i)https?://[^"'<>\s\\]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'<>\s\\]*)?"""
-        )
-
-        return regex.findAll(window)
-            .mapNotNull { match ->
-                val url = match.value
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
-
-                if (
-                    url.contains("logo", true) ||
-                    url.contains("icon", true) ||
-                    url.contains("avatar", true) ||
-                    url.contains("favicon", true)
-                ) {
-                    return@mapNotNull null
-                }
-
-                val contextStart = max(
-                    0,
-                    match.range.first - 1000
-                )
-                val contextEnd = min(
-                    window.length,
-                    match.range.last + 1000
-                )
-                val context = window.substring(
-                    contextStart,
-                    contextEnd
-                )
-
-                val width = Regex(
-                    """(?i)"(?:width|w)"\s*[:=]\s*(\d{2,5})"""
-                ).find(context)?.groupValues?.getOrNull(1)
-                    ?.toIntOrNull() ?: 0
-
-                val height = Regex(
-                    """(?i)"(?:height|h)"\s*[:=]\s*(\d{2,5})"""
-                ).find(context)?.groupValues?.getOrNull(1)
-                    ?.toIntOrNull() ?: 0
-
-                val portrait =
-                    height > 0 &&
-                        width > 0 &&
-                        height >= width * 1.05
-
-                var score = 0
-                if (portrait) score += 100
-                if (width >= 300) score += 20
-                if (height >= 400) score += 20
-                if (url.contains("/image/", true)) score += 15
-                if (url.contains("pbcdn", true)) score += 10
-
-                Candidate(
-                    url,
-                    portrait,
-                    score
-                )
-            }
-            .sortedWith(
-                compareByDescending<Candidate> { it.score }
-                    .thenByDescending { it.portrait }
-            )
-            .firstOrNull()
-            ?.url
-    }
-
-private fun parseNuxtListing(
+    private fun parseNuxtListing(
         document: Document,
         forcedType: TvType?
     ): List<SiteItem> {
@@ -2547,21 +1858,6 @@ private fun parseNuxtListing(
         title: String,
         forcedType: TvType?
     ): SiteItem? {
-        val routePattern = when (forcedType) {
-            TvType.TvSeries -> Regex(
-                """(?i)/tv-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            TvType.Anime -> Regex(
-                """(?i)/animated-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            TvType.Movie -> Regex(
-                """(?i)/(?:film|movies)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            null -> Regex(
-                """(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""
-            )
-            else -> return null
-        }
 
         val titleToken = "\"${title.replace("\"", "\\\"")}\""
         var searchFrom = payloadStart
@@ -2569,73 +1865,111 @@ private fun parseNuxtListing(
         var bestScore = -1.0
 
         while (true) {
-            val titleIndex = source.indexOf(
-                titleToken,
-                searchFrom
-            )
+            val titleIndex = source.indexOf(titleToken, searchFrom)
             if (titleIndex < 0) break
 
-            // Small locality window; never mix an unrelated nearby card.
-            val start = max(payloadStart, titleIndex - 1600)
-            val end = min(
-                source.length,
-                titleIndex + titleToken.length + 1600
-            )
-            val window = source.substring(
-                start,
-                end
-            )
+            val windowStart = max(payloadStart, titleIndex - 8000)
+            val windowEnd = min(source.length, titleIndex + titleToken.length + 8000)
+            val window = source.substring(windowStart, windowEnd)
 
-            val route = routePattern
-                .findAll(window)
-                .maxByOrNull { match ->
-                    val slugTitle = cleanTitle(
-                        match.value
-                            .substringAfterLast('/')
-                            .substringBefore('?')
-                            .replace(
-                                Regex("-[A-Za-z0-9]{8,}$"),
-                                ""
-                            )
-                            .replace('-', ' ')
-                            .replace('_', ' ')
+            val routePatterns =
+                when (forcedType) {
+                    TvType.TvSeries -> listOf(
+                        Regex("""(?i)/tv-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
                     )
-                    searchScore(title, slugTitle)
+
+                    TvType.Anime -> listOf(
+                        Regex("""(?i)/animated-series/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    TvType.Movie -> listOf(
+                        Regex("""(?i)/film/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?"""),
+                        Regex("""(?i)/movies/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    null -> listOf(
+                        Regex("""(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                    )
+
+                    else -> emptyList()
                 }
 
-            if (route != null) {
-                val candidatePath = route.value
-                val slugTitle = cleanTitle(
-                    candidatePath
-                        .substringAfterLast('/')
-                        .substringBefore('?')
-                        .replace(
-                            Regex("-[A-Za-z0-9]{8,}$"),
-                            ""
-                        )
-                        .replace('-', ' ')
-                        .replace('_', ' ')
-                )
+            val routeMatch =
+                routePatterns
+                    .asSequence()
+                    .mapNotNull { pattern ->
+                        pattern.find(window)
+                    }
+                    .firstOrNull()
 
-                val score = searchScore(
-                    title,
-                    slugTitle
-                )
+            val backendMatch =
+                if (forcedType == null) {
+                    Regex(
+                        """(?i)https?://wefeed-h5-bff\.wefeed-prod/detail/([A-Za-z0-9._~%\-]+)"""
+                    ).find(window)
+                } else {
+                    null
+                }
 
-                val poster = extractBestLocalPoster(
-                    window
-                )
+            val candidatePath =
+                routeMatch?.value
+                    ?: backendMatch?.groupValues
+                        ?.getOrNull(1)
+                        ?.let { slug ->
+                            when (forcedType) {
+                                TvType.TvSeries ->
+                                    "/tv-series/$slug"
+
+                                TvType.Anime ->
+                                    "/animated-series/$slug"
+
+                                else ->
+                                    "/film/$slug"
+                            }
+                        }
+                    ?: findBestDetailPath(
+                        window,
+                        title
+                    )?.third?.let {
+                        when (forcedType) {
+                            TvType.TvSeries ->
+                                "/tv-series/$it"
+                            TvType.Anime ->
+                                "/animated-series/$it"
+                            else ->
+                                "/film/$it"
+                        }
+                    }
+
+            if (candidatePath != null) {
+                val detailType = forcedType ?: typeFromPath(candidatePath)
 
                 if (
-                    score >= 0.60 &&
-                    (best == null || score > bestScore)
+                    forcedType != null &&
+                    detailType != forcedType
                 ) {
+                    searchFrom =
+                        titleIndex + titleToken.length
+                    continue
+                }
+
+                val slugTitle = candidatePath
+                    .substringAfterLast('/')
+                    .replace('-', ' ')
+                    .replace('_', ' ')
+                val score = max(
+                    searchScore(title, slugTitle),
+                    searchScore(title, cleanTitle(candidatePath))
+                )
+                val poster = findNearestPoster(source, titleIndex, windowEnd)
+
+                if (score >= 0.20 && (best == null || score > bestScore)) {
                     bestScore = score
                     best = SiteItem(
                         title = title,
                         url = canonicalUrl(candidatePath),
                         poster = poster,
-                        type = forcedType ?: typeFromPath(candidatePath),
+                        type = detailType,
                         languageRank = languageRank(title)
                     )
                 }
@@ -2647,7 +1981,7 @@ private fun parseNuxtListing(
         return best
     }
 
-private fun findBestDetailPath(
+    private fun findBestDetailPath(
         window: String,
         title: String
     ): Triple<Int, Double, String>? {
@@ -2693,37 +2027,56 @@ private fun findBestDetailPath(
 
     private fun findNearestPoster(
         source: String,
-        anchor: Int,
+        start: Int,
         end: Int
     ): String? {
-        val center = when {
-            anchor >= 0 -> anchor
-            end >= 0 -> end
-            else -> return null
-        }
-
-        val windowStart = max(
-            0,
-            center - 1800
-        )
-        val windowEnd = min(
-            source.length,
-            center + 1800
-        )
-
+        val windowStart = max(0, end)
+        val windowEnd = min(source.length, end + 9000)
         if (windowEnd <= windowStart) return null
 
-        val window = source.substring(
-            windowStart,
-            windowEnd
+        val window = source.substring(windowStart, windowEnd)
+
+        data class Candidate(
+            val url: String,
+            val width: Int,
+            val height: Int,
+            val score: Int,
+            val distance: Int
         )
 
-        return extractBestLocalPoster(
-            window
-        )
+        val candidates = Regex(
+            """(?is)"(?:jpg|jpeg|png|webp)",(\d{3,5}),\d{2,10},"(https?://[^"]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)",(\d{3,5})"""
+        ).findAll(window).mapNotNull { match ->
+            val height = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+            val width = match.groupValues[3].toIntOrNull() ?: return@mapNotNull null
+            val url = match.groupValues[2]
+                .replace("\\/", "/")
+                .replace("\\:", ":")
+                .replace("\\\\", "\\")
+            if (url.contains("logo", true) || url.contains("icon", true) || url.contains("avatar", true)) return@mapNotNull null
+            val score = when {
+                url.contains("/media/vone/", true) -> 30
+                url.contains("/image/", true) -> 20
+                else -> 10
+            } + if (height >= width) 25 else 0
+            Candidate(url, width, height, score, match.range.first)
+        }.toList()
+
+        if (candidates.isNotEmpty()) {
+            return candidates.maxWithOrNull(
+                compareBy<Candidate> { it.score }
+                    .thenByDescending { it.height * it.width }
+                    .thenBy { it.distance }
+            )?.url
+        }
+
+        return Regex(
+            """https?:(?:/|\\/){2}[^"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s]*)?""",
+            RegexOption.IGNORE_CASE
+        ).find(window)?.value?.replace("\\/", "/")
     }
 
-private fun unescapeSsrText(
+    private fun unescapeSsrText(
         value: String
     ): String {
         return value
@@ -2832,253 +2185,7 @@ private fun unescapeSsrText(
         )
     }
 
-    private suspend fun resolveMobileEpisodes(
-        subjectId: String?,
-        title: String,
-        fallbackDocument: Document?
-    ): List<Episode> {
-        if (!subjectId.isNullOrBlank()) {
-            val seasons = fetchSeasonCounts(subjectId)
-            if (seasons.isNotEmpty()) {
-                return seasons.flatMap { seasonInfo ->
-                    (1..seasonInfo.second).map { ep ->
-                        newEpisode(
-                            data = "MBEP|$subjectId|${seasonInfo.first}|$ep|$title"
-                        ) {
-                            name = "Episode $ep"
-                            season = seasonInfo.first
-                            episode = ep
-                        }
-                    }
-                }
-            }
-        }
-
-        return fallbackDocument?.let(::parseEpisodes).orEmpty()
-    }
-
-    private suspend fun fetchSeasonCounts(
-        subjectId: String
-    ): List<Pair<Int, Int>> {
-        val encodedId = URLEncoder.encode(subjectId, "UTF-8")
-        val combined = linkedMapOf<Int, Int>()
-
-        for (host in mobileApiHosts) {
-            repeat(API_RETRY_ATTEMPTS) {
-                val endpoints = listOf(
-                    "$host/wefeed-mobile-bff/subject-api/season-info?subjectId=$encodedId",
-                    "$host/wefeed-mobile-bff/subject-api/episode-list?subjectId=$encodedId"
-                )
-
-                for (endpoint in endpoints) {
-                    val response = runCatching {
-                        app.get(
-                            addCacheBuster(endpoint),
-                            headers = mobileApiHeaders(host)
-                        )
-                    }.getOrNull() ?: continue
-
-                    if (response.code !in 200..399) continue
-
-                    parseSeasonCounts(response.text).forEach { (season, count) ->
-                        if (count > 0) {
-                            combined[season] = maxOf(
-                                combined[season] ?: 0,
-                                count
-                            )
-                        }
-                    }
-                }
-
-                if (combined.isNotEmpty()) {
-                    return@repeat
-                }
-            }
-        }
-
-        return combined.entries
-            .sortedBy { it.key }
-            .map { it.key to it.value }
-    }
-
-private fun parseSeasonCounts(
-        body: String
-    ): List<Pair<Int, Int>> {
-        val root = runCatching {
-            jsonMapper.readTree(body)
-        }.getOrNull() ?: return emptyList()
-
-        val result = linkedMapOf<Int, Int>()
-
-        fun update(season: Int?, count: Int?) {
-            if (season == null || season <= 0) return
-            if (count == null || count <= 0) return
-            val safe = count.coerceAtMost(MAX_EPISODES_PER_SEASON)
-            result[season] = maxOf(
-                result[season] ?: 0,
-                safe
-            )
-        }
-
-        fun walk(node: JsonNode, inheritedSeason: Int = 1) {
-            if (node.isObject) {
-                val season = firstJsonLong(
-                    node,
-                    "season",
-                    "seasonNumber",
-                    "se",
-                    "seasonNo"
-                )?.toInt() ?: inheritedSeason
-
-                val count = firstJsonLong(
-                    node,
-                    "episodesAvailable",
-                    "totalEpisode",
-                    "totalEpisodes",
-                    "episodeCount",
-                    "maxEp",
-                    "allEp",
-                    "total",
-                    "count"
-                )?.toInt()
-
-                update(season, count)
-
-                listOf(
-                    "episodes",
-                    "episodeList",
-                    "epList",
-                    "episodeItems"
-                ).forEach { key ->
-                    val arr = node.get(key)
-                    if (
-                        arr != null &&
-                        arr.isArray
-                    ) {
-                        val numbers = arr.mapNotNull { child ->
-                            firstJsonLong(
-                                child,
-                                "episode",
-                                "episodeNumber",
-                                "ep",
-                                "epNum"
-                            )?.toInt()
-                        }
-                        update(
-                            season,
-                            if (numbers.isNotEmpty()) {
-                                numbers.maxOrNull()
-                            } else {
-                                arr.size()
-                            }
-                        )
-                    }
-                }
-
-                val resolutions = node.get("resolutions")
-                if (
-                    resolutions != null &&
-                    resolutions.isArray
-                ) {
-                    resolutions.forEach { resolution ->
-                        update(
-                            season,
-                            firstJsonLong(
-                                resolution,
-                                "epNum",
-                                "episodesAvailable",
-                                "maxEp",
-                                "episodeCount"
-                            )?.toInt()
-                        )
-                    }
-                }
-
-                node.fields().forEachRemaining { (_, child) ->
-                    walk(
-                        child,
-                        season
-                    )
-                }
-            } else if (node.isArray) {
-                node.forEach {
-                    walk(
-                        it,
-                        inheritedSeason
-                    )
-                }
-            }
-        }
-
-        walk(root)
-
-        return result.entries
-            .sortedBy { it.key }
-            .map { it.key to it.value }
-    }
-
-private fun findSubjectIdFromPage(
-        document: Document?,
-        title: String
-    ): String? {
-        if (document == null) return null
-
-        val html = document.html()
-        val normalizedTitle = normalizeSearch(title)
-
-        fun validId(value: String?): String? {
-            val id = value?.trim() ?: return null
-            return id.takeIf { it.matches(Regex("""\d{12,22}""")) }
-        }
-
-        // 1) Prefer a subjectId that appears in the same small context as the
-        // exact page title. This avoids accidentally taking a cast/staff ID.
-        val titleCandidates = Regex(
-            """(?is)(.{0,1800}${Regex.escape(title)}.{0,1800})"""
-        ).findAll(html).toList()
-
-        titleCandidates.forEach { match ->
-            val context = match.value
-            Regex("""(?i)"subjectId"\s*:\s*"?(\d{12,22})""")
-                .find(context)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.let(::validId)
-                ?.let { return it }
-
-            Regex("""(?i)(?:[?&]id=|["']id["']\s*:\s*["']?)(\d{12,22})""")
-                .find(context)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.let(::validId)
-                ?.let { return it }
-        }
-
-        // 2) The player route on MovieBox exposes the subject id in its query
-        // string. Prefer an id attached to a /play/ URL over unrelated numbers.
-        Regex(
-            """(?i)/play/[A-Za-z0-9._~-]+[^"'<>\s]{0,500}?[?&]id=(\d{12,22})"""
-        ).findAll(html).forEach { match ->
-            validId(match.groupValues.getOrNull(1))?.let { return it }
-        }
-
-        // 3) Then look for a subjectId adjacent to a detailPath/route.
-        Regex(
-            """(?is)"subjectId"\s*:\s*"?(\d{12,22})"?[^}]{0,1500}"detailPath"\s*:\s*"([^"]+)"""
-        ).findAll(html).forEach { match ->
-            val route = match.groupValues.getOrNull(2).orEmpty()
-            if (
-                route.contains(normalizedTitle.replace(" ", "-"), true) ||
-                route.contains(normalizedTitle.replace(" ", "_"), true)
-            ) {
-                validId(match.groupValues.getOrNull(1))?.let { return it }
-            }
-        }
-
-        return null
-    }
-
-private fun parseEpisodes(
+    private fun parseEpisodes(
         document: Document
     ): List<Episode> {
 
@@ -4362,169 +3469,4 @@ private fun parseEpisodes(
     ): String {
         return url.removeSuffix("/")
     }
-
-    private suspend fun repairPosters(
-        items: List<SiteItem>
-    ): List<SiteItem> {
-        if (items.size <= 1) return items
-
-        val posterCounts = items
-            .mapNotNull { it.poster?.takeIf { p -> p.isNotBlank() } }
-            .groupingBy { it }
-            .eachCount()
-
-        val repaired = items.toMutableList()
-
-        for (index in items.indices) {
-            val item = items[index]
-            val poster = item.poster
-
-            val brokenOrRepeated =
-                poster.isNullOrBlank() ||
-                    (posterCounts[poster] ?: 0) > 1
-
-            if (!brokenOrRepeated) continue
-
-            val candidates = runCatching {
-                searchMobileApi(item.title)
-            }.getOrDefault(emptyList())
-
-            val best = candidates
-                .asSequence()
-                .filter { candidate ->
-                    candidate.poster?.isNotBlank() == true &&
-                        candidate.type == item.type
-                }
-                .map {
-                    it to searchScore(
-                        item.title,
-                        it.title
-                    )
-                }
-                .filter { it.second >= 0.70 }
-                .maxByOrNull { it.second }
-                ?.first
-
-            if (best?.poster.isNullOrBlank()) continue
-
-            repaired[index] = item.copy(
-                poster = best?.poster
-            )
-        }
-
-        return repaired
-    }
-
-private fun apiItemFromNode(
-        node: JsonNode,
-        forcedType: TvType? = null
-    ): SiteItem? {
-        val title = cleanTitle(
-            nodeText(
-                node,
-                "title",
-                "name"
-            ).orEmpty()
-        )
-        if (title.isBlank()) return null
-
-        val detailPath = nodeText(
-            node,
-            "detailPath",
-            "detailUrl",
-            "url"
-        ).orEmpty()
-
-        val type = forcedType ?: when {
-            detailPath.contains(
-                "/animated-series/",
-                true
-            ) -> TvType.Anime
-
-            detailPath.contains(
-                "/tv-series/",
-                true
-            ) -> TvType.TvSeries
-
-            nodeText(
-                node,
-                "subjectType"
-            ).equals("2", true) ||
-                nodeText(
-                    node,
-                    "type"
-                ).equals("tv", true) ||
-                nodeText(
-                    node,
-                    "type"
-                ).equals("series", true) ->
-                TvType.TvSeries
-
-            else -> TvType.Movie
-        }
-
-        val id = nodeText(
-            node,
-            "subjectId",
-            "id"
-        )
-
-        val slug = when {
-            detailPath.startsWith(
-                "http",
-                true
-            ) -> pathFromUrl(detailPath)
-
-            detailPath.startsWith("/") ->
-                detailPath
-
-            !id.isNullOrBlank() ->
-                when (type) {
-                    TvType.TvSeries ->
-                        "/tv-series/${detailPath.substringAfterLast('/').ifBlank { slugifyForUrl(title) + "-" + id }}"
-
-                    TvType.Anime ->
-                        "/animated-series/${detailPath.substringAfterLast('/').ifBlank { slugifyForUrl(title) + "-" + id }}"
-
-                    else ->
-                        "/film/${detailPath.substringAfterLast('/').ifBlank { slugifyForUrl(title) + "-" + id }}"
-                }
-
-            else -> null
-        } ?: return null
-
-        if (!isLikelyContentPath(slug)) return null
-
-        val poster = firstUsefulUrl(
-            firstUrlFromJsonNode(
-                node.get("poster")
-            ),
-            firstUrlFromJsonNode(
-                node.get("cover")
-            ),
-            firstUrlFromJsonNode(
-                node.get("image")
-            ),
-            firstUrlFromJsonNode(
-                node.get("thumbnail")
-            ),
-            nodeText(
-                node,
-                "poster",
-                "cover",
-                "image",
-                "thumbnail"
-            )
-        )
-
-        return SiteItem(
-            title = title,
-            url = canonicalUrl(slug),
-            poster = poster,
-            type = type,
-            languageRank = languageRank(title),
-            subjectId = id
-        )
-    }
-
 }
