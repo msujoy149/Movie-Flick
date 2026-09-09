@@ -129,7 +129,7 @@ class MovieBox : MainAPI() {
             if (items.isEmpty()) continue
 
             return newHomePageResponse(
-                request = request,
+                data = request,
                 list = items
                     .take(HOME_LIMIT)
                     .map { it.toSearchResponse() },
@@ -141,7 +141,7 @@ class MovieBox : MainAPI() {
         }
 
         return newHomePageResponse(
-            request = request,
+            data = request,
             list = emptyList(),
             hasNext = false
         )
