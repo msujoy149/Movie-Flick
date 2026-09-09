@@ -1,5 +1,8 @@
 package com.movieflick.moviebox
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
+
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -26,7 +29,6 @@ class MovieBox : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl" to POPULAR,
         "$mainUrl/film" to MOVIES,
         "$mainUrl/tv-series" to TV_SHOW,
         "$mainUrl/animated-series" to ANIME
@@ -51,12 +53,9 @@ class MovieBox : MainAPI() {
         const val MOVIE_DETAIL_ENDPOINT = "http://wefeed-h5-bff.wefeed-prod/detail"
         const val MAX_PLAYBACK_ATTEMPTS = 10
 
-        const val POPULAR = "Most Popular"
         const val MOVIES = "Movies"
         const val TV_SHOW = "Tv Show"
         const val ANIME = "Anime"
-        const val POPULAR_MOVIES_PATH = "/ranking-list?id=997144265920760504&page_from=more_SUBJECTS_MOVIE"
-        const val POPULAR_SERIES_PATH = "/ranking-list?id=1232643093049001320&page_from=more_SUBJECTS_MOVIE"
     }
 
     private data class SiteItem(
@@ -113,87 +112,53 @@ class MovieBox : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-
         val currentPage = page.coerceAtLeast(1)
         val section = request.name
 
-        if (section == POPULAR) {
-            val rankingItems = ArrayList<SiteItem>()
-
-            val rankingPaths = listOf(
-                POPULAR_MOVIES_PATH,
-                POPULAR_SERIES_PATH
-            )
-
-            for (basePath in rankingPaths) {
-                for (route in rankingPageRoutes(basePath, currentPage)) {
-                    val result = fetchMirrorPage(route) ?: continue
-                    val items = parseNuxtListing(result.document, null)
-                    if (items.isNotEmpty()) {
-                        rankingItems.addAll(items)
-                        break
-                    }
-                }
-            }
-
-            val sortedItems = sortHomeItems(rankingItems)
-
-            val pageItems =
-                if (currentPage == 1) {
-                    interleaveBySourceType(
-                        sortedItems
-                    ).take(
-                        HOME_INITIAL_LIMIT
-                    )
-                } else {
-                    sortedItems
-                        .drop(
-                            (currentPage - 1) *
-                                HOME_PAGE_LIMIT
-                        )
-                        .take(
-                            HOME_PAGE_LIMIT
-                        )
-                }
-
-            return newHomePageResponse(
+        val basePath = when (section) {
+            MOVIES -> "/film"
+            TV_SHOW -> "/tv-series"
+            ANIME -> "/animated-series"
+            else -> return newHomePageResponse(
                 data = request,
-                list = pageItems.map { it.toSearchResponse() },
-                hasNext = rankingItems.size > (
-                    if (currentPage == 1) {
-                        HOME_INITIAL_LIMIT
-                    } else {
-                        currentPage * HOME_PAGE_LIMIT
-                    }
-                )
+                list = emptyList(),
+                hasNext = false
             )
         }
 
-        val basePath = when (section) {
-            TV_SHOW -> "/tv-series"
-            ANIME -> "/animated-series"
-            else -> "/film"
+        val forcedType = when (section) {
+            TV_SHOW -> TvType.TvSeries
+            ANIME -> TvType.Anime
+            else -> TvType.Movie
         }
 
         for (route in pageRoutes(basePath, currentPage)) {
             val result = fetchMirrorPage(route) ?: continue
-
-            val forcedType = when (section) {
-                TV_SHOW -> TvType.TvSeries
-                ANIME -> TvType.Anime
-                else -> TvType.Movie
-            }
-
             val items = parseListing(result.document, forcedType)
             if (items.isEmpty()) continue
 
-            val sortedItems = sortHomeItems(items)
             val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
-
             return newHomePageResponse(
                 data = request,
-                list = sortedItems.take(limit).map { it.toSearchResponse() },
-                hasNext = detectHasNext(result.document, currentPage) || sortedItems.size > limit
+                list = items.take(limit).map { it.toSearchResponse() },
+                hasNext = detectHasNext(result.document, currentPage) || items.size > limit
+            )
+        }
+
+        // API listing fallback. The public BFF is queried only when the HTML
+        // listing did not yield usable cards. No authentication bypass or
+        // private signing secret is used here.
+        val apiItems = fetchApiCatalog(
+            section = section,
+            page = currentPage
+        )
+
+        if (apiItems.isNotEmpty()) {
+            val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
+            return newHomePageResponse(
+                data = request,
+                list = apiItems.take(limit).map { it.toSearchResponse() },
+                hasNext = apiItems.size > limit
             )
         }
 
@@ -216,7 +181,7 @@ class MovieBox : MainAPI() {
 
         val movies =
             items.filter {
-                it.type == TvType.Movie || it.type == TvType.Anime
+                it.type == TvType.Movie
             }
 
         val series =
@@ -295,6 +260,11 @@ class MovieBox : MainAPI() {
         val value = query.trim()
         if (value.isBlank()) return emptyList()
 
+        val api = searchApi(value, 1, 12)
+        if (api.isNotEmpty()) {
+            return rankSearchResults(value, api).take(8)
+        }
+
         return runCatching {
             rankSearchResults(
                 value,
@@ -303,55 +273,19 @@ class MovieBox : MainAPI() {
         }.getOrDefault(emptyList())
     }
 
-    override suspend fun search(
-        query: String
-    ): List<SearchResponse> {
-
+    override suspend fun search(query: String): List<SearchResponse> {
         val original = query.trim()
         if (original.isBlank()) return emptyList()
 
+        val apiResults = searchApi(original, 1, SEARCH_RESULT_LIMIT)
+        if (apiResults.isNotEmpty()) {
+            return rankSearchResults(original, apiResults)
+        }
+
         for (domain in domains) {
-            val nativeItems =
-                searchNative(
-                    domain,
-                    original
-                )
-
-            /*
-             * Native search is the fast path.
-             *
-             * If it already returned a useful amount of content, we
-             * avoid the heavier sitemap scan. Otherwise sitemap search
-             * augments it so search can cover the whole site.
-             */
-            val combined =
-                ArrayList<SiteItem>(
-                    nativeItems.size +
-                        SITEMAP_RESULT_LIMIT
-                )
-
-            combined.addAll(nativeItems)
-
-            if (
-                nativeItems.size <
-                    SEARCH_RESULT_LIMIT / 2
-            ) {
-                combined.addAll(
-                    searchSitemap(
-                        domain,
-                        original
-                    )
-                )
-            }
-
-            val ranked =
-                rankSearchResults(
-                    original,
-                    combined
-                )
-
-            if (ranked.isNotEmpty()) {
-                return ranked
+            val nativeItems = searchNative(domain, original)
+            if (nativeItems.isNotEmpty()) {
+                return rankSearchResults(original, nativeItems)
             }
         }
 
@@ -362,117 +296,39 @@ class MovieBox : MainAPI() {
         domain: String,
         query: String
     ): List<SiteItem> {
+        val home = getDocument(domain, "/")?.document
+        val variants = buildSearchVariants(query)
+        val routes = linkedSetOf<String>()
 
-        val home =
-            getDocument(domain, "/")?.document
-
-        val variants =
-            buildSearchVariants(query)
-
-        val routes =
-            linkedSetOf<String>()
-
-        discoverSearchForms(
-            home = home,
-            variants = variants,
-            routes = routes
-        )
+        discoverSearchForms(home, variants, routes)
 
         for (variant in variants) {
-            val encoded =
-                URLEncoder.encode(
-                    variant,
-                    "UTF-8"
-                )
-
-            routes +=
-                "/search?q=$encoded"
-
-            routes +=
-                "/search?query=$encoded"
-
-            routes +=
-                "/search?keyword=$encoded"
-
-            routes +=
-                "/search?s=$encoded"
+            val encoded = URLEncoder.encode(variant, "UTF-8")
+            routes += "/search?q=$encoded"
+            routes += "/search?query=$encoded"
+            routes += "/search?keyword=$encoded"
+            routes += "/search?s=$encoded"
         }
 
-        val results =
-            ArrayList<SiteItem>()
-
+        val results = ArrayList<SiteItem>()
         for (route in routes) {
-
             for (page in 1..SEARCH_NATIVE_PAGES) {
-
-                val result =
-                    getDocument(
-                        domain,
-                        addPageParameter(
-                            route,
-                            page
-                        )
-                    ) ?: break
-
-                val nuxtResults = parseNuxtListing(
-                    result.document,
-                    null
-                )
-
+                val result = getDocument(domain, addPageParameter(route, page)) ?: break
+                val nuxtResults = parseNuxtListing(result.document, null)
                 if (nuxtResults.isNotEmpty()) {
                     results.addAll(nuxtResults)
                 } else {
-                    val cards = result.document.select(
-                        ".movie-card, " +
-                            ".flw-item, " +
-                            ".film-poster-ahref, " +
-                            ".film_list-wrap .flw-item"
-                    )
-
-                    if (cards.isEmpty()) break
-
-                    cards.mapNotNull(::parseSearchCard).forEach { item ->
-                        // Do not deduplicate search results.
-                        results += item
-                    }
+                    result.document.select(
+                        ".movie-card, .flw-item, .film-poster-ahref, .film_list-wrap .flw-item"
+                    ).mapNotNull(::parseSearchCard).forEach { results += it }
                 }
-
-                if (
-                    !detectHasNext(
-                        result.document,
-                        page
-                    )
-                ) {
-                    break
-                }
-
-                if (
-                    results.size >=
-                        SEARCH_RESULT_LIMIT * 2
-                ) {
-                    break
-                }
+                if (!detectHasNext(result.document, page) || results.size >= SEARCH_RESULT_LIMIT * 2) break
             }
-
-            if (
-                results.size >=
-                    SEARCH_RESULT_LIMIT * 2
-            ) {
-                break
-            }
+            if (results.size >= SEARCH_RESULT_LIMIT * 2) break
         }
-
         return results
     }
 
-    /*
-     * ------------------------------------------------------------
-     * SEARCH FALLBACK
-     * ------------------------------------------------------------
-     *
-     * Sitemap is used only after native search produced no useful
-     * result on the current mirror.
-     */
     private suspend fun searchSitemap(
         domain: String,
         query: String
@@ -681,147 +537,88 @@ class MovieBox : MainAPI() {
      * LOAD
      * ------------------------------------------------------------
      */
-    override suspend fun load(
-        url: String
-    ): LoadResponse? {
-
+    override suspend fun load(url: String): LoadResponse? {
         val path = pathFromUrl(url)
+        if (path.isBlank()) return null
 
-        /*
-         * MovieBox currently exposes the content slug/id in the page SSR
-         * payload and also uses a backend detail endpoint. The public web
-         * route can be /film/... or /movies/... depending on the page/version.
-         *
-         * Keep the CloudStream item URL as-is, but use every known public
-         * detail route as a read-only fallback so a stale web route does not
-         * make the title unloadable.
-         */
         val candidatePaths = linkedSetOf<String>().apply {
             add(path)
-
-            if (path.startsWith("/film/")) {
-                add("/movies/" + path.removePrefix("/film/"))
-                derivedPlayPath(path)?.let(::add)
-            } else if (path.startsWith("/movies/")) {
-                add("/film/" + path.removePrefix("/movies/"))
-                add("/play/" + path.removePrefix("/movies/"))
-            } else if (path.startsWith("/play/")) {
-                val slug = path.removePrefix("/play/")
-                if (slug.isNotBlank()) {
-                    add("/film/$slug")
-                    add("/movies/$slug")
+            when {
+                path.startsWith("/film/") -> {
+                    add("/movies/" + path.removePrefix("/film/"))
+                    derivedPlayPath(path)?.let(::add)
+                }
+                path.startsWith("/movies/") -> {
+                    add("/film/" + path.removePrefix("/movies/"))
+                    add("/play/" + path.removePrefix("/movies/"))
+                }
+                path.startsWith("/tv-series/") || path.startsWith("/animated-series/") -> {
+                    val slug = path.substringAfterLast('/')
+                    if (slug.isNotBlank()) {
+                        add("/play/$slug")
+                    }
+                }
+                path.startsWith("/play/") -> {
+                    val slug = path.removePrefix("/play/")
+                    if (slug.isNotBlank()) {
+                        add("/film/$slug")
+                        add("/movies/$slug")
+                        add("/tv-series/$slug")
+                        add("/animated-series/$slug")
+                    }
                 }
             }
         }
 
         var page: MirrorPage? = null
-
         for (candidate in candidatePaths) {
             page = fetchMirrorPage(candidate)
             if (page != null) break
         }
 
         var document = page?.document
-
-        /*
-         * Public MovieBox SSR data also exposes a backend detail URL of the
-         * form:
-         *
-         *   /detail/<slug-id>
-         *
-         * Fetch that page as an additional public metadata source when the
-         * normal website route is unavailable or incomplete.
-         */
         if (document == null) {
-            val slug = contentSlug(path)
-            if (!slug.isNullOrBlank()) {
-                document = fetchBackendDetailDocument(slug)
-            }
+            contentSlug(path)?.let { document = fetchBackendDetailDocument(it) }
         }
 
-        val title =
-            cleanTitle(
-                firstNonBlank(
-                    document?.selectFirst(
-                        "meta[property=og:title]"
-                    )?.attr("content"),
-
-                    document?.selectFirst(
-                        "h1"
-                    )?.text(),
-
-                    document?.selectFirst(
-                        ".film-name"
-                    )?.text(),
-
-                    document?.title()
-                ).orEmpty()
-            ).ifBlank {
-                titleFromContentPath(path)
-            }
-
-        if (title.isBlank()) {
-            return null
-        }
-
-        val poster =
-            firstUsefulUrl(
-                document?.selectFirst(
-                    "meta[property=og:image]"
-                )?.attr("content"),
-
-                document?.selectFirst(
-                    "meta[name=twitter:image]"
-                )?.attr("content"),
-
-                document?.selectFirst(
-                    ".film-poster img, " +
-                        ".movie-card img, " +
-                        "img"
-                )?.let(
-                    ::extractImageUrl
-                )
-            )
-
-        val plot =
+        val title = cleanTitle(
             firstNonBlank(
-                document?.selectFirst(
-                    "meta[property=og:description]"
-                )?.attr("content"),
+                document?.selectFirst("meta[property=og:title]")?.attr("content"),
+                document?.selectFirst("h1")?.text(),
+                document?.selectFirst(".film-name")?.text(),
+                document?.title()
+            ).orEmpty()
+        ).ifBlank { titleFromContentPath(path) }
 
-                document?.selectFirst(
-                    ".description, " +
-                        ".film-description, " +
-                        ".description-content"
-                )?.text()
-            )
+        if (title.isBlank()) return null
 
-        val year =
-            if (document != null) {
-                extractYear(title, document)
-            } else {
-                Regex("""\b(19|20)\d{2}\b""")
-                    .find(title)
-                    ?.value
-                    ?.toIntOrNull()
-            }
+        val poster = firstUsefulUrl(
+            document?.selectFirst("meta[property=og:image]")?.attr("content"),
+            document?.selectFirst("meta[name=twitter:image]")?.attr("content"),
+            document?.selectFirst(".film-poster img, .movie-card img, img")?.let(::extractImageUrl)
+        )
 
+        val plot = firstNonBlank(
+            document?.selectFirst("meta[property=og:description]")?.attr("content"),
+            document?.selectFirst(".description, .film-description, .description-content")?.text()
+        )
+
+        val year = document?.let { extractYear(title, it) }
         val type = typeFromPath(path)
 
-        if (
-            type == TvType.Movie ||
-            type == TvType.Anime
-        ) {
-            /*
-             * Pass the original item URL into loadLinks. loadLinks will
-             * independently resolve the current public player/media route
-             * on every Play action.
-             */
-            return newMovieLoadResponse(
+        if (type == TvType.TvSeries) {
+            val subjectId = findApiSubjectId(title)
+            val episodes = if (!subjectId.isNullOrBlank()) {
+                fetchApiEpisodes(subjectId, title)
+            } else {
+                emptyList()
+            }
+
+            return newTvSeriesLoadResponse(
                 name = title,
                 url = canonicalUrl(path),
-                type = type,
-                dataUrl = canonicalUrl(path)
+                type = TvType.TvSeries,
+                episodes = episodes
             ) {
                 posterUrl = poster
                 this.plot = plot
@@ -829,29 +626,11 @@ class MovieBox : MainAPI() {
             }
         }
 
-        /*
-         * A MovieBox TV page's SSR `resource.videoAddress` is trailer/player
-         * metadata, not the series episode catalogue. The provided Trigger
-         * source, for example, exposes a 94-second trailer resource and a
-         * generic /play/trigger-... route. Treating that route as Episode 1
-         * is what creates the false short-episode behavior.
-         *
-         * parseEpisodes therefore accepts only explicit episode routes/markers.
-         */
-        val episodes =
-            if (document != null) {
-                parseEpisodes(
-                    document = document
-                )
-            } else {
-                emptyList()
-            }
-
-        return newTvSeriesLoadResponse(
+        return newMovieLoadResponse(
             name = title,
             url = canonicalUrl(path),
-            type = TvType.TvSeries,
-            episodes = episodes
+            type = type,
+            dataUrl = canonicalUrl(path)
         ) {
             posterUrl = poster
             this.plot = plot
@@ -874,420 +653,79 @@ class MovieBox : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-
         val rawData = data.trim()
         if (rawData.isBlank()) return false
 
-        val pageUrl =
-            rawData.substringBefore("||").trim()
+        if (rawData.startsWith("mbxepisode||")) {
+            val parts = rawData.split("||")
+            if (parts.size >= 4) {
+                val subjectId = parts[1]
+                val season = parts[2].toIntOrNull() ?: 1
+                val episode = parts[3].toIntOrNull() ?: 1
+                return resolveApiPlayback(subjectId, season, episode, subtitleCallback, callback)
+            }
+        }
 
+        // Movie/anime public-page fallback. Signed media is only used when it is
+        // already exposed by the public player response; no private signing
+        // secret or authentication bypass is generated here.
+        val pageUrl = rawData.substringBefore("||").trim()
         val pagePath = pathFromUrl(pageUrl)
         if (pagePath.isBlank()) return false
 
-        /*
-         * Every Play action starts from scratch.
-         *
-         * We deliberately do not persist a tokenized media URL. The site may
-         * return a new signed CDN URL on every request.
-         */
-        repeat(MAX_PLAYBACK_ATTEMPTS) { attempt ->
-
+        repeat(MAX_PLAYBACK_ATTEMPTS) {
             val candidateUrls = linkedSetOf<String>()
-
             candidateUrls += canonicalUrl(pagePath)
-
             if (pagePath.startsWith("/film/")) {
-                candidateUrls += canonicalUrl(
-                    "/movies/" + pagePath.removePrefix("/film/")
-                )
+                candidateUrls += canonicalUrl("/movies/" + pagePath.removePrefix("/film/"))
             }
-
-            if (pagePath.startsWith("/movies/")) {
-                candidateUrls += canonicalUrl(
-                    "/film/" + pagePath.removePrefix("/movies/")
-                )
-            }
-
             contentSlug(pagePath)?.let { slug ->
-                candidateUrls += "$MOVIE_DETAIL_ENDPOINT/$slug"
                 candidateUrls += canonicalUrl("/play/$slug")
             }
-
-            derivedPlayPath(pagePath)?.let { playPath ->
-                candidateUrls += canonicalUrl(playPath)
-            }
-
             for (candidateUrl in candidateUrls) {
-                if (
-                    resolveMovieCandidate(
-                        candidateUrl = candidateUrl,
-                        sourcePageUrl = pageUrl,
-                        subtitleCallback = subtitleCallback,
-                        callback = callback
-                    )
-                ) {
+                if (resolvePublicPageCandidate(candidateUrl, pageUrl, subtitleCallback, callback)) {
                     return true
                 }
             }
         }
-
         return false
     }
 
-    private suspend fun resolveMovieCandidate(
+    private suspend fun resolvePublicPageCandidate(
         candidateUrl: String,
         sourcePageUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-
-        val response =
-            runCatching {
-                app.get(
-                    addCacheBuster(candidateUrl),
-                    headers = browserHeaders(
-                        sourcePageUrl
-                    ) + mapOf(
-                        "Referer" to sourcePageUrl,
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept" to (
-                            "text/html,application/xhtml+xml," +
-                                "application/json,text/plain,*/*;q=0.8"
-                        ),
-                        "Cache-Control" to "no-cache",
-                        "Pragma" to "no-cache"
-                    )
+        val response = runCatching {
+            app.get(
+                addCacheBuster(candidateUrl),
+                headers = browserHeaders(sourcePageUrl) + mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8",
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
                 )
-            }.getOrNull()
-                ?: return false
-
-        if (response.code !in 200..399) {
-            return false
-        }
-
-        val html = response.text
-        val document = response.document
-        val mediaCandidates = linkedMapOf<String, MediaSource>()
-
-        fun collect(source: MediaSource) {
-            if (!looksLikePlayableMedia(source.url)) return
-
-            val existing = mediaCandidates[source.url]
-            if (existing == null) {
-                mediaCandidates[source.url] = source
-            } else {
-                mediaCandidates[source.url] = existing.copy(
-                    declaredSize = max(
-                        existing.declaredSize,
-                        source.declaredSize
-                    ),
-                    declaredDurationSeconds = max(
-                        existing.declaredDurationSeconds,
-                        source.declaredDurationSeconds
-                    ),
-                    quality = max(
-                        existing.quality,
-                        source.quality
-                    )
-                )
-            }
-        }
-
-        /*
-         * 1. Direct media / serialized state from the current response.
-         */
-        extractJsonLdMedia(
-            html = html,
-            pageUrl = candidateUrl
-        ).forEach(::collect)
-
-        extractMediaSources(
-            document = document,
-            pageUrl = candidateUrl,
-            html = html
-        ).forEach(::collect)
-
-        /*
-         * 2. The current response may expose fresh public /play/... URLs.
-         */
-        val playUrls = linkedSetOf<String>()
-        playUrls += extractJsonLdUrls(html)
-
-        val decodedHtml = html
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-            .replace("&amp;", "&")
-
-        Regex(
-            """(?i)https?://[^\"'<>\s]+/play/[^\"'<>\s]+"""
-        ).findAll(decodedHtml).forEach { match ->
-            playUrls += match.value
-        }
-
-        Regex(
-            """(?i)"(/play/[^\"]+)"""
-        ).findAll(decodedHtml).forEach { match ->
-            playUrls += absoluteUrl(match.groupValues[1])
-        }
-
-        /*
-         * 3. Backend detail route fallback.
-         */
-        if (candidateUrl.startsWith(MOVIE_DETAIL_ENDPOINT, true)) {
-            val slug =
-                contentSlug(sourcePageUrl)
-                    ?: contentSlug(candidateUrl)
-
-            if (!slug.isNullOrBlank()) {
-                playUrls += canonicalUrl("/play/$slug")
-            }
-        }
-
-        /*
-         * 4. Inspect every fresh player route. We intentionally inspect the
-         * player response on every Play action, so a time-limited signed media
-         * URL is never persisted by this provider.
-         */
-        for (playUrl in playUrls) {
-            val watchResponse =
-                runCatching {
-                    app.get(
-                        addCacheBuster(playUrl),
-                        headers = browserHeaders(candidateUrl) + mapOf(
-                            "Referer" to candidateUrl,
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to (
-                                "text/html,application/xhtml+xml," +
-                                    "application/json,text/plain,*/*;q=0.8"
-                            ),
-                            "Cache-Control" to "no-cache",
-                            "Pragma" to "no-cache"
-                        )
-                    )
-                }.getOrNull()
-                    ?: continue
-
-            if (watchResponse.code !in 200..399) continue
-
-            val watchHtml = watchResponse.text
-
-            extractJsonLdMedia(
-                html = watchHtml,
-                pageUrl = playUrl
-            ).forEach(::collect)
-
-            extractMediaSources(
-                document = watchResponse.document,
-                pageUrl = playUrl,
-                html = watchHtml
-            ).forEach(::collect)
-
-            extractSubtitles(
-                watchResponse.document
-            ).forEach { subtitle ->
-                subtitleCallback(
-                    newSubtitleFile(
-                        subtitle.first,
-                        subtitle.second
-                    )
-                )
-            }
-        }
-
-        if (mediaCandidates.isEmpty()) return false
-
-        /*
-         * 5. Freshly probe the candidate media URLs with a one-byte Range
-         * request. MovieBox/CDN responds with 206 and Content-Range, which gives
-         * us the total size of the real media object without downloading it.
-         * Content-Disposition can also expose the exact filename/quality, e.g.
-         * `Trigger-S1E1-480P.mp4`.
-         */
-        val inspected = LinkedHashMap<String, MediaSource>()
-
-        for (source in mediaCandidates.values) {
-            val probeHeaders = mapOf(
-                "User-Agent" to browserHeaders(source.referer)["User-Agent"].orEmpty(),
-                "Accept" to "*/*",
-                "Range" to "bytes=0-0",
-                "Referer" to source.referer,
-                "Cache-Control" to "no-cache"
             )
+        }.getOrNull() ?: return false
 
-            val headResponse =
-                runCatching {
-                    app.head(
-                        source.url,
-                        headers = probeHeaders,
-                        referer = source.referer,
-                        timeout = 5
-                    )
-                }.getOrNull()
+        if (response.code !in 200..399) return false
 
-            val totalSizeFromHead =
-                headResponse?.headers?.get("Content-Range")
-                    ?.let {
-                        Regex("/([0-9]+)").find(it)?.groupValues?.getOrNull(1)?.toLongOrNull()
-                    }
-                    ?: headResponse?.headers?.get("Content-Length")?.toLongOrNull()
-                    ?: -1L
-
-            val dispositionFromHead =
-                headResponse?.headers?.get("Content-Disposition").orEmpty()
-
-            // Some CDN configurations do not answer HEAD correctly. In that case
-            // fall back to a one-byte Range GET so we still inspect headers without
-            // intentionally downloading the full video.
-            val rangeResponse =
-                if (headResponse == null || totalSizeFromHead <= 0L) {
-                    runCatching {
-                        app.get(
-                            source.url,
-                            headers = probeHeaders
-                        )
-                    }.getOrNull()
-                } else {
-                    null
-                }
-
-            val totalSize =
-                if (totalSizeFromHead > 0L) {
-                    totalSizeFromHead
-                } else {
-                    rangeResponse?.headers?.get("Content-Range")
-                        ?.let {
-                            Regex("/([0-9]+)").find(it)?.groupValues?.getOrNull(1)?.toLongOrNull()
-                        }
-                        ?: rangeResponse?.headers?.get("Content-Length")?.toLongOrNull()
-                        ?: -1L
-                }
-
-            val disposition =
-                if (dispositionFromHead.isNotBlank()) {
-                    dispositionFromHead
-                } else {
-                    rangeResponse?.headers?.get("Content-Disposition").orEmpty()
-                }
-
-            val headerQuality =
-                qualityFromText(disposition)
-
-            val enriched =
-                source.copy(
-                    declaredSize = max(source.declaredSize, totalSize),
-                    quality = if (
-                        headerQuality != Qualities.Unknown.value
-                    ) {
-                        headerQuality
-                    } else {
-                        source.quality
-                    }
-                )
-
-            inspected[source.url] = enriched
-        }
-
-        if (inspected.isEmpty()) return false
-
-        val usable = inspected.values
+        val sources = extractMediaSources(response.document, candidateUrl, response.text)
             .filter { looksLikePlayableMedia(it.url) }
             .filterNot { isObviousTrailerOrPreview(it.url) }
-            .ifEmpty {
-                inspected.values.filter { looksLikePlayableMedia(it.url) }
-            }
 
-        if (usable.isEmpty()) return false
+        if (sources.isEmpty()) return false
 
-        /*
-         * 6. IMPORTANT QUALITY POLICY
-         *
-         * If MovieBox exposes a single adaptive/master manifest, keep that URL as
-         * one source (Auto / Multi-Quality). We do NOT prefer M3U8 merely because
-         * it is M3U8; it is only treated as a single adaptive source when it is
-         * actually exposed by the site.
-         *
-         * Otherwise, preserve every distinct 480p/720p/1080p MP4 resource. For
-         * each quality, choose only the best/full resource for that quality using:
-         *     declared total size -> duration -> quality -> URL
-         *
-         * This means one episode with 480+720+1080 produces three CloudStream
-         * choices, while an episode with only 720 produces only 720.
-         */
-        val adaptiveSources =
-            usable.filter {
-                it.url.contains(".m3u8", true) ||
-                    it.url.contains(".mpd", true)
-            }
+        val best = sources.maxWithOrNull(
+            compareBy<MediaSource> { it.declaredSize }
+                .thenBy { it.declaredDurationSeconds }
+                .thenBy { it.quality }
+        ) ?: return false
 
-        val adaptiveBest =
-            adaptiveSources.maxWithOrNull(
-                compareBy<MediaSource> {
-                    it.declaredSize
-                }.thenBy {
-                    it.declaredDurationSeconds
-                }.thenBy {
-                    it.quality
-                }
-            )
-
-        val explicitQuality =
-            usable.filter {
-                it.quality in setOf(480, 720, 1080)
-            }
-
-        val groupedByQuality =
-            explicitQuality.groupBy { it.quality }
-                .mapValues { (_, list) ->
-                    list.maxWithOrNull(
-                        compareBy<MediaSource> {
-                            it.declaredSize
-                        }.thenBy {
-                            it.declaredDurationSeconds
-                        }.thenBy {
-                            it.url
-                        }
-                    )
-                }
-                .values
-                .filterNotNull()
-                .sortedByDescending { it.quality }
-
-        val fallbackUnknown =
-            if (groupedByQuality.isEmpty() && adaptiveBest == null) {
-                usable.maxWithOrNull(
-                    compareBy<MediaSource> {
-                        it.declaredSize
-                    }.thenBy {
-                        it.declaredDurationSeconds
-                    }.thenBy {
-                        it.quality
-                    }.thenBy {
-                        it.url
-                    }
-                )?.let(::listOf) ?: emptyList()
-            } else {
-                emptyList()
-            }
-
-        val selected =
-            buildList {
-                if (adaptiveBest != null) add(adaptiveBest)
-                addAll(groupedByQuality)
-                if (isEmpty()) addAll(fallbackUnknown)
-            }
-                .distinctBy { it.url }
-
-        if (selected.isEmpty()) return false
-
-        /*
-         * 7. Emit every available quality/adaptive source. CloudStream can then
-         * show the source choices and the user can pick 480p/720p/1080p when all
-         * three are available.
-         */
-        selected.forEach { source ->
-            emitSource(source, callback)
+        emitSource(best, callback)
+        extractSubtitles(response.document).forEach { subtitle ->
+            subtitleCallback(newSubtitleFile(subtitle.first, subtitle.second))
         }
-
         return true
     }
 
@@ -1353,6 +791,530 @@ class MovieBox : MainAPI() {
         ).any {
             value.contains(it)
         }
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * PUBLIC BFF API FALLBACK
+     * ------------------------------------------------------------
+     *
+     * The website is backed by public MovieBox/WeFeed BFF routes. We use only
+     * ordinary GET requests with normal client headers here. No application
+     * secret, cryptographic gateway key, or private authentication token is
+     * embedded in the provider.
+     */
+    private object ApiConfig {
+        const val API_BASE_1 = "https://api6.aoneroom.com"
+        const val API_BASE_2 = "https://api5.aoneroom.com"
+        const val API_PREFIX = "/wefeed-mobile-bff/subject-api"
+        const val JSON_SEARCH = "$API_PREFIX/search"
+        const val JSON_SUGGEST = "$API_PREFIX/search-suggest"
+        const val JSON_GET = "$API_PREFIX/get"
+        const val JSON_SEASON_INFO = "$API_PREFIX/season-info"
+        const val JSON_EPISODE_LIST = "$API_PREFIX/episode-list"
+        const val JSON_PLAY_INFO = "$API_PREFIX/play-info"
+    }
+
+    private val jsonMapper by lazy { ObjectMapper() }
+
+    private fun apiHeaders() = mapOf(
+        "Accept" to "application/json,text/plain,*/*;q=0.8",
+        "User-Agent" to (browserHeaders()["User-Agent"] ?: "Mozilla/5.0"),
+        "Accept-Language" to "en-US,en;q=0.9,hi;q=0.8,bn;q=0.7",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
+        "Referer" to "$mainUrl/"
+    )
+
+    private suspend fun apiGetJson(
+        path: String,
+        params: Map<String, String>
+    ): JsonNode? {
+        val query = params.entries.joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+
+        for (base in listOf(ApiConfig.API_BASE_1, ApiConfig.API_BASE_2)) {
+            val url = if (query.isBlank()) {
+                "$base$path"
+            } else {
+                "$base$path?$query"
+            }
+
+            val response = runCatching {
+                app.get(addCacheBuster(url), headers = apiHeaders())
+            }.getOrNull() ?: continue
+
+            if (response.code !in 200..399) continue
+
+            return runCatching {
+                jsonMapper.readTree(response.text)
+            }.getOrNull()
+        }
+
+        return null
+    }
+
+    private fun nodeText(node: JsonNode?, vararg names: String): String? {
+        if (node == null || !node.isObject) return null
+        for (name in names) {
+            val value = node.get(name) ?: continue
+            if (!value.isNull) {
+                val text = when {
+                    value.isTextual -> value.asText()
+                    value.isNumber -> value.numberValue().toString()
+                    else -> value.toString()
+                }
+                if (text.isNotBlank() && text != "null") return text
+            }
+        }
+        return null
+    }
+
+    private fun nodeLong(node: JsonNode?, vararg names: String): Long {
+        if (node == null || !node.isObject) return -1L
+        for (name in names) {
+            val value = node.get(name) ?: continue
+            if (value.isNumber) return value.asLong()
+            value.asText().toLongOrNull()?.let { return it }
+        }
+        return -1L
+    }
+
+    private fun collectJsonObjects(
+        node: JsonNode?,
+        out: MutableList<JsonNode>
+    ) {
+        if (node == null) return
+        if (node.isObject) {
+            val hasTitle = node.has("title") || node.has("name")
+            val hasId = node.has("subjectId") || node.has("id")
+            if (hasTitle && hasId) out += node
+            node.fields().forEachRemaining { (_, child) ->
+                collectJsonObjects(child, out)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectJsonObjects(child, out) }
+        }
+    }
+
+    private fun firstUrlFromJsonNode(node: JsonNode?): String? {
+        if (node == null) return null
+        if (node.isTextual) {
+            val value = node.asText().trim()
+            if (value.startsWith("http://", true) || value.startsWith("https://", true)) {
+                return value
+            }
+            return null
+        }
+        if (node.isObject) {
+            val direct = nodeText(node, "url", "src", "href", "path")
+            if (!direct.isNullOrBlank()) {
+                direct.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }?.let { return it }
+            }
+            node.fields().forEachRemaining { (_, child) ->
+                firstUrlFromJsonNode(child)?.let { return it }
+            }
+        } else if (node.isArray) {
+            node.forEach { child ->
+                firstUrlFromJsonNode(child)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun apiItemFromNode(node: JsonNode, forcedType: TvType? = null): SiteItem? {
+        val title = cleanTitle(
+            nodeText(node, "title", "name").orEmpty()
+        )
+        if (title.isBlank()) return null
+
+        val detailPath = nodeText(
+            node,
+            "detailPath", "detailUrl", "url"
+        ).orEmpty()
+
+        val typeValue = nodeText(node, "type", "subjectType")
+        val type = forcedType ?: when {
+            typeValue.equals("2", true) -> TvType.TvSeries
+            typeValue.equals("tv", true) -> TvType.TvSeries
+            typeValue.equals("series", true) -> TvType.TvSeries
+            typeValue.equals("7", true) -> TvType.Anime
+            detailPath.contains("animated-series", true) -> TvType.Anime
+            detailPath.contains("tv-series", true) -> TvType.TvSeries
+            else -> TvType.Movie
+        }
+
+        val id = nodeText(node, "subjectId", "id")
+        val slug = when {
+            detailPath.startsWith("http", true) -> pathFromUrl(detailPath)
+            detailPath.startsWith("/") -> detailPath
+            !id.isNullOrBlank() -> when (type) {
+                TvType.TvSeries -> "/tv-series/${detailPath.substringAfterLast('/').ifBlank { id }}"
+                TvType.Anime -> "/animated-series/${detailPath.substringAfterLast('/').ifBlank { id }}"
+                else -> "/film/${detailPath.substringAfterLast('/').ifBlank { id }}"
+            }
+            else -> null
+        } ?: return null
+
+        val poster = firstUsefulUrl(
+            firstUrlFromJsonNode(node.get("poster")),
+            firstUrlFromJsonNode(node.get("cover")),
+            firstUrlFromJsonNode(node.get("image")),
+            firstUrlFromJsonNode(node.get("thumbnail")),
+            nodeText(node, "poster", "cover", "image", "thumbnail")
+        )
+
+        return SiteItem(
+            title = title,
+            url = canonicalUrl(slug),
+            poster = poster,
+            type = type,
+            languageRank = languageRank(title)
+        )
+    }
+
+    private suspend fun fetchApiCatalog(
+        section: String,
+        page: Int
+    ): List<SiteItem> {
+        val query = when (section) {
+            TV_SHOW -> "tv"
+            ANIME -> "anime"
+            else -> "movie"
+        }
+
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to query,
+                "page" to page.toString(),
+                "pageSize" to HOME_PAGE_LIMIT.toString()
+            )
+        ) ?: return emptyList()
+
+        val forcedType = when (section) {
+            TV_SHOW -> TvType.TvSeries
+            ANIME -> TvType.Anime
+            else -> TvType.Movie
+        }
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+        return nodes
+            .mapNotNull { apiItemFromNode(it) }
+            .filter { it.type == forcedType }
+    }
+
+    private suspend fun searchApi(
+        query: String,
+        page: Int,
+        pageSize: Int
+    ): List<SiteItem> {
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to query,
+                "page" to page.toString(),
+                "pageSize" to pageSize.toString()
+            )
+        ) ?: return emptyList()
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+
+        val result = nodes.mapNotNull { apiItemFromNode(it) }
+        if (result.isNotEmpty()) return result
+
+        val suggest = apiGetJson(
+            ApiConfig.JSON_SUGGEST,
+            mapOf("q" to query)
+        ) ?: return emptyList()
+
+        nodes.clear()
+        collectJsonObjects(suggest, nodes)
+        return nodes.mapNotNull { apiItemFromNode(it) }
+    }
+
+    private suspend fun findApiSubjectId(title: String): String? {
+        val json = apiGetJson(
+            ApiConfig.JSON_SEARCH,
+            mapOf(
+                "q" to title,
+                "page" to "1",
+                "pageSize" to "20"
+            )
+        ) ?: return null
+
+        val nodes = ArrayList<JsonNode>()
+        collectJsonObjects(json, nodes)
+
+        return nodes
+            .mapNotNull { node ->
+                val id = nodeText(node, "subjectId") ?: return@mapNotNull null
+                val nodeTitle = nodeText(node, "title", "name").orEmpty()
+                Triple(id, nodeTitle, searchScore(title, nodeTitle))
+            }
+            .filter { it.third >= 0.55 }
+            .maxByOrNull { it.third }
+            ?.first
+    }
+
+    private fun episodeCountFromSeasonNode(node: JsonNode): Int {
+        return nodeLong(
+            node,
+            "episodesAvailable",
+            "totalEpisode",
+            "episodeCount",
+            "maxEp",
+            "allEp"
+        ).toInt().coerceAtLeast(0)
+    }
+
+    private suspend fun fetchApiEpisodes(
+        subjectId: String,
+        seriesTitle: String
+    ): List<Episode> {
+        val requests = listOf(
+            ApiConfig.JSON_SEASON_INFO to mapOf("subjectId" to subjectId),
+            ApiConfig.JSON_EPISODE_LIST to mapOf("subjectId" to subjectId)
+        )
+
+        val episodes = LinkedHashMap<String, EpisodeInfoHolder>()
+
+        for ((endpoint, params) in requests) {
+            val json = apiGetJson(endpoint, params) ?: continue
+            collectEpisodeObjects(json, episodes)
+        }
+
+        if (episodes.isEmpty()) return emptyList()
+
+        return episodes.values
+            .sortedWith(compareBy<EpisodeInfoHolder> { it.season }.thenBy { it.episode })
+            .map { info ->
+                newEpisode(
+                    data = "mbxepisode||$subjectId||${info.season}||${info.episode}"
+                ) {
+                    name = info.title.ifBlank { "Episode ${info.episode}" }
+                    season = info.season
+                    episode = info.episode
+                }
+            }
+    }
+
+    private data class EpisodeInfoHolder(
+        val season: Int,
+        val episode: Int,
+        val title: String = ""
+    )
+
+    private fun collectEpisodeObjects(
+        node: JsonNode?,
+        out: MutableMap<String, EpisodeInfoHolder>,
+        inheritedSeason: Int = 1
+    ) {
+        if (node == null) return
+
+        if (node.isObject) {
+            val season = nodeLong(node, "season", "seasonNumber", "se").toInt().let {
+                if (it > 0) it else inheritedSeason
+            }
+
+            val episode = nodeLong(
+                node,
+                "episode",
+                "episodeNumber",
+                "ep",
+                "epNum"
+            ).toInt()
+
+            if (episode > 0) {
+                val key = "$season-$episode"
+                out[key] = EpisodeInfoHolder(
+                    season = season,
+                    episode = episode,
+                    title = nodeText(node, "title", "name", "episodeTitle").orEmpty()
+                )
+            }
+
+            val count = episodeCountFromSeasonNode(node)
+            if (count > 0 && (node.has("season") || node.has("seasonNumber") || node.has("se"))) {
+                for (ep in 1..count) {
+                    val key = "$season-$ep"
+                    out.putIfAbsent(key, EpisodeInfoHolder(season, ep))
+                }
+            }
+
+            node.fields().forEachRemaining { (_, child) ->
+                collectEpisodeObjects(child, out, season)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectEpisodeObjects(child, out, inheritedSeason) }
+        }
+    }
+
+    private suspend fun resolveApiPlayback(
+        subjectId: String,
+        season: Int,
+        episode: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val qualities = listOf("1080p", "720p", "480p")
+        val found = linkedMapOf<String, MediaSource>()
+
+        suspend fun requestPlayback(resourceId: String? = null, quality: String? = null) {
+            val params = linkedMapOf(
+                "subjectId" to subjectId,
+                "se" to season.toString(),
+                "ep" to episode.toString()
+            )
+            if (!quality.isNullOrBlank()) params["quality"] = quality
+            if (!resourceId.isNullOrBlank()) params["resourceId"] = resourceId
+
+            val json = apiGetJson(ApiConfig.JSON_PLAY_INFO, params) ?: return
+            collectStreamSources(json, found)
+            collectApiSubtitles(json, subtitleCallback)
+        }
+
+        // First use the normal public resolver.
+        for (quality in qualities) {
+            requestPlayback(quality = quality)
+        }
+
+        // If the public resolver requires a resourceId (dub/source group),
+        // discover resourceIds from the public metadata endpoint and retry each
+        // quality with those ids. No application secrets are generated here.
+        if (found.isEmpty()) {
+            val detail = apiGetJson(
+                ApiConfig.JSON_GET,
+                mapOf(
+                    "subjectId" to subjectId,
+                    "host" to mainUrl
+                )
+            )
+            val resourceIds = LinkedHashSet<String>()
+            collectResourceIds(detail, resourceIds)
+
+            for (resourceId in resourceIds.take(6)) {
+                for (quality in qualities) {
+                    requestPlayback(resourceId = resourceId, quality = quality)
+                }
+            }
+        }
+
+        if (found.isEmpty()) {
+            requestPlayback()
+        }
+
+        val playable = found.values
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+
+        if (playable.isEmpty()) return false
+
+        val explicit = playable
+            .filter { it.quality in setOf(480, 720, 1080) }
+            .groupBy { it.quality }
+            .values
+            .mapNotNull { list ->
+                list.maxWithOrNull(
+                    compareBy<MediaSource> { it.declaredSize }
+                        .thenBy { it.declaredDurationSeconds }
+                        .thenBy { it.url }
+                )
+            }
+
+        val selected = if (explicit.isNotEmpty()) {
+            explicit.sortedByDescending { it.quality }
+        } else {
+            playable.maxWithOrNull(
+                compareBy<MediaSource> { it.declaredSize }
+                    .thenBy { it.declaredDurationSeconds }
+                    .thenBy { it.quality }
+            )?.let(::listOf) ?: emptyList()
+        }
+
+        selected.forEach { emitSource(it, callback) }
+        return selected.isNotEmpty()
+    }
+
+    private fun collectResourceIds(
+        node: JsonNode?,
+        out: MutableSet<String>
+    ) {
+        if (node == null) return
+        if (node.isObject) {
+            val resourceId = nodeText(node, "resourceId", "rid")
+            if (!resourceId.isNullOrBlank()) out += resourceId
+            node.fields().forEachRemaining { (_, child) ->
+                collectResourceIds(child, out)
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectResourceIds(child, out) }
+        }
+    }
+
+    private fun collectStreamSources(
+        node: JsonNode?,
+        out: MutableMap<String, MediaSource>,
+        context: String = ""
+    ) {
+        if (node == null) return
+
+        if (node.isObject) {
+            val localQuality = nodeText(
+                node,
+                "quality", "definition", "resolution", "name", "label"
+            ).orEmpty()
+            val localSize = nodeLong(node, "size", "fileSize", "contentLength")
+            val localDuration = nodeLong(node, "duration", "durationSeconds")
+
+            node.fields().forEachRemaining { (key, child) ->
+                if (child.isTextual && looksLikePlayableMedia(child.asText())) {
+                    val url = normalizeMediaUrl(child.asText(), mainUrl) ?: return@forEachRemaining
+                    val quality = qualityFromText("$localQuality $context $url")
+                    out[url] = MediaSource(
+                        url = url,
+                        quality = quality,
+                        label = if (quality > 0) "${quality}p" else "MovieBox Stream",
+                        referer = mainUrl,
+                        declaredSize = maxOf(out[url]?.declaredSize ?: -1L, localSize),
+                        declaredDurationSeconds = maxOf(
+                            out[url]?.declaredDurationSeconds ?: -1L,
+                            localDuration
+                        )
+                    )
+                } else {
+                    collectStreamSources(child, out, "$context $key $localQuality")
+                }
+            }
+        } else if (node.isArray) {
+            node.forEach { child -> collectStreamSources(child, out, context) }
+        }
+    }
+
+    private fun collectApiSubtitles(
+        node: JsonNode?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        fun walk(value: JsonNode?) {
+            if (value == null) return
+            if (value.isObject) {
+                val url = nodeText(value, "url", "subtitleUrl", "src")
+                val language = nodeText(value, "lanName", "language", "name", "lang")
+                if (!url.isNullOrBlank() && (url.contains(".srt", true) || url.contains(".vtt", true))) {
+                    val absolute = normalizeMediaUrl(url, mainUrl)
+                    if (absolute != null) {
+                        subtitleCallback(newSubtitleFile(language ?: "Subtitle", absolute))
+                    }
+                }
+                value.fields().forEachRemaining { (_, child) -> walk(child) }
+            } else if (value.isArray) {
+                value.forEach(::walk)
+            }
+        }
+        walk(node)
     }
 
     private fun extractJsonLdUrls(
@@ -1975,7 +1937,7 @@ class MovieBox : MainAPI() {
                     searchScore(title, slugTitle),
                     searchScore(title, cleanTitle(candidatePath))
                 )
-                val poster = findNearestPoster(source, windowStart, titleIndex)
+                val poster = findNearestPoster(source, titleIndex, windowEnd)
 
                 if (score >= 0.20 && (best == null || score > bestScore)) {
                     bestScore = score
@@ -2044,177 +2006,50 @@ class MovieBox : MainAPI() {
         start: Int,
         end: Int
     ): String? {
-
-        val windowStart =
-            max(
-                0,
-                start - 9000
-            )
-
-        val windowEnd =
-            min(
-                source.length,
-                end + 3500
-            )
-
+        val windowStart = max(0, end)
+        val windowEnd = min(source.length, end + 9000)
         if (windowEnd <= windowStart) return null
 
-        val window =
-            source.substring(
-                windowStart,
-                windowEnd
-            )
+        val window = source.substring(windowStart, windowEnd)
 
-        data class PosterCandidate(
+        data class Candidate(
             val url: String,
             val width: Int,
             val height: Int,
-            val assetScore: Int,
+            val score: Int,
             val distance: Int
         )
 
-        /*
-         * MovieBox's Nuxt/devalue media objects commonly serialize the poster
-         * dimensions around the image URL:
-         *
-         * "jpg",HEIGHT,SIZE,"URL",WIDTH
-         *
-         * This lets us prefer a true portrait cover over a landscape banner or
-         * thumbnail, which is what was causing the first Movie/TV cards to
-         * render shorter than the other poster cards.
-         */
-        val dimensionRegex =
-            Regex(
-                """(?is)"(?:jpg|jpeg|png|webp)",(\d{3,5}),\d{2,10},"(https?://[^"]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)",(\d{3,5})"""
-            )
+        val candidates = Regex(
+            """(?is)"(?:jpg|jpeg|png|webp)",(\d{3,5}),\d{2,10},"(https?://[^"]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)",(\d{3,5})"""
+        ).findAll(window).mapNotNull { match ->
+            val height = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+            val width = match.groupValues[3].toIntOrNull() ?: return@mapNotNull null
+            val url = match.groupValues[2]
+                .replace("\/", "/")
+                .replace("\:", ":")
+                .replace("\\", "\")
+            if (url.contains("logo", true) || url.contains("icon", true) || url.contains("avatar", true)) return@mapNotNull null
+            val score = when {
+                url.contains("/media/vone/", true) -> 30
+                url.contains("/image/", true) -> 20
+                else -> 10
+            } + if (height >= width) 25 else 0
+            Candidate(url, width, height, score, match.range.first)
+        }.toList()
 
-        val dimensionCandidates =
-            dimensionRegex
-                .findAll(window)
-                .mapNotNull { match ->
-                    val height =
-                        match.groupValues[1]
-                            .toIntOrNull()
-                            ?: return@mapNotNull null
-
-                    val width =
-                        match.groupValues[3]
-                            .toIntOrNull()
-                            ?: return@mapNotNull null
-
-                    val rawUrl =
-                        match.groupValues[2]
-
-                    val url =
-                        rawUrl
-                            .replace("\\/", "/")
-                            .replace("\\:", ":")
-                            .replace("\\\\", "\\")
-
-                    if (
-                        url.contains("logo", true) ||
-                        url.contains("icon", true) ||
-                        url.contains("avatar", true)
-                    ) {
-                        return@mapNotNull null
-                    }
-
-                    val assetScore =
-                        when {
-                            url.contains("/media/vone/", true) -> 30
-                            url.contains("/image/", true) -> 20
-                            else -> 10
-                        }
-
-                    PosterCandidate(
-                        url = url,
-                        width = width,
-                        height = height,
-                        assetScore = assetScore,
-                        distance =
-                            kotlin.math.abs(
-                                (windowStart + match.range.first) - end
-                            )
-                    )
-                }
-                .toList()
-
-        if (dimensionCandidates.isNotEmpty()) {
-            return dimensionCandidates
-                .sortedWith(
-                    compareByDescending<PosterCandidate> {
-                        when {
-                            it.height >= it.width * 1.05 -> 40
-                            it.height >= it.width -> 25
-                            else -> 5
-                        }
-                    }
-                        .thenByDescending {
-                            it.assetScore
-                        }
-                        .thenBy {
-                            it.distance
-                        }
-                )
-                .first()
-                .url
+        if (candidates.isNotEmpty()) {
+            return candidates.maxWithOrNull(
+                compareBy<Candidate> { it.score }
+                    .thenByDescending { it.height * it.width }
+                    .thenBy { it.distance }
+            )?.url
         }
 
-        /*
-         * Fallback for pages where dimension metadata is not serialized.
-         */
-        val regex =
-            Regex(
-                """https?:(?:/|\\/){2}[^"'<>\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'<>\s]*)?""",
-                RegexOption.IGNORE_CASE
-            )
-
-        val candidates =
-            regex.findAll(window)
-                .map { match ->
-                    val raw = match.value
-
-                    val normalized =
-                        raw
-                            .replace("\\/", "/")
-                            .replace("\\:", ":")
-                            .replace("\\\\", "\\")
-
-                    val score =
-                        when {
-                            normalized.contains("/media/vone/", true) -> 30
-                            normalized.contains("/image/", true) -> 20
-                            else -> 10
-                        }
-
-                    PosterCandidate(
-                        url = normalized,
-                        width = 0,
-                        height = 0,
-                        assetScore = score,
-                        distance =
-                            kotlin.math.abs(
-                                (windowStart + match.range.first) - end
-                            )
-                    )
-                }
-                .filter {
-                    !it.url.contains("logo", true) &&
-                        !it.url.contains("icon", true) &&
-                        !it.url.contains("avatar", true)
-                }
-                .toList()
-
-        return candidates
-            .sortedWith(
-                compareByDescending<PosterCandidate> {
-                    it.assetScore
-                }.thenBy {
-                    it.distance
-                }
-            )
-            .firstOrNull()
-            ?.url
+        return Regex(
+            """https?:(?:/|\\/){2}[^"'\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s]*)?""",
+            RegexOption.IGNORE_CASE
+        ).find(window)?.value?.replace("\/", "/")
     }
 
     private fun unescapeSsrText(
