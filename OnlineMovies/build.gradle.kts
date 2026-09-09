@@ -29,10 +29,6 @@ android {
 }
 
 dependencies {
-    implementation(
-        "com.github.recloudstream.cloudstream:library:-SNAPSHOT"
-    )
-
     implementation(kotlin("stdlib"))
 
     implementation(
