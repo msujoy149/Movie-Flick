@@ -26,9 +26,8 @@ class MovieBox : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl" to FEATURED,
-        "$mainUrl" to RECENTLY,
-        "$mainUrl/film" to "Movies",
+        "$mainUrl/ranking-list?id=997144265920760504&page_from=more_SUBJECTS_MOVIE" to POPULAR,
+        "$mainUrl/film" to MOVIES,
         "$mainUrl/tv-series" to TV_SHOW,
         "$mainUrl/animated-series" to ANIME
     )
@@ -45,7 +44,6 @@ class MovieBox : MainAPI() {
     private companion object {
         const val HOME_INITIAL_LIMIT = 6
         const val HOME_PAGE_LIMIT = 10
-        const val HOME_FEATURED_LIMIT = 1
         const val SEARCH_NATIVE_PAGES = 2
         const val SEARCH_RESULT_LIMIT = 50
         const val SITEMAP_RESULT_LIMIT = 80
@@ -53,10 +51,12 @@ class MovieBox : MainAPI() {
         const val MOVIE_DETAIL_ENDPOINT = "http://wefeed-h5-bff.wefeed-prod/detail"
         const val MAX_PLAYBACK_ATTEMPTS = 10
 
-        const val FEATURED = "Featured"
-        const val RECENTLY = "Recently Uploads"
+        const val POPULAR = "Most Popular"
+        const val MOVIES = "Movies"
         const val TV_SHOW = "Tv Show"
         const val ANIME = "Anime"
+        const val POPULAR_MOVIES_PATH = "/ranking-list?id=997144265920760504&page_from=more_SUBJECTS_MOVIE"
+        const val POPULAR_SERIES_PATH = "/ranking-list?id=1232643093049001320&page_from=more_SUBJECTS_MOVIE"
     }
 
     private data class SiteItem(
@@ -115,39 +115,32 @@ class MovieBox : MainAPI() {
         val currentPage = page.coerceAtLeast(1)
         val section = request.name
 
-        if (section == FEATURED || section == RECENTLY) {
-            val result = fetchMirrorPage("/") ?: return newHomePageResponse(
-                data = request,
-                list = emptyList(),
-                hasNext = false
+        if (section == POPULAR) {
+            val rankingItems = ArrayList<SiteItem>()
+
+            val rankingPaths = listOf(
+                POPULAR_MOVIES_PATH,
+                POPULAR_SERIES_PATH
             )
 
-            val allItems = parseNuxtListing(
-                result.document,
-                null
-            )
-
-            val ranked = sortHomeItems(allItems)
-
-            val limit = if (section == FEATURED) {
-                HOME_FEATURED_LIMIT
-            } else if (currentPage == 1) {
-                HOME_INITIAL_LIMIT
-            } else {
-                HOME_PAGE_LIMIT
+            for (basePath in rankingPaths) {
+                for (route in rankingPageRoutes(basePath, currentPage)) {
+                    val result = fetchMirrorPage(route) ?: continue
+                    val items = parseNuxtListing(result.document, null)
+                    if (items.isNotEmpty()) {
+                        rankingItems.addAll(items)
+                        break
+                    }
+                }
             }
 
-            val start = if (section == FEATURED) 0 else if (currentPage == 1) 0 else (HOME_INITIAL_LIMIT + (currentPage - 2) * HOME_PAGE_LIMIT)
-            val pageItems = if (section == FEATURED) {
-                ranked.take(limit)
-            } else {
-                ranked.drop(start).take(limit)
-            }
+            val sortedItems = sortHomeItems(rankingItems)
+            val limit = if (currentPage == 1) HOME_INITIAL_LIMIT else HOME_PAGE_LIMIT
 
             return newHomePageResponse(
                 data = request,
-                list = pageItems.map { it.toSearchResponse() },
-                hasNext = if (section == FEATURED) false else ranked.size > start + pageItems.size
+                list = sortedItems.take(limit).map { it.toSearchResponse() },
+                hasNext = sortedItems.size > limit
             )
         }
 
@@ -166,11 +159,7 @@ class MovieBox : MainAPI() {
                 else -> TvType.Movie
             }
 
-            val items = parseListing(
-                result.document,
-                forcedType
-            )
-
+            val items = parseListing(result.document, forcedType)
             if (items.isEmpty()) continue
 
             val sortedItems = sortHomeItems(items)
@@ -191,7 +180,8 @@ class MovieBox : MainAPI() {
     }
 
     private fun sortHomeItems(items: List<SiteItem>): List<SiteItem> {
-        return items.sortedBy { it.languageRank }
+        // Keep the website ranking/order intact on home/category pages.
+        return items
     }
 
     /*
@@ -209,6 +199,23 @@ class MovieBox : MainAPI() {
      * We never move to another mirror after a useful result has
      * already been found.
      */
+    /**
+     * CloudStream can call quickSearch while the user is typing.
+     * We use the site's native search fast path here and keep the same
+     * language ranking used by full search.
+     */
+    override suspend fun quickSearch(query: String): List<SearchResponse>? {
+        val value = query.trim()
+        if (value.isBlank()) return emptyList()
+
+        return runCatching {
+            rankSearchResults(
+                value,
+                searchNative(mainUrl, value).take(20)
+            ).take(8)
+        }.getOrDefault(emptyList())
+    }
+
     override suspend fun search(
         query: String
     ): List<SearchResponse> {
@@ -735,6 +742,15 @@ class MovieBox : MainAPI() {
             }
         }
 
+        /*
+         * A MovieBox TV page's SSR `resource.videoAddress` is trailer/player
+         * metadata, not the series episode catalogue. The provided Trigger
+         * source, for example, exposes a 94-second trailer resource and a
+         * generic /play/trigger-... route. Treating that route as Episode 1
+         * is what creates the false short-episode behavior.
+         *
+         * parseEpisodes therefore accepts only explicit episode routes/markers.
+         */
         val episodes =
             if (document != null) {
                 parseEpisodes(
@@ -1631,60 +1647,102 @@ class MovieBox : MainAPI() {
 
         val found = linkedMapOf<String, EpisodeInfo>()
 
-        document.select(
-            "a[href*='episode'], " +
-                ".episode a[href], " +
-                ".episodes a[href], " +
-                ".ep-item a[href], " +
-                "[class*='episode'] a[href]"
-        ).forEach { anchor ->
-            val href = anchor.attr("href").trim()
-            if (href.isBlank()) return@forEach
+        fun addEpisode(rawUrl: String?, rawLabel: String?, rawSeason: String? = null, rawEpisode: String? = null) {
+            if (rawUrl.isNullOrBlank()) return
 
-            val url = absoluteUrl(href)
-            val label = cleanTitle(
-                firstNonBlank(
-                    anchor.text(),
-                    anchor.attr("title")
-                ).orEmpty()
+            val url = absoluteUrl(rawUrl.trim())
+            val label = cleanTitle(rawLabel.orEmpty())
+            val context = "$label $url"
+
+            val episodeNumber = (
+                rawEpisode?.toIntOrNull()
+                    ?: Regex("(?i)(?:season\\s*)?S(\\d{1,3})?[^A-Z0-9]{0,3}E(\\d{1,4})").find(context)?.groupValues?.getOrNull(2)?.toIntOrNull()
+                    ?: Regex("(?i)(?:episode|ep|e)[\\s._-]*(\\d{1,4})\\b").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
             )
-            val episodeNumber = Regex(
-                """(?i)(?:episode|ep|e)[\s._-]*(\d+)"""
-            ).find("$label $url")?.groupValues?.getOrNull(1)?.toIntOrNull()
-            val seasonNumber = Regex(
-                """(?i)(?:season|s)[\s._-]*(\d+)"""
-            ).find("$label $url")?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+            val seasonNumber = (
+                rawSeason?.toIntOrNull()
+                    ?: Regex("(?i)\\bS(\\d{1,3})\\b").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ?: Regex("(?i)(?:season|s)[\\s._-]*(\\d{1,3})\\b").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            )
+
+            // IMPORTANT: do not turn generic /play/<slug> trailer URLs into episodes.
+            if (episodeNumber == null && !isExplicitEpisodeUrl(url)) return
+
+            val safeEpisode = episodeNumber ?: (found.size + 1)
+            val safeSeason = seasonNumber ?: 1
+            val title = label.ifBlank {
+                if (episodeNumber != null) "Episode $episodeNumber" else "Episode $safeEpisode"
+            }
 
             found.putIfAbsent(
-                "$url|${seasonNumber ?: 1}|${episodeNumber ?: found.size + 1}",
-                EpisodeInfo(
-                    url,
-                    label.ifBlank { "Episode ${episodeNumber ?: found.size + 1}" },
-                    seasonNumber,
-                    episodeNumber
+                "$url|$safeSeason|$safeEpisode",
+                EpisodeInfo(url, title, safeSeason, safeEpisode)
+            )
+        }
+
+        // Real episode anchors/buttons, when the page exposes them server-side.
+        document.select(
+            "a[href], button[data-url], [data-href], [data-play-url], " +
+                "[data-episode], [data-episode-number], [data-episode-id]"
+        ).forEach { element ->
+            val href = firstNonBlank(
+                element.attr("href"),
+                element.attr("data-url"),
+                element.attr("data-href"),
+                element.attr("data-play-url"),
+                element.attr("data-src")
+            ) ?: return@forEach
+
+            if (!href.contains("/play/", true) && !href.contains("episode", true)) return@forEach
+
+            addEpisode(
+                rawUrl = href,
+                rawLabel = firstNonBlank(
+                    element.text(),
+                    element.attr("title"),
+                    element.attr("aria-label"),
+                    element.attr("data-episode"),
+                    element.attr("data-episode-number")
+                ),
+                rawSeason = element.attr("data-season"),
+                rawEpisode = firstNonBlank(
+                    element.attr("data-episode"),
+                    element.attr("data-episode-number"),
+                    element.attr("data-ep")
                 )
             )
         }
 
-        // Nuxt SSR often serializes the episode list without rendering <a> tags.
-        // Capture explicit /play/... URLs together with nearby episode numbers.
+        // Serialized Nuxt state can contain explicit episode routes.
+        // We only accept routes whose nearby serialized context identifies an episode.
         val html = document.html()
-        val playRegex = Regex(
-            """(?i)(/play/[A-Za-z0-9._-]+(?:\?[^\"'<>\s]*)?)"""
-        )
-        playRegex.findAll(html).forEach { match ->
-            val url = absoluteUrl(match.groupValues[1])
-            val before = html.substring(max(0, match.range.first - 600), match.range.first)
-            val after = html.substring(match.range.last + 1, min(html.length, match.range.last + 601))
-            val context = before + after
-            val episodeNumber = Regex("""(?i)(?:episode|ep|e)[\s._-]*(\d+)""").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
-            val seasonNumber = Regex("""(?i)(?:season|s)[\s._-]*(\d+)""").find(context)?.groupValues?.getOrNull(1)?.toIntOrNull()
-            val title = "Episode ${episodeNumber ?: found.size + 1}"
-            found.putIfAbsent(
-                "$url|${seasonNumber ?: 1}|${episodeNumber ?: found.size + 1}",
-                EpisodeInfo(url, title, seasonNumber, episodeNumber)
-            )
-        }
+        val decoded = html
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        Regex("(?i)(/play/[A-Za-z0-9._-]+(?:\\?[^\"'<>\\s]*)?)")
+            .findAll(decoded)
+            .forEach { match ->
+                val before = decoded.substring(max(0, match.range.first - 900), match.range.first)
+                val after = decoded.substring(match.range.last + 1, min(decoded.length, match.range.last + 900))
+                val context = before + after
+
+                val episodeNumber = Regex("(?i)(?:episode|ep|e)[\\s._:-]*(\\d{1,4})\\b")
+                    .find(context)?.groupValues?.getOrNull(1)
+                val seasonNumber = Regex("(?i)(?:season|s)[\\s._:-]*(\\d{1,3})\\b")
+                    .find(context)?.groupValues?.getOrNull(1)
+
+                if (episodeNumber != null || isExplicitEpisodeUrl(match.value)) {
+                    addEpisode(
+                        match.value,
+                        "Episode ${episodeNumber ?: found.size + 1}",
+                        seasonNumber,
+                        episodeNumber
+                    )
+                }
+            }
 
         return found.values
             .sortedWith(compareBy<EpisodeInfo> { it.season ?: 1 }.thenBy { it.episode ?: Int.MAX_VALUE })
@@ -1697,6 +1755,11 @@ class MovieBox : MainAPI() {
                     episode = info.episode
                 }
             }
+    }
+
+    private fun isExplicitEpisodeUrl(url: String): Boolean {
+        return Regex("(?i)(/episode|/ep[-_./]|episode[-_./]|(?:[?&](?:episode|ep|episodeId)=))").containsMatchIn(url) ||
+            Regex("(?i)S\\d{1,3}E\\d{1,4}").containsMatchIn(url)
     }
 
     /*
@@ -2163,6 +2226,19 @@ class MovieBox : MainAPI() {
      * HELPERS
      * ------------------------------------------------------------
      */
+    private fun rankingPageRoutes(
+        basePath: String,
+        page: Int
+    ): List<String> {
+        if (page <= 1) return listOf(basePath).distinct()
+
+        val separator = if (basePath.contains("?")) "&" else "?"
+        return listOf(
+            "$basePath${separator}page=$page",
+            "$basePath${separator}p=$page"
+        ).distinct()
+    }
+
     private fun pageRoutes(
         basePath: String,
         page: Int
@@ -2369,6 +2445,9 @@ class MovieBox : MainAPI() {
         return value.startsWith(
             "/film/"
         ) ||
+            value.startsWith(
+                "/movies/"
+            ) ||
             value.startsWith(
                 "/tv-series/"
             ) ||
