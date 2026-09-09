@@ -18,6 +18,7 @@ cloudstream {
     )
 
     language = "en"
+    isCrossPlatform = true
 
     setRepo(
         System.getenv("GITHUB_REPOSITORY")
