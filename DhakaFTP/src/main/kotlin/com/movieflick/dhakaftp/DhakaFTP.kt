@@ -30,7 +30,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLDecoder
@@ -139,13 +138,13 @@ class DhakaFTP : MainAPI() {
          * The first synchronous homepage request is intentionally
          * lightweight. The full recursive index has no folder-depth cap.
          */
-        const val QUICK_SCAN_DIRECTORY_LIMIT = 28
+        const val QUICK_SCAN_DIRECTORY_LIMIT = 48
 
         /* First-page synchronous probe budget. */
-        const val QUICK_PAGE_TIMEOUT_MS = 1800L
+        const val QUICK_DIRECTORY_TIMEOUT_MS = 900L
 
         /* Directories fetched concurrently during a quick probe. */
-        const val QUICK_SCAN_BATCH_SIZE = 8
+        const val QUICK_SCAN_BATCH_SIZE = 12
 
         const val CACHE_MINUTES = 10L
 
@@ -318,8 +317,8 @@ class DhakaFTP : MainAPI() {
         /*
          * PAGE 1 MUST NEVER wait for the complete recursive crawl.
          *
-         * We give the quick probe a small time budget. The full index
-         * starts immediately in the background afterwards.
+         * Quick discovery uses small per-directory network timeouts.
+         * The complete recursive index starts immediately afterwards.
          */
         if (page == 1) {
 
@@ -338,14 +337,18 @@ class DhakaFTP : MainAPI() {
                 ) {
                     cachedFirst
                 } else {
-                    withTimeoutOrNull(
-                        QUICK_PAGE_TIMEOUT_MS
-                    ) {
+                    val probed =
                         scanLatestGroups(
                             root,
                             MOVIE_HOME_SIZE
                         )
-                    }.orEmpty()
+
+                    probed.ifEmpty {
+                        validCache(root)
+                            ?.groups
+                            ?.take(MOVIE_HOME_SIZE)
+                            .orEmpty()
+                    }
                 }
 
             /*
@@ -601,21 +604,25 @@ class DhakaFTP : MainAPI() {
         }
 
         val initial =
-            withTimeoutOrNull(
-                QUICK_PAGE_TIMEOUT_MS
-            ) {
-                scanLatestGroups(
-                    root,
-                    limit
-                )
-            }.orEmpty()
+            scanLatestGroups(
+                root,
+                limit
+            )
+
+        val usable =
+            initial.ifEmpty {
+                validCache(root)
+                    ?.groups
+                    ?.take(limit)
+                    .orEmpty()
+            }
 
         updatePartialCache(
             root,
-            initial
+            usable
         )
 
-        return initial
+        return usable
     }
 
     private fun mixThreeAndThree(
@@ -1314,6 +1321,43 @@ class DhakaFTP : MainAPI() {
      *
      * Folder depth itself is NOT limited.
      */
+    private fun directoryPriority(
+        entry: FtpEntry
+    ): Long {
+
+        val name =
+            decodeSafely(
+                entry.name
+            ).trim()
+
+        val year =
+            Regex(
+                "(?<!\\d)(19\\d{2}|20\\d{2})(?!\\d)"
+            )
+                .find(name)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toLongOrNull()
+
+        return when {
+            year != null ->
+                year * 1_000_000L
+
+            name.contains(
+                "latest",
+                ignoreCase = true
+            ) ||
+                name.contains(
+                    "new",
+                    ignoreCase = true
+                ) ->
+                900_000L
+
+            else ->
+                0L
+        }
+    }
+
     private suspend fun scanLatestGroups(
         rootRaw: String,
         limit: Int
@@ -1412,7 +1456,8 @@ class DhakaFTP : MainAPI() {
 
                             node to
                                 safeDirectoryEntries(
-                                    node.url
+                                    node.url,
+                                    QUICK_DIRECTORY_TIMEOUT_MS
                                 )
                         }
 
@@ -1654,7 +1699,8 @@ class DhakaFTP : MainAPI() {
                                     maxOf(
                                         child.modifiedAt
                                             ?: 0L,
-                                        modified
+                                        modified,
+                                        directoryPriority(child)
                                     ),
                                 collectionRoot =
                                     seriesRoot,
@@ -1672,7 +1718,7 @@ class DhakaFTP : MainAPI() {
 
                 /*
                  * Publish discoveries immediately to the partial cache.
-                 * If the 1.8 second homepage budget expires, the data found
+                 * If an individual quick directory request times out, the data found
                  * before the timeout is still available to the caller /
                  * background pagination.
                  */
@@ -3261,12 +3307,14 @@ class DhakaFTP : MainAPI() {
      */
 
     private suspend fun safeDirectoryEntries(
-        url: String
+        url: String,
+        timeoutMs: Long? = null
     ): List<FtpEntry> {
 
         return try {
             getDirectoryEntries(
-                url
+                url,
+                timeoutMs
             )
         } catch (_: Exception) {
             emptyList()
@@ -3274,7 +3322,8 @@ class DhakaFTP : MainAPI() {
     }
 
     private suspend fun getDirectoryEntries(
-        urlRaw: String
+        urlRaw: String,
+        timeoutMs: Long? = null
     ): List<FtpEntry> {
 
         val url =
@@ -3283,9 +3332,19 @@ class DhakaFTP : MainAPI() {
             )
 
         val response =
-            app.get(
-                url
-            )
+            if (timeoutMs == null) {
+                app.get(
+                    url
+                )
+            } else {
+                kotlinx.coroutines.withTimeoutOrNull(
+                    timeoutMs
+                ) {
+                    app.get(
+                        url
+                    )
+                }
+            } ?: return emptyList()
 
         val anchors =
             response.document.select(
