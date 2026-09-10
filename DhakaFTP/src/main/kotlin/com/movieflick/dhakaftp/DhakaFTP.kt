@@ -30,6 +30,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLDecoder
@@ -138,7 +139,13 @@ class DhakaFTP : MainAPI() {
          * The first synchronous homepage request is intentionally
          * lightweight. The full recursive index has no folder-depth cap.
          */
-        const val QUICK_SCAN_DIRECTORY_LIMIT = 120
+        const val QUICK_SCAN_DIRECTORY_LIMIT = 28
+
+        /* First-page synchronous probe budget. */
+        const val QUICK_PAGE_TIMEOUT_MS = 1800L
+
+        /* Directories fetched concurrently during a quick probe. */
+        const val QUICK_SCAN_BATCH_SIZE = 8
 
         const val CACHE_MINUTES = 10L
 
@@ -289,6 +296,9 @@ class DhakaFTP : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
 
+        /*
+         * TV Show is a combined category backed by two separate roots.
+         */
         if (
             request.data.startsWith(
                 TV_SHOW_PREFIX
@@ -305,31 +315,51 @@ class DhakaFTP : MainAPI() {
                 request.data
             )
 
+        /*
+         * PAGE 1 MUST NEVER wait for the complete recursive crawl.
+         *
+         * We give the quick probe a small time budget. The full index
+         * starts immediately in the background afterwards.
+         */
         if (page == 1) {
 
             val cached =
                 validCache(root)
 
-            val firstGroups =
+            val cachedFirst =
                 cached
                     ?.groups
                     ?.take(MOVIE_HOME_SIZE)
-                    ?.takeIf {
-                        it.isNotEmpty()
-                    }
-                    ?: scanLatestGroups(
-                        root,
-                        MOVIE_HOME_SIZE
-                    )
+                    .orEmpty()
 
+            val firstGroups =
+                if (
+                    cachedFirst.isNotEmpty()
+                ) {
+                    cachedFirst
+                } else {
+                    withTimeoutOrNull(
+                        QUICK_PAGE_TIMEOUT_MS
+                    ) {
+                        scanLatestGroups(
+                            root,
+                            MOVIE_HOME_SIZE
+                        )
+                    }.orEmpty()
+                }
+
+            /*
+             * Save whatever the fast probe discovered.
+             */
             updatePartialCache(
                 root,
                 firstGroups
             )
 
             /*
-             * Important: full indexing starts AFTER the small first
-             * batch has been prepared.
+             * IMPORTANT:
+             * Start full recursive discovery ONLY after the small
+             * first batch has been prepared.
              */
             prewarm(root)
 
@@ -342,6 +372,10 @@ class DhakaFTP : MainAPI() {
             )
         }
 
+        /*
+         * When the user scrolls, first use any content already discovered
+         * by the background crawler.
+         */
         val offset =
             (page - 1) *
                 MOVIE_HOME_SIZE
@@ -349,10 +383,6 @@ class DhakaFTP : MainAPI() {
         val cached =
             validCache(root)
 
-        /*
-         * If background indexing has already discovered enough content,
-         * return it immediately. This makes normal scrolling feel lazy.
-         */
         if (
             cached != null &&
             cached.groups.size > offset
@@ -378,8 +408,8 @@ class DhakaFTP : MainAPI() {
         }
 
         /*
-         * If the user scrolls faster than the background scan, wait for
-         * the SAME scan instead of launching another recursive crawl.
+         * Fast scroll fallback:
+         * share the same background scan instead of starting another scan.
          */
         val complete =
             awaitCompleteIndex(root)
@@ -420,6 +450,11 @@ class DhakaFTP : MainAPI() {
             decodeTvShowRoots(
                 request.data
             )
+                ?: return newHomePageResponse(
+                    request,
+                    emptyList(),
+                    false
+                )
 
         if (
             roots.size < 2
@@ -431,20 +466,43 @@ class DhakaFTP : MainAPI() {
             )
         }
 
+        /*
+         * First TV Show screen:
+         *
+         * 3 from TV/Web Series
+         * 3 from K-Drama
+         *
+         * Both probes run concurrently so one server does not block
+         * the other.
+         */
         if (page == 1) {
 
-            val first =
-                getInitialGroups(
-                    roots[0],
-                    TV_SOURCE_BATCH
-                )
+            val (first, second) =
+                coroutineScope {
 
-            val second =
-                getInitialGroups(
-                    roots[1],
-                    TV_SOURCE_BATCH
-                )
+                    val firstDeferred =
+                        async {
+                            getInitialGroups(
+                                roots[0],
+                                TV_SOURCE_BATCH
+                            )
+                        }
 
+                    val secondDeferred =
+                        async {
+                            getInitialGroups(
+                                roots[1],
+                                TV_SOURCE_BATCH
+                            )
+                        }
+
+                    firstDeferred.await() to
+                        secondDeferred.await()
+                }
+
+            /*
+             * Continue both complete crawls in background.
+             */
             prewarm(roots[0])
             prewarm(roots[1])
 
@@ -452,9 +510,10 @@ class DhakaFTP : MainAPI() {
                 mixThreeAndThree(
                     first,
                     second
-                ).take(
-                    TV_HOME_SIZE
                 )
+                    .take(
+                        TV_HOME_SIZE
+                    )
 
             return newHomePageResponse(
                 request,
@@ -465,15 +524,29 @@ class DhakaFTP : MainAPI() {
             )
         }
 
-        val first =
-            awaitCompleteIndex(
-                roots[0]
-            )
+        /*
+         * Scroll pages use the shared indexes.
+         */
+        val (first, second) =
+            coroutineScope {
 
-        val second =
-            awaitCompleteIndex(
-                roots[1]
-            )
+                val firstDeferred =
+                    async {
+                        awaitCompleteIndex(
+                            roots[0]
+                        )
+                    }
+
+                val secondDeferred =
+                    async {
+                        awaitCompleteIndex(
+                            roots[1]
+                        )
+                    }
+
+                firstDeferred.await() to
+                    secondDeferred.await()
+            }
 
         val mixed =
             mixThreeAndThree(
@@ -496,14 +569,14 @@ class DhakaFTP : MainAPI() {
             )
         }
 
-        val result =
+        val pageItems =
             mixed
                 .drop(offset)
                 .take(TV_HOME_SIZE)
 
         return newHomePageResponse(
             request,
-            result.map {
+            pageItems.map {
                 toSearchResponse(it)
             },
             offset +
@@ -528,10 +601,14 @@ class DhakaFTP : MainAPI() {
         }
 
         val initial =
-            scanLatestGroups(
-                root,
-                limit
-            )
+            withTimeoutOrNull(
+                QUICK_PAGE_TIMEOUT_MS
+            ) {
+                scanLatestGroups(
+                    root,
+                    limit
+                )
+            }.orEmpty()
 
         updatePartialCache(
             root,
@@ -1252,6 +1329,8 @@ class DhakaFTP : MainAPI() {
                 compareByDescending<CrawlNode> {
                     it.inheritedModifiedAt
                         ?: 0L
+                }.thenBy {
+                    it.seasonHint ?: Int.MAX_VALUE
                 }
             )
 
@@ -1266,11 +1345,16 @@ class DhakaFTP : MainAPI() {
 
         queue.add(
             CrawlNode(
-                url = root,
-                inheritedPoster = null,
-                inheritedModifiedAt = null,
-                collectionRoot = null,
-                seasonHint = null
+                url =
+                    root,
+                inheritedPoster =
+                    null,
+                inheritedModifiedAt =
+                    null,
+                collectionRoot =
+                    null,
+                seasonHint =
+                    null
             )
         )
 
@@ -1280,249 +1364,343 @@ class DhakaFTP : MainAPI() {
         var order =
             0L
 
+        /*
+         * Fetch several candidate folders concurrently.
+         *
+         * This is the important change from the previous version:
+         * the homepage probe is breadth/priority based instead of
+         * performing one directory request after another.
+         */
         while (
             queue.isNotEmpty() &&
             directoriesVisited <
-            QUICK_SCAN_DIRECTORY_LIMIT
+            QUICK_SCAN_DIRECTORY_LIMIT &&
+            builders.values
+                .count {
+                    it.videos.isNotEmpty()
+                } < limit
         ) {
 
-            val node =
-                queue.poll()
+            val batch =
+                mutableListOf<CrawlNode>()
 
-            val current =
-                normalizeDirectoryUrl(
-                    node.url
-                )
-
-            if (
-                !visited.add(
-                    current
-                )
+            repeat(
+                QUICK_SCAN_BATCH_SIZE
             ) {
-                continue
-            }
-
-            directoriesVisited++
-
-            val entries =
-                safeDirectoryEntries(
-                    current
-                )
-
-            val localPoster =
-                pickPoster(
-                    entries
-                )
-
-            val poster =
-                localPoster
-                    ?: node.inheritedPoster
-
-            val modified =
-                maxOf(
-                    node.inheritedModifiedAt
-                        ?: 0L,
-                    entries.maxOfOrNull {
-                        it.modifiedAt
-                            ?: 0L
-                    } ?: 0L
-                )
-
-            val directories =
-                entries.filter {
-                    it.isDirectory
-                }
-
-            val seasonDirectories =
-                directories.filter {
-                    isSeasonDirectory(
-                        it.name
-                    )
-                }
-
-            val seriesRoot =
-                when {
-
-                    node.collectionRoot !=
-                        null ->
-                        node.collectionRoot
-
-                    seasonDirectories
-                        .isNotEmpty() ->
-                        current
-
-                    else ->
-                        null
-                }
-
-            if (
-                seasonDirectories.isNotEmpty()
-            ) {
-
-                val builder =
-                    builders.getOrPut(
-                        current
-                    ) {
-                        GroupBuilder(
-                            title =
-                                getFolderTitle(
-                                    current
-                                ),
-                            url =
-                                current,
-                            kind =
-                                detectKind(
-                                    root
-                                )
-                        )
-                    }
 
                 if (
-                    builder.posterUrl == null
+                    queue.isNotEmpty()
                 ) {
-                    builder.posterUrl =
-                        localPoster
-                            ?: node.inheritedPoster
+                    batch.add(
+                        queue.poll()
+                    )
+                }
+            }
+
+            if (
+                batch.isEmpty()
+            ) {
+                break
+            }
+
+            val fetched =
+                coroutineScope {
+
+                    batch.map { node ->
+
+                        async {
+
+                            node to
+                                safeDirectoryEntries(
+                                    node.url
+                                )
+                        }
+
+                    }.awaitAll()
                 }
 
-                builder.modifiedAt =
+            for (
+                (node, entries)
+                in fetched
+            ) {
+
+                if (
+                    directoriesVisited >=
+                    QUICK_SCAN_DIRECTORY_LIMIT
+                ) {
+                    break
+                }
+
+                directoriesVisited++
+
+                val current =
+                    normalizeDirectoryUrl(
+                        node.url
+                    )
+
+                if (
+                    visited.contains(
+                        current
+                    )
+                ) {
+                    continue
+                }
+
+                visited.add(
+                    current
+                )
+
+                val directPoster =
+                    pickPoster(
+                        entries
+                    )
+
+                val poster =
+                    directPoster
+                        ?: node.inheritedPoster
+
+                val modified =
                     maxOf(
-                        builder.modifiedAt,
-                        modified
+                        node.inheritedModifiedAt
+                            ?: 0L,
+                        entries.maxOfOrNull {
+                            it.modifiedAt
+                                ?: 0L
+                        } ?: 0L
                     )
-            }
 
-            val directVideos =
-                entries.filter {
-                    it.isVideo
-                }
+                val directories =
+                    entries.filter {
+                        it.isDirectory
+                    }
 
-            if (
-                directVideos.isNotEmpty()
-            ) {
-
-                val groupRoot =
-                    seriesRoot
-                        ?: current
-
-                val builder =
-                    builders.getOrPut(
-                        groupRoot
-                    ) {
-                        GroupBuilder(
-                            title =
-                                getFolderTitle(
-                                    groupRoot
-                                ),
-                            url =
-                                groupRoot,
-                            kind =
-                                detectKind(
-                                    root
-                                )
+                val seasonDirectories =
+                    directories.filter {
+                        isSeasonDirectory(
+                            it.name
                         )
                     }
 
+                val seriesRoot =
+                    when {
+
+                        node.collectionRoot !=
+                            null ->
+                            node.collectionRoot
+
+                        seasonDirectories
+                            .isNotEmpty() ->
+                            current
+
+                        else ->
+                            null
+                    }
+
+                /*
+                 * Register the show/series container before descending
+                 * into its Season folders.
+                 */
                 if (
-                    builder.posterUrl == null
+                    seasonDirectories.isNotEmpty()
                 ) {
-                    builder.posterUrl =
-                        if (
-                            groupRoot ==
+
+                    val builder =
+                        builders.getOrPut(
                             current
                         ) {
-                            localPoster
-                                ?: node.inheritedPoster
-                        } else {
-                            poster
+
+                            GroupBuilder(
+                                title =
+                                    getFolderTitle(
+                                        current
+                                    ),
+                                url =
+                                    current,
+                                kind =
+                                    detectKind(
+                                        root
+                                    )
+                            )
                         }
-                }
 
-                directVideos.forEach { entry ->
-
-                    val video =
-                        makeVideo(
-                            entry,
-                            builder.posterUrl
-                                ?: poster,
-                            extractSeasonNumber(
-                                current
-                            ) ?: node.seasonHint,
-                            order++
-                        )
-
-                    builder.videos.add(
-                        video
-                    )
+                    builder.posterUrl =
+                        builder.posterUrl
+                            ?: directPoster
+                            ?: node.inheritedPoster
 
                     builder.modifiedAt =
                         maxOf(
                             builder.modifiedAt,
-                            video.modifiedAt
+                            modified
                         )
                 }
-            }
 
-            directories
-                .sortedWith(
-                    compareByDescending<FtpEntry> {
-                        it.modifiedAt
-                            ?: modified
+                /*
+                 * Final content directory found.
+                 */
+                val videos =
+                    entries.filter {
+                        it.isVideo
                     }
-                )
-                .forEach { child ->
 
-                    queue.add(
-                        CrawlNode(
-                            url =
-                                normalizeDirectoryUrl(
-                                    child.url
-                                ),
-                            inheritedPoster =
-                                if (
-                                    seriesRoot != null
-                                ) {
-                                    builders[
-                                        seriesRoot
-                                    ]?.posterUrl
-                                        ?: poster
-                                } else {
-                                    poster
-                                },
-                            inheritedModifiedAt =
-                                maxOf(
-                                    child.modifiedAt
-                                        ?: 0L,
-                                    modified
-                                ),
-                            collectionRoot =
-                                seriesRoot,
-                            seasonHint =
-                                extractSeasonNumber(
-                                    child.name
-                                )
-                                    ?: extractSeasonNumber(
-                                        current
+                if (
+                    videos.isNotEmpty()
+                ) {
+
+                    val groupRoot =
+                        seriesRoot
+                            ?: current
+
+                    val builder =
+                        builders.getOrPut(
+                            groupRoot
+                        ) {
+
+                            GroupBuilder(
+                                title =
+                                    getFolderTitle(
+                                        groupRoot
+                                    ),
+                                url =
+                                    groupRoot,
+                                kind =
+                                    detectKind(
+                                        root
                                     )
-                                    ?: node.seasonHint
+                            )
+                        }
+
+                    if (
+                        builder.posterUrl ==
+                        null
+                    ) {
+                        builder.posterUrl =
+                            if (
+                                groupRoot ==
+                                current
+                            ) {
+                                poster
+                            } else {
+                                poster
+                                    ?: node.inheritedPoster
+                            }
+                    }
+
+                    videos.forEach { entry ->
+
+                        val video =
+                            makeVideo(
+                                entry =
+                                    entry,
+                                poster =
+                                    builder.posterUrl
+                                        ?: poster,
+                                seasonHint =
+                                    extractSeasonNumber(
+                                        current
+                                    ) ?: node.seasonHint,
+                                order =
+                                    order++
+                            )
+
+                        builder.videos.add(
+                            video
                         )
-                    )
+
+                        builder.modifiedAt =
+                            maxOf(
+                                builder.modifiedAt,
+                                video.modifiedAt
+                            )
+                    }
                 }
 
-            val groups =
-                normalizeBuilders(
-                    builders.values.toList()
-                )
-
-            if (
-                groups.size >= limit
-            ) {
-
-                return groups
+                /*
+                 * Continue deeper.
+                 *
+                 * Latest/most-recently-modified directories go first,
+                 * but there is no fixed content depth.
+                 */
+                directories
                     .sortedWith(
-                        groupComparator()
+                        compareByDescending<FtpEntry> {
+                            it.modifiedAt
+                                ?: modified
+                        }.thenBy {
+                            it.order
+                        }
                     )
-                    .take(limit)
+                    .take(16)
+                    .forEach { child ->
+
+                        queue.add(
+                            CrawlNode(
+                                url =
+                                    normalizeDirectoryUrl(
+                                        child.url
+                                    ),
+                                inheritedPoster =
+                                    if (
+                                        seriesRoot != null
+                                    ) {
+                                        builders[
+                                            seriesRoot
+                                        ]?.posterUrl
+                                            ?: poster
+                                    } else {
+                                        poster
+                                    },
+                                inheritedModifiedAt =
+                                    maxOf(
+                                        child.modifiedAt
+                                            ?: 0L,
+                                        modified
+                                    ),
+                                collectionRoot =
+                                    seriesRoot,
+                                seasonHint =
+                                    extractSeasonNumber(
+                                        child.name
+                                    )
+                                        ?: extractSeasonNumber(
+                                            current
+                                        )
+                                        ?: node.seasonHint
+                            )
+                        )
+                    }
+
+                /*
+                 * Publish discoveries immediately to the partial cache.
+                 * If the 1.8 second homepage budget expires, the data found
+                 * before the timeout is still available to the caller /
+                 * background pagination.
+                 */
+                val currentGroups =
+                    normalizeBuilders(
+                        builders.values.toList()
+                    )
+
+                if (
+                    currentGroups.isNotEmpty()
+                ) {
+
+                    updatePartialCache(
+                        root,
+                        currentGroups
+                    )
+
+                    if (
+                        currentGroups
+                            .size >= limit
+                    ) {
+                        return currentGroups
+                            .sortedWith(
+                                groupComparator()
+                            )
+                            .take(limit)
+                    }
+                }
             }
         }
 
@@ -1535,13 +1713,6 @@ class DhakaFTP : MainAPI() {
             .take(limit)
     }
 
-    /*
-     * ---------------------------------------------------------------
-     * COMPLETE INDEX
-     * ---------------------------------------------------------------
-     *
-     * This crawler has NO artificial folder-depth limit.
-     */
     private suspend fun scanAllGroups(
         rootRaw: String
     ): List<FtpGroup> {
