@@ -93,6 +93,11 @@ subprojects {
             kotlin("stdlib")
         )
 
+        // Coroutines - used for non-blocking background directory indexing
+        implementation(
+            "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"
+        )
+
         // HTTP
         implementation(
             "com.github.Blatzar:NiceHttp:0.4.11"
