@@ -3660,7 +3660,7 @@ class DhakaFTP : MainAPI() {
                 Qualities.P720.value
 
             "576p" in value ->
-                Qualities.P576.value
+                Qualities.P480.value
 
             "480p" in value ->
                 Qualities.P480.value
