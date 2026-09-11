@@ -1724,7 +1724,7 @@ class DhakaFTP : MainAPI() {
     }
 
 
-    private fun buildAnimeNativeSearchResults(
+    private suspend fun buildAnimeNativeSearchResults(
         videoHits: List<H5aiSearchHit>,
         parentEntries: Map<String, List<FtpEntry>>,
         query: String
