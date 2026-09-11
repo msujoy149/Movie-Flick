@@ -139,6 +139,13 @@ class DhakaFTP : MainAPI() {
         const val QUICK_SEARCH_DIRECTORY_TIMEOUT_MS = 1200L
 
         /*
+         * Compatibility alias. This does not remove or change the existing
+         * search timeout; it only supplies the name used by the deep loader.
+         */
+        const val SEARCH_DIRECTORY_TIMEOUT_MS =
+            QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+
+        /*
          * The first synchronous homepage request is intentionally
          * lightweight. The full recursive index has no folder-depth cap.
          */
@@ -215,7 +222,9 @@ class DhakaFTP : MainAPI() {
         val posterUrl: String?,
         val modifiedAt: Long,
         val videos: List<FtpVideo>,
-        val kind: ContentKind
+        val kind: ContentKind,
+        val isSeasonCard: Boolean = false,
+        val seasonNumber: Int? = null
     ) {
         /*
          * Movie categories NEVER turn multiple files in one folder into
@@ -3630,6 +3639,148 @@ class DhakaFTP : MainAPI() {
             ?.first
     }
 
+    /*
+     * Direct Season loader.
+     *
+     * Homepage/search points to a Season directory. Clicking that card
+     * must open a TvSeries response containing only that Season's episodes.
+     */
+    private suspend fun loadSeasonFolder(
+        seasonFolderRaw: String,
+        kind: ContentKind
+    ): LoadResponse {
+
+        val seasonFolder =
+            normalizeDirectoryUrl(
+                seasonFolderRaw
+            )
+
+        val group =
+            buildGroupFromFolder(
+                seasonFolder
+            )
+
+        if (
+            group == null ||
+            group.videos.isEmpty()
+        ) {
+            return newMovieLoadResponse(
+                getFolderTitle(
+                    seasonFolder
+                ),
+                seasonFolder,
+                if (
+                    kind == ContentKind.ANIME
+                ) {
+                    TvType.Anime
+                } else {
+                    TvType.TvSeries
+                },
+                seasonFolder
+            ) {
+                posterUrl =
+                    group?.posterUrl
+            }
+        }
+
+        val season =
+            group.seasonNumber
+                ?: extractSeasonNumber(
+                    getFolderTitle(
+                        seasonFolder
+                    )
+                )
+                ?: 1
+
+        val videos =
+            deduplicateVideos(
+                group.videos.map {
+                    it.copy(
+                        season = season,
+                        posterUrl =
+                            group.posterUrl
+                                ?: it.posterUrl
+                    )
+                }
+            ).sortedWith(
+                compareBy<FtpVideo> {
+                    it.episode ?: Int.MAX_VALUE
+                }.thenBy {
+                    it.order
+                }
+            )
+
+        val episodes =
+            videos.mapIndexed {
+                    index,
+                    video ->
+
+                val episode =
+                    video.episode
+                        ?: index + 1
+
+                newEpisode(
+                    video.url
+                ) {
+                    name =
+                        episodeDisplayName(
+                            video.title,
+                            episode
+                        )
+
+                    this.season =
+                        season
+
+                    this.episode =
+                        episode
+
+                    posterUrl =
+                        group.posterUrl
+                            ?: video.posterUrl
+
+                    description =
+                        if (
+                            video.dualAudio
+                        ) {
+                            "Season $season • Dual Audio"
+                        } else {
+                            "Season $season"
+                        }
+
+                    date =
+                        video.modifiedAt
+                }
+            }
+
+        return newTvSeriesLoadResponse(
+            group.title,
+            seasonFolder,
+            if (
+                kind == ContentKind.ANIME
+            ) {
+                TvType.Anime
+            } else {
+                TvType.TvSeries
+            },
+            episodes
+        ) {
+            posterUrl =
+                group.posterUrl
+
+            plot =
+                "Season $season" +
+                    if (
+                        videos.any {
+                            it.dualAudio
+                        }
+                    ) {
+                        "\nDual Audio"
+                    } else {
+                        ""
+                    }
+        }
+    }
+
     private suspend fun buildGroupFromFolder(
         folderRaw: String
     ): FtpGroup? {
@@ -3761,7 +3912,9 @@ class DhakaFTP : MainAPI() {
                         ContentKind.ANIME
                     } else {
                         ContentKind.SERIES
-                    }
+                    },
+                isSeasonCard = true,
+                seasonNumber = seasonNumber
             )
         }
 
