@@ -142,10 +142,10 @@ class DhakaFTP : MainAPI() {
          * The first synchronous homepage request is intentionally
          * lightweight. The full recursive index has no folder-depth cap.
          */
-        const val QUICK_SCAN_DIRECTORY_LIMIT = 72
+        const val QUICK_SCAN_DIRECTORY_LIMIT = 96
 
         /* First-page synchronous probe budget. */
-        const val QUICK_DIRECTORY_TIMEOUT_MS = 1600L
+        const val QUICK_DIRECTORY_TIMEOUT_MS = 1250L
 
         /* Directories fetched concurrently during a quick probe. */
         const val QUICK_SCAN_BATCH_SIZE = 16
@@ -354,8 +354,8 @@ class DhakaFTP : MainAPI() {
                     }
                     ?: scanLatestGroups(
                         root,
-                        MOVIE_HOME_SIZE
-                    )
+                        MOVIE_HOME_SIZE * 2
+                    ).take(MOVIE_HOME_SIZE)
 
             if (
                 firstGroups.isNotEmpty()
@@ -769,79 +769,68 @@ class DhakaFTP : MainAPI() {
         groups: List<FtpGroup>
     ): List<FtpGroup> {
 
-        val latest =
+        /*
+         * TV homepage rule:
+         * - if a show has Season folders, show ONLY its newest Season card
+         * - older Seasons remain searchable
+         * - if no Season folder exists, keep its direct-episode show card
+         */
+        val seasonCards =
+            groups.filter {
+                it.kind == ContentKind.SERIES &&
+                    it.isSeasonCard
+            }
+
+        val latestByShow =
             LinkedHashMap<String, FtpGroup>()
 
-        val other =
-            mutableListOf<FtpGroup>()
+        seasonCards.forEach { card ->
 
-        groups.forEach { group ->
-
-            val season =
-                extractSeasonNumber(
-                    group.title
+            val showRoot =
+                normalizeDirectoryUrl(
+                    parentDirectory(card.url) ?: card.url
                 )
+
+            val existing =
+                latestByShow[showRoot]
 
             if (
-                group.kind ==
-                    ContentKind.SERIES &&
-                season != null
-            ) {
-
-                val key =
-                    normalizeSearchText(
-                        group.title
-                    )
-                        .replace(
-                            Regex(
-                                "(?i)\\bseason\\s*\\d{1,3}\\b"
-                            ),
-                            " "
-                        )
-                        .replace(
-                            Regex("\\s+"),
-                            " "
-                        )
-                        .trim()
-
-                val existing =
-                    latest[key]
-
-                if (
-                    existing == null ||
-                    group.modifiedAt >
-                    existing.modifiedAt ||
-                    (
-                        group.modifiedAt ==
-                            existing.modifiedAt &&
-                        season >
-                        (
-                            extractSeasonNumber(
-                                existing.title
-                            ) ?: 0
-                        )
-                    )
-                ) {
-
-                    latest[key] =
-                        group
-                }
-
-            } else {
-
-                other.add(
-                    group
+                existing == null ||
+                card.modifiedAt > existing.modifiedAt ||
+                (
+                    card.modifiedAt == existing.modifiedAt &&
+                    (card.seasonNumber ?: 0) >
+                        (existing.seasonNumber ?: 0)
                 )
+            ) {
+                latestByShow[showRoot] = card
             }
         }
 
-        return (
-            latest.values +
-                other
-            )
-            .sortedWith(
-                groupComparator()
-            )
+        val seasonShowRoots =
+            latestByShow.keys.map {
+                normalizeDirectoryUrl(it)
+            }.toSet()
+
+        val fallback =
+            groups.filter { group ->
+
+                if (
+                    group.kind != ContentKind.SERIES ||
+                    group.isSeasonCard
+                ) {
+                    true
+                } else {
+                    normalizeDirectoryUrl(group.url) !in
+                        seasonShowRoots
+                }
+            }
+
+        return (latestByShow.values + fallback)
+            .distinctBy {
+                it.url.lowercase(Locale.getDefault())
+            }
+            .sortedWith(groupComparator())
     }
 
     private suspend fun getInitialGroups(
@@ -853,32 +842,34 @@ class DhakaFTP : MainAPI() {
             validCache(root)
 
         if (
-            cached?.groups
-                ?.isNotEmpty() == true
+            cached?.groups?.isNotEmpty() == true
         ) {
             return cached.groups.take(limit)
         }
 
+        /*
+         * Collect a few extra candidates because duplicate filtering or
+         * latest-season collapsing may remove some of them.
+         */
+        val probeLimit =
+            maxOf(limit, limit * 2)
+
         val initial =
             scanLatestGroups(
                 root,
-                limit
+                probeLimit
             )
 
-        val usable =
-            initial.ifEmpty {
-                validCache(root)
-                    ?.groups
-                    ?.take(limit)
-                    .orEmpty()
-            }
+        if (
+            initial.isNotEmpty()
+        ) {
+            updatePartialCache(
+                root,
+                initial
+            )
+        }
 
-        updatePartialCache(
-            root,
-            usable
-        )
-
-        return usable
+        return initial.take(limit)
     }
 
     private fun mixThreeAndThree(
@@ -2244,11 +2235,33 @@ class DhakaFTP : MainAPI() {
             )
         }
 
+        val folder =
+            normalizeDirectoryUrl(url)
+
+        val directKind =
+            detectKind(folder)
+
+        if (
+            directKind == ContentKind.SERIES &&
+            !isSeasonDirectory(
+                getFolderTitle(folder)
+            )
+        ) {
+
+            val latestSeason =
+                findLatestSeasonFolderDeep(folder)
+
+            if (latestSeason != null) {
+                return loadSeasonFolder(
+                    latestSeason,
+                    ContentKind.SERIES
+                )
+            }
+        }
+
         val group =
             buildGroupFromFolder(
-                normalizeDirectoryUrl(
-                    url
-                )
+                folder
             )
 
         if (
@@ -2671,9 +2684,13 @@ class DhakaFTP : MainAPI() {
             scope.async {
 
                 val result =
-                    scanAllGroups(
-                        root
-                    )
+                    try {
+                        scanAllGroups(
+                            root
+                        )
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
 
                 cache[root] =
                     CacheEntry(
@@ -2717,9 +2734,13 @@ class DhakaFTP : MainAPI() {
                 scope.async {
 
                     val result =
-                        scanAllGroups(
-                            root
-                        )
+                        try {
+                            scanAllGroups(
+                                root
+                            )
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
 
                     val final =
                         deduplicateGroups(
@@ -3117,7 +3138,6 @@ class DhakaFTP : MainAPI() {
                             it.order
                         }
                     )
-                    .take(24)
                     .forEach { child ->
 
                         val childIsSeason =
@@ -3545,6 +3565,70 @@ class DhakaFTP : MainAPI() {
             )
     }
 
+
+    private suspend fun findLatestSeasonFolderDeep(
+        rootRaw: String
+    ): String? {
+
+        val root =
+            normalizeDirectoryUrl(rootRaw)
+
+        val queue =
+            ArrayDeque<Pair<String, Int>>()
+
+        val visited =
+            HashSet<String>()
+
+        val candidates =
+            mutableListOf<Pair<String, Long>>()
+
+        queue.addLast(root to 0)
+
+        while (queue.isNotEmpty()) {
+
+            val (current, depth) =
+                queue.removeFirst()
+
+            if (!visited.add(current)) {
+                continue
+            }
+
+            val entries =
+                safeDirectoryEntries(
+                    current,
+                    SEARCH_DIRECTORY_TIMEOUT_MS
+                )
+
+            entries
+                .filter { it.isDirectory }
+                .forEach { entry ->
+
+                    val child =
+                        normalizeDirectoryUrl(entry.url)
+
+                    if (isSeasonDirectory(entry.name)) {
+                        candidates.add(
+                            child to (entry.modifiedAt ?: 0L)
+                        )
+                    } else if (depth < 10) {
+                        queue.addLast(
+                            child to (depth + 1)
+                        )
+                    }
+                }
+        }
+
+        return candidates
+            .maxWithOrNull(
+                compareBy<Pair<String, Long>> { it.second }
+                    .thenBy {
+                        extractSeasonNumber(
+                            getFolderTitle(it.first)
+                        ) ?: 0
+                    }
+            )
+            ?.first
+    }
 
     private suspend fun buildGroupFromFolder(
         folderRaw: String
