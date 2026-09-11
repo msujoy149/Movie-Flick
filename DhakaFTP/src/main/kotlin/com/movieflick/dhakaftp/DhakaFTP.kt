@@ -4287,6 +4287,32 @@ class DhakaFTP : MainAPI() {
      * ---------------------------------------------------------------
      */
 
+    /*
+     * Formats the episode display name without unnecessarily modifying the
+     * source filename. Existing SxxExx / E-number tags are preserved.
+     */
+    private fun episodeDisplayName(
+        title: String,
+        episode: Int
+    ): String {
+
+        val hasEpisodeTag =
+            Regex(
+                "(?i)\\bS\\d{1,3}E\\d{1,4}\\b"
+            ).containsMatchIn(title) ||
+                Regex(
+                    "(?i)\\bE(?:P(?:ISODE)?)?[ ._-]*\\d{1,4}\\b"
+                ).containsMatchIn(title)
+
+        return if (
+            hasEpisodeTag
+        ) {
+            title
+        } else {
+            "Episode $episode • $title"
+        }
+    }
+
     private fun makeVideo(
         entry: FtpEntry,
         poster: String?,
