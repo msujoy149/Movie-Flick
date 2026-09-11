@@ -4932,6 +4932,87 @@ class DhakaFTP : MainAPI() {
         )
     }
 
+    /*
+     * Movie-card duplicate resolution.
+     *
+     * IMPORTANT:
+     * - 720p and 1080p are different cards.
+     * - Dual Audio only replaces a non-Dual-Audio copy when the logical
+     *   title/version and resolution are otherwise the same.
+     * - Similar-looking titles are NOT merged automatically.
+     */
+    private fun deduplicateMovieGroups(
+        groups: List<FtpGroup>
+    ): List<FtpGroup> {
+
+        return groups
+            .filter {
+                it.kind == ContentKind.MOVIE &&
+                    it.videos.isNotEmpty()
+            }
+            .groupBy { group ->
+
+                val video =
+                    group.videos.first()
+
+                val logicalVideoName =
+                    normalizeSearchText(
+                        video.title
+                    )
+                        .replace(
+                            Regex(
+                                "(?i)\\bdual\\s*audio\\b"
+                            ),
+                            " "
+                        )
+                        .replace(
+                            Regex(
+                                "(?i)\\bmulti\\s*audio\\b"
+                            ),
+                            " "
+                        )
+                        .replace(
+                            Regex(
+                                "\\s+"
+                            ),
+                            " "
+                        )
+                        .trim()
+
+                normalizeSearchText(
+                    group.title
+                ) +
+                    "::" +
+                    logicalVideoName +
+                    "::R" +
+                    video.resolution
+            }
+            .values
+            .mapNotNull { candidates ->
+
+                candidates.maxWithOrNull(
+                    compareByDescending<FtpGroup> {
+                        if (
+                            it.hasDualAudio
+                        ) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                        .thenByDescending {
+                            it.maxResolution
+                        }
+                        .thenByDescending {
+                            it.maxSizeBytes
+                        }
+                        .thenByDescending {
+                            it.modifiedAt
+                        }
+                )
+            }
+    }
+
     private fun deduplicateVideos(
         videos: List<FtpVideo>
     ): List<FtpVideo> {
