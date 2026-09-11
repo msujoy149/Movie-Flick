@@ -3873,45 +3873,140 @@ class DhakaFTP : MainAPI() {
             )
     }
 
+    /*
+     * ---------------------------------------------------------------
+     * GROUP-LEVEL DUPLICATE RESOLUTION
+     * ---------------------------------------------------------------
+     *
+     * IMPORTANT MOVIE RULE:
+     *
+     * Same title + same resolution:
+     *     normal
+     *     Dual Audio
+     *         -> one result, Dual Audio wins.
+     *
+     * Same title + different resolution:
+     *     720p
+     *     1080p
+     *         -> BOTH remain separate results.
+     *
+     * This layer is intentionally conservative. It does not remove
+     * items merely because their titles look similar.
+     */
+    private fun deduplicateGroups(
+        groups: List<FtpGroup>
+    ): List<FtpGroup> {
+
+        return groups
+            .groupBy {
+                canonicalGroupKey(it)
+            }
+            .values
+            .mapNotNull { candidates ->
+
+                /*
+                 * Only candidates with the exact same canonical key
+                 * reach this point. Therefore Dual Audio can safely
+                 * win without collapsing different resolutions.
+                 */
+                candidates.maxWithOrNull(
+                    compareByDescending<FtpGroup> {
+                        if (
+                            it.hasDualAudio
+                        ) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                        .thenByDescending {
+                            it.maxResolution
+                        }
+                        .thenByDescending {
+                            it.maxSizeBytes
+                        }
+                        .thenByDescending {
+                            it.modifiedAt
+                        }
+                        .thenBy {
+                            it.url
+                        }
+                )
+            }
+            .sortedWith(
+                groupComparator()
+            )
+    }
+
     private fun canonicalGroupKey(
         group: FtpGroup
     ): String {
 
         /*
-         * Resolution is part of identity.
+         * Movie / anime single-item cards:
          *
-         * Same title + same resolution:
-         *   normal
-         *   Dual Audio
-         * -> one logical result; Dual Audio wins through the comparator.
+         * title + resolution are the duplicate identity.
          *
-         * Different resolutions:
-         *   720p
-         *   1080p
-         * -> two separate results.
+         * Dual Audio is intentionally NOT part of the key, because
+         * the Dual Audio copy must replace the non-Dual-Audio copy
+         * when everything else is the same.
+         *
+         * Resolution IS part of the key, so 720p and 1080p are never
+         * collapsed into one item.
          */
-        return normalizeSearchText(
-            group.title
-        )
-            .replace(
-                Regex(
-                    "(?i)\\bdual\\s*audio\\b"
-                ),
-                " "
+        if (
+            group.kind != ContentKind.SERIES &&
+            group.videos.size == 1
+        ) {
+
+            val video =
+                group.videos.first()
+
+            val base =
+                normalizeSearchText(
+                    video.title
+                )
+                    .replace(
+                        Regex(
+                            "(?i)\\bdual\\s*audio\\b"
+                        ),
+                        " "
+                    )
+                    .replace(
+                        Regex(
+                            "(?i)\\bmulti\\s*audio\\b"
+                        ),
+                        " "
+                    )
+                    .replace(
+                        Regex(
+                            "(?i)\\s+"
+                        ),
+                        " "
+                    )
+                    .trim()
+
+            return group.kind.name +
+                ":MOVIE:" +
+                base +
+                ":R" +
+                video.resolution
+        }
+
+        /*
+         * Series/show identity is intentionally conservative.
+         * Same title coming from two separate source paths is not
+         * treated as a duplicate automatically.
+         */
+        return group.kind.name +
+            ":SERIES:" +
+            normalizeSearchText(
+                group.title
+            ) +
+            ":" +
+            normalizeSearchText(
+                group.url
             )
-            .replace(
-                Regex(
-                    "(?i)\\bmulti\\s*audio\\b"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "(?i)\\s+"
-                ),
-                " "
-            )
-            .trim()
     }
 
     private fun groupComparator():
