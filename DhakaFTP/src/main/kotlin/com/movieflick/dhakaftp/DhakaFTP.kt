@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.fasterxml.jackson.databind.ObjectMapper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,7 @@ import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.PriorityQueue
@@ -133,6 +135,8 @@ class DhakaFTP : MainAPI() {
         const val TV_HOME_SIZE = 6
         const val TV_SOURCE_BATCH = 3
         const val SEARCH_PAGE_SIZE = 50
+        const val QUICK_SEARCH_NATIVE_TIMEOUT_MS = 5000L
+        const val QUICK_SEARCH_DIRECTORY_TIMEOUT_MS = 1200L
 
         /*
          * The first synchronous homepage request is intentionally
@@ -213,12 +217,31 @@ class DhakaFTP : MainAPI() {
         val videos: List<FtpVideo>,
         val kind: ContentKind
     ) {
+        /*
+         * Movie categories NEVER turn multiple files in one folder into
+         * CloudStream episodes. TV Show is the episode-based category.
+         * Anime remains episode-based only when multiple real files exist.
+         */
         val isSeries: Boolean
             get() =
-                videos.size > 1 ||
-                    videos.any {
-                        it.season != null
-                    }
+                when (kind) {
+                    ContentKind.SERIES ->
+                        videos.size > 1 ||
+                            videos.any {
+                                it.season != null ||
+                                    it.episode != null
+                            }
+
+                    ContentKind.ANIME ->
+                        videos.size > 1 ||
+                            videos.any {
+                                it.season != null ||
+                                    it.episode != null
+                            }
+
+                    ContentKind.MOVIE ->
+                        false
+                }
 
         val hasDualAudio: Boolean
             get() =
@@ -692,83 +715,1068 @@ class DhakaFTP : MainAPI() {
             )
         }
 
-        val indexes =
+        /*
+         * PRIMARY ENGINE:
+         *
+         * DhakaFlix uses h5ai. Its server-side search can recursively walk
+         * the real filesystem without us downloading every directory page
+         * over HTTP. This is dramatically faster for deep searches such as
+         * an Aquaman file buried several folders below the root.
+         */
+        val nativeResults =
             coroutineScope {
 
                 searchRoots.map { root ->
                     async {
-                        awaitCompleteIndex(
-                            normalizeDirectoryUrl(
-                                root
-                            )
+                        searchNativeH5ai(
+                            root = root,
+                            query = normalizedQuery
                         )
                     }
-                }.awaitAll()
+                }.awaitAll().flatten()
             }
 
-        val groups =
-            deduplicateGroups(
-                indexes.flatMap {
-                    it.groups
-                }
-            )
-
-        val matches =
-            groups.mapNotNull { group ->
-
-                val score =
-                    scoreGroup(
-                        normalizedQuery,
-                        group
-                    )
-
-                if (
-                    score > 0
-                ) {
-                    SearchMatch(
-                        group,
-                        score
-                    )
-                } else {
-                    null
-                }
+        /*
+         * Do not launch a full-library crawl on every search.
+         *
+         * If the server-side h5ai search is unavailable, use whatever index
+         * is already present in memory and return immediately. A background
+         * homepage prewarm will continue to build the index for later use.
+         */
+        val results =
+            if (
+                nativeResults.isNotEmpty()
+            ) {
+                nativeResults
+            } else {
+                searchFromAvailableCache(
+                    normalizedQuery
+                )
             }
 
         val sorted =
-            matches.sortedWith(
-                compareByDescending<SearchMatch> {
-                    it.score
+            results
+                .sortedWith(
+                    compareByDescending<NativeSearchResult> {
+                        it.score
+                    }
+                        .thenByDescending {
+                            it.modifiedAt
+                        }
+                        .thenBy {
+                            it.title.lowercase(
+                                Locale.getDefault()
+                            )
+                        }
+                )
+                .distinctBy {
+                    it.url.lowercase(
+                        Locale.getDefault()
+                    )
                 }
-                    .thenByDescending {
-                        it.group.modifiedAt
-                    }
-                    .thenBy {
-                        it.group.title.lowercase(
-                            Locale.getDefault()
-                        )
-                    }
-            )
 
         val offset =
             (page - 1) *
                 SEARCH_PAGE_SIZE
 
-        val result =
+        val pageItems =
             sorted
                 .drop(offset)
-                .take(SEARCH_PAGE_SIZE)
+                .take(
+                    SEARCH_PAGE_SIZE
+                )
                 .map {
-                    toSearchResponse(
-                        it.group
-                    )
+                    it.response
                 }
 
         return newSearchResponseList(
-            result,
+            pageItems,
             offset +
                 SEARCH_PAGE_SIZE <
                 sorted.size
         )
+    }
+
+    private data class NativeSearchResult(
+        val root: String,
+        val title: String,
+        val url: String,
+        val posterUrl: String?,
+        val modifiedAt: Long,
+        val score: Int,
+        val response: SearchResponse
+    )
+
+    private data class H5aiSearchHit(
+        val href: String,
+        val time: Long?,
+        val size: Long?,
+        val isDirectory: Boolean
+    )
+
+    private val jsonMapper =
+        ObjectMapper()
+
+    private suspend fun searchNativeH5ai(
+        root: String,
+        query: String
+    ): List<NativeSearchResult> {
+
+        val hits =
+            nativeH5aiSearchHits(
+                root,
+                query
+            )
+
+        if (
+            hits.isEmpty()
+        ) {
+            return emptyList()
+        }
+
+        val kind =
+            detectKind(root)
+
+        /*
+         * We want actual video files from the native search.
+         * The h5ai search also returns matching folder paths.
+         */
+        val videoHits =
+            hits.filter {
+                !it.isDirectory &&
+                    isVideo(
+                        it.href
+                    )
+            }
+
+        if (
+            videoHits.isEmpty()
+        ) {
+            return emptyList()
+        }
+
+        /*
+         * Fetch poster data once per unique immediate video directory.
+         */
+        val parents =
+            videoHits
+                .map {
+                    normalizeDirectoryUrl(
+                        it.href.substringBeforeLast(
+                            "/"
+                        )
+                    )
+                }
+                .distinct()
+
+        val parentEntries =
+            coroutineScope {
+
+                parents.map { parent ->
+
+                    async {
+
+                        parent to
+                            safeDirectoryEntries(
+                                parent,
+                                QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+                            )
+                    }
+
+                }.awaitAll()
+                    .toMap()
+            }
+
+        if (
+            kind == ContentKind.SERIES
+        ) {
+            return buildTvNativeSearchResults(
+                videoHits,
+                parentEntries,
+                query
+            )
+        }
+
+        /*
+         * Movie categories:
+         * EVERY real video is a separate result card.
+         */
+        if (
+            kind == ContentKind.MOVIE
+        ) {
+
+            return videoHits.mapNotNull { hit ->
+
+                val parent =
+                    normalizeDirectoryUrl(
+                        hit.href.substringBeforeLast(
+                            "/"
+                        )
+                    )
+
+                val poster =
+                    pickPoster(
+                        parentEntries[parent]
+                            ?: emptyList()
+                    )
+
+                val title =
+                    getTitleFromUrl(
+                        hit.href
+                    )
+
+                val score =
+                    scoreSearchCandidate(
+                        query,
+                        title
+                    )
+
+                if (
+                    score <= 0
+                ) {
+                    null
+                } else {
+
+                    val response =
+                        newMovieSearchResponse(
+                            title,
+                            hit.href,
+                            TvType.Movie
+                        ) {
+                            posterUrl =
+                                poster
+                        }
+
+                    NativeSearchResult(
+                        root =
+                            root,
+                        title =
+                            title,
+                        url =
+                            hit.href,
+                        posterUrl =
+                            poster,
+                        modifiedAt =
+                            hit.time ?: 0L,
+                        score =
+                            score +
+                                if (
+                                    detectDualAudio(
+                                        title
+                                    )
+                                ) {
+                                    150
+                                } else {
+                                    0
+                                },
+                        response =
+                            response
+                    )
+                }
+            }
+        }
+
+        /*
+         * Anime:
+         * a Season path is returned as a series; otherwise each actual
+         * video remains an individual playable result.
+         */
+        return buildAnimeNativeSearchResults(
+            videoHits,
+            parentEntries,
+            query
+        )
+    }
+
+    private suspend fun nativeH5aiSearchHits(
+        rootRaw: String,
+        query: String
+    ): List<H5aiSearchHit> {
+
+        val root =
+            normalizeDirectoryUrl(
+                rootRaw
+            )
+
+        val uri =
+            try {
+                URI(
+                    root
+                )
+            } catch (_: Exception) {
+                return emptyList()
+            }
+
+        val scheme =
+            uri.scheme
+                ?: return emptyList()
+
+        val authority =
+            uri.rawAuthority
+                ?: return emptyList()
+
+        val searchHref =
+            uri.rawPath
+                ?.ifBlank {
+                    "/"
+                }
+                ?: "/"
+
+        /*
+         * h5ai's public API lives beneath /_h5ai/public/index.php.
+         */
+        val endpoint =
+            "$scheme://$authority/_h5ai/public/index.php" +
+                "?action=get" +
+                "&search=1" +
+                "&search.href=" +
+                encodeQueryValue(
+                    searchHref
+                ) +
+                "&search.pattern=" +
+                encodeQueryValue(
+                    query
+                ) +
+                "&search.ignorecase=1"
+
+        val response =
+            try {
+
+                kotlinx.coroutines.withTimeoutOrNull(
+                    QUICK_SEARCH_NATIVE_TIMEOUT_MS
+                ) {
+                    app.get(
+                        endpoint
+                    )
+                }
+
+            } catch (_: Exception) {
+                null
+            }
+                ?: return emptyList()
+
+        return parseH5aiSearchJson(
+            response.text
+        )
+    }
+
+    private fun parseH5aiSearchJson(
+        text: String
+    ): List<H5aiSearchHit> {
+
+        return try {
+
+            val json =
+                jsonMapper.readTree(
+                    text
+                )
+
+            val array =
+                when {
+
+                    json.isArray ->
+                        json
+
+                    json.has("search") &&
+                        json["search"].isArray ->
+                        json["search"]
+
+                    else ->
+                        return emptyList()
+                }
+
+            array.mapNotNull { item ->
+
+                val href =
+                    item["href"]
+                        ?.asText()
+                        ?.takeIf {
+                            it.isNotBlank()
+                        }
+                        ?: return@mapNotNull null
+
+                H5aiSearchHit(
+                    href =
+                        href,
+                    time =
+                        item["time"]
+                            ?.takeIf {
+                                !it.isNull
+                            }
+                            ?.asLong(),
+                    size =
+                        item["size"]
+                            ?.takeIf {
+                                !it.isNull
+                            }
+                            ?.asLong(),
+                    isDirectory =
+                        href.endsWith(
+                            "/"
+                        )
+                )
+            }
+
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun encodeQueryValue(
+        value: String
+    ): String =
+        URLEncoder
+            .encode(
+                value,
+                "UTF-8"
+            )
+            .replace(
+                "+",
+                "%20"
+            )
+
+    private suspend fun buildTvNativeSearchResults(
+        videoHits: List<H5aiSearchHit>,
+        parentEntries: Map<String, List<FtpEntry>>,
+        query: String
+    ): List<NativeSearchResult> {
+
+        /*
+         * TV Show paths normally contain:
+         * Show / Season N / Episode
+         *
+         * We identify the show URL without network traversal.
+         */
+        val showRoots =
+            videoHits
+                .mapNotNull {
+                    findSeasonSeriesRoot(
+                        it.href
+                    )
+                }
+                .distinct()
+
+        return showRoots.mapNotNull { showRoot ->
+
+            /*
+             * The show folder itself may not be one of the immediate
+             * video parents, so we fetch it directly.
+             */
+            val showEntries =
+                safeDirectoryEntries(
+                    showRoot,
+                    QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+                )
+
+            val poster =
+                pickPoster(
+                    showEntries
+                )
+                    ?: findNearestPosterFromMap(
+                        showRoot,
+                        parentEntries
+                    )
+
+            val title =
+                getFolderTitle(
+                    showRoot
+                )
+
+            val matching =
+                videoHits.filter {
+                    findSeasonSeriesRoot(
+                        it.href
+                    )?.equals(
+                        showRoot,
+                        true
+                    ) == true
+                }
+
+            val score =
+                maxOf(
+                    scoreSearchCandidate(
+                        query,
+                        title
+                    ),
+                    matching.maxOfOrNull {
+                        scoreSearchCandidate(
+                            query,
+                            getTitleFromUrl(
+                                it.href
+                            )
+                        )
+                    } ?: 0
+                )
+
+            if (
+                score <= 0
+            ) {
+                return@mapNotNull null
+            }
+
+            val response =
+                newTvSeriesSearchResponse(
+                    title,
+                    showRoot,
+                    TvType.TvSeries
+                ) {
+                    posterUrl =
+                        poster
+                }
+
+            NativeSearchResult(
+                root =
+                    showRoot,
+                title =
+                    title,
+                url =
+                    showRoot,
+                posterUrl =
+                    poster,
+                modifiedAt =
+                    matching.maxOfOrNull {
+                        it.time ?: 0L
+                    } ?: 0L,
+                score =
+                    score +
+                        if (
+                            matching.any {
+                                detectDualAudio(
+                                    getTitleFromUrl(
+                                        it.href
+                                    )
+                                )
+                            }
+                        ) {
+                            60
+                        } else {
+                            0
+                        },
+                response =
+                    response
+            )
+        }
+    }
+
+    private suspend fun findNearestPosterFromMap(
+        root: String,
+        parentEntries: Map<String, List<FtpEntry>>
+    ): String? {
+
+        var current =
+            normalizeDirectoryUrl(
+                root
+            )
+
+        repeat(8) {
+
+            parentEntries[current]
+                ?.let {
+                    pickPoster(it)
+                }
+                ?.let {
+                    return it
+                }
+
+            val entries =
+                safeDirectoryEntries(
+                    current,
+                    QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+                )
+
+            pickPoster(
+                entries
+            )?.let {
+                return it
+            }
+
+            val parent =
+                parentDirectory(
+                    current
+                )
+                    ?: return null
+
+            if (
+                parent.equals(
+                    current,
+                    true
+                )
+            ) {
+                return null
+            }
+
+            current =
+                parent
+        }
+
+        return null
+    }
+
+    private fun buildAnimeNativeSearchResults(
+        videoHits: List<H5aiSearchHit>,
+        parentEntries: Map<String, List<FtpEntry>>,
+        query: String
+    ): List<NativeSearchResult> {
+
+        val result =
+            mutableListOf<NativeSearchResult>()
+
+        /*
+         * Season-based Anime gets one series search result.
+         */
+        val seriesRoots =
+            videoHits
+                .mapNotNull {
+                    findSeasonSeriesRoot(
+                        it.href
+                    )
+                }
+                .distinct()
+
+        seriesRoots.forEach { root ->
+
+            val title =
+                getFolderTitle(
+                    root
+                )
+
+            val poster =
+                parentEntries[
+                    normalizeDirectoryUrl(
+                        root
+                    )
+                ]?.let {
+                    pickPoster(it)
+                }
+
+            val matching =
+                videoHits.filter {
+                    findSeasonSeriesRoot(
+                        it.href
+                    )?.equals(
+                        root,
+                        true
+                    ) == true
+                }
+
+            val score =
+                maxOf(
+                    scoreSearchCandidate(
+                        query,
+                        title
+                    ),
+                    matching.maxOfOrNull {
+                        scoreSearchCandidate(
+                            query,
+                            getTitleFromUrl(
+                                it.href
+                            )
+                        )
+                    } ?: 0
+                )
+
+            if (
+                score > 0
+            ) {
+
+                val response =
+                    newTvSeriesSearchResponse(
+                        title,
+                        root,
+                        TvType.Anime
+                    ) {
+                        posterUrl =
+                            poster
+                    }
+
+                result.add(
+                    NativeSearchResult(
+                        root =
+                            root,
+                        title =
+                            title,
+                        url =
+                            root,
+                        posterUrl =
+                            poster,
+                        modifiedAt =
+                            matching.maxOfOrNull {
+                                it.time ?: 0L
+                            } ?: 0L,
+                        score =
+                            score,
+                        response =
+                            response
+                    )
+                )
+            }
+        }
+
+        /*
+         * Plain Anime movie/video search.
+         */
+        videoHits
+            .filter {
+                findSeasonSeriesRoot(
+                    it.href
+                ) == null
+            }
+            .forEach { hit ->
+
+                val parent =
+                    normalizeDirectoryUrl(
+                        hit.href.substringBeforeLast(
+                            "/"
+                        )
+                    )
+
+                val title =
+                    getTitleFromUrl(
+                        hit.href
+                    )
+
+                val score =
+                    scoreSearchCandidate(
+                        query,
+                        title
+                    )
+
+                if (
+                    score > 0
+                ) {
+
+                    val response =
+                        newMovieSearchResponse(
+                            title,
+                            hit.href,
+                            TvType.Anime
+                        ) {
+                            posterUrl =
+                                pickPoster(
+                                    parentEntries[
+                                        parent
+                                    ] ?: emptyList()
+                                )
+                        }
+
+                    result.add(
+                        NativeSearchResult(
+                            root =
+                                parent,
+                            title =
+                                title,
+                            url =
+                                hit.href,
+                            posterUrl =
+                                null,
+                            modifiedAt =
+                                hit.time ?: 0L,
+                            score =
+                                score,
+                            response =
+                                response
+                        )
+                    )
+                }
+            }
+
+        return result
+    }
+
+    private fun findSeasonSeriesRoot(
+        videoUrl: String
+    ): String? {
+
+        var current =
+            normalizeDirectoryUrl(
+                videoUrl.substringBeforeLast(
+                    "/"
+                )
+            )
+
+        repeat(12) {
+
+            val name =
+                getFolderTitle(
+                    current
+                )
+
+            if (
+                Regex(
+                    "(?i)^season\\s*\\d{1,3}$"
+                ).matches(
+                    name.trim()
+                )
+            ) {
+                return parentDirectory(
+                    current
+                )
+            }
+
+            val parent =
+                parentDirectory(
+                    current
+                )
+                    ?: return null
+
+            if (
+                parent.equals(
+                    current,
+                    true
+                )
+            ) {
+                return null
+            }
+
+            current =
+                parent
+        }
+
+        return null
+    }
+
+    private fun searchFromAvailableCache(
+        query: String
+    ): List<NativeSearchResult> {
+
+        return cache.values
+            .flatMap {
+                it.groups
+            }
+            .mapNotNull { group ->
+
+                val score =
+                    scoreGroup(
+                        query,
+                        group
+                    )
+
+                if (
+                    score <= 0
+                ) {
+                    null
+                } else {
+
+                    NativeSearchResult(
+                        root =
+                            group.url,
+                        title =
+                            group.title,
+                        url =
+                            group.url,
+                        posterUrl =
+                            group.posterUrl,
+                        modifiedAt =
+                            group.modifiedAt,
+                        score =
+                            score,
+                        response =
+                            toSearchResponse(
+                                group
+                            )
+                    )
+                }
+            }
+    }
+
+    private fun scoreSearchCandidate(
+        query: String,
+        candidate: String
+    ): Int {
+
+        val q =
+            normalizeSearchText(
+                query
+            )
+
+        val c =
+            normalizeSearchText(
+                candidate
+            )
+
+        if (
+            q.isBlank() ||
+            c.isBlank()
+        ) {
+            return 0
+        }
+
+        if (
+            c == q
+        ) {
+            return 7000
+        }
+
+        if (
+            c.startsWith(
+                q
+            )
+        ) {
+            return 5800
+        }
+
+        if (
+            c.contains(
+                q
+            )
+        ) {
+            return 5000
+        }
+
+        val qTokens =
+            q.split(
+                " "
+            ).filter {
+                it.isNotBlank()
+            }
+
+        val cTokens =
+            c.split(
+                " "
+            ).filter {
+                it.isNotBlank()
+            }
+
+        if (
+            qTokens.isEmpty()
+        ) {
+            return 0
+        }
+
+        var matched =
+            0
+
+        var total =
+            0
+
+        qTokens.forEach { token ->
+
+            val best =
+                cTokens.maxOfOrNull {
+                    tokenSimilarityScore(
+                        token,
+                        it
+                    )
+                } ?: 0
+
+            if (
+                best > 0
+            ) {
+                matched++
+                total +=
+                    best
+            }
+        }
+
+        /*
+         * For 3+ query words, at least two meaningful terms must match.
+         */
+        if (
+            qTokens.size >= 3 &&
+            matched < 2
+        ) {
+            return 0
+        }
+
+        if (
+            matched == 0
+        ) {
+            return 0
+        }
+
+        val coverage =
+            matched.toDouble() /
+                qTokens.size.toDouble()
+
+        return (
+            total *
+                (0.60 + coverage * 0.40)
+            ).toInt() +
+            if (
+                matched == qTokens.size
+            ) {
+                1000
+            } else {
+                0
+            }
+    }
+
+    private fun tokenSimilarityScore(
+        query: String,
+        candidate: String
+    ): Int {
+
+        if (
+            query == candidate
+        ) {
+            return 1200
+        }
+
+        if (
+            candidate.startsWith(
+                query
+            )
+        ) {
+            return 1000
+        }
+
+        if (
+            candidate.contains(
+                query
+            )
+        ) {
+            return 900
+        }
+
+        /*
+         * User explicitly wants 2/3/4-character discovery.
+         */
+        if (
+            query.length in 2..4
+        ) {
+            return if (
+                candidate.contains(
+                    query
+                )
+            ) {
+                850
+            } else {
+                0
+            }
+        }
+
+        /*
+         * Typo tolerance for longer words.
+         */
+        if (
+            query.length >= 5 &&
+            candidate.length >= 5
+        ) {
+
+            val distance =
+                levenshtein(
+                    query,
+                    candidate
+                )
+
+            val allowed =
+                maxOf(
+                    2,
+                    query.length / 4
+                )
+
+            if (
+                distance <= allowed
+            ) {
+                return 750 -
+                    minOf(
+                        450,
+                        distance * 100
+                    )
+            }
+        }
+
+        return 0
     }
 
     override suspend fun quickSearch(
@@ -2603,74 +3611,91 @@ class DhakaFTP : MainAPI() {
     ): String {
 
         /*
-         * For SxxExx episodes, season+episode is the strongest identity.
+         * Episode duplicate identity:
+         *
+         * same season + same episode + same resolution
+         *
+         * Dual Audio is intentionally ignored in the key so:
+         *   Episode 1 720p
+         *   Episode 1 720p Dual Audio
+         *
+         * become one item and Dual Audio wins.
+         *
+         * But:
+         *   Episode 1 720p
+         *   Episode 1 1080p
+         *
+         * remain two different versions.
          */
         if (
             video.season != null &&
             video.episode != null
         ) {
-            return "S${video.season}-E${video.episode}"
+
+            return "EP:" +
+                video.season +
+                ":" +
+                video.episode +
+                ":R" +
+                video.resolution
         }
 
-        return normalizeSearchText(
-            video.title
-        )
-            .replace(
-                Regex(
-                    "\\b(2160p|1440p|1080p|720p|576p|480p|360p|240p|144p)\\b"
-                ),
-                " "
+        /*
+         * Movie duplicate identity:
+         *
+         * base title + resolution.
+         *
+         * Dual Audio is a preference, NOT a unique identity.
+         * Therefore:
+         *
+         * Kotlin 720p
+         * Kotlin 720p Dual Audio
+         *
+         * collapse to one, Dual Audio wins.
+         *
+         * Kotlin 720p
+         * Kotlin 1080p
+         *
+         * are kept separately.
+         */
+        val base =
+            normalizeSearchText(
+                video.title
             )
-            .replace(
-                Regex(
-                    "\\b(4k|uhd|fhd|web[- ]?dl|webrip|bluray|brrip|hdtc|hcam|hdrip|dvdrip|hd)\\b"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "\\b(dual\\s*audio|multi\\s*audio|hindi|english|korean|bangla|bengali)\\b"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "\\b(x264|x265|h264|h265|hevc|10bit|8bit|aac|ac3|dts|ddp|eac3|esub|subs?|msub)\\b"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "\\[[^\\]]*]"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "\\([^)]*\\)"
-                ),
-                " "
-            )
-            .replace(
-                Regex(
-                    "[^\\p{L}\\p{N}]+"
-                ),
-                " "
-            )
-            .trim()
-            .replace(
-                Regex(
-                    "\\s+"
-                ),
-                " "
-            )
+                .replace(
+                    Regex(
+                        "(?i)\\bdual\\s*audio\\b"
+                    ),
+                    " "
+                )
+                .replace(
+                    Regex(
+                        "(?i)\\bmulti\\s*audio\\b"
+                    ),
+                    " "
+                )
+                .replace(
+                    Regex(
+                        "(?i)\\s+"
+                    ),
+                    " "
+                )
+                .trim()
+
+        return "MOVIE:" +
+            base +
+            ":R" +
+            video.resolution
     }
 
     private fun normalizeBuilders(
         builders: List<GroupBuilder>
     ): List<FtpGroup> {
 
-        return builders.mapNotNull { builder ->
+        val output =
+            mutableListOf<FtpGroup>()
+
+        builders.forEach { builder ->
 
             val videos =
                 deduplicateVideos(
@@ -2680,101 +3705,169 @@ class DhakaFTP : MainAPI() {
             if (
                 videos.isEmpty()
             ) {
-                return@mapNotNull null
+                return@forEach
             }
 
-            val series =
-                videos.size > 1 ||
-                    videos.any {
-                        it.season != null
-                    }
-
-            val sharedPoster =
+            val commonPoster =
                 builder.posterUrl
                     ?: videos.firstOrNull {
                         it.posterUrl != null
                     }?.posterUrl
 
-            FtpGroup(
-                title =
-                    builder.title,
-                url =
-                    builder.url,
-                posterUrl =
-                    sharedPoster,
-                modifiedAt =
-                    maxOf(
-                        builder.modifiedAt,
-                        videos.maxOf {
-                            it.modifiedAt
-                        }
-                    ),
-                videos =
-                    if (
-                        series
-                    ) {
-                        videos.map {
-                            it.copy(
+            when (
+                builder.kind
+            ) {
+
+                /*
+                 * MOVIE CATEGORIES:
+                 *
+                 * every real video = one separate movie card.
+                 *
+                 * This is deliberately NOT episode-based.
+                 */
+                ContentKind.MOVIE -> {
+
+                    videos.forEach { video ->
+
+                        val poster =
+                            video.posterUrl
+                                ?: commonPoster
+
+                        output.add(
+                            FtpGroup(
+                                title =
+                                    video.title,
+                                url =
+                                    video.url,
                                 posterUrl =
-                                    sharedPoster
-                                        ?: it.posterUrl
+                                    poster,
+                                modifiedAt =
+                                    video.modifiedAt,
+                                videos =
+                                    listOf(
+                                        video.copy(
+                                            posterUrl =
+                                                poster
+                                        )
+                                    ),
+                                kind =
+                                    ContentKind.MOVIE
+                            )
+                        )
+                    }
+                }
+
+                /*
+                 * TV SHOW:
+                 * all seasons/episodes remain one series.
+                 */
+                ContentKind.SERIES -> {
+
+                    output.add(
+                        FtpGroup(
+                            title =
+                                builder.title,
+                            url =
+                                builder.url,
+                            posterUrl =
+                                commonPoster,
+                            modifiedAt =
+                                maxOf(
+                                    builder.modifiedAt,
+                                    videos.maxOf {
+                                        it.modifiedAt
+                                    }
+                                ),
+                            videos =
+                                videos.map {
+                                    it.copy(
+                                        posterUrl =
+                                            commonPoster
+                                                ?: it.posterUrl
+                                    )
+                                },
+                            kind =
+                                ContentKind.SERIES
+                        )
+                    )
+                }
+
+                /*
+                 * ANIME:
+                 * one video = playable item
+                 * multiple videos = episodes/series.
+                 */
+                ContentKind.ANIME -> {
+
+                    val episodeMode =
+                        videos.size > 1 ||
+                            videos.any {
+                                it.season != null ||
+                                    it.episode != null
+                            }
+
+                    if (
+                        episodeMode
+                    ) {
+
+                        output.add(
+                            FtpGroup(
+                                title =
+                                    builder.title,
+                                url =
+                                    builder.url,
+                                posterUrl =
+                                    commonPoster,
+                                modifiedAt =
+                                    maxOf(
+                                        builder.modifiedAt,
+                                        videos.maxOf {
+                                            it.modifiedAt
+                                        }
+                                    ),
+                                videos =
+                                    videos.map {
+                                        it.copy(
+                                            posterUrl =
+                                                commonPoster
+                                                    ?: it.posterUrl
+                                        )
+                                    },
+                                kind =
+                                    ContentKind.ANIME
+                            )
+                        )
+
+                    } else {
+
+                        videos.forEach { video ->
+
+                            output.add(
+                                FtpGroup(
+                                    title =
+                                        video.title,
+                                    url =
+                                        video.url,
+                                    posterUrl =
+                                        video.posterUrl
+                                            ?: commonPoster,
+                                    modifiedAt =
+                                        video.modifiedAt,
+                                    videos =
+                                        listOf(
+                                            video
+                                        ),
+                                    kind =
+                                        ContentKind.ANIME
+                                )
                             )
                         }
-                    } else {
-                        videos
-                    },
-                kind =
-                    if (
-                        builder.kind ==
-                        ContentKind.ANIME
-                    ) {
-                        ContentKind.ANIME
-                    } else if (
-                        series
-                    ) {
-                        ContentKind.SERIES
-                    } else {
-                        ContentKind.MOVIE
                     }
-            )
+                }
+            }
         }
-    }
 
-    private fun deduplicateGroups(
-        groups: List<FtpGroup>
-    ): List<FtpGroup> {
-
-        return groups
-            .groupBy {
-                canonicalGroupKey(
-                    it
-                )
-            }
-            .values
-            .mapNotNull {
-                    candidates ->
-
-                candidates.maxWithOrNull(
-                    compareByDescending<FtpGroup> {
-                        if (
-                            it.hasDualAudio
-                        ) {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                        .thenByDescending {
-                            it.maxResolution
-                        }
-                        .thenByDescending {
-                            it.maxSizeBytes
-                        }
-                        .thenByDescending {
-                            it.modifiedAt
-                        }
-                )
-            }
+        return output
             .sortedWith(
                 groupComparator()
             )
@@ -2784,34 +3877,41 @@ class DhakaFTP : MainAPI() {
         group: FtpGroup
     ): String {
 
+        /*
+         * Resolution is part of identity.
+         *
+         * Same title + same resolution:
+         *   normal
+         *   Dual Audio
+         * -> one logical result; Dual Audio wins through the comparator.
+         *
+         * Different resolutions:
+         *   720p
+         *   1080p
+         * -> two separate results.
+         */
         return normalizeSearchText(
             group.title
         )
             .replace(
                 Regex(
-                    "\\b(2160p|1440p|1080p|720p|576p|480p|360p|240p|144p|4k|uhd|fhd|web[- ]?dl|webrip|bluray|brrip|hdtc|hcam|hdrip|dvdrip)\\b"
+                    "(?i)\\bdual\\s*audio\\b"
                 ),
                 " "
             )
             .replace(
                 Regex(
-                    "\\b(dual\\s*audio|multi\\s*audio|hindi|english|korean|bangla|bengali)\\b"
+                    "(?i)\\bmulti\\s*audio\\b"
                 ),
                 " "
             )
             .replace(
                 Regex(
-                    "[^\\p{L}\\p{N}]+"
+                    "(?i)\\s+"
                 ),
                 " "
             )
             .trim()
-            .replace(
-                Regex(
-                    "\\s+"
-                ),
-                " "
-            )
     }
 
     private fun groupComparator():
