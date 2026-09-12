@@ -34,6 +34,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.HttpURLConnection
@@ -7842,7 +7843,8 @@ class DhakaFTP : MainAPI() {
      * CloudStream/NiceHttp so those existing behaviors are preserved.
      */
     private suspend fun ultraFastDirectoryEntries(
-        url: String
+        url: String,
+        timeoutMs: Long = FIRST_SCREEN_DIRECTORY_TIMEOUT_MS
     ): List<FtpEntry> =
         kotlinx.coroutines.withContext(
             Dispatchers.IO
@@ -7854,11 +7856,17 @@ class DhakaFTP : MainAPI() {
                         as? HttpURLConnection)
                         ?: return@withContext emptyList()
 
+                val effectiveTimeout =
+                    timeoutMs
+                        .coerceAtLeast(250L)
+                        .coerceAtMost(5000L)
+                        .toInt()
+
                 connection.connectTimeout =
-                    FIRST_SCREEN_DIRECTORY_TIMEOUT_MS.toInt()
+                    effectiveTimeout
 
                 connection.readTimeout =
-                    FIRST_SCREEN_DIRECTORY_TIMEOUT_MS.toInt()
+                    effectiveTimeout
 
                 connection.instanceFollowRedirects =
                     true
