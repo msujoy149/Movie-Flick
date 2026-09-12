@@ -965,112 +965,152 @@ class DhakaFTP : MainAPI() {
         return initial.take(limit)
     }
 
+
     private fun collapseLatestTvAcrossSources(
         groups: List<FtpGroup>
     ): List<FtpGroup> {
 
-        val seasonCards =
-            groups.filter {
-                it.kind == ContentKind.SERIES &&
-                    it.isSeasonCard
-            }
-
-        val latest =
+        val latestByShow =
             LinkedHashMap<String, FtpGroup>()
 
-        seasonCards.forEach { card ->
-
-            val logicalTitle =
-                normalizeSearchText(
-                    card.title
-                )
-                    .replace(
-                        Regex(
-                            "(?i)\\bseason\\s*\\d{1,3}\\b"
-                        ),
-                        " "
-                    )
-                    .replace(
-                        Regex(
-                            "(?i)\\bS\\d{1,3}\\b"
-                        ),
-                        " "
-                    )
-                    .replace(
-                        Regex(
-                            "\\s+"
-                        ),
-                        " "
-                    )
-                    .trim()
-
-            val key =
-                compactSearchText(
-                    logicalTitle
-                )
-
-            val existing =
-                latest[key]
-
-            if (
-                existing == null ||
-                card.modifiedAt >
-                    existing.modifiedAt ||
-                (
-                    card.modifiedAt ==
-                        existing.modifiedAt &&
-                    (
-                        card.seasonNumber
-                            ?: 0
-                    ) >
-                        (
-                            existing.seasonNumber
-                                ?: 0
-                        )
-                )
-            ) {
-                latest[key] = card
-            }
-        }
-
         /*
-         * Preserve non-season TV cards as fallback, but suppress a fallback
-         * if the same logical show already has a real Season card.
+         * Home-only rule:
+         * one logical show -> one latest Season card.
+         * This never deletes older seasons from the search index.
          */
-        val seasonKeys =
-            latest.keys
+        groups
+            .filter {
+                it.kind == ContentKind.SERIES
+            }
+            .forEach { card ->
 
-        val fallback =
-            groups.filter {
-                group ->
+                val key =
+                    logicalTvShowKey(
+                        card.title
+                    )
+
+                val current =
+                    latestByShow[key]
 
                 if (
-                    group.kind !=
-                        ContentKind.SERIES ||
-                    group.isSeasonCard
+                    current == null ||
+                    tvCardIsNewer(
+                        card,
+                        current
+                    )
                 ) {
-                    true
-                } else {
-                    compactSearchText(
-                        normalizeSearchText(
-                            group.title
-                        )
-                    ) !in seasonKeys
+                    latestByShow[key] =
+                        card
                 }
             }
 
-        return (
-            latest.values +
-                fallback
+        return latestByShow.values
+            .sortedWith(
+                tvHomeComparator()
             )
-                .distinctBy {
-                    it.url.lowercase(
-                        Locale.getDefault()
-                    )
-                }
-                .sortedWith(
-                    groupComparator()
+    }
+
+    private fun logicalTvShowKey(
+        titleRaw: String
+    ): String {
+
+        var value =
+            normalizeSearchText(
+                titleRaw
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\bseason\\s*\\d{1,3}\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\bS\\d{1,3}\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(tv\\s*series|tv\\s*show|series)\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\[[^]]*]"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\([^)]*\\)"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\s+"
+                ),
+                " "
+            )
+            .trim()
+
+        return compactSearchText(
+            value
+        )
+    }
+
+    private fun tvCardIsNewer(
+        candidate: FtpGroup,
+        current: FtpGroup
+    ): Boolean {
+
+        if (
+            candidate.modifiedAt !=
+            current.modifiedAt
+        ) {
+            return candidate.modifiedAt >
+                current.modifiedAt
+        }
+
+        return (
+            candidate.seasonNumber
+                ?: 0
+        ) >
+            (
+                current.seasonNumber
+                    ?: 0
+            )
+    }
+
+    private fun tvHomeComparator():
+        Comparator<FtpGroup> {
+
+        return compareByDescending<FtpGroup> {
+            it.modifiedAt
+        }
+            .thenByDescending {
+                it.seasonNumber
+                    ?: 0
+            }
+            .thenBy {
+                it.title.lowercase(
+                    Locale.getDefault()
                 )
+            }
     }
 
     private fun mixThreeAndThree(
@@ -3168,6 +3208,7 @@ class DhakaFTP : MainAPI() {
      * Breadth-first + concurrent. The containing folder is authoritative
      * for the displayed movie title.
      */
+
     private suspend fun fastMovieBootstrap(
         rootRaw: String,
         desired: Int
@@ -3196,13 +3237,16 @@ class DhakaFTP : MainAPI() {
             )
 
         /*
-         * Cheapest possible path:
-         * files are already directly under the requested category.
+         * Cheapest path.
          */
         val directVideos =
-            rootEntries.filter {
-                it.isVideo
-            }
+            rootEntries
+                .filter {
+                    it.isVideo
+                }
+                .sortedByDescending {
+                    it.modifiedAt ?: 0L
+                }
 
         if (
             directVideos.isNotEmpty()
@@ -3212,29 +3256,26 @@ class DhakaFTP : MainAPI() {
                     folderUrl =
                         root,
                     entries =
-                        directVideos
-                            .sortedByDescending {
-                                it.modifiedAt ?: 0L
-                            }
-                            .take(
-                                desired
-                            ),
+                        directVideos.take(
+                            desired
+                        ),
                     poster =
-                        pickPoster(rootEntries),
+                        pickPoster(
+                            rootEntries
+                        ),
                     kind =
                         kind
                 )
-            ).take(desired)
+            ).take(
+                desired
+            )
         }
 
         /*
-         * Inspect a SMALL number of newest/highest-priority root branches.
-         *
-         * This is intentionally multi-lane rather than "pick one branch".
-         * English Movies in particular can contain multiple year/wrapper
-         * branches; one empty branch must not make the whole category vanish.
+         * Use several newest/high-priority root branches.
+         * A single empty branch must not make the category empty.
          */
-        val rootDirs =
+        val branches =
             rootEntries
                 .filter {
                     it.isDirectory
@@ -3242,21 +3283,17 @@ class DhakaFTP : MainAPI() {
                 .sortedWith(
                     homepageDirectoryComparator()
                 )
-                .take(3)
+                .take(6)
 
         if (
-            rootDirs.isEmpty()
+            branches.isEmpty()
         ) {
             return emptyList()
         }
 
-        /*
-         * Pass 1:
-         * root -> wrapper/show/year -> direct videos.
-         */
         val firstWave =
             coroutineScope {
-                rootDirs.map {
+                branches.map {
                     branch ->
                     async {
 
@@ -3268,7 +3305,7 @@ class DhakaFTP : MainAPI() {
                         val entries =
                             safeDirectoryEntries(
                                 branchUrl,
-                                950L
+                                900L
                             )
 
                         val poster =
@@ -3276,37 +3313,32 @@ class DhakaFTP : MainAPI() {
                                 entries
                             )
 
-                        val direct =
-                            entries.filter {
-                                it.isVideo
-                            }
+                        val videos =
+                            entries
+                                .filter {
+                                    it.isVideo
+                                }
+                                .sortedByDescending {
+                                    it.modifiedAt ?: 0L
+                                }
 
-                        val directGroups =
+                        val groups =
                             buildGroupsFromVideoEntries(
                                 folderUrl =
                                     branchUrl,
                                 entries =
-                                    direct
-                                        .sortedByDescending {
-                                            it.modifiedAt
-                                                ?: 0L
-                                        }
-                                        .take(
-                                            desired
-                                        ),
+                                    videos.take(
+                                        desired
+                                    ),
                                 poster =
                                     poster,
                                 kind =
                                     kind
                             )
 
-                        /*
-                         * If the branch itself is not a leaf, expose its
-                         * highest-priority child directories for pass 2.
-                         */
                         val children =
                             if (
-                                direct.isEmpty()
+                                videos.isEmpty()
                             ) {
                                 entries
                                     .filter {
@@ -3315,29 +3347,28 @@ class DhakaFTP : MainAPI() {
                                     .sortedWith(
                                         homepageDirectoryComparator()
                                     )
-                                    .take(4)
+                                    .take(8)
                             } else {
                                 emptyList()
                             }
 
                         Triple(
-                            directGroups,
+                            groups,
                             children,
-                            poster
+                            branch
                         )
                     }
                 }.awaitAll()
             }
 
-        val firstGroups =
-            firstWave
-                .flatMap {
-                    it.first
-                }
+        val directGroups =
+            firstWave.flatMap {
+                it.first
+            }
 
         val firstNormalized =
             normalizeQuickBootstrapGroups(
-                firstGroups
+                directGroups
             )
 
         if (
@@ -3349,12 +3380,10 @@ class DhakaFTP : MainAPI() {
         }
 
         /*
-         * Pass 2:
-         * root -> wrapper -> movie folder -> video.
-         *
-         * Only a handful of children are opened, in parallel.
+         * One more bounded level:
+         * root -> wrapper/year -> movie folder -> video.
          */
-        val childCandidates =
+        val leafCandidates =
             firstWave
                 .flatMap {
                     it.second
@@ -3367,12 +3396,10 @@ class DhakaFTP : MainAPI() {
                 .sortedWith(
                     homepageDirectoryComparator()
                 )
-                .take(
-                    8
-                )
+                .take(12)
 
         if (
-            childCandidates.isEmpty()
+            leafCandidates.isEmpty()
         ) {
             return firstNormalized.take(
                 desired
@@ -3381,19 +3408,19 @@ class DhakaFTP : MainAPI() {
 
         val secondWave =
             coroutineScope {
-                childCandidates.map {
-                    child ->
+                leafCandidates.map {
+                    leaf ->
                     async {
 
-                        val childUrl =
+                        val leafUrl =
                             normalizeDirectoryUrl(
-                                child.url
+                                leaf.url
                             )
 
                         val entries =
                             safeDirectoryEntries(
-                                childUrl,
-                                1050L
+                                leafUrl,
+                                1000L
                             )
 
                         val poster =
@@ -3403,15 +3430,18 @@ class DhakaFTP : MainAPI() {
 
                         buildGroupsFromVideoEntries(
                             folderUrl =
-                                childUrl,
+                                leafUrl,
                             entries =
-                                entries.filter {
-                                    it.isVideo
-                                }.sortedByDescending {
-                                    it.modifiedAt ?: 0L
-                                }.take(
-                                    desired
-                                ),
+                                entries
+                                    .filter {
+                                        it.isVideo
+                                    }
+                                    .sortedByDescending {
+                                        it.modifiedAt ?: 0L
+                                    }
+                                    .take(
+                                        desired
+                                    ),
                             poster =
                                 poster,
                             kind =
@@ -3423,12 +3453,11 @@ class DhakaFTP : MainAPI() {
             }
 
         return normalizeQuickBootstrapGroups(
-            firstGroups +
+            directGroups +
                 secondWave
+        ).take(
+            desired
         )
-            .take(
-                desired
-            )
     }
 
     private fun buildGroupsFromVideoEntries(
