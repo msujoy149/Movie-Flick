@@ -315,6 +315,52 @@ class DhakaFTP : MainAPI() {
     private val scanJobs =
         ConcurrentHashMap<String, Deferred<List<FtpGroup>>>()
 
+    /*
+     * Dynamic Home cursors.
+     *
+     * First page = 6 items.
+     * Later horizontal pages = 10 items.
+     *
+     * The cursor keeps a directory queue so a category is continued from
+     * the exact point reached previously instead of rescanning the root.
+     */
+    private data class DynamicMovieCursor(
+        val root: String,
+        val kind: ContentKind,
+        val queue:
+            java.util.ArrayDeque<FtpEntry> =
+            java.util.ArrayDeque(),
+        val emitted:
+            MutableSet<String> =
+            HashSet(),
+        val pages:
+            ConcurrentHashMap<Int, List<FtpGroup>> =
+            ConcurrentHashMap(),
+        var initialized: Boolean = false,
+        var exhausted: Boolean = false
+    )
+
+    private data class DynamicTvCursor(
+        val root: String,
+        val queue:
+            java.util.ArrayDeque<FtpEntry> =
+            java.util.ArrayDeque(),
+        val emitted:
+            MutableSet<String> =
+            HashSet(),
+        val pages:
+            ConcurrentHashMap<Int, List<FtpGroup>> =
+            ConcurrentHashMap(),
+        var initialized: Boolean = false,
+        var exhausted: Boolean = false
+    )
+
+    private val dynamicMovieCursors =
+        ConcurrentHashMap<String, DynamicMovieCursor>()
+
+    private val dynamicTvCursors =
+        ConcurrentHashMap<String, DynamicTvCursor>()
+
     private val searchRoots by lazy {
         listOf(
             ROOT_ENGLISH,
@@ -332,6 +378,7 @@ class DhakaFTP : MainAPI() {
      * HOMEPAGE
      * ---------------------------------------------------------------
      */
+
 
 
     override suspend fun getMainPage(
@@ -355,156 +402,337 @@ class DhakaFTP : MainAPI() {
                 request.data
             )
 
-        /*
-         * FIRST PAGE:
-         * bounded discovery only. The full scanner is intentionally delayed
-         * and is never required for the first response.
-         */
-        if (page == 1) {
-
-            val cached =
-                validCache(root)
-
-            val firstGroups =
-                cached
-                    ?.groups
-                    ?.sortedWith(
-                        groupComparator()
-                    )
-                    ?.take(
-                        MOVIE_HOME_SIZE
-                    )
-                    ?.takeIf {
-                        it.isNotEmpty()
-                    }
-                    ?: kotlinx.coroutines.withTimeoutOrNull(
-                        2800L
-                    ) {
-                        fastMovieBootstrap(
-                            root,
-                            MOVIE_HOME_SIZE
-                        )
-                    }.orEmpty()
-
-            if (
-                firstGroups.isNotEmpty()
-            ) {
-                updatePartialCache(
-                    root,
-                    firstGroups
-                )
-            }
-
-            /*
-             * Full recursive indexing is deliberately deferred.
-             * It continues independently after the UI has already rendered.
-             */
-            scope.launch {
-                kotlinx.coroutines.delay(
-                    12000L
-                )
-                prewarm(
-                    root
-                )
-            }
-
-            return newHomePageResponse(
-                request,
-                firstGroups.map {
-                    toSearchResponse(it)
-                },
-                true
-            )
-        }
-
-        /*
-         * LATER PAGES:
-         * use the existing partial index and only probe the category when
-         * the requested horizontal range has not arrived yet.
-         */
-        val offset =
-            (page - 1) *
+        val requested =
+            if (page <= 1) {
                 MOVIE_HOME_SIZE
-
-        waitForPartialIndex(
-            root = root,
-            requiredCount =
-                offset + 1,
-            maxWaitMs = 500L
-        )
-
-        var current =
-            validCache(root)
-
-        if (
-            current == null ||
-            offset >=
-            current.groups.size
-        ) {
-
-            val probed =
-                kotlinx.coroutines.withTimeoutOrNull(
-                    1800L
-                ) {
-                    fastMovieBootstrap(
-                        root,
-                        offset +
-                            MOVIE_HOME_SIZE
-                    )
-                }.orEmpty()
-
-            if (
-                probed.isNotEmpty()
-            ) {
-                updatePartialCache(
-                    root,
-                    probed
-                )
-                current =
-                    validCache(root)
+            } else {
+                10
             }
-        }
 
-        if (
-            current == null ||
-            current.groups.isEmpty()
-        ) {
-            return newHomePageResponse(
-                request,
-                emptyList(),
-                true
+        /*
+         * This response path never waits for the full recursive index.
+         */
+        val items =
+            loadDynamicMoviePage(
+                root = root,
+                kind = detectKind(root),
+                page = page,
+                pageSize = requested
             )
-        }
 
-        if (
-            offset >=
-            current.groups.size
-        ) {
-            return newHomePageResponse(
-                request,
-                emptyList(),
-                !current.complete
+        /*
+         * Full recursive indexing is background-only and delayed.
+         * It is not part of first paint.
+         */
+        scope.launch {
+            kotlinx.coroutines.delay(
+                15000L
             )
+            prewarm(root)
         }
 
-        val pageItems =
-            current.groups
-                .sortedWith(
-                    groupComparator()
-                )
-                .drop(offset)
-                .take(
-                    MOVIE_HOME_SIZE
-                )
+        val state =
+            dynamicMovieCursors[root]
 
         return newHomePageResponse(
             request,
-            pageItems.map {
+            items.map {
                 toSearchResponse(it)
             },
-            true
+            state?.exhausted != true ||
+                items.isNotEmpty()
         )
     }
+
+    private suspend fun loadDynamicMoviePage(
+        root: String,
+        kind: ContentKind,
+        page: Int,
+        pageSize: Int
+    ): List<FtpGroup> {
+
+        val state =
+            dynamicMovieCursors.computeIfAbsent(
+                root
+            ) {
+                DynamicMovieCursor(
+                    root = root,
+                    kind = kind
+                )
+            }
+
+        state.pages[page]?.let {
+            return it
+        }
+
+        if (!state.initialized) {
+
+            val rootEntries =
+                safeDirectoryEntries(
+                    root,
+                    1800L
+                )
+
+            state.initialized = true
+
+            if (
+                rootEntries.isEmpty()
+            ) {
+                state.exhausted = true
+                state.pages[page] =
+                    emptyList()
+                return emptyList()
+            }
+
+            /*
+             * Direct files: fastest possible path.
+             */
+            val direct =
+                rootEntries
+                    .filter {
+                        it.isVideo
+                    }
+                    .sortedByDescending {
+                        it.modifiedAt ?: 0L
+                    }
+
+            if (
+                direct.isNotEmpty()
+            ) {
+
+                val groups =
+                    normalizeQuickBootstrapGroups(
+                        buildGroupsFromVideoEntries(
+                            folderUrl =
+                                root,
+                            entries =
+                                direct,
+                            poster =
+                                pickPoster(
+                                    rootEntries
+                                ),
+                            kind =
+                                kind
+                        )
+                    )
+
+                val first =
+                    emitDynamicMovieGroups(
+                        state,
+                        groups
+                    ).take(
+                        pageSize
+                    )
+
+                if (
+                    first.isEmpty()
+                ) {
+                    state.exhausted = true
+                }
+
+                state.pages[page] =
+                    first
+
+                return first
+            }
+
+            /*
+             * LIVE ORDER:
+             * newest year first, then modification time.
+             * No fixed 2023 assumption here.
+             */
+            rootEntries
+                .filter {
+                    it.isDirectory
+                }
+                .sortedWith(
+                    latestLiveFolderComparator()
+                )
+                .forEach {
+                    state.queue.addLast(
+                        it
+                    )
+                }
+        }
+
+        val collected =
+            mutableListOf<FtpGroup>()
+
+        while (
+            collected.size <
+                pageSize &&
+            !state.exhausted
+        ) {
+
+            if (
+                state.queue.isEmpty()
+            ) {
+                state.exhausted = true
+                break
+            }
+
+            val batch =
+                mutableListOf<FtpEntry>()
+
+            repeat(
+                minOf(
+                    pageSize,
+                    state.queue.size
+                )
+            ) {
+                batch.add(
+                    state.queue.removeFirst()
+                )
+            }
+
+            val results =
+                coroutineScope {
+                    batch.map {
+                        directory ->
+                        async {
+
+                            val folderUrl =
+                                normalizeDirectoryUrl(
+                                    directory.url
+                                )
+
+                            val entries =
+                                safeDirectoryEntries(
+                                    folderUrl,
+                                    2200L
+                                )
+
+                            val poster =
+                                pickPoster(
+                                    entries
+                                )
+
+                            val videos =
+                                entries
+                                    .filter {
+                                        it.isVideo
+                                    }
+                                    .sortedByDescending {
+                                        it.modifiedAt ?: 0L
+                                    }
+
+                            val groups =
+                                if (
+                                    videos.isNotEmpty()
+                                ) {
+                                    buildGroupsFromVideoEntries(
+                                        folderUrl =
+                                            folderUrl,
+                                        entries =
+                                            videos,
+                                        poster =
+                                            poster,
+                                        kind =
+                                            kind
+                                    )
+                                } else {
+                                    emptyList()
+                                }
+
+                            val children =
+                                if (
+                                    videos.isEmpty()
+                                ) {
+                                    entries
+                                        .filter {
+                                            it.isDirectory
+                                        }
+                                        .sortedWith(
+                                            latestLiveFolderComparator()
+                                        )
+                                } else {
+                                    emptyList()
+                                }
+
+                            Pair(
+                                groups,
+                                children
+                            )
+                        }
+                    }.awaitAll()
+                }
+
+            results.forEach {
+                result ->
+
+                collected.addAll(
+                    emitDynamicMovieGroups(
+                        state,
+                        result.first
+                    )
+                )
+
+                result.second.forEach {
+                    child ->
+                    state.queue.addLast(
+                        child
+                    )
+                }
+            }
+        }
+
+        val result =
+            collected
+                .sortedWith(
+                    groupComparator()
+                )
+                .take(
+                    pageSize
+                )
+
+        state.pages[page] =
+            result
+
+        return result
+    }
+
+    private fun emitDynamicMovieGroups(
+        state: DynamicMovieCursor,
+        groups: List<FtpGroup>
+    ): List<FtpGroup> {
+
+        return normalizeQuickBootstrapGroups(
+            groups
+        ).filter {
+            val key =
+                it.kind.name +
+                    ":" +
+                    normalizeSearchText(
+                        it.title
+                    ) +
+                    ":R" +
+                    it.maxResolution
+
+            state.emitted.add(
+                key
+            )
+        }
+    }
+
+    private fun latestLiveFolderComparator():
+        Comparator<FtpEntry> {
+
+        return compareByDescending<FtpEntry> {
+            yearValueFromName(
+                it.name
+            ) ?: -1
+        }
+            .thenByDescending {
+                it.modifiedAt ?: 0L
+            }
+            .thenByDescending {
+                directoryPriority(it)
+            }
+            .thenBy {
+                it.order
+            }
+    }
+
 
     private suspend fun getTvShowHomePage(
         page: Int,
@@ -530,242 +758,460 @@ class DhakaFTP : MainAPI() {
             )
         }
 
-        if (page == 1) {
+        /*
+         * Each source advances independently. We then collapse the combined
+         * source page by logical show, leaving only the newest Season card
+         * for every show on Home.
+         */
+        val (sourceA, sourceB) =
+            coroutineScope {
 
-            /*
-             * EXACT FIRST-SCREEN BUDGET:
-             *
-             * source A -> 3 latest logical Season cards
-             * source B -> 3 latest logical Season cards
-             *
-             * Then collapse duplicates across both sources.
-             */
-            val (first, second) =
-                coroutineScope {
-
-                    val a =
-                        async {
-                            fastTvBootstrap(
-                                roots[0],
-                                TV_SOURCE_BATCH
-                            )
-                        }
-
-                    val b =
-                        async {
-                            fastTvBootstrap(
-                                roots[1],
-                                TV_SOURCE_BATCH
-                            )
-                        }
-
-                    a.await() to b.await()
-                }
-
-            val combined =
-                collapseLatestTvAcrossSources(
-                    first +
-                        second
-                )
-                    .take(
-                        TV_HOME_SIZE
-                    )
-
-            if (
-                combined.isNotEmpty()
-            ) {
-                updatePartialCache(
-                    ROOT_TV_1,
-                    first
-                )
-                updatePartialCache(
-                    ROOT_TV_2,
-                    second
-                )
-            }
-
-            /*
-             * Start background indexing only after the first Home response.
-             * prewarm() itself already has its own delayed scanner.
-             */
-            scope.launch {
-                kotlinx.coroutines.delay(
-                    12000L
-                )
-                prewarm(roots[0])
-                prewarm(roots[1])
-            }
-
-            return newHomePageResponse(
-                request,
-                combined.map {
-                    toSearchResponse(it)
-                },
-                true
-            )
-        }
-
-        val offset =
-            (page - 1) *
-                TV_HOME_SIZE
-
-        var first =
-            validCache(
-                roots[0]
-            )
-
-        var second =
-            validCache(
-                roots[1]
-            )
-
-        var combined =
-            collapseLatestTvAcrossSources(
-                (
-                    first?.groups.orEmpty() +
-                        second?.groups.orEmpty()
-                )
-            )
-
-        if (
-            combined.size <= offset
-        ) {
-
-            val sourceSkip =
-                offset / TV_SOURCE_BATCH
-
-            val quickFast =
-                coroutineScope {
-
-                    val a =
-                        async {
-                            fastTvBootstrap(
-                                roots[0],
-                                TV_SOURCE_BATCH,
-                                sourceSkip
-                            )
-                        }
-
-                    val b =
-                        async {
-                            fastTvBootstrap(
-                                roots[1],
-                                TV_SOURCE_BATCH,
-                                sourceSkip
-                            )
-                        }
-
-                    a.await() to
-                        b.await()
-                }
-
-            val quick =
-                if (
-                    quickFast.first.isNotEmpty() ||
-                    quickFast.second.isNotEmpty()
-                ) {
-                    quickFast
-                } else {
-                    coroutineScope {
-
-                        val a =
-                            async {
-                                scanLatestGroups(
-                                    roots[0],
-                                    offset +
-                                        TV_HOME_SIZE
-                                )
-                            }
-
-                        val b =
-                            async {
-                                scanLatestGroups(
-                                    roots[1],
-                                    offset +
-                                        TV_HOME_SIZE
-                                )
-                            }
-
-                        a.await() to
-                            b.await()
+                val a =
+                    async {
+                        loadDynamicTvPage(
+                            roots[0],
+                            page,
+                            6
+                        )
                     }
-                }
 
-            if (
-                quick.first.isNotEmpty()
-            ) {
-                updatePartialCache(
-                    roots[0],
-                    quick.first
-                )
+                val b =
+                    async {
+                        loadDynamicTvPage(
+                            roots[1],
+                            page,
+                            6
+                        )
+                    }
+
+                a.await() to
+                    b.await()
             }
 
-            if (
-                quick.second.isNotEmpty()
-            ) {
-                updatePartialCache(
-                    roots[1],
-                    quick.second
-                )
-            }
-
-            first =
-                validCache(
-                    roots[0]
-                )
-
-            second =
-                validCache(
-                    roots[1]
-                )
-
-            combined =
-                collapseLatestTvAcrossSources(
-                    (
-                        first?.groups.orEmpty() +
-                            second?.groups.orEmpty()
-                    )
-                )
-        }
-
-        if (
-            combined.size <= offset
-        ) {
-
-            val complete =
-                first?.complete == true &&
-                    second?.complete == true
-
-            return newHomePageResponse(
-                request,
-                emptyList(),
-                !complete
+        val combined =
+            collapseLatestTvAcrossSources(
+                sourceA +
+                    sourceB
             )
-        }
-
-        val pageItems =
-            combined
-                .drop(offset)
                 .take(
                     TV_HOME_SIZE
                 )
 
-        val complete =
-            first?.complete == true &&
-                second?.complete == true
+        if (
+            page >= 2
+        ) {
+            scope.launch {
+                kotlinx.coroutines.delay(
+                    15000L
+                )
+                prewarm(roots[0])
+                prewarm(roots[1])
+            }
+        }
 
         return newHomePageResponse(
             request,
-            pageItems.map {
+            combined.map {
                 toSearchResponse(it)
             },
-            !(
-                complete &&
-                    offset +
-                    TV_HOME_SIZE >=
-                    combined.size
-            )
+            (
+                dynamicTvCursors[
+                    roots[0]
+                ]?.exhausted != true ||
+                    dynamicTvCursors[
+                        roots[1]
+                    ]?.exhausted != true
+            ) || combined.isNotEmpty()
         )
+    }
+
+    private suspend fun loadDynamicTvPage(
+        rootRaw: String,
+        page: Int,
+        pageSize: Int
+    ): List<FtpGroup> {
+
+        val root =
+            normalizeDirectoryUrl(
+                rootRaw
+            )
+
+        val state =
+            dynamicTvCursors.computeIfAbsent(
+                root
+            ) {
+                DynamicTvCursor(
+                    root = root
+                )
+            }
+
+        state.pages[page]?.let {
+            return it
+        }
+
+        if (!state.initialized) {
+
+            val rootEntries =
+                safeDirectoryEntries(
+                    root,
+                    1800L
+                )
+
+            state.initialized = true
+
+            if (
+                rootEntries.isEmpty()
+            ) {
+                state.exhausted = true
+                state.pages[page] =
+                    emptyList()
+                return emptyList()
+            }
+
+            rootEntries
+                .filter {
+                    it.isDirectory
+                }
+                .sortedWith(
+                    latestLiveFolderComparator()
+                )
+                .forEach {
+                    state.queue.addLast(
+                        it
+                    )
+                }
+        }
+
+        val result =
+            mutableListOf<FtpGroup>()
+
+        while (
+            result.size <
+                pageSize &&
+            !state.exhausted
+        ) {
+
+            if (
+                state.queue.isEmpty()
+            ) {
+                state.exhausted = true
+                break
+            }
+
+            val batch =
+                mutableListOf<FtpEntry>()
+
+            repeat(
+                minOf(
+                    pageSize,
+                    state.queue.size
+                )
+            ) {
+                batch.add(
+                    state.queue.removeFirst()
+                )
+            }
+
+            val fetched =
+                coroutineScope {
+                    batch.map {
+                        showEntry ->
+                        async {
+
+                            val showUrl =
+                                normalizeDirectoryUrl(
+                                    showEntry.url
+                                )
+
+                            val entries =
+                                safeDirectoryEntries(
+                                    showUrl,
+                                    2200L
+                                )
+
+                            val showPoster =
+                                pickPoster(
+                                    entries
+                                )
+
+                            val seasonFolders =
+                                entries
+                                    .filter {
+                                        it.isDirectory &&
+                                            isSeasonDirectory(
+                                                it.name
+                                            )
+                                    }
+                                    .sortedWith(
+                                        compareByDescending<FtpEntry> {
+                                            it.modifiedAt
+                                                ?: 0L
+                                        }.thenByDescending {
+                                            extractSeasonNumber(
+                                                it.name
+                                            ) ?: 0
+                                        }
+                                    )
+
+                            /*
+                             * A show folder with multiple Seasons yields
+                             * one candidate per Season. The Home-level
+                             * collapse selects only the newest one.
+                             */
+                            val seasons =
+                                seasonFolders.map {
+                                    seasonEntry ->
+
+                                    val season =
+                                        extractSeasonNumber(
+                                            seasonEntry.name
+                                        ) ?: 1
+
+                                    val seasonUrl =
+                                        normalizeDirectoryUrl(
+                                            seasonEntry.url
+                                        )
+
+                                    if (
+                                        showPoster != null
+                                    ) {
+                                        posterCache[
+                                            seasonUrl
+                                        ] =
+                                            showPoster
+                                    }
+
+                                    FtpGroup(
+                                        title =
+                                            "${
+                                                getFolderTitle(
+                                                    showUrl
+                                                )
+                                            } Season $season",
+                                        url =
+                                            seasonUrl,
+                                        posterUrl =
+                                            showPoster,
+                                        modifiedAt =
+                                            seasonEntry.modifiedAt
+                                                ?: 0L,
+                                        videos =
+                                            emptyList(),
+                                        kind =
+                                            ContentKind.SERIES,
+                                        isSeasonCard =
+                                            true,
+                                        seasonNumber =
+                                            season
+                                    )
+                                }
+
+                            val directEpisodes =
+                                entries
+                                    .filter {
+                                        it.isVideo
+                                    }
+                                    .sortedBy {
+                                        episodeSortKey(
+                                            it.name
+                                        )
+                                    }
+
+                            val directShow =
+                                if (
+                                    seasons.isEmpty() &&
+                                    directEpisodes.isNotEmpty()
+                                ) {
+
+                                    val videos =
+                                        directEpisodes.mapIndexed {
+                                            index,
+                                            episode ->
+                                            makeVideo(
+                                                entry =
+                                                    episode,
+                                                poster =
+                                                    showPoster,
+                                                seasonHint =
+                                                    1,
+                                                order =
+                                                    index.toLong()
+                                            )
+                                        }
+
+                                    FtpGroup(
+                                        title =
+                                            "${
+                                                getFolderTitle(
+                                                    showUrl
+                                                )
+                                            } Season 1",
+                                        url =
+                                            showUrl,
+                                        posterUrl =
+                                            showPoster,
+                                        modifiedAt =
+                                            maxOf(
+                                                showEntry.modifiedAt
+                                                    ?: 0L,
+                                                directEpisodes.maxOfOrNull {
+                                                    it.modifiedAt
+                                                        ?: 0L
+                                                } ?: 0L
+                                            ),
+                                        videos =
+                                            videos,
+                                        kind =
+                                            ContentKind.SERIES,
+                                        isSeasonCard =
+                                            true,
+                                        seasonNumber =
+                                            1
+                                    )
+                                } else {
+                                    null
+                                }
+
+                            Triple(
+                                showEntry,
+                                seasons,
+                                directShow
+                            )
+                        }
+                    }.awaitAll()
+                }
+
+            fetched.forEach {
+                (_, seasons, directShow) ->
+
+                val candidates =
+                    if (
+                        seasons.isNotEmpty()
+                    ) {
+                        seasons
+                    } else {
+                        directShow?.let {
+                            listOf(it)
+                        }.orEmpty()
+                    }
+
+                candidates.forEach {
+                    card ->
+
+                    /*
+                     * Physical show-folder identity is more reliable than
+                     * the visible truncated title.
+                     */
+                    val key =
+                        logicalTvShowHomeKey(
+                            card
+                        )
+
+                    if (
+                        state.emitted.add(
+                            key
+                        )
+                    ) {
+                        result.add(
+                            card
+                        )
+                    }
+                }
+            }
+        }
+
+        val final =
+            result
+                .sortedWith(
+                    tvHomeComparator()
+                )
+                .take(
+                    pageSize
+                )
+
+        state.pages[page] =
+            final
+
+        return final
+    }
+
+    private fun logicalTvShowHomeKey(
+        card: FtpGroup
+    ): String {
+
+        val showFolder =
+            if (
+                card.isSeasonCard
+            ) {
+                parentDirectory(
+                    card.url
+                )
+            } else {
+                card.url
+            }
+
+        val title =
+            showFolder?.let {
+                getFolderTitle(it)
+            } ?: card.title
+
+        return "TV:" +
+            logicalTvShowKey(
+                title
+            )
+    }
+
+    private fun episodeSortKey(
+        name: String
+    ): Int {
+
+        val normalized =
+            decodeSafely(
+                name
+            ).uppercase(
+                Locale.getDefault()
+            )
+
+        Regex(
+            "(?<![A-Z0-9])S\\d{1,3}E(\\d{1,4})(?![A-Z0-9])"
+        )
+            .find(
+                normalized
+            )
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.let {
+                return it
+            }
+
+        Regex(
+            "(?<![A-Z0-9])E(\\d{1,4})(?![A-Z0-9])"
+        )
+            .find(
+                normalized
+            )
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.let {
+                return it
+            }
+
+        Regex(
+            "(?<![A-Z0-9])(?:EP|EPISODE)[ ._-]*(\\d{1,4})(?![A-Z0-9])"
+        )
+            .find(
+                normalized
+            )
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.let {
+                return it
+            }
+
+        return Int.MAX_VALUE
     }
 
     private suspend fun waitForPartialIndex(
@@ -5981,33 +6427,15 @@ class DhakaFTP : MainAPI() {
             if (
                 it.kind == ContentKind.SERIES
             ) {
-                false
+                -1
             } else {
                 yearValueFromName(
                     getFolderTitle(
                         it.url
                     )
-                ) == 2023 ||
-                    Regex(
-                        "(?<!\\d)2023(?!\\d)"
-                    ).containsMatchIn(
-                        decodeSafely(it.url)
-                    )
+                ) ?: -1
             }
         }
-            .thenByDescending {
-                if (
-                    it.kind == ContentKind.SERIES
-                ) {
-                    -1
-                } else {
-                    yearValueFromName(
-                        getFolderTitle(
-                            it.url
-                        )
-                    ) ?: -1
-                }
-            }
             .thenByDescending {
                 it.modifiedAt
             }
