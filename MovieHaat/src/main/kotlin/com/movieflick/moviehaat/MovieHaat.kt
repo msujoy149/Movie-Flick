@@ -77,7 +77,9 @@ class MovieHaat : MainAPI() {
          * logical home batch. Batch 1 => first 2 from every source,
          * batch 2 => next 2 from every source, etc.
          */
-        const val ITEMS_PER_SOURCE_PER_BATCH = 2
+        // CloudStream should initially expose six items per logical row.
+        // Subsequent row pages are loaded lazily as the user keeps scrolling.
+        const val ITEMS_PER_CATEGORY_PER_BATCH = 6
 
         const val MOVIE_LIST_API = "viewallmovies"
         const val MOVIE_SEARCH_API = "searchmovies"
@@ -187,45 +189,11 @@ class MovieHaat : MainAPI() {
         page: Int,
         sources: List<Source>
     ): HomePageResponse {
-        val targetEnd = page * ITEMS_PER_SOURCE_PER_BATCH
-
-        val sourceItems = coroutineScope {
-            sources.map { source ->
-                async {
-                    getMovieItemsUpTo(
-                        source = source,
-                        requiredCount = targetEnd
-                    )
-                }
-            }.awaitAll()
-        }
-
-        val pageStart = (page - 1) * ITEMS_PER_SOURCE_PER_BATCH
-        val merged = linkedMapOf<String, HomeItem>()
-
-        sourceItems.forEach { items ->
-            items
-                .drop(pageStart)
-                .take(ITEMS_PER_SOURCE_PER_BATCH)
-                .forEach { item ->
-                    merged.putIfAbsent(homeDedupKey(item), item)
-                }
-        }
-
-        val ordered = merged.values.toList()
-
-        /*
-         * Continue while at least one source has another item beyond this
-         * logical batch.
-         */
-        val hasNext = sourceItems.any {
-            it.size > page * ITEMS_PER_SOURCE_PER_BATCH
-        }
-
-        return newHomePageResponse(
-            request,
-            ordered.map(::toSearchResponse),
-            hasNext
+        return buildLazyHome(
+            request = request,
+            page = page,
+            sources = sources,
+            isSeries = false
         )
     }
 
@@ -234,42 +202,119 @@ class MovieHaat : MainAPI() {
         page: Int,
         sources: List<Source>
     ): HomePageResponse {
-        val targetEnd = page * ITEMS_PER_SOURCE_PER_BATCH
+        return buildLazyHome(
+            request = request,
+            page = page,
+            sources = sources,
+            isSeries = true
+        )
+    }
+
+    /*
+     * Build one logical CloudStream row page at a time.
+     *
+     * Page 1 => six items
+     * Page 2 => next six items
+     * Page 3 => next six items
+     * ...
+     *
+     * Items are interleaved across all configured sources so one source does
+     * not monopolize the row. CloudStream requests the next page when the user
+     * reaches the end of the current horizontal row.
+     */
+    private suspend fun buildLazyHome(
+        request: MainPageRequest,
+        page: Int,
+        sources: List<Source>,
+        isSeries: Boolean
+    ): HomePageResponse {
+        val pageNumber = page.coerceAtLeast(1)
+        val pageSize = ITEMS_PER_CATEGORY_PER_BATCH
+
+        if (sources.isEmpty()) {
+            return newHomePageResponse(
+                request,
+                emptyList(),
+                false
+            )
+        }
+
+        val targetEnd = pageNumber * pageSize
+
+        /*
+         * Because items are interleaved source-by-source, each source only
+         * needs approximately targetEnd / sourceCount items. We fetch one
+         * extra item from each source to make the next-page decision reliable
+         * when source lengths are uneven.
+         */
+        val requiredPerSource =
+            ((targetEnd + sources.size - 1) / sources.size) + 1
 
         val sourceItems = coroutineScope {
             sources.map { source ->
                 async {
-                    getTvItemsUpTo(
-                        source = source,
-                        requiredCount = targetEnd
-                    )
+                    if (isSeries) {
+                        getTvItemsUpTo(
+                            source = source,
+                            requiredCount = requiredPerSource
+                        )
+                    } else {
+                        getMovieItemsUpTo(
+                            source = source,
+                            requiredCount = requiredPerSource
+                        )
+                    }
                 }
             }.awaitAll()
         }
 
-        val pageStart = (page - 1) * ITEMS_PER_SOURCE_PER_BATCH
-        val merged = linkedMapOf<String, HomeItem>()
+        val interleaved = interleaveSources(sourceItems)
+        val pageStart = (pageNumber - 1) * pageSize
+        val pageItems = interleaved
+            .drop(pageStart)
+            .take(pageSize)
 
-        sourceItems.forEach { items ->
-            items
-                .drop(pageStart)
-                .take(ITEMS_PER_SOURCE_PER_BATCH)
-                .forEach { item ->
-                    merged.putIfAbsent(homeDedupKey(item), item)
-                }
-        }
-
-        val ordered = merged.values.toList()
-
-        val hasNext = sourceItems.any {
-            it.size > page * ITEMS_PER_SOURCE_PER_BATCH
-        }
+        val hasNext = interleaved.size > pageNumber * pageSize
 
         return newHomePageResponse(
             request,
-            ordered.map(::toSearchResponse),
+            pageItems.map(::toSearchResponse),
             hasNext
         )
+    }
+
+    /*
+     * Round-robin merge:
+     * source1 item1, source2 item1, source3 item1, ...
+     * source1 item2, source2 item2, source3 item2, ...
+     *
+     * Exhausted sources are skipped, so short categories do not block the
+     * remaining sources from continuing.
+     */
+    private fun interleaveSources(
+        sourceItems: List<List<HomeItem>>
+    ): List<HomeItem> {
+        if (sourceItems.isEmpty()) return emptyList()
+
+        val result = mutableListOf<HomeItem>()
+        var index = 0
+
+        while (true) {
+            var added = false
+
+            sourceItems.forEach { items ->
+                if (index < items.size) {
+                    result += items[index]
+                    added = true
+                }
+            }
+
+            if (!added) break
+            index++
+        }
+
+        return result
+            .distinctBy(::homeDedupKey)
     }
 
     private suspend fun getMovieItemsUpTo(
