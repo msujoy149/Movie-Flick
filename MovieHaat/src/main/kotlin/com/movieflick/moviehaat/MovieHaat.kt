@@ -507,6 +507,7 @@ class MovieHaat : MainAPI() {
     ): LoadResponse {
         val value = url.trim()
 
+        // Internal links are kept for the final playback hand-off.
         if (value.startsWith("movie:", true)) {
             val id = value.substringAfter(":", "").trim()
             return loadMovieById(id)
@@ -517,21 +518,40 @@ class MovieHaat : MainAPI() {
             return loadTvById(id)
         }
 
-        return if (looksLikeDirectMedia(value)) {
-            newMovieLoadResponse(
-                titleFromUrl(value),
-                value,
-                TvType.Movie,
-                value
-            )
-        } else {
-            newMovieLoadResponse(
+        // Use the real Movie Haat routes as SearchResponse URLs. This lets
+        // CloudStream invoke this provider's load() reliably instead of
+        // treating a custom scheme such as movie:18605 as a generic URL.
+        val path = runCatching {
+            URI(value).path.orEmpty()
+        }.getOrDefault("")
+
+        val moviePrefix = "/movies-detail/"
+        if (path.startsWith(moviePrefix, true)) {
+            val id = path.substringAfter(moviePrefix).trim('/')
+            if (id.isNotBlank()) return loadMovieById(id)
+        }
+
+        val tvPrefix = "/episodes/"
+        if (path.startsWith(tvPrefix, true)) {
+            val id = path.substringAfter(tvPrefix).trim('/')
+            if (id.isNotBlank()) return loadTvById(id)
+        }
+
+        if (looksLikeDirectMedia(value)) {
+            return newMovieLoadResponse(
                 titleFromUrl(value),
                 value,
                 TvType.Movie,
                 value
             )
         }
+
+        return newMovieLoadResponse(
+            titleFromUrl(value),
+            value,
+            TvType.Movie,
+            value
+        )
     }
 
     private suspend fun loadMovieById(
@@ -923,17 +943,20 @@ class MovieHaat : MainAPI() {
     private fun toSearchResponse(
         item: HomeItem
     ): SearchResponse {
-        val data =
+        // Real site routes are used as the public SearchResponse URL.
+        // For movies with a media path already present in the list API, we
+        // can hand the direct media URL to CloudStream immediately.
+        val publicUrl =
             if (item.isSeries) {
-                "tv:${item.id}"
+                "$mainUrl/episodes/${urlPath(item.id)}"
             } else {
-                "movie:${item.id}"
+                "$mainUrl/movies-detail/${urlPath(item.id)}"
             }
 
         return if (item.isSeries) {
             newTvSeriesSearchResponse(
                 item.title,
-                data,
+                publicUrl,
                 TvType.TvSeries
             ) {
                 posterUrl = item.posterUrl
@@ -941,7 +964,7 @@ class MovieHaat : MainAPI() {
         } else {
             newMovieSearchResponse(
                 item.title,
-                data,
+                publicUrl,
                 TvType.Movie
             ) {
                 posterUrl = item.posterUrl
