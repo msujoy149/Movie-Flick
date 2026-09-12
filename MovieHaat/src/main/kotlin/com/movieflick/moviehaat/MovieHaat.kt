@@ -3,7 +3,7 @@ package com.movieflick.moviehaat
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -21,6 +21,7 @@ import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.mainPageOf
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
@@ -343,7 +344,7 @@ class MovieHaat : MainAPI() {
                 data = mapOf(
                     "category" to source.category,
                     "subcategory" to source.subcategory,
-                    "pageNumber" to page
+                    "pageNumber" to page.toString()
                 )
             )
         }.getOrNull() ?: return emptyList()
@@ -364,7 +365,7 @@ class MovieHaat : MainAPI() {
                 data = mapOf(
                     "category" to source.category,
                     "subcategory" to source.subcategory,
-                    "pageNumber" to page
+                    "pageNumber" to page.toString()
                 )
             )
         }.getOrNull() ?: return emptyList()
@@ -600,7 +601,7 @@ class MovieHaat : MainAPI() {
                     }.thenBy {
                         it.episode ?: Int.MAX_VALUE
                     }.thenBy {
-                        it.name.lowercase(Locale.ROOT)
+                        (it.name ?: "").lowercase(Locale.ROOT)
                     }
                 )
 
@@ -661,8 +662,8 @@ class MovieHaat : MainAPI() {
                     "$API_BASE$TV_EPISODE_API",
                     data = mapOf(
                         "series_id" to seriesId,
-                        "seasonNumber" to season,
-                        "episodeNumber" to episode
+                        "seasonNumber" to season.toString(),
+                        "episodeNumber" to episode.toString()
                     )
                 )
             }.getOrNull() ?: return false
@@ -957,9 +958,6 @@ class MovieHaat : MainAPI() {
 
             Regex("""(?i)\b720p\b""").containsMatchIn(value) ->
                 Qualities.P720.value
-
-            Regex("""(?i)\b576p\b""").containsMatchIn(value) ->
-                Qualities.P576.value
 
             Regex("""(?i)\b480p\b""").containsMatchIn(value) ->
                 Qualities.P480.value
