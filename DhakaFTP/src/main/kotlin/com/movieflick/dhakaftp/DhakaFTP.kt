@@ -1847,64 +1847,104 @@ class DhakaFTP : MainAPI() {
             tmdbItems
                 .take(3)
 
-        candidates.forEach { media ->
+        val candidateResults =
+            coroutineScope {
+                candidates
+                    .map { media ->
+                        async {
+                            val roots =
+                                when (media.mediaType) {
+                                    TmdbMediaType.MOVIE ->
+                                        movieRootsForTmdb(
+                                            media
+                                        )
 
-            val roots =
-                when (media.mediaType) {
-                    TmdbMediaType.MOVIE ->
-                        movieRootsForTmdb(
-                            media
-                        )
+                                    TmdbMediaType.TV ->
+                                        tvRootsForTmdb(
+                                            media
+                                        )
+                                }
 
-                    TmdbMediaType.TV ->
-                        tvRootsForTmdb(
-                            media
-                        )
-                }
-
-            val targetedResults =
-                if (
-                    media.mediaType == TmdbMediaType.MOVIE
-                ) {
-                    searchMovieTmdbCandidate(
-                        query = query,
-                        media = media,
-                        roots = roots
-                    )
-                } else {
-                    searchTvTmdbCandidate(
-                        query = query,
-                        media = media,
-                        roots = roots
-                    )
-                }
-
-            if (
-                targetedResults.isNotEmpty()
-            ) {
-                return targetedResults
-                    .sortedWith(
-                        compareByDescending<NativeSearchResult> {
-                            it.score
-                        }
-                            .thenByDescending {
-                                it.modifiedAt
-                            }
-                            .thenBy {
-                                it.title.lowercase(
-                                    Locale.ROOT
+                            if (
+                                media.mediaType ==
+                                TmdbMediaType.MOVIE
+                            ) {
+                                searchMovieTmdbCandidate(
+                                    query = query,
+                                    media = media,
+                                    roots = roots
+                                )
+                            } else {
+                                searchTvTmdbCandidate(
+                                    query = query,
+                                    media = media,
+                                    roots = roots
                                 )
                             }
+                        }
+                    }
+                    .awaitAll()
+                    .flatten()
+            }
+
+        return candidateResults
+            .filter {
+                maxOf(
+                    scoreSearchCandidate(
+                        query,
+                        it.title
+                    ),
+                    searchTitleFromNativeResult(
+                        it,
+                        query
                     )
-                    .distinctBy {
-                        it.url.lowercase(
+                ) >= SEARCH_MIN_RESULT_SCORE
+            }
+            .sortedWith(
+                compareByDescending<NativeSearchResult> {
+                    /*
+                     * Exact/near-exact user-query matches outrank a broader
+                     * related TMDB result such as "Doom at Your Service" when
+                     * the query is simply "Doom".
+                     */
+                    scoreSearchCandidate(
+                        query,
+                        it.title
+                    )
+                }
+                    .thenByDescending {
+                        it.score
+                    }
+                    .thenByDescending {
+                        it.modifiedAt
+                    }
+                    .thenBy {
+                        it.title.lowercase(
                             Locale.ROOT
                         )
                     }
+            )
+            .distinctBy {
+                it.url.lowercase(
+                    Locale.ROOT
+                )
             }
-        }
+    }
 
-        return emptyList()
+    private fun searchTitleFromNativeResult(
+        result: NativeSearchResult,
+        query: String
+    ): Int {
+        return maxOf(
+            scoreSearchCandidate(
+                query,
+                result.title
+            ),
+            scoreSearchCandidate(
+                compactSearchText(query),
+                compactSearchText(result.title)
+            )
+        )
     }
 
     private suspend fun searchMovieTmdbCandidate(
@@ -1952,30 +1992,46 @@ class DhakaFTP : MainAPI() {
                         year = media.year
                     )
 
-                val results =
-                    searchNativeH5ai(
-                        root = targetRoot,
-                        query = media.searchTitle
-                            .ifBlank { query }
+                val searchRoots =
+                    listOf(
+                        targetRoot,
+                        normalizeDirectoryUrl(
+                            root
+                        )
                     )
+                        .distinct()
 
-                val relevant =
-                    results
-                        .filter {
-                            scoreSearchCandidate(
-                                query,
-                                it.title
-                            ) >= SEARCH_MIN_RESULT_SCORE ||
-                                scoreSearchCandidate(
-                                    media.searchTitle,
-                                    it.title
-                                ) >= SEARCH_MIN_RESULT_SCORE
-                        }
-
-                if (
-                    relevant.isNotEmpty()
+                for (
+                    searchRoot in searchRoots
                 ) {
-                    return relevant
+                    val results =
+                        searchNativeH5ai(
+                            root = searchRoot,
+                            query = media.searchTitle
+                                .ifBlank { query }
+                        )
+
+                    val relevant =
+                        results
+                            .filter {
+                                maxOf(
+                                    scoreSearchCandidate(
+                                        query,
+                                        it.title
+                                    ),
+                                    scoreSearchCandidate(
+                                        media.searchTitle,
+                                        it.title
+                                    )
+                                ) >=
+                                    SEARCH_MIN_RESULT_SCORE
+                            }
+
+                    if (
+                        relevant.isNotEmpty()
+                    ) {
+                        return relevant
+                    }
                 }
             }
 
@@ -2726,7 +2782,7 @@ class DhakaFTP : MainAPI() {
         var hits =
             coroutineScope {
                 variants
-                    .take(10)
+                    .take(2)
                     .map { variant ->
                         async {
                             nativeH5aiSearchHits(
@@ -2788,34 +2844,16 @@ class DhakaFTP : MainAPI() {
                             Locale.ROOT
                         )
                     }
-        } else {
-            /*
-             * Supplement good native results with a small targeted crawl.
-             * This catches deep folder matches that h5ai omitted.
-             */
-            val supplemental =
-                kotlinx.coroutines.withTimeoutOrNull(
-                    SEARCH_TARGETED_SUPPLEMENT_TIMEOUT_MS
-                ) {
-                    discoverSearchHitsRecursively(
-                        root = root,
-                        query = query,
-                        stopWhenStrongMatchCount =
-                            SEARCH_STRONG_MATCH_STOP_COUNT
-                    )
-                }.orEmpty()
-
-            hits =
-                (
-                    hits +
-                        supplemental
-                    )
-                        .distinctBy {
-                            it.href.lowercase(
-                                Locale.ROOT
-                            )
-                        }
         }
+
+        /*
+         * FAST PATH:
+         * A good h5ai response should not be followed by another multi-second
+         * recursive crawl. That extra crawl was a major source of search delay.
+         *
+         * Recursive search is still available whenever the native result is
+         * weak/empty, so the reliable fallback is preserved.
+         */
 
         if (
             hits.isEmpty()
