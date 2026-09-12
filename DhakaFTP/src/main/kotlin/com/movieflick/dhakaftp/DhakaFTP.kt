@@ -36,6 +36,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.jsoup.nodes.Element
 import java.net.URI
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
@@ -190,7 +192,8 @@ class DhakaFTP : MainAPI() {
          * First-screen probes are independent from the background index.
          * They are intentionally short and bounded.
          */
-        const val FIRST_SCREEN_DIRECTORY_TIMEOUT_MS = 1200L
+        const val FIRST_SCREEN_DIRECTORY_TIMEOUT_MS = 900L
+        const val FIRST_SCREEN_TOTAL_TIMEOUT_MS = 5200L
         const val FIRST_SCREEN_LEAF_BRANCHES = 6
 
         const val CACHE_MINUTES = 10L
@@ -425,7 +428,7 @@ class DhakaFTP : MainAPI() {
 
             val first =
                 kotlinx.coroutines.withTimeoutOrNull(
-                    ULTRA_HOME_TOTAL_TIMEOUT_MS
+                    FIRST_SCREEN_TOTAL_TIMEOUT_MS
                 ) {
                     ultraFastHomeGroups(
                         root = root,
@@ -556,7 +559,7 @@ class DhakaFTP : MainAPI() {
          */
 
         val rootEntries =
-            safeDirectoryEntries(
+            ultraFastDirectoryEntries(
                 rootUrl,
                 ULTRA_HOME_REQUEST_TIMEOUT_MS
             )
@@ -628,7 +631,7 @@ class DhakaFTP : MainAPI() {
                             )
 
                         val entries =
-                            safeDirectoryEntries(
+                            ultraFastDirectoryEntries(
                                 branchUrl,
                                 FIRST_SCREEN_DIRECTORY_TIMEOUT_MS
                             )
@@ -752,7 +755,7 @@ class DhakaFTP : MainAPI() {
                             )
 
                         val entries =
-                            safeDirectoryEntries(
+                            ultraFastDirectoryEntries(
                                 branchUrl,
                                 FIRST_SCREEN_DIRECTORY_TIMEOUT_MS
                             )
@@ -883,7 +886,7 @@ class DhakaFTP : MainAPI() {
                             )
 
                         val entries =
-                            safeDirectoryEntries(
+                            ultraFastDirectoryEntries(
                                 leafUrl,
                                 FIRST_SCREEN_DIRECTORY_TIMEOUT_MS
                             )
@@ -4759,7 +4762,7 @@ class DhakaFTP : MainAPI() {
          * Season cards. Season contents are NEVER fetched here.
          */
         val rootEntries =
-            safeDirectoryEntries(
+            ultraFastDirectoryEntries(
                 root,
                 FAST_HOME_REQUEST_TIMEOUT_MS
             )
@@ -4806,7 +4809,7 @@ class DhakaFTP : MainAPI() {
                 level1.map { wrapper ->
                     async {
                         val entries =
-                            safeDirectoryEntries(
+                            ultraFastDirectoryEntries(
                                 normalizeDirectoryUrl(
                                     wrapper.url
                                 ),
@@ -4944,7 +4947,7 @@ class DhakaFTP : MainAPI() {
                             )
 
                         val entries =
-                            safeDirectoryEntries(
+                            ultraFastDirectoryEntries(
                                 url,
                                 FAST_HOME_REQUEST_TIMEOUT_MS
                             )
@@ -7824,6 +7827,252 @@ class DhakaFTP : MainAPI() {
      * DIRECTORY PARSER / H5AI
      * ---------------------------------------------------------------
      */
+
+    /*
+     * True network-level timeout for the first-screen path.
+     *
+     * Why this exists:
+     * coroutine cancellation alone is not enough protection when the HTTP
+     * client is waiting on a socket. The old path could therefore sit behind
+     * the application's much larger underlying HTTP timeout even though the
+     * coroutine had a small timeout budget.
+     *
+     * Homepage-only requests use a plain HttpURLConnection with explicit
+     * connect/read timeouts. Search/playback/detail code continues to use
+     * CloudStream/NiceHttp so those existing behaviors are preserved.
+     */
+    private suspend fun ultraFastDirectoryEntries(
+        url: String
+    ): List<FtpEntry> =
+        kotlinx.coroutines.withContext(
+            Dispatchers.IO
+        ) {
+            try {
+
+                val connection =
+                    (URL(url).openConnection()
+                        as? HttpURLConnection)
+                        ?: return@withContext emptyList()
+
+                connection.connectTimeout =
+                    FIRST_SCREEN_DIRECTORY_TIMEOUT_MS.toInt()
+
+                connection.readTimeout =
+                    FIRST_SCREEN_DIRECTORY_TIMEOUT_MS.toInt()
+
+                connection.instanceFollowRedirects =
+                    true
+
+                connection.useCaches =
+                    true
+
+                connection.requestMethod =
+                    "GET"
+
+                connection.setRequestProperty(
+                    "Accept",
+                    "text/html,application/xhtml+xml"
+                )
+
+                connection.setRequestProperty(
+                    "Accept-Language",
+                    "en-US,en;q=0.8"
+                )
+
+                connection.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Android) DhakaFTP/1.0"
+                )
+
+                val responseCode =
+                    connection.responseCode
+
+                if (
+                    responseCode !in
+                    200..399
+                ) {
+                    connection.disconnect()
+                    return@withContext emptyList()
+                }
+
+                val html =
+                    connection.inputStream
+                        .bufferedReader(
+                            Charsets.UTF_8
+                        )
+                        .use {
+                            it.readText()
+                        }
+
+                connection.disconnect()
+
+                parseDirectoryHtml(
+                    html = html,
+                    baseUrl =
+                        normalizeDirectoryUrl(
+                            url
+                        )
+                )
+
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+    private fun parseDirectoryHtml(
+        html: String,
+        baseUrl: String
+    ): List<FtpEntry> {
+
+        val document =
+            Jsoup.parse(
+                html,
+                baseUrl
+            )
+
+        val anchors =
+            document.select(
+                "a[href]"
+            )
+
+        val result =
+            mutableListOf<FtpEntry>()
+
+        var order =
+            0L
+
+        for (
+            element in anchors
+        ) {
+
+            val href =
+                element
+                    .attr("href")
+                    .trim()
+
+            if (
+                href.isBlank() ||
+                href.startsWith("#") ||
+                href.startsWith(
+                    "javascript:",
+                    true
+                ) ||
+                href.startsWith(
+                    "mailto:",
+                    true
+                )
+            ) {
+                continue
+            }
+
+            val absolute =
+                resolveUrl(
+                    baseUrl,
+                    href
+                )
+
+            if (
+                absolute.isBlank()
+            ) {
+                continue
+            }
+
+            val normalized =
+                if (
+                    absolute.endsWith("/")
+                ) {
+                    normalizeDirectoryUrl(
+                        absolute
+                    )
+                } else {
+                    absolute
+                }
+
+            if (
+                isParentDirectoryLink(
+                    href,
+                    normalized,
+                    baseUrl
+                )
+            ) {
+                continue
+            }
+
+            if (
+                normalized.equals(
+                    normalizeDirectoryUrl(
+                        baseUrl
+                    ),
+                    true
+                )
+            ) {
+                continue
+            }
+
+            val name =
+                decodeSafely(
+                    element
+                        .text()
+                        .trim()
+                        .ifBlank {
+                            getTitleFromUrl(
+                                normalized
+                            )
+                        }
+                )
+
+            val lowered =
+                normalized
+                    .substringBefore("?")
+                    .lowercase(
+                        Locale.getDefault()
+                    )
+
+            val isVideo =
+                VIDEO_EXTENSIONS.any {
+                    lowered.endsWith(it)
+                }
+
+            val isImage =
+                IMAGE_EXTENSIONS.any {
+                    lowered.endsWith(it)
+                }
+
+            val isDirectory =
+                normalized
+                    .substringBefore("?")
+                    .endsWith("/")
+
+            if (
+                !isVideo &&
+                !isImage &&
+                !isDirectory
+            ) {
+                continue
+            }
+
+            result.add(
+                FtpEntry(
+                    name = name,
+                    url = normalized,
+                    isVideo = isVideo,
+                    isImage = isImage,
+                    isDirectory = isDirectory,
+                    modifiedAt =
+                        findModifiedTime(
+                            element
+                        ),
+                    sizeBytes =
+                        findSizeBytes(
+                            element
+                        ),
+                    order = order++
+                )
+            )
+        }
+
+        return result
+    }
 
     private suspend fun safeDirectoryEntries(
         url: String,
