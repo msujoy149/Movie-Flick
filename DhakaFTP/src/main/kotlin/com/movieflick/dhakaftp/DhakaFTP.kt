@@ -150,13 +150,13 @@ class DhakaFTP : MainAPI() {
          * The first synchronous homepage request is intentionally
          * lightweight. The full recursive index has no folder-depth cap.
          */
-        const val QUICK_SCAN_DIRECTORY_LIMIT = 96
+        const val QUICK_SCAN_DIRECTORY_LIMIT = 36
 
         /* First-page synchronous probe budget. */
-        const val QUICK_DIRECTORY_TIMEOUT_MS = 1250L
+        const val QUICK_DIRECTORY_TIMEOUT_MS = 850L
 
         /* Directories fetched concurrently during a quick probe. */
-        const val QUICK_SCAN_BATCH_SIZE = 16
+        const val QUICK_SCAN_BATCH_SIZE = 8
 
         /*
          * Fast first-screen bootstrap only. The full recursive index remains
@@ -381,6 +381,7 @@ class DhakaFTP : MainAPI() {
 
 
 
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -402,45 +403,122 @@ class DhakaFTP : MainAPI() {
                 request.data
             )
 
-        val requested =
-            if (page <= 1) {
-                MOVIE_HOME_SIZE
-            } else {
-                10
+        /*
+         * First screen:
+         * use the proven priority crawl, but cap it tightly. It follows
+         * arbitrary folder depth, so English/South/etc. do not disappear
+         * merely because their structure is deeper than one wrapper.
+         */
+        if (page == 1) {
+
+            val cached =
+                validCache(root)
+                    ?.groups
+                    ?.sortedWith(
+                        groupComparator()
+                    )
+                    ?.take(MOVIE_HOME_SIZE)
+                    .orEmpty()
+
+            val groups =
+                if (
+                    cached.isNotEmpty()
+                ) {
+                    cached
+                } else {
+                    scanLatestGroups(
+                        root,
+                        MOVIE_HOME_SIZE
+                    )
+                        .sortedWith(
+                            groupComparator()
+                        )
+                        .take(
+                            MOVIE_HOME_SIZE
+                        )
+                }
+
+            if (
+                groups.isNotEmpty()
+            ) {
+                updatePartialCache(
+                    root,
+                    groups
+                )
             }
 
-        /*
-         * This response path never waits for the full recursive index.
-         */
-        val items =
-            loadDynamicMoviePage(
-                root = root,
-                kind = detectKind(root),
-                page = page,
-                pageSize = requested
-            )
+            /*
+             * Background full index is intentionally detached from this
+             * response and starts later, so it cannot hold up first paint.
+             */
+            scope.launch {
+                kotlinx.coroutines.delay(
+                    20000L
+                )
+                prewarm(root)
+            }
 
-        /*
-         * Full recursive indexing is background-only and delayed.
-         * It is not part of first paint.
-         */
-        scope.launch {
-            kotlinx.coroutines.delay(
-                15000L
+            return newHomePageResponse(
+                request,
+                groups.map {
+                    toSearchResponse(it)
+                },
+                true
             )
-            prewarm(root)
         }
 
-        val state =
-            dynamicMovieCursors[root]
+        /*
+         * Later horizontal pages use the partial index first. If the page
+         * has not arrived yet, perform one bounded quick crawl only.
+         */
+        val offset =
+            (page - 1) *
+                10
+
+        var groups =
+            validCache(root)
+                ?.groups
+                ?.sortedWith(
+                    groupComparator()
+                )
+                .orEmpty()
+
+        if (
+            groups.size <= offset
+        ) {
+
+            val quick =
+                scanLatestGroups(
+                    root,
+                    offset + 10
+                )
+                    .sortedWith(
+                        groupComparator()
+                    )
+
+            if (
+                quick.isNotEmpty()
+            ) {
+                updatePartialCache(
+                    root,
+                    quick
+                )
+                groups =
+                    quick
+            }
+        }
+
+        val items =
+            groups
+                .drop(offset)
+                .take(10)
 
         return newHomePageResponse(
             request,
             items.map {
                 toSearchResponse(it)
             },
-            state?.exhausted != true ||
-                items.isNotEmpty()
+            items.isNotEmpty()
         )
     }
 
@@ -734,6 +812,7 @@ class DhakaFTP : MainAPI() {
     }
 
 
+
     private suspend fun getTvShowHomePage(
         page: Int,
         request: MainPageRequest
@@ -759,36 +838,26 @@ class DhakaFTP : MainAPI() {
         }
 
         /*
-         * Each source advances independently. We then collapse the combined
-         * source page by logical show, leaving only the newest Season card
-         * for every show on Home.
+         * Both TV roots use the bounded deep crawler. Unlike the old
+         * three-show shallow probe, this can find:
+         *
+         * root -> year/category -> show -> Season
+         *
+         * while still stopping once enough logical shows are available.
          */
-        val (sourceA, sourceB) =
-            coroutineScope {
+        val sourceA =
+            scanLatestGroups(
+                roots[0],
+                12
+            )
 
-                val a =
-                    async {
-                        loadDynamicTvPage(
-                            roots[0],
-                            page,
-                            6
-                        )
-                    }
+        val sourceB =
+            scanLatestGroups(
+                roots[1],
+                12
+            )
 
-                val b =
-                    async {
-                        loadDynamicTvPage(
-                            roots[1],
-                            page,
-                            6
-                        )
-                    }
-
-                a.await() to
-                    b.await()
-            }
-
-        val combined =
+        val homeGroups =
             collapseLatestTvAcrossSources(
                 sourceA +
                     sourceB
@@ -797,31 +866,23 @@ class DhakaFTP : MainAPI() {
                     TV_HOME_SIZE
                 )
 
-        if (
-            page >= 2
-        ) {
-            scope.launch {
-                kotlinx.coroutines.delay(
-                    15000L
-                )
-                prewarm(roots[0])
-                prewarm(roots[1])
-            }
+        /*
+         * Do not block first render with full indexing.
+         */
+        scope.launch {
+            kotlinx.coroutines.delay(
+                20000L
+            )
+            prewarm(roots[0])
+            prewarm(roots[1])
         }
 
         return newHomePageResponse(
             request,
-            combined.map {
+            homeGroups.map {
                 toSearchResponse(it)
             },
-            (
-                dynamicTvCursors[
-                    roots[0]
-                ]?.exhausted != true ||
-                    dynamicTvCursors[
-                        roots[1]
-                    ]?.exhausted != true
-            ) || combined.isNotEmpty()
+            true
         )
     }
 
