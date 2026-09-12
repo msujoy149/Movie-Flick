@@ -1973,7 +1973,7 @@ class DhakaFTP : MainAPI() {
         )
             .replace(
                 Regex(
-                    "[^\p{L}\p{N}]"
+                    "[^\\p{L}\\p{N}]"
                 ),
                 ""
             )
