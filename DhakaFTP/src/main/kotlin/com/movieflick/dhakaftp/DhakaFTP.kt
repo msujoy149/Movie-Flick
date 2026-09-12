@@ -142,15 +142,15 @@ class DhakaFTP : MainAPI() {
         const val QUICK_SEARCH_DIRECTORY_TIMEOUT_MS = 700L
         const val SEARCH_FALLBACK_TIMEOUT_MS = 4500L
         const val SEARCH_FALLBACK_DIRECTORY_TIMEOUT_MS = 650L
-        const val SEARCH_FALLBACK_MAX_DIRECTORIES = 64
-        const val SEARCH_FALLBACK_MAX_DEPTH = 6
+        const val SEARCH_FALLBACK_MAX_DIRECTORIES = 300
+        const val SEARCH_FALLBACK_MAX_DEPTH = 12
         const val SEARCH_FALLBACK_BATCH_SIZE = 12
 
         const val SEARCH_NATIVE_ACCEPT_SCORE = 5600
         const val SEARCH_FALLBACK_MATCH_SCORE = 500
         const val SEARCH_STRONG_MATCH_SCORE = 6500
         const val SEARCH_MIN_RESULT_SCORE = 450
-        const val SEARCH_DIRECTORY_EXPANSION_SCORE = 5000
+        const val SEARCH_DIRECTORY_EXPANSION_SCORE = 3200
         const val SEARCH_DIRECTORY_HIT_BONUS = 120
         const val SEARCH_VIDEO_HIT_BONUS = 220
         const val SEARCH_FOLDER_NAME_BOOST = 240
@@ -2768,7 +2768,7 @@ class DhakaFTP : MainAPI() {
         if (
             strongNativeHits.isEmpty()
         ) {
-            hits =
+            val recursiveHits =
                 kotlinx.coroutines.withTimeoutOrNull(
                     SEARCH_FALLBACK_TIMEOUT_MS
                 ) {
@@ -2777,6 +2777,17 @@ class DhakaFTP : MainAPI() {
                         query = query
                     )
                 }.orEmpty()
+
+            hits =
+                (
+                    hits +
+                        recursiveHits
+                    )
+                    .distinctBy {
+                        it.href.lowercase(
+                            Locale.ROOT
+                        )
+                    }
         } else {
             /*
              * Supplement good native results with a small targeted crawl.
@@ -2821,9 +2832,23 @@ class DhakaFTP : MainAPI() {
             hits
                 .filter { it.isDirectory }
                 .filter {
-                    searchHitRelevance(
-                        query,
-                        it
+                    val relevance =
+                        searchHitRelevance(
+                            query,
+                            it
+                        )
+
+                    val folderTitleScore =
+                        scoreSearchCandidate(
+                            query,
+                            getFolderTitle(
+                                normalizeDirectoryUrl(it.href)
+                            )
+                        )
+
+                    maxOf(
+                        relevance,
+                        folderTitleScore
                     ) >= SEARCH_DIRECTORY_EXPANSION_SCORE
                 }
                 .take(
