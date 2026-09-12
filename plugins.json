@@ -141,11 +141,11 @@
         "name": "MovieBox"
     },
     {
-        "jarFileSize": 165177,
-        "fileHash": "sha256-602d98f958ea91763da7f6c7502c2b1790e62199dfef8c4e727aabd1258db666",
+        "jarFileSize": 165293,
+        "fileHash": "sha256-22024b82973445f8a6434543b1c9b8bb0969343a336bfbd9fbaa0d0430d8b6bd",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 36570,
+        "fileSize": 36620,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -161,7 +161,7 @@
         "description": "Movie Haat provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieHaat.cs3",
         "name": "MovieHaat",
-        "jarHash": "sha256-f07f48024e7a5601d891ee5a3a829bb1a82cc4bf97bb651e51a031f2095aface"
+        "jarHash": "sha256-110ff895b80af9c624f1a189ee0852f32ce926d536fb94d96eeab7b97b332825"
     },
     {
         "iconUrl": "https://movielinkbd.tv/favicon.png",
