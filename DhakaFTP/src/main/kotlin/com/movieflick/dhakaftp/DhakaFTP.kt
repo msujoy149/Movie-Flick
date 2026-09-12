@@ -780,7 +780,7 @@ class DhakaFTP : MainAPI() {
             val key =
                 it.kind.name +
                     ":" +
-                    normalizeSearchText(
+                    logicalMovieDuplicateKey(
                         it.title
                     ) +
                     ":R" +
@@ -1473,6 +1473,7 @@ class DhakaFTP : MainAPI() {
     }
 
 
+
     private fun collapseLatestTvAcrossSources(
         groups: List<FtpGroup>
     ): List<FtpGroup> {
@@ -1481,9 +1482,15 @@ class DhakaFTP : MainAPI() {
             LinkedHashMap<String, FtpGroup>()
 
         /*
-         * Home-only rule:
-         * one logical show -> one latest Season card.
-         * This never deletes older seasons from the search index.
+         * Home-only TV dedup:
+         * one logical show -> one Home card.
+         *
+         * Use the actual show-folder identity, not the rendered title.
+         * This prevents duplicate SWAT cards when two source folders use
+         * slightly different display metadata.
+         *
+         * Choose the newest Season by modification time; season number breaks
+         * equal timestamps. Older seasons remain searchable.
          */
         groups
             .filter {
@@ -1492,8 +1499,8 @@ class DhakaFTP : MainAPI() {
             .forEach { card ->
 
                 val key =
-                    logicalTvShowKey(
-                        card.title
+                    logicalTvShowHomeKey(
+                        card
                     )
 
                 val current =
@@ -4092,19 +4099,15 @@ class DhakaFTP : MainAPI() {
             )
     }
 
+
     private fun homepageDirectoryComparator():
         Comparator<FtpEntry> {
 
         return compareByDescending<FtpEntry> {
             yearValueFromName(
                 it.name
-            ) == 2023
+            ) ?: -1
         }
-            .thenByDescending {
-                yearValueFromName(
-                    it.name
-                ) ?: -1
-            }
             .thenByDescending {
                 it.modifiedAt ?: 0L
             }
@@ -5854,6 +5857,7 @@ class DhakaFTP : MainAPI() {
      *   title/version and resolution are otherwise the same.
      * - Similar-looking titles are NOT merged automatically.
      */
+
     private fun deduplicateMovieGroups(
         groups: List<FtpGroup>
     ): List<FtpGroup> {
@@ -5868,36 +5872,30 @@ class DhakaFTP : MainAPI() {
                 val video =
                     group.videos.first()
 
-                val logicalVideoName =
-                    normalizeSearchText(
-                        video.title
+                /*
+                 * The containing folder is authoritative for movie identity.
+                 * Strip technical release tags only for the comparison key.
+                 * Resolution is deliberately kept outside the title key so
+                 * 720p and 1080p remain separate cards.
+                 */
+                val folderTitle =
+                    getFolderTitle(
+                        normalizeDirectoryUrl(
+                            group.url
+                        )
                     )
-                        .replace(
-                            Regex(
-                                "(?i)\\bdual\\s*audio\\b"
-                            ),
-                            " "
-                        )
-                        .replace(
-                            Regex(
-                                "(?i)\\bmulti\\s*audio\\b"
-                            ),
-                            " "
-                        )
-                        .replace(
-                            Regex(
-                                "\\s+"
-                            ),
-                            " "
-                        )
-                        .trim()
 
-                normalizeSearchText(
-                    group.title
-                ) +
-                    "::" +
-                    logicalVideoName +
-                    "::R" +
+                "MOVIE:" +
+                    logicalMovieDuplicateKey(
+                        if (
+                            folderTitle.isBlank()
+                        ) {
+                            group.title
+                        } else {
+                            folderTitle
+                        }
+                    ) +
+                    ":R" +
                     video.resolution
             }
             .values
@@ -5922,8 +5920,93 @@ class DhakaFTP : MainAPI() {
                         .thenByDescending {
                             it.modifiedAt
                         }
+                        .thenBy {
+                            it.url
+                        }
                 )
             }
+            .sortedWith(
+                groupComparator()
+            )
+    }
+
+    private fun logicalMovieDuplicateKey(
+        sourceRaw: String
+    ): String {
+
+        var value =
+            normalizeSearchText(
+                sourceRaw
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(dual|multi)\\s*audio\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(2160|1440|1080|720|576|480)\\s*p\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(x264|x265|h264|h265|hevc|av1|10bit|8bit|hdr10|hdr)\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(blu\\s*ray|bluray|web\\s*-?\\s*dl|web\\s*-?\\s*rip|webrip|brrip|dvdrip|hdtv|hdcam|camrip)\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "(?i)\\b(5\\.1|7\\.1|2\\.0|aac2?\\.?\\d*|ddp?\\d*|ac3|dts|truehd)\\b"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\[[^]]*]"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\([^)]*\\)"
+                ),
+                " "
+            )
+
+        value =
+            value.replace(
+                Regex(
+                    "\\s+"
+                ),
+                " "
+            )
+            .trim()
+
+        return compactSearchText(
+            value
+        )
     }
 
     private fun deduplicateVideos(
