@@ -146,6 +146,22 @@ class DhakaFTP : MainAPI() {
         const val SEARCH_FALLBACK_MAX_DEPTH = 6
         const val SEARCH_FALLBACK_BATCH_SIZE = 12
 
+        const val SEARCH_NATIVE_ACCEPT_SCORE = 5600
+        const val SEARCH_FALLBACK_MATCH_SCORE = 500
+        const val SEARCH_STRONG_MATCH_SCORE = 6500
+        const val SEARCH_MIN_RESULT_SCORE = 450
+        const val SEARCH_DIRECTORY_EXPANSION_SCORE = 5000
+        const val SEARCH_DIRECTORY_HIT_BONUS = 120
+        const val SEARCH_VIDEO_HIT_BONUS = 220
+        const val SEARCH_FOLDER_NAME_BOOST = 240
+        const val SEARCH_DUAL_AUDIO_BOOST = 150
+        const val SEARCH_DEPTH_PENALTY = 25
+        const val SEARCH_MAX_PARENT_FETCHES = 140
+        const val SEARCH_MAX_MATCHING_DIRECTORIES_TO_EXPAND = 16
+        const val SEARCH_FALLBACK_MAX_RESULTS = 96
+        const val SEARCH_TARGETED_SUPPLEMENT_TIMEOUT_MS = 3200L
+        const val SEARCH_STRONG_MATCH_STOP_COUNT = 3
+
         /*
          * Compatibility alias. This does not remove or change the existing
          * search timeout; it only supplies the name used by the deep loader.
@@ -1800,6 +1816,21 @@ class DhakaFTP : MainAPI() {
 
         val sorted =
             results
+                .filter {
+                    it.score >= SEARCH_MIN_RESULT_SCORE
+                }
+                .groupBy {
+                    it.url.lowercase(
+                        Locale.ROOT
+                    )
+                }
+                .values
+                .mapNotNull {
+                    candidates ->
+                    candidates.maxByOrNull {
+                        it.score
+                    }
+                }
                 .sortedWith(
                     compareByDescending<NativeSearchResult> {
                         it.score
@@ -1813,11 +1844,6 @@ class DhakaFTP : MainAPI() {
                             )
                         }
                 )
-                .distinctBy {
-                    it.url.lowercase(
-                        Locale.ROOT
-                    )
-                }
 
         val offset =
             (
@@ -1865,6 +1891,7 @@ class DhakaFTP : MainAPI() {
 
 
 
+
     private suspend fun searchNativeH5ai(
         root: String,
         query: String
@@ -1873,67 +1900,45 @@ class DhakaFTP : MainAPI() {
         val variants =
             LinkedHashSet<String>()
 
-        variants.add(
-            query
-        )
+        variants.add(query)
 
         val compact =
-            compactSearchText(
-                query
-            )
+            compactSearchText(query)
 
         if (
             compact.length >= 3 &&
             compact != query
         ) {
-            variants.add(
-                compact
-            )
+            variants.add(compact)
         }
 
-        /*
-         * Independent token requests make search resilient to h5ai/server
-         * versions that treat multi-word patterns differently.
-         */
-        val tokens =
-            normalizeSearchText(
-                query
-            )
-                .split(" ")
-                .filter {
-                    it.length >= 2
-                }
-                .distinct()
+        normalizeSearchText(query)
+            .split(" ")
+            .filter { it.length >= 2 }
+            .distinct()
+            .sortedByDescending { it.length }
+            .take(6)
+            .forEach { variants.add(it) }
 
-        tokens
-            .take(5)
-            .forEach {
-                variants.add(it)
-            }
-
-        val fallback =
-            buildSearchFallbackQuery(
-                query
-            )
-
-        if (
-            fallback.isNotBlank()
-        ) {
-            variants.add(
-                fallback
-            )
-        }
+        buildSearchFallbackQuery(query)
+            .takeIf { it.isNotBlank() }
+            ?.let { variants.add(it) }
 
         var hits =
-            variants
-                .take(8)
-                .flatMap {
-                    variant ->
-                    nativeH5aiSearchHits(
-                        root,
-                        variant
-                    )
-                }
+            coroutineScope {
+                variants
+                    .take(10)
+                    .map { variant ->
+                        async {
+                            nativeH5aiSearchHits(
+                                root,
+                                variant
+                            )
+                        }
+                    }
+                    .awaitAll()
+                    .flatten()
+            }
                 .map {
                     it.copy(
                         href =
@@ -1950,12 +1955,19 @@ class DhakaFTP : MainAPI() {
                 }
 
         /*
-         * Critical fallback: if h5ai search is disabled/unavailable, search
-         * the actual directory tree incrementally. This fixes deep paths such
-         * as root -> year -> collection -> movie folder -> video.
+         * Do not trust "non-empty h5ai response" as success.
+         * A server may return unrelated results for a valid query.
          */
+        val strongNativeHits =
+            hits.filter {
+                searchHitRelevance(
+                    query,
+                    it
+                ) >= SEARCH_NATIVE_ACCEPT_SCORE
+            }
+
         if (
-            hits.isEmpty()
+            strongNativeHits.isEmpty()
         ) {
             hits =
                 kotlinx.coroutines.withTimeoutOrNull(
@@ -1966,6 +1978,33 @@ class DhakaFTP : MainAPI() {
                         query = query
                     )
                 }.orEmpty()
+        } else {
+            /*
+             * Supplement good native results with a small targeted crawl.
+             * This catches deep folder matches that h5ai omitted.
+             */
+            val supplemental =
+                kotlinx.coroutines.withTimeoutOrNull(
+                    SEARCH_TARGETED_SUPPLEMENT_TIMEOUT_MS
+                ) {
+                    discoverSearchHitsRecursively(
+                        root = root,
+                        query = query,
+                        stopWhenStrongMatchCount =
+                            SEARCH_STRONG_MATCH_STOP_COUNT
+                    )
+                }.orEmpty()
+
+            hits =
+                (
+                    hits +
+                        supplemental
+                    )
+                        .distinctBy {
+                            it.href.lowercase(
+                                Locale.ROOT
+                            )
+                        }
         }
 
         if (
@@ -1973,6 +2012,81 @@ class DhakaFTP : MainAPI() {
         ) {
             return emptyList()
         }
+
+        /*
+         * h5ai may return a matching directory instead of its video.
+         * Expand relevant directory hits so the actual playable file
+         * becomes discoverable.
+         */
+        val directoryHits =
+            hits
+                .filter { it.isDirectory }
+                .filter {
+                    searchHitRelevance(
+                        query,
+                        it
+                    ) >= SEARCH_DIRECTORY_EXPANSION_SCORE
+                }
+                .take(
+                    SEARCH_MAX_MATCHING_DIRECTORIES_TO_EXPAND
+                )
+
+        if (
+            directoryHits.isNotEmpty()
+        ) {
+            val expanded =
+                coroutineScope {
+                    directoryHits.map {
+                        directory ->
+                        async {
+                            safeDirectoryEntries(
+                                normalizeDirectoryUrl(
+                                    directory.href
+                                ),
+                                QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+                            ).map { entry ->
+                                H5aiSearchHit(
+                                    href =
+                                        resolveSearchHref(
+                                            directory.href,
+                                            entry.url
+                                        ),
+                                    time =
+                                        entry.modifiedAt,
+                                    size =
+                                        entry.sizeBytes,
+                                    isDirectory =
+                                        entry.isDirectory
+                                )
+                            }
+                        }
+                    }
+                        .awaitAll()
+                        .flatten()
+                }
+
+            hits =
+                (
+                    hits +
+                        expanded
+                )
+                    .distinctBy {
+                        it.href.lowercase(
+                            Locale.ROOT
+                        )
+                    }
+        }
+
+        /*
+         * Strongest matching media/folder paths must be considered first.
+         */
+        hits =
+            hits.sortedByDescending {
+                searchHitRelevance(
+                    query,
+                    it
+                )
+            }
 
         val kind =
             detectKind(root)
@@ -1983,6 +2097,12 @@ class DhakaFTP : MainAPI() {
                     isVideo(it.href)
             }
 
+        if (
+            videoHits.isEmpty()
+        ) {
+            return emptyList()
+        }
+
         val parents =
             (
                 videoHits.map {
@@ -1990,18 +2110,16 @@ class DhakaFTP : MainAPI() {
                         it.href.substringBeforeLast("/")
                     )
                 } +
-                hits.filter {
-                    it.isDirectory
-                }.map {
-                    normalizeDirectoryUrl(it.href)
-                }
+                    hits.filter { it.isDirectory }.map {
+                        normalizeDirectoryUrl(it.href)
+                    }
             )
                 .distinct()
 
         val parentEntries =
             coroutineScope {
                 parents
-                    .take(80)
+                    .take(SEARCH_MAX_PARENT_FETCHES)
                     .map { parent ->
                         async {
                             parent to
@@ -2027,97 +2145,110 @@ class DhakaFTP : MainAPI() {
         }
 
         if (
-            videoHits.isEmpty()
-        ) {
-            return emptyList()
-        }
-
-        if (
             kind ==
             ContentKind.MOVIE
         ) {
-            return videoHits.mapNotNull { hit ->
+            return videoHits
+                .mapNotNull { hit ->
 
-                val parent =
-                    normalizeDirectoryUrl(
-                        hit.href.substringBeforeLast("/")
-                    )
+                    val parent =
+                        normalizeDirectoryUrl(
+                            hit.href.substringBeforeLast("/")
+                        )
 
-                val poster =
-                    pickPoster(
+                    val entries =
                         parentEntries[
                             parent
                         ].orEmpty()
-                    )
 
-                val filenameTitle =
-                    getTitleFromUrl(
-                        hit.href
-                    )
+                    val poster =
+                        pickPoster(entries)
 
-                val folderTitle =
-                    getFolderTitle(
-                        parent
-                    )
+                    val filenameTitle =
+                        getTitleFromUrl(hit.href)
 
-                val score =
-                    maxOf(
+                    /*
+                     * Always take the displayed movie name from the actual
+                     * containing folder, not the noisy video filename.
+                     */
+                    val folderTitle =
+                        getFolderTitle(parent)
+
+                    val folderScore =
                         scoreSearchCandidate(
                             query,
                             folderTitle
-                        ),
+                        )
+
+                    val filenameScore =
                         scoreSearchCandidate(
                             query,
                             filenameTitle
-                        ),
+                        )
+
+                    val pathScore =
                         scoreSearchCandidate(
                             query,
-                            parent
+                            hit.href
                         )
-                    )
 
-                if (
-                    score <= 0
-                ) {
-                    null
-                } else {
-                    val response =
-                        newMovieSearchResponse(
-                            folderTitle,
-                            hit.href,
-                            TvType.Movie
-                        ) {
+                    val score =
+                        maxOf(
+                            folderScore +
+                                SEARCH_FOLDER_NAME_BOOST,
+                            filenameScore,
+                            pathScore
+                        )
+
+                    if (
+                        score <
+                        SEARCH_MIN_RESULT_SCORE
+                    ) {
+                        null
+                    } else {
+
+                        val dualBoost =
+                            if (
+                                detectDualAudio(
+                                    filenameTitle
+                                )
+                            ) {
+                                SEARCH_DUAL_AUDIO_BOOST
+                            } else {
+                                0
+                            }
+
+                        NativeSearchResult(
+                            root =
+                                root,
+                            title =
+                                folderTitle,
+                            url =
+                                hit.href,
                             posterUrl =
-                                poster
-                        }
-
-                    NativeSearchResult(
-                        root =
-                            root,
-                        title =
-                            folderTitle,
-                        url =
-                            hit.href,
-                        posterUrl =
-                            poster,
-                        modifiedAt =
-                            hit.time ?: 0L,
-                        score =
-                            score +
-                                if (
-                                    detectDualAudio(
-                                        filenameTitle
-                                    )
+                                poster,
+                            modifiedAt =
+                                hit.time ?: 0L,
+                            score =
+                                score +
+                                    dualBoost,
+                            response =
+                                newMovieSearchResponse(
+                                    folderTitle,
+                                    hit.href,
+                                    TvType.Movie
                                 ) {
-                                    150
-                                } else {
-                                    0
-                                },
-                        response =
-                            response
+                                    posterUrl =
+                                        poster
+                                }
+                        )
+                    }
+                }
+                .distinctBy {
+                    it.url.lowercase(
+                        Locale.ROOT
                     )
                 }
-            }
         }
 
         return buildAnimeNativeSearchResults(
@@ -2127,18 +2258,26 @@ class DhakaFTP : MainAPI() {
         )
     }
 
+
     private suspend fun discoverSearchHitsRecursively(
         root: String,
-        query: String
+        query: String,
+        stopWhenStrongMatchCount: Int =
+            Int.MAX_VALUE
     ): List<H5aiSearchHit> {
 
         data class SearchNode(
             val url: String,
-            val depth: Int
+            val depth: Int,
+            val priority: Int
         )
 
         val queue =
-            java.util.ArrayDeque<SearchNode>()
+            java.util.PriorityQueue(
+                compareByDescending<SearchNode> {
+                    it.priority
+                }.thenBy { it.depth }
+            )
 
         val seen =
             HashSet<String>()
@@ -2146,14 +2285,21 @@ class DhakaFTP : MainAPI() {
         val matches =
             LinkedHashMap<String, H5aiSearchHit>()
 
-        queue.addLast(
+        queue.add(
             SearchNode(
-                normalizeDirectoryUrl(root),
-                0
+                url =
+                    normalizeDirectoryUrl(root),
+                depth =
+                    0,
+                priority =
+                    0
             )
         )
 
         var scanned =
+            0
+
+        var strongMatches =
             0
 
         while (
@@ -2173,8 +2319,9 @@ class DhakaFTP : MainAPI() {
                     batch.size <
                     SEARCH_FALLBACK_MAX_DIRECTORIES
             ) {
+
                 val node =
-                    queue.removeFirst()
+                    queue.poll()
 
                 val key =
                     normalizeDirectoryUrl(
@@ -2214,9 +2361,37 @@ class DhakaFTP : MainAPI() {
 
             fetched.forEach { (node, entries) ->
 
+                val currentFolderScore =
+                    scoreSearchCandidate(
+                        query,
+                        getFolderTitle(node.url)
+                    )
+
                 entries.forEach { entry ->
 
-                    val matchScore =
+                    val absolute =
+                        resolveSearchHref(
+                            node.url,
+                            entry.url
+                        )
+
+                    val hit =
+                        H5aiSearchHit(
+                            href =
+                                absolute,
+                            time =
+                                entry.modifiedAt,
+                            size =
+                                entry.sizeBytes,
+                            isDirectory =
+                                entry.isDirectory
+                        )
+
+                    /*
+                     * Score every useful representation:
+                     * filename, full URL, and current folder context.
+                     */
+                    val entryScore =
                         maxOf(
                             scoreSearchCandidate(
                                 query,
@@ -2224,31 +2399,15 @@ class DhakaFTP : MainAPI() {
                             ),
                             scoreSearchCandidate(
                                 query,
-                                entry.url
-                            )
+                                absolute
+                            ),
+                            currentFolderScore
                         )
 
                     if (
-                        matchScore > 0
+                        entryScore >=
+                            SEARCH_FALLBACK_MATCH_SCORE
                     ) {
-                        val absolute =
-                            resolveSearchHref(
-                                node.url,
-                                entry.url
-                            )
-
-                        val hit =
-                            H5aiSearchHit(
-                                href =
-                                    absolute,
-                                time =
-                                    entry.modifiedAt,
-                                size =
-                                    entry.sizeBytes,
-                                isDirectory =
-                                    entry.isDirectory
-                            )
-
                         matches[
                             absolute.lowercase(
                                 Locale.ROOT
@@ -2258,35 +2417,153 @@ class DhakaFTP : MainAPI() {
                     }
 
                     if (
+                        entryScore >=
+                            SEARCH_STRONG_MATCH_SCORE
+                    ) {
+                        strongMatches++
+                    }
+
+                    if (
                         entry.isDirectory &&
                         node.depth <
                             SEARCH_FALLBACK_MAX_DEPTH
                     ) {
-                        queue.addLast(
+
+                        /*
+                         * Search matching branches first, but never discard
+                         * non-matching branches: a title can live several
+                         * levels deeper under a generic wrapper folder.
+                         */
+                        val childPriority =
+                            (
+                                entryScore * 100
+                            ) -
+                                (
+                                    node.depth *
+                                        SEARCH_DEPTH_PENALTY
+                                )
+
+                        queue.add(
                             SearchNode(
                                 url =
                                     normalizeDirectoryUrl(
-                                        resolveSearchHref(
-                                            node.url,
-                                            entry.url
-                                        )
+                                        absolute
                                     ),
                                 depth =
-                                    node.depth + 1
+                                    node.depth + 1,
+                                priority =
+                                    childPriority
                             )
                         )
                     }
                 }
+
+                /*
+                 * If the current folder itself matches strongly, expose all
+                 * of its direct video files even when filenames are noisy.
+                 */
+                if (
+                    currentFolderScore >=
+                        SEARCH_DIRECTORY_EXPANSION_SCORE
+                ) {
+                    entries
+                        .filter {
+                            !it.isDirectory &&
+                                isVideo(it.url)
+                        }
+                        .forEach { entry ->
+
+                            val absolute =
+                                resolveSearchHref(
+                                    node.url,
+                                    entry.url
+                                )
+
+                            val hit =
+                                H5aiSearchHit(
+                                    href =
+                                        absolute,
+                                    time =
+                                        entry.modifiedAt,
+                                    size =
+                                        entry.sizeBytes,
+                                    isDirectory =
+                                        false
+                                )
+
+                            matches[
+                                absolute.lowercase(
+                                    Locale.ROOT
+                                )
+                            ] =
+                                hit
+                        }
+                }
             }
 
             if (
-                matches.size >= 24
+                strongMatches >=
+                    stopWhenStrongMatchCount
+            ) {
+                break
+            }
+
+            if (
+                matches.size >=
+                    SEARCH_FALLBACK_MAX_RESULTS
             ) {
                 break
             }
         }
 
-        return matches.values.toList()
+        return matches.values
+            .sortedByDescending {
+                searchHitRelevance(
+                    query,
+                    it
+                )
+            }
+            .take(
+                SEARCH_FALLBACK_MAX_RESULTS
+            )
+    }
+
+    private fun searchHitRelevance(
+        query: String,
+        hit: H5aiSearchHit
+    ): Int {
+
+        val hrefScore =
+            scoreSearchCandidate(
+                query,
+                hit.href
+            )
+
+        val title =
+            getTitleFromUrl(
+                hit.href
+            )
+
+        val titleScore =
+            scoreSearchCandidate(
+                query,
+                title
+            )
+
+        val base =
+            maxOf(
+                hrefScore,
+                titleScore
+            )
+
+        return base +
+            if (
+                hit.isDirectory
+            ) {
+                SEARCH_DIRECTORY_HIT_BONUS
+            } else {
+                SEARCH_VIDEO_HIT_BONUS
+            }
     }
 
     private fun resolveSearchHref(
