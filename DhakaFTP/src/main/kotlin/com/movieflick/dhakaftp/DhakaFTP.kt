@@ -252,11 +252,7 @@ class DhakaFTP : MainAPI() {
                             }
 
                     ContentKind.ANIME ->
-                        videos.size > 1 ||
-                            videos.any {
-                                it.season != null ||
-                                    it.episode != null
-                            }
+                        videos.size >= 3
 
                     ContentKind.MOVIE ->
                         false
@@ -3313,6 +3309,176 @@ class DhakaFTP : MainAPI() {
         return normalizeQuickBootstrapGroups(
             fetched
         ).take(desired)
+    }
+
+    /*
+     * Build homepage groups from a set of real video entries.
+     *
+     * Movie categories keep every file as an individual card.
+     * Anime becomes episode-style only when the folder has 3+ videos.
+     */
+    private fun buildGroupsFromVideoEntries(
+        folderUrl: String,
+        entries: List<FtpEntry>,
+        poster: String?,
+        kind: ContentKind
+    ): List<FtpGroup> {
+
+        if (entries.isEmpty()) {
+            return emptyList()
+        }
+
+        val videos =
+            entries.mapIndexed {
+                    index,
+                    entry ->
+
+                makeVideo(
+                    entry = entry,
+                    poster = poster,
+                    seasonHint = null,
+                    order = index.toLong()
+                )
+            }
+
+        return when (kind) {
+
+            ContentKind.MOVIE -> {
+                videos.map {
+                    video ->
+
+                    FtpGroup(
+                        title =
+                            getFolderTitle(
+                                folderUrl
+                            ),
+                        url =
+                            video.url,
+                        posterUrl =
+                            poster
+                                ?: video.posterUrl,
+                        modifiedAt =
+                            video.modifiedAt,
+                        videos =
+                            listOf(video),
+                        kind =
+                            ContentKind.MOVIE
+                    )
+                }
+            }
+
+            ContentKind.ANIME -> {
+
+                if (
+                    videos.size >= 3
+                ) {
+
+                    listOf(
+                        FtpGroup(
+                            title =
+                                getFolderTitle(
+                                    folderUrl
+                                ),
+                            url =
+                                normalizeDirectoryUrl(
+                                    folderUrl
+                                ),
+                            posterUrl =
+                                poster
+                                    ?: videos.firstOrNull {
+                                        it.posterUrl != null
+                                    }?.posterUrl,
+                            modifiedAt =
+                                videos.maxOf {
+                                    it.modifiedAt
+                                },
+                            videos =
+                                videos,
+                            kind =
+                                ContentKind.ANIME
+                        )
+                    )
+
+                } else {
+
+                    videos.map {
+                        video ->
+
+                        FtpGroup(
+                            title =
+                                getFolderTitle(
+                                    folderUrl
+                                ),
+                            url =
+                                video.url,
+                            posterUrl =
+                                poster
+                                    ?: video.posterUrl,
+                            modifiedAt =
+                                video.modifiedAt,
+                            videos =
+                                listOf(video),
+                            kind =
+                                ContentKind.ANIME
+                        )
+                    }
+                }
+            }
+
+            ContentKind.SERIES ->
+                emptyList()
+        }
+    }
+
+    private fun normalizeQuickBootstrapGroups(
+        groups: List<FtpGroup>
+    ): List<FtpGroup> {
+
+        return deduplicateGroups(
+            groups
+        )
+            .sortedWith(
+                groupComparator()
+            )
+    }
+
+    private fun homepageDirectoryComparator():
+        Comparator<FtpEntry> {
+
+        return compareByDescending<FtpEntry> {
+            yearValueFromName(
+                it.name
+            ) == 2023
+        }
+            .thenByDescending {
+                yearValueFromName(
+                    it.name
+                ) ?: -1
+            }
+            .thenByDescending {
+                it.modifiedAt ?: 0L
+            }
+            .thenByDescending {
+                directoryPriority(it)
+            }
+            .thenBy {
+                it.order
+            }
+    }
+
+    private fun yearValueFromName(
+        value: String
+    ): Int? {
+
+        return Regex(
+            "(?<!\\d)(19\\d{2}|20\\d{2})(?!\\d)"
+        )
+            .find(
+                decodeSafely(value)
+            )
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
     }
 
     private suspend fun fastTvBootstrap(
