@@ -1786,32 +1786,836 @@ class DhakaFTP : MainAPI() {
         }
 
         /*
-         * Search every configured category in parallel. Each root first uses
-         * h5ai's server-side search; if that returns nothing, the same root
-         * automatically gets a bounded recursive fallback.
+         * TMDB-FIRST SEARCH:
+         *
+         * 1. Ask TMDB for the best media identity first.
+         * 2. Route to the most likely DhakaFTP branch.
+         * 3. Search the targeted branch before touching the legacy engine.
+         * 4. If TMDB is unavailable, returns no usable identity, or the routed
+         *    branches do not contain the title, fall back to the old search.
+         *
+         * IMPORTANT:
+         * A valid TMDB response with zero results is NOT treated as an API
+         * credential failure. Credential rotation only happens for actual
+         * request/API failures inside TmdbHelper.
          */
-        val networkResults =
-            coroutineScope {
-                searchRoots.map { root ->
+        val tmdbOutcome =
+            TmdbHelper.search(
+                normalizedQuery
+            )
+
+        if (
+            tmdbOutcome.isApiUsable &&
+                tmdbOutcome.items.isNotEmpty()
+        ) {
+
+            val smartResults =
+                searchByTmdbRouting(
+                    query = normalizedQuery,
+                    tmdbItems = tmdbOutcome.items
+                )
+
+            if (
+                smartResults.isNotEmpty()
+            ) {
+                return paginateSearchResults(
+                    smartResults,
+                    page
+                )
+            }
+        }
+
+        /*
+         * HARD SAFETY FALLBACK:
+         *
+         * TMDB outage, quota exhaustion, invalid credentials, timeout, or
+         * a routed search miss must never break DhakaFTP search.
+         * The existing legacy engine remains the final source of truth.
+         */
+        return legacySearch(
+            normalizedQuery,
+            page
+        )
+    }
+
+    private suspend fun searchByTmdbRouting(
+        query: String,
+        tmdbItems: List<TmdbMedia>
+    ): List<NativeSearchResult> {
+
+        val candidates =
+            tmdbItems
+                .take(3)
+
+        candidates.forEach { media ->
+
+            val roots =
+                when (media.mediaType) {
+                    TmdbMediaType.MOVIE ->
+                        movieRootsForTmdb(
+                            media
+                        )
+
+                    TmdbMediaType.TV ->
+                        tvRootsForTmdb(
+                            media
+                        )
+                }
+
+            val targetedResults =
+                if (
+                    media.mediaType == TmdbMediaType.MOVIE
+                ) {
+                    searchMovieTmdbCandidate(
+                        query = query,
+                        media = media,
+                        roots = roots
+                    )
+                } else {
+                    searchTvTmdbCandidate(
+                        query = query,
+                        media = media,
+                        roots = roots
+                    )
+                }
+
+            if (
+                targetedResults.isNotEmpty()
+            ) {
+                return targetedResults
+                    .sortedWith(
+                        compareByDescending<NativeSearchResult> {
+                            it.score
+                        }
+                            .thenByDescending {
+                                it.modifiedAt
+                            }
+                            .thenBy {
+                                it.title.lowercase(
+                                    Locale.ROOT
+                                )
+                            }
+                    )
+                    .distinctBy {
+                        it.url.lowercase(
+                            Locale.ROOT
+                        )
+                    }
+            }
+        }
+
+        return emptyList()
+    }
+
+    private suspend fun searchMovieTmdbCandidate(
+        query: String,
+        media: TmdbMedia,
+        roots: List<String>
+    ): List<NativeSearchResult> {
+
+        val orderedRoots =
+            roots
+                .distinct()
+                .take(4)
+
+        /*
+         * Satyajit Ray has a dedicated Kolkata collection. When TMDB confirms
+         * the director, try that collection first. If the collection misses,
+         * the normal Kolkata/year route is still attempted.
+         */
+        val specialRoots =
+            if (
+                media.isSatyajitRay
+            ) {
+                findSpecialCollectionRoots(
+                    ROOT_KOLKATA,
+                    listOf(
+                        "Satyajit Ray Films",
+                        "Satyajit Ray"
+                    )
+                )
+            } else {
+                emptyList()
+            }
+
+        val firstRoots =
+            specialRoots +
+                orderedRoots
+
+        firstRoots
+            .distinct()
+            .forEach { root ->
+
+                val targetRoot =
+                    resolveMovieTargetRoot(
+                        categoryRoot = root,
+                        year = media.year
+                    )
+
+                val results =
+                    searchNativeH5ai(
+                        root = targetRoot,
+                        query = media.searchTitle
+                            .ifBlank { query }
+                    )
+
+                val relevant =
+                    results
+                        .filter {
+                            scoreSearchCandidate(
+                                query,
+                                it.title
+                            ) >= SEARCH_MIN_RESULT_SCORE ||
+                                scoreSearchCandidate(
+                                    media.searchTitle,
+                                    it.title
+                                ) >= SEARCH_MIN_RESULT_SCORE
+                        }
+
+                if (
+                    relevant.isNotEmpty()
+                ) {
+                    return relevant
+                }
+            }
+
+        /*
+         * Secondary-root safety net:
+         * if the classified category did not contain the title, briefly try
+         * the other movie roots before falling back to the full legacy search.
+         */
+        val secondaryRoots =
+            listOf(
+                ROOT_ENGLISH,
+                ROOT_HINDI,
+                ROOT_KOLKATA,
+                ROOT_SOUTH
+            )
+                .filter {
+                    it !in orderedRoots
+                }
+
+        return coroutineScope {
+            secondaryRoots
+                .take(3)
+                .map { root ->
                     async {
+                        val targetRoot =
+                            resolveMovieTargetRoot(
+                                categoryRoot = root,
+                                year = media.year
+                            )
+
                         searchNativeH5ai(
-                            root = root,
-                            query = normalizedQuery
+                            root = targetRoot,
+                            query = media.searchTitle
+                                .ifBlank { query }
                         )
                     }
                 }
+                .awaitAll()
+                .flatten()
+                .filter {
+                    scoreSearchCandidate(
+                        media.searchTitle
+                            .ifBlank { query },
+                        it.title
+                    ) >= SEARCH_MIN_RESULT_SCORE
+                }
+        }
+    }
+
+    private suspend fun searchTvTmdbCandidate(
+        query: String,
+        media: TmdbMedia,
+        roots: List<String>
+    ): List<NativeSearchResult> {
+
+        val orderedRoots =
+            roots
+                .distinct()
+                .take(2)
+
+        orderedRoots.forEach { root ->
+
+            val targetRoot =
+                if (
+                    root == ROOT_TV_1
+                ) {
+                    resolveTvRoot1Bucket(
+                        media.searchTitle
+                            .ifBlank { query }
+                    )
+                } else {
+                    root
+                }
+
+            val results =
+                searchNativeH5ai(
+                    root = targetRoot,
+                    query = media.searchTitle
+                        .ifBlank { query }
+                )
+
+            val relevant =
+                results
+                    .filter {
+                        maxOf(
+                            scoreSearchCandidate(
+                                query,
+                                it.title
+                            ),
+                            scoreSearchCandidate(
+                                media.searchTitle,
+                                it.title
+                            )
+                        ) >= SEARCH_MIN_RESULT_SCORE
+                    }
+
+            if (
+                relevant.isNotEmpty()
+            ) {
+                return relevant
+            }
+        }
+
+        return emptyList()
+    }
+
+    private fun movieRootsForTmdb(
+        media: TmdbMedia
+    ): List<String> {
+
+        val language =
+            media.originalLanguage
+                .lowercase(
+                    Locale.ROOT
+                )
+
+        val country =
+            media.originCountries
+                .map {
+                    it.uppercase(
+                        Locale.ROOT
+                    )
+                }
+                .toSet()
+
+        val isIndian =
+            "IN" in country ||
+                language in setOf(
+                    "hi",
+                    "bn",
+                    "ta",
+                    "te",
+                    "ml",
+                    "kn",
+                    "mr",
+                    "gu",
+                    "pa"
+                )
+
+        if (
+            media.isSatyajitRay ||
+                language == "bn"
+        ) {
+            return listOf(
+                ROOT_KOLKATA,
+                ROOT_ENGLISH,
+                ROOT_HINDI,
+                ROOT_SOUTH
+            )
+        }
+
+        if (
+            language == "hi"
+        ) {
+            return listOf(
+                ROOT_HINDI,
+                ROOT_ENGLISH,
+                ROOT_SOUTH,
+                ROOT_KOLKATA
+            )
+        }
+
+        if (
+            isIndian
+        ) {
+            return listOf(
+                ROOT_SOUTH,
+                ROOT_ENGLISH,
+                ROOT_HINDI,
+                ROOT_KOLKATA
+            )
+        }
+
+        if (
+            language == "en" ||
+                country.any {
+                    it in setOf(
+                        "US",
+                        "GB",
+                        "CA",
+                        "AU",
+                        "NZ",
+                        "IE"
+                    )
+                }
+        ) {
+            return listOf(
+                ROOT_ENGLISH,
+                ROOT_HINDI,
+                ROOT_SOUTH,
+                ROOT_KOLKATA
+            )
+        }
+
+        /*
+         * Unknown/foreign movie: English is the first broad movie source,
+         * followed by the remaining movie sources. Legacy search remains the
+         * final authority if all targeted attempts miss.
+         */
+        return listOf(
+            ROOT_ENGLISH,
+            ROOT_HINDI,
+            ROOT_SOUTH,
+            ROOT_KOLKATA
+        )
+    }
+
+    private fun tvRootsForTmdb(
+        media: TmdbMedia
+    ): List<String> {
+
+        val language =
+            media.originalLanguage
+                .lowercase(
+                    Locale.ROOT
+                )
+
+        val countries =
+            media.originCountries
+                .map {
+                    it.uppercase(
+                        Locale.ROOT
+                    )
+                }
+                .toSet()
+
+        val foreignAsianOrTurkish =
+            language in setOf(
+                "ko",
+                "zh",
+                "ja",
+                "tr"
+            ) ||
+                countries.any {
+                    it in setOf(
+                        "KR",
+                        "CN",
+                        "JP",
+                        "TR"
+                    )
+                }
+
+        return if (
+            foreignAsianOrTurkish
+        ) {
+            listOf(
+                ROOT_TV_2,
+                ROOT_TV_1
+            )
+        } else {
+            listOf(
+                ROOT_TV_1,
+                ROOT_TV_2
+            )
+        }
+    }
+
+    private suspend fun resolveTvRoot1Bucket(
+        titleRaw: String
+    ): String {
+
+        val first =
+            titleRaw
+                .trim()
+                .firstOrNull()
+                ?.uppercaseChar()
+                ?: return ROOT_TV_1
+
+        val expected =
+            when {
+                first.isDigit() ->
+                    "0"
+
+                first in 'A'..'L' ->
+                    "AL"
+
+                first in 'M'..'R' ->
+                    "MR"
+
+                first in 'S'..'Z' ->
+                    "SZ"
+
+                else ->
+                    return ROOT_TV_1
+            }
+
+        val entries =
+            safeDirectoryEntries(
+                ROOT_TV_1,
+                900L
+            )
+
+        val bucket =
+            entries
+                .filter {
+                    it.isDirectory
+                }
+                .firstOrNull { entry ->
+                    val normalized =
+                        compactSearchText(
+                            decodeSafely(
+                                entry.name
+                            )
+                        )
+
+                    when (expected) {
+                        "0" ->
+                            normalized.contains("0") &&
+                                normalized.contains("9")
+
+                        "AL" ->
+                            normalized.contains("a") &&
+                                normalized.contains("l")
+
+                        "MR" ->
+                            normalized.contains("m") &&
+                                normalized.contains("r")
+
+                        "SZ" ->
+                            normalized.contains("s") &&
+                                normalized.contains("z")
+
+                        else -> false
+                    }
+                }
+
+        return bucket?.let {
+            normalizeDirectoryUrl(
+                it.url
+            )
+        } ?: ROOT_TV_1
+    }
+
+    private suspend fun resolveMovieTargetRoot(
+        categoryRoot: String,
+        year: Int?
+    ): String {
+
+        if (
+            year == null
+        ) {
+            return categoryRoot
+        }
+
+        val entries =
+            safeDirectoryEntries(
+                categoryRoot,
+                900L
+            )
+
+        if (
+            entries.isEmpty()
+        ) {
+            return categoryRoot
+        }
+
+        val yearText =
+            year.toString()
+
+        val exact =
+            entries
+                .asSequence()
+                .filter {
+                    it.isDirectory
+                }
+                .filter {
+                    val name =
+                        decodeSafely(
+                            it.name
+                        ).trim()
+
+                    name == "($yearText)" ||
+                        name.equals(
+                            yearText,
+                            true
+                        )
+                }
+                .sortedByDescending {
+                    it.modifiedAt ?: 0L
+                }
+                .firstOrNull()
+
+        if (
+            exact != null
+        ) {
+            return normalizeDirectoryUrl(
+                exact.url
+            )
+        }
+
+        val ranged =
+            entries
+                .asSequence()
+                .filter {
+                    it.isDirectory
+                }
+                .filter {
+                    yearMatchesRange(
+                        year,
+                        decodeSafely(
+                            it.name
+                        )
+                    )
+                }
+                .sortedWith(
+                    compareByDescending<FtpEntry> {
+                        yearRangeSpecificity(
+                            year,
+                            decodeSafely(it.name)
+                        )
+                    }
+                        .thenByDescending {
+                            it.modifiedAt ?: 0L
+                        }
+                )
+                .firstOrNull()
+
+        return ranged?.let {
+            normalizeDirectoryUrl(
+                it.url
+            )
+        } ?: categoryRoot
+    }
+
+    private fun yearMatchesRange(
+        year: Int,
+        folderName: String
+    ): Boolean {
+
+        val normalized =
+            folderName
+                .replace(
+                    "&",
+                    " "
+                )
+                .replace(
+                    "–",
+                    "-"
+                )
+                .replace(
+                    "—",
+                    "-"
+                )
+                .replace(
+                    "\u2013",
+                    "-"
+                )
+                .lowercase(
+                    Locale.ROOT
+                )
+
+        val years =
+            Regex(
+                "\\d{4}"
+            )
+                .findAll(
+                    normalized
+                )
+                .map {
+                    it.value.toInt()
+                }
+                .toList()
+
+        if (
+            years.size >= 2
+        ) {
+            val start =
+                minOf(
+                    years[0],
+                    years[1]
+                )
+
+            val end =
+                maxOf(
+                    years[0],
+                    years[1]
+                )
+
+            return year in start..end
+        }
+
+        if (
+            years.size == 1 &&
+                normalized.contains(
+                    "before"
+                )
+        ) {
+            return year <= years.first()
+        }
+
+        return false
+    }
+
+    private fun yearRangeSpecificity(
+        year: Int,
+        folderName: String
+    ): Int {
+
+        if (
+            Regex(
+                "\\(\\s*$year\\s*\\)"
+            )
+                .containsMatchIn(
+                    folderName
+                )
+        ) {
+            return 1000
+        }
+
+        return if (
+            yearMatchesRange(
+                year,
+                folderName
+            )
+        ) {
+            500
+        } else {
+            0
+        }
+    }
+
+    private suspend fun findSpecialCollectionRoots(
+        categoryRoot: String,
+        names: List<String>
+    ): List<String> {
+
+        val entries =
+            safeDirectoryEntries(
+                categoryRoot,
+                900L
+            )
+
+        return entries
+            .filter {
+                it.isDirectory
+            }
+            .filter { entry ->
+                val normalized =
+                    compactSearchText(
+                        decodeSafely(
+                            entry.name
+                        )
+                    )
+
+                names.any { candidate ->
+                    val target =
+                        compactSearchText(
+                            candidate
+                        )
+
+                    normalized == target ||
+                        normalized.contains(target) ||
+                        target.contains(normalized)
+                }
+            }
+            .sortedByDescending {
+                it.modifiedAt ?: 0L
+            }
+            .map {
+                normalizeDirectoryUrl(
+                    it.url
+                )
+            }
+            .distinct()
+    }
+
+    private fun paginateSearchResults(
+        results: List<NativeSearchResult>,
+        page: Int
+    ): SearchResponseList {
+
+        val sorted =
+            results
+                .filter {
+                    it.score >= SEARCH_MIN_RESULT_SCORE
+                }
+                .distinctBy {
+                    it.url.lowercase(
+                        Locale.ROOT
+                    )
+                }
+                .sortedWith(
+                    compareByDescending<NativeSearchResult> {
+                        it.score
+                    }
+                        .thenByDescending {
+                            it.modifiedAt
+                        }
+                        .thenBy {
+                            it.title.lowercase(
+                                Locale.ROOT
+                            )
+                        }
+                )
+
+        val offset =
+            maxOf(
+                0,
+                page - 1
+            ) *
+                SEARCH_PAGE_SIZE
+
+        val pageItems =
+            sorted
+                .drop(offset)
+                .take(SEARCH_PAGE_SIZE)
+                .map {
+                    it.response
+                }
+
+        return newSearchResponseList(
+            pageItems,
+            offset + SEARCH_PAGE_SIZE < sorted.size
+        )
+    }
+
+    private suspend fun legacySearch(
+        query: String,
+        page: Int
+    ): SearchResponseList {
+
+        val networkResults =
+            coroutineScope {
+                searchRoots
+                    .map { root ->
+                        async {
+                            searchNativeH5ai(
+                                root = root,
+                                query = query
+                            )
+                        }
+                    }
                     .awaitAll()
                     .flatten()
             }
 
-        /*
-         * Keep already indexed Home/Load items as an instant zero-network
-         * secondary source.
-         */
         val results =
             networkResults +
                 searchFromAvailableCache(
-                    normalizedQuery
+                    query
                 )
 
         val sorted =
@@ -1825,8 +2629,7 @@ class DhakaFTP : MainAPI() {
                     )
                 }
                 .values
-                .mapNotNull {
-                    candidates ->
+                .mapNotNull { candidates ->
                     candidates.maxByOrNull {
                         it.score
                     }
@@ -1846,17 +2649,13 @@ class DhakaFTP : MainAPI() {
                 )
 
         val offset =
-            (
-                page - 1
-            ) *
+            (page - 1) *
                 SEARCH_PAGE_SIZE
 
         val pageItems =
             sorted
                 .drop(offset)
-                .take(
-                    SEARCH_PAGE_SIZE
-                )
+                .take(SEARCH_PAGE_SIZE)
                 .map {
                     it.response
                 }
