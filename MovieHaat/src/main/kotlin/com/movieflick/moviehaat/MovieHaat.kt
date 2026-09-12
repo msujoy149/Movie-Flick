@@ -1281,26 +1281,28 @@ class MovieHaat : MainAPI() {
             return root.toList()
         }
 
-        val direct =
-            root.path("data")
+        val direct = root.path("data")
 
-        if (
-            direct.isArray
-        ) {
+        if (direct.isArray) {
             return direct.toList()
         }
 
-        if (
-            direct.isObject &&
-            direct.path("results").isArray
-        ) {
-            return direct.path("results").toList()
+        if (direct.isObject) {
+            for (path in paths) {
+                val nested = direct.path(path)
+                if (nested.isArray) {
+                    return nested.toList()
+                }
+            }
+
+            val results = direct.path("results")
+            if (results.isArray) {
+                return results.toList()
+            }
         }
 
         for (path in paths) {
-            val node =
-                root.path(path)
-
+            val node = root.path(path)
             if (node.isArray) {
                 return node.toList()
             }
