@@ -50,10 +50,10 @@
         "jarHash": "sha256-3ff76b1899ad20e007d5cd4a437a4d70041051542982886bbdb776faec387500"
     },
     {
-        "fileHash": "sha256-a4bce0fc573852b966755b4707b4bcebea57ba7e07cbf0c16c7b39d361c0ee04",
+        "fileHash": "sha256-5171e58f8ba034194cb480b60fa382ec0c5a76525f962cb64a09e8e46a0a6d31",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 120695,
+        "fileSize": 118789,
         "status": 1,
         "language": "bn",
         "authors": [
