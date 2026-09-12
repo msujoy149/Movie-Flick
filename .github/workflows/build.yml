@@ -58,6 +58,17 @@ jobs:
       - name: Build plugins
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+
+          # DhakaFTP-only TMDB credentials.
+          # These values come from GitHub Repository Secrets.
+          TMDB_PRIMARY_API_KEY: ${{ secrets.TMDB_PRIMARY_API_KEY }}
+          TMDB_PRIMARY_ACCESS_TOKEN: ${{ secrets.TMDB_PRIMARY_ACCESS_TOKEN }}
+
+          TMDB_SECONDARY_API_KEY: ${{ secrets.TMDB_SECONDARY_API_KEY }}
+          TMDB_SECONDARY_ACCESS_TOKEN: ${{ secrets.TMDB_SECONDARY_ACCESS_TOKEN }}
+
+          TMDB_TERTIARY_API_KEY: ${{ secrets.TMDB_TERTIARY_API_KEY }}
+          TMDB_TERTIARY_ACCESS_TOKEN: ${{ secrets.TMDB_TERTIARY_ACCESS_TOKEN }}
         run: |
           cd "$GITHUB_WORKSPACE/src"
 
@@ -72,15 +83,11 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/build-output"
 
           # Copy all compiled CloudStream plugins
-          find "$GITHUB_WORKSPACE/src" \
-            -type f \
-            -name "*.cs3" \
-            -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
+          find "$GITHUB_WORKSPACE/src"             -type f             -name "*.cs3"             -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
 
           # Copy generated plugins.json
           if [ -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
-            cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
-              "$GITHUB_WORKSPACE/build-output/plugins.json"
+            cp "$GITHUB_WORKSPACE/src/build/plugins.json"               "$GITHUB_WORKSPACE/build-output/plugins.json"
           else
             echo "ERROR: plugins.json was not generated"
             exit 1
@@ -116,9 +123,7 @@ jobs:
 
           rm -rf builds
 
-          git clone \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
-            builds
+          git clone             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"             builds
 
           cd builds
 
@@ -146,8 +151,7 @@ jobs:
       # --------------------------------------------------
       - name: Copy build files
         run: |
-          cp -f "$GITHUB_WORKSPACE/build-output/"* \
-            "$GITHUB_WORKSPACE/builds/"
+          cp -f "$GITHUB_WORKSPACE/build-output/"*             "$GITHUB_WORKSPACE/builds/"
 
           cd "$GITHUB_WORKSPACE/builds"
 
@@ -187,8 +191,6 @@ jobs:
 
           git add -A
 
-          git commit \
-            -m "Build ${{ github.sha }}" \
-            || echo "No changes to commit"
+          git commit             -m "Build ${{ github.sha }}"             || echo "No changes to commit"
 
           git push origin builds --force
