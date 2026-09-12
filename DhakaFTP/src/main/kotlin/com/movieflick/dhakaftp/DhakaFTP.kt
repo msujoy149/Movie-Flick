@@ -136,8 +136,15 @@ class DhakaFTP : MainAPI() {
         const val TV_HOME_SIZE = 6
         const val TV_SOURCE_BATCH = 3
         const val SEARCH_PAGE_SIZE = 50
-        const val QUICK_SEARCH_NATIVE_TIMEOUT_MS = 5000L
-        const val QUICK_SEARCH_DIRECTORY_TIMEOUT_MS = 1200L
+
+        /* Search-only performance / fallback tuning. */
+        const val QUICK_SEARCH_NATIVE_TIMEOUT_MS = 2200L
+        const val QUICK_SEARCH_DIRECTORY_TIMEOUT_MS = 700L
+        const val SEARCH_FALLBACK_TIMEOUT_MS = 4500L
+        const val SEARCH_FALLBACK_DIRECTORY_TIMEOUT_MS = 650L
+        const val SEARCH_FALLBACK_MAX_DIRECTORIES = 64
+        const val SEARCH_FALLBACK_MAX_DEPTH = 6
+        const val SEARCH_FALLBACK_BATCH_SIZE = 12
 
         /*
          * Compatibility alias. This does not remove or change the existing
@@ -1742,13 +1749,16 @@ class DhakaFTP : MainAPI() {
      * ---------------------------------------------------------------
      */
 
+
     override suspend fun search(
         query: String,
         page: Int
     ): SearchResponseList {
 
         val normalizedQuery =
-            normalizeSearchText(query)
+            normalizeSearchText(
+                query
+            )
 
         if (
             normalizedQuery.isBlank()
@@ -1760,16 +1770,12 @@ class DhakaFTP : MainAPI() {
         }
 
         /*
-         * PRIMARY ENGINE:
-         *
-         * DhakaFlix uses h5ai. Its server-side search can recursively walk
-         * the real filesystem without us downloading every directory page
-         * over HTTP. This is dramatically faster for deep searches such as
-         * an Aquaman file buried several folders below the root.
+         * Search every configured category in parallel. Each root first uses
+         * h5ai's server-side search; if that returns nothing, the same root
+         * automatically gets a bounded recursive fallback.
          */
-        val nativeResults =
+        val networkResults =
             coroutineScope {
-
                 searchRoots.map { root ->
                     async {
                         searchNativeH5ai(
@@ -1777,18 +1783,17 @@ class DhakaFTP : MainAPI() {
                             query = normalizedQuery
                         )
                     }
-                }.awaitAll().flatten()
+                }
+                    .awaitAll()
+                    .flatten()
             }
 
         /*
-         * Do not launch a full-library crawl on every search.
-         *
-         * If the server-side h5ai search is unavailable, use whatever index
-         * is already present in memory and return immediately. A background
-         * homepage prewarm will continue to build the index for later use.
+         * Keep already indexed Home/Load items as an instant zero-network
+         * secondary source.
          */
         val results =
-            nativeResults +
+            networkResults +
                 searchFromAvailableCache(
                     normalizedQuery
                 )
@@ -1804,18 +1809,20 @@ class DhakaFTP : MainAPI() {
                         }
                         .thenBy {
                             it.title.lowercase(
-                                Locale.getDefault()
+                                Locale.ROOT
                             )
                         }
                 )
                 .distinctBy {
                     it.url.lowercase(
-                        Locale.getDefault()
+                        Locale.ROOT
                     )
                 }
 
         val offset =
-            (page - 1) *
+            (
+                page - 1
+            ) *
                 SEARCH_PAGE_SIZE
 
         val pageItems =
@@ -1857,6 +1864,7 @@ class DhakaFTP : MainAPI() {
         ObjectMapper()
 
 
+
     private suspend fun searchNativeH5ai(
         root: String,
         query: String
@@ -1883,23 +1891,42 @@ class DhakaFTP : MainAPI() {
             )
         }
 
+        /*
+         * Independent token requests make search resilient to h5ai/server
+         * versions that treat multi-word patterns differently.
+         */
+        val tokens =
+            normalizeSearchText(
+                query
+            )
+                .split(" ")
+                .filter {
+                    it.length >= 2
+                }
+                .distinct()
+
+        tokens
+            .take(5)
+            .forEach {
+                variants.add(it)
+            }
+
         val fallback =
             buildSearchFallbackQuery(
                 query
             )
 
         if (
-            fallback.isNotBlank() &&
-            fallback != query
+            fallback.isNotBlank()
         ) {
             variants.add(
                 fallback
             )
         }
 
-        val hits =
+        var hits =
             variants
-                .take(3)
+                .take(8)
                 .flatMap {
                     variant ->
                     nativeH5aiSearchHits(
@@ -1907,11 +1934,39 @@ class DhakaFTP : MainAPI() {
                         variant
                     )
                 }
-                .distinctBy {
-                    it.href.lowercase(
-                        Locale.getDefault()
+                .map {
+                    it.copy(
+                        href =
+                            resolveSearchHref(
+                                root,
+                                it.href
+                            )
                     )
                 }
+                .distinctBy {
+                    it.href.lowercase(
+                        Locale.ROOT
+                    )
+                }
+
+        /*
+         * Critical fallback: if h5ai search is disabled/unavailable, search
+         * the actual directory tree incrementally. This fixes deep paths such
+         * as root -> year -> collection -> movie folder -> video.
+         */
+        if (
+            hits.isEmpty()
+        ) {
+            hits =
+                kotlinx.coroutines.withTimeoutOrNull(
+                    SEARCH_FALLBACK_TIMEOUT_MS
+                ) {
+                    discoverSearchHitsRecursively(
+                        root = root,
+                        query = query
+                    )
+                }.orEmpty()
+        }
 
         if (
             hits.isEmpty()
@@ -1920,69 +1975,50 @@ class DhakaFTP : MainAPI() {
         }
 
         val kind =
-            detectKind(
-                root
-            )
+            detectKind(root)
 
-        /*
-         * Keep both file and directory hits available.
-         * TV/Anime can need a Season directory hit even when the query
-         * itself is "Season 1" rather than an episode filename.
-         */
         val videoHits =
             hits.filter {
                 !it.isDirectory &&
-                    isVideo(
-                        it.href
-                    )
+                    isVideo(it.href)
             }
 
         val parents =
             (
                 videoHits.map {
                     normalizeDirectoryUrl(
-                        it.href.substringBeforeLast(
-                            "/"
-                        )
+                        it.href.substringBeforeLast("/")
                     )
                 } +
                 hits.filter {
                     it.isDirectory
                 }.map {
-                    normalizeDirectoryUrl(
-                        it.href
-                    )
+                    normalizeDirectoryUrl(it.href)
                 }
             )
                 .distinct()
 
         val parentEntries =
             coroutineScope {
-
-                parents.map { parent ->
-
-                    async {
-
-                        parent to
-                            safeDirectoryEntries(
-                                parent,
-                                QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
-                            )
+                parents
+                    .take(80)
+                    .map { parent ->
+                        async {
+                            parent to
+                                safeDirectoryEntries(
+                                    parent,
+                                    QUICK_SEARCH_DIRECTORY_TIMEOUT_MS
+                                )
+                        }
                     }
-
-                }.awaitAll()
+                    .awaitAll()
                     .toMap()
             }
 
-        /*
-         * TV Show:
-         * always return Season cards, never raw episode cards.
-         */
         if (
             kind ==
             ContentKind.SERIES
         ) {
-
             return buildTvNativeSearchResults(
                 hits,
                 parentEntries,
@@ -1996,28 +2032,22 @@ class DhakaFTP : MainAPI() {
             return emptyList()
         }
 
-        /*
-         * Movie categories:
-         * every real video is its own playable result.
-         */
         if (
             kind ==
             ContentKind.MOVIE
         ) {
-
             return videoHits.mapNotNull { hit ->
 
                 val parent =
                     normalizeDirectoryUrl(
-                        hit.href.substringBeforeLast(
-                            "/"
-                        )
+                        hit.href.substringBeforeLast("/")
                     )
 
                 val poster =
                     pickPoster(
-                        parentEntries[parent]
-                            ?: emptyList()
+                        parentEntries[
+                            parent
+                        ].orEmpty()
                     )
 
                 val filenameTitle =
@@ -2039,6 +2069,10 @@ class DhakaFTP : MainAPI() {
                         scoreSearchCandidate(
                             query,
                             filenameTitle
+                        ),
+                        scoreSearchCandidate(
+                            query,
+                            parent
                         )
                     )
 
@@ -2047,14 +2081,12 @@ class DhakaFTP : MainAPI() {
                 ) {
                     null
                 } else {
-
                     val response =
                         newMovieSearchResponse(
                             folderTitle,
                             hit.href,
                             TvType.Movie
                         ) {
-
                             posterUrl =
                                 poster
                         }
@@ -2088,16 +2120,212 @@ class DhakaFTP : MainAPI() {
             }
         }
 
-        /*
-         * Anime:
-         * explicit Season paths are season cards.
-         * Plain single videos remain individual playable items.
-         */
         return buildAnimeNativeSearchResults(
             videoHits,
             parentEntries,
             query
         )
+    }
+
+    private suspend fun discoverSearchHitsRecursively(
+        root: String,
+        query: String
+    ): List<H5aiSearchHit> {
+
+        data class SearchNode(
+            val url: String,
+            val depth: Int
+        )
+
+        val queue =
+            java.util.ArrayDeque<SearchNode>()
+
+        val seen =
+            HashSet<String>()
+
+        val matches =
+            LinkedHashMap<String, H5aiSearchHit>()
+
+        queue.addLast(
+            SearchNode(
+                normalizeDirectoryUrl(root),
+                0
+            )
+        )
+
+        var scanned =
+            0
+
+        while (
+            queue.isNotEmpty() &&
+            scanned <
+                SEARCH_FALLBACK_MAX_DIRECTORIES
+        ) {
+
+            val batch =
+                mutableListOf<SearchNode>()
+
+            while (
+                batch.size <
+                    SEARCH_FALLBACK_BATCH_SIZE &&
+                queue.isNotEmpty() &&
+                scanned +
+                    batch.size <
+                    SEARCH_FALLBACK_MAX_DIRECTORIES
+            ) {
+                val node =
+                    queue.removeFirst()
+
+                val key =
+                    normalizeDirectoryUrl(
+                        node.url
+                    ).lowercase(
+                        Locale.ROOT
+                    )
+
+                if (
+                    seen.add(key)
+                ) {
+                    batch.add(node)
+                }
+            }
+
+            if (
+                batch.isEmpty()
+            ) {
+                break
+            }
+
+            val fetched =
+                coroutineScope {
+                    batch.map { node ->
+                        async {
+                            node to
+                                safeDirectoryEntries(
+                                    node.url,
+                                    SEARCH_FALLBACK_DIRECTORY_TIMEOUT_MS
+                                )
+                        }
+                    }.awaitAll()
+                }
+
+            scanned +=
+                batch.size
+
+            fetched.forEach { (node, entries) ->
+
+                entries.forEach { entry ->
+
+                    val matchScore =
+                        maxOf(
+                            scoreSearchCandidate(
+                                query,
+                                entry.name
+                            ),
+                            scoreSearchCandidate(
+                                query,
+                                entry.url
+                            )
+                        )
+
+                    if (
+                        matchScore > 0
+                    ) {
+                        val absolute =
+                            resolveSearchHref(
+                                node.url,
+                                entry.url
+                            )
+
+                        val hit =
+                            H5aiSearchHit(
+                                href =
+                                    absolute,
+                                time =
+                                    entry.modifiedAt,
+                                size =
+                                    entry.sizeBytes,
+                                isDirectory =
+                                    entry.isDirectory
+                            )
+
+                        matches[
+                            absolute.lowercase(
+                                Locale.ROOT
+                            )
+                        ] =
+                            hit
+                    }
+
+                    if (
+                        entry.isDirectory &&
+                        node.depth <
+                            SEARCH_FALLBACK_MAX_DEPTH
+                    ) {
+                        queue.addLast(
+                            SearchNode(
+                                url =
+                                    normalizeDirectoryUrl(
+                                        resolveSearchHref(
+                                            node.url,
+                                            entry.url
+                                        )
+                                    ),
+                                depth =
+                                    node.depth + 1
+                            )
+                        )
+                    }
+                }
+            }
+
+            if (
+                matches.size >= 24
+            ) {
+                break
+            }
+        }
+
+        return matches.values.toList()
+    }
+
+    private fun resolveSearchHref(
+        baseRaw: String,
+        hrefRaw: String
+    ): String {
+
+        val href =
+            hrefRaw.trim()
+
+        if (
+            href.startsWith(
+                "http://",
+                true
+            ) ||
+            href.startsWith(
+                "https://",
+                true
+            )
+        ) {
+            return href
+        }
+
+        return try {
+            URI(
+                normalizeDirectoryUrl(
+                    baseRaw
+                )
+            )
+                .resolve(
+                    href
+                )
+                .toString()
+        } catch (_: Exception) {
+            normalizeDirectoryUrl(
+                baseRaw
+            ) +
+                href.trimStart('/')
+        }
     }
 
     private fun buildSearchFallbackQuery(
@@ -2920,20 +3148,17 @@ class DhakaFTP : MainAPI() {
             }
     }
 
+
     private fun scoreSearchCandidate(
         query: String,
         candidate: String
     ): Int {
 
         val q =
-            normalizeSearchText(
-                query
-            )
+            normalizeSearchText(query)
 
         val c =
-            normalizeSearchText(
-                candidate
-            )
+            normalizeSearchText(candidate)
 
         if (
             q.isBlank() ||
@@ -2942,41 +3167,36 @@ class DhakaFTP : MainAPI() {
             return 0
         }
 
-        if (
-            c == q
-        ) {
-            return 7000
-        }
+        val compactQ =
+            compactSearchText(q)
 
-        if (
-            c.startsWith(
-                q
-            )
-        ) {
-            return 5800
-        }
+        val compactC =
+            compactSearchText(c)
 
+        if (c == q) return 9000
+        if (c.startsWith(q)) return 8200
+        if (c.contains(q)) return 7600
+
+        /*
+         * Separator-insensitive:
+         * Aqua Man / Aquaman / Aqua-Man / Aqua.Man
+         */
         if (
-            c.contains(
-                q
-            )
+            compactQ.length >= 3 &&
+            compactC.contains(compactQ)
         ) {
-            return 5000
+            return 7400
         }
 
         val qTokens =
-            q.split(
-                " "
-            ).filter {
-                it.isNotBlank()
-            }
+            q.split(" ")
+                .filter { it.isNotBlank() }
+                .distinct()
 
         val cTokens =
-            c.split(
-                " "
-            ).filter {
-                it.isNotBlank()
-            }
+            c.split(" ")
+                .filter { it.isNotBlank() }
+                .distinct()
 
         if (
             qTokens.isEmpty()
@@ -2984,15 +3204,12 @@ class DhakaFTP : MainAPI() {
             return 0
         }
 
-        var matched =
-            0
-
-        var total =
-            0
+        var matched = 0
+        var total = 0
 
         qTokens.forEach { token ->
 
-            val best =
+            val tokenBest =
                 cTokens.maxOfOrNull {
                     tokenSimilarityScore(
                         token,
@@ -3000,23 +3217,30 @@ class DhakaFTP : MainAPI() {
                     )
                 } ?: 0
 
+            val compactBest =
+                if (
+                    token.length >= 2
+                ) {
+                    tokenSimilarityScore(
+                        compactSearchText(token),
+                        compactC
+                    )
+                } else {
+                    0
+                }
+
+            val best =
+                maxOf(
+                    tokenBest,
+                    compactBest
+                )
+
             if (
                 best > 0
             ) {
                 matched++
-                total +=
-                    best
+                total += best
             }
-        }
-
-        /*
-         * For 3+ query words, at least two meaningful terms must match.
-         */
-        if (
-            qTokens.size >= 3 &&
-            matched < 2
-        ) {
-            return 0
         }
 
         if (
@@ -3029,18 +3253,38 @@ class DhakaFTP : MainAPI() {
             matched.toDouble() /
                 qTokens.size.toDouble()
 
-        return (
-            total *
-                (0.60 + coverage * 0.40)
-            ).toInt() +
-            if (
-                matched == qTokens.size
-            ) {
-                1000
-            } else {
-                0
-            }
+        var score =
+            (
+                total *
+                    (
+                        0.55 +
+                            coverage * 0.45
+                        )
+                ).toInt()
+
+        when {
+            matched == qTokens.size ->
+                score += 1800
+
+            matched >= 2 ->
+                score += 650
+        }
+
+        /*
+         * Multi-word search uses OR-style retrieval: a meaningful matching
+         * token is sufficient. For long queries, require at least two tokens
+         * to avoid unrelated fuzzy results.
+         */
+        if (
+            qTokens.size >= 4 &&
+            matched < 2
+        ) {
+            return 0
+        }
+
+        return score
     }
+
 
     private fun tokenSimilarityScore(
         query: String,
@@ -3048,50 +3292,53 @@ class DhakaFTP : MainAPI() {
     ): Int {
 
         if (
-            query == candidate
+            query.isBlank() ||
+            candidate.isBlank()
         ) {
-            return 1200
+            return 0
         }
 
         if (
-            candidate.startsWith(
-                query
-            )
+            query == candidate
+        ) return 1400
+
+        if (
+            candidate.startsWith(query)
+        ) return 1200
+
+        if (
+            candidate.contains(query)
+        ) return 1050
+
+        val cq =
+            compactSearchText(query)
+
+        val cc =
+            compactSearchText(candidate)
+
+        if (
+            cq.length >= 2 &&
+            cc.contains(cq)
         ) {
             return 1000
         }
 
         if (
-            candidate.contains(
-                query
-            )
-        ) {
-            return 900
-        }
-
-        /*
-         * User explicitly wants 2/3/4-character discovery.
-         */
-        if (
             query.length in 2..4
         ) {
             return if (
-                candidate.contains(
-                    query
-                )
+                candidate.contains(query) ||
+                    cc.contains(cq)
             ) {
-                850
+                900
             } else {
                 0
             }
         }
 
-        /*
-         * Typo tolerance for longer words.
-         */
         if (
-            query.length >= 5 &&
-            candidate.length >= 5
+            query.length >= 4 &&
+            candidate.length >= 4
         ) {
 
             val distance =
@@ -3101,18 +3348,24 @@ class DhakaFTP : MainAPI() {
                 )
 
             val allowed =
-                maxOf(
-                    2,
-                    query.length / 4
-                )
+                when {
+                    query.length <= 5 ->
+                        1
+
+                    query.length <= 8 ->
+                        2
+
+                    else ->
+                        3
+                }
 
             if (
                 distance <= allowed
             ) {
-                return 750 -
+                return 800 -
                     minOf(
-                        450,
-                        distance * 100
+                        500,
+                        distance * 120
                     )
             }
         }
@@ -6944,15 +7197,20 @@ class DhakaFTP : MainAPI() {
         return 0
     }
 
+
     private fun normalizeSearchText(
         value: String
     ): String {
 
         return decodeSafely(
             value
+                .replace('\u200B'.toString(), "")
+                .replace('\u200C'.toString(), "")
+                .replace('\u200D'.toString(), "")
+                .replace('\uFEFF'.toString(), "")
         )
             .lowercase(
-                Locale.getDefault()
+                Locale.ROOT
             )
             .replace(
                 "&",
@@ -6964,30 +7222,25 @@ class DhakaFTP : MainAPI() {
                 ),
                 " "
             )
-            .trim()
             .replace(
                 Regex(
                     "\\s+"
                 ),
                 " "
             )
+            .trim()
     }
 
-    /*
-     * Search-only compact normalization.
-     *
-     * Aquaman == Aqua Man == Aqua-Man
-     *
-     * Display titles are never modified by this helper.
-     */
+
     private fun compactSearchText(
         value: String
     ): String =
         normalizeSearchText(
             value
-        ).filter {
-            it.isLetterOrDigit()
-        }
+        )
+            .filter {
+                it.isLetterOrDigit()
+            }
 
     private fun levenshtein(
         a: String,
