@@ -405,18 +405,46 @@ class DhakaFTP : MainAPI() {
             page == 1
         ) {
 
+            /*
+             * FIRST SCREEN ISOLATION
+             *
+             * Use the proven bounded bootstrap path for the first six cards.
+             * It inspects only the newest useful branches and NEVER starts the
+             * full recursive scanner before the response is ready.
+             */
+            val kind =
+                detectKind(root)
+
             val first =
-                loadLazyCategory(
-                    root = root,
-                    requestedTotal = MOVIE_HOME_SIZE,
-                    kind = detectKind(root),
-                    firstBatch = true
-                )
+                kotlinx.coroutines.withTimeoutOrNull(
+                    maxOf(
+                        FAST_HOME_REQUEST_TIMEOUT_MS,
+                        2200L
+                    )
+                ) {
+                    getInitialGroups(
+                        root = root,
+                        limit =
+                            MOVIE_HOME_SIZE *
+                                2
+                    )
+                }?.take(
+                    MOVIE_HOME_SIZE
+                ).orEmpty()
 
             /*
-             * Background indexing is deliberately delayed. The user gets
-             * the first screen before the heavyweight recursive index can
-             * compete for LAN/CPU resources.
+             * Seed the persistent lazy cursor with what we already discovered.
+             * Page 2+ therefore continues from this partial result instead of
+             * throwing away the first-screen work.
+             */
+            primeLazyState(
+                root = root,
+                kind = kind,
+                groups = first
+            )
+
+            /*
+             * Full indexing remains strictly background work.
              */
             scope.launch {
                 kotlinx.coroutines.delay(
@@ -427,9 +455,7 @@ class DhakaFTP : MainAPI() {
 
             return newHomePageResponse(
                 request,
-                first.take(
-                    MOVIE_HOME_SIZE
-                ).map {
+                first.map {
                     toSearchResponse(it)
                 },
                 true
@@ -537,17 +563,49 @@ class DhakaFTP : MainAPI() {
                     LAZY_HOME_BATCH_SIZE
             }
 
-        val firstSource =
-            loadTvLazyCategory(
-                roots[0],
-                targetPerSource
-            )
+        val (firstSource, secondSource) =
+            kotlinx.coroutines.coroutineScope {
 
-        val secondSource =
-            loadTvLazyCategory(
-                roots[1],
-                targetPerSource
+                val first =
+                    async {
+                        loadTvLazyCategory(
+                            roots[0],
+                            targetPerSource
+                        )
+                    }
+
+                val second =
+                    async {
+                        loadTvLazyCategory(
+                            roots[1],
+                            targetPerSource
+                        )
+                    }
+
+                first.await() to
+                    second.await()
+            }
+
+        /*
+         * Keep the discovered Season cards inside their own source cache.
+         * Older Seasons remain searchable; homepage filtering is performed
+         * by latestSeasonPerShow().
+         */
+        if (firstSource.isNotEmpty()) {
+            primeLazyState(
+                root = roots[0],
+                kind = ContentKind.SERIES,
+                groups = firstSource
             )
+        }
+
+        if (secondSource.isNotEmpty()) {
+            primeLazyState(
+                root = roots[1],
+                kind = ContentKind.SERIES,
+                groups = secondSource
+            )
+        }
 
         if (
             page == 1
@@ -650,11 +708,179 @@ class DhakaFTP : MainAPI() {
         requestedTotal: Int
     ): List<FtpGroup> {
 
-        return loadLazyCategory(
-            root = root,
-            requestedTotal = requestedTotal,
-            kind = ContentKind.SERIES,
-            firstBatch = requestedTotal <= TV_SOURCE_BATCH * 2
+        val normalizedRoot =
+            normalizeDirectoryUrl(
+                root
+            )
+
+        /*
+         * TV requires explicit Season-card discovery. The generic movie/anime
+         * cursor cannot be used here because it would treat episode-containing
+         * folders as generic multi-file groups.
+         *
+         * fastTvBootstrap() is bounded to the newest branches only; it never
+         * performs a whole-library crawl for a homepage request.
+         */
+        val cached =
+            validCache(
+                normalizedRoot
+            )
+
+        if (
+            cached != null &&
+            cached.groups.size >= requestedTotal
+        ) {
+            return cached.groups
+                .sortedWith(
+                    groupComparator()
+                )
+                .take(requestedTotal)
+        }
+
+        val discovered =
+            kotlinx.coroutines.withTimeoutOrNull(
+                FAST_HOME_REQUEST_TIMEOUT_MS +
+                    if (
+                        requestedTotal >
+                            TV_HOME_SIZE
+                    ) {
+                        650L
+                    } else {
+                        0L
+                    }
+            ) {
+                fastTvBootstrap(
+                    normalizedRoot,
+                    maxOf(
+                        requestedTotal,
+                        TV_HOME_SIZE *
+                            2
+                    )
+                )
+            }.orEmpty()
+
+        if (
+            discovered.isNotEmpty()
+        ) {
+            updatePartialCache(
+                normalizedRoot,
+                discovered
+            )
+        }
+
+        return latestSeasonPerShow(
+            discovered
+        )
+            .sortedWith(
+                groupComparator()
+            )
+            .take(
+                requestedTotal
+            )
+    }
+
+    /*
+     * Seeds the per-category cursor with work already completed by the fast
+     * first-screen bootstrap. This is deliberately non-destructive:
+     * existing groups and cursor state are retained.
+     */
+    private suspend fun primeLazyState(
+        root: String,
+        kind: ContentKind,
+        groups: List<FtpGroup>
+    ) {
+
+        if (
+            groups.isEmpty()
+        ) {
+            return
+        }
+
+        val key =
+            normalizeDirectoryUrl(
+                root
+            )
+
+        val state =
+            lazyStates.computeIfAbsent(key) {
+                LazyCategoryState()
+            }
+
+        state.mutex.withLock {
+
+            if (
+                !state.initialized
+            ) {
+                state.initialized = true
+
+                /*
+                 * The root remains in the queue so scrolling can continue
+                 * deeper. Duplicate protection prevents already-discovered
+                 * cards from multiplying in the visible result.
+                 */
+                state.queue.add(
+                    CrawlNode(
+                        url = key,
+                        inheritedPoster = null,
+                        inheritedModifiedAt = null,
+                        collectionRoot = null,
+                        seasonHint = null
+                    )
+                )
+            }
+
+            val merged =
+                when (kind) {
+
+                    ContentKind.MOVIE ->
+                        deduplicateMovieGroups(
+                            state.groups +
+                                groups
+                        )
+
+                    ContentKind.ANIME ->
+                        deduplicateLazyGroups(
+                            state.groups +
+                                groups,
+                            kind
+                        )
+
+                    ContentKind.SERIES ->
+                        (state.groups + groups)
+                            .groupBy {
+                                normalizeDirectoryUrl(
+                                    it.url
+                                )
+                            }
+                            .values
+                            .mapNotNull {
+                                candidates ->
+                                candidates.maxWithOrNull(
+                                    compareByDescending<FtpGroup> {
+                                        it.modifiedAt
+                                    }.thenByDescending {
+                                        it.seasonNumber
+                                            ?: 0
+                                    }
+                                )
+                            }
+                            .sortedWith(
+                                groupComparator()
+                            )
+                }
+
+            state.groups.clear()
+            state.groups.addAll(
+                merged
+                    .sortedWith(
+                        groupComparator()
+                    )
+            )
+        }
+
+        updatePartialCache(
+            key,
+            groups
         )
     }
 
@@ -1436,38 +1662,43 @@ class DhakaFTP : MainAPI() {
         query: String
     ): List<NativeSearchResult> {
 
-        var hits =
-            nativeH5aiSearchHits(
-                root,
+        /*
+         * SEARCH VARIANTS
+         *
+         * A filesystem may contain:
+         *     Aqua Man
+         * while the user types:
+         *     Aquaman
+         *
+         * Or the opposite. h5ai's native matcher may not bridge that
+         * boundary, so we issue a very small bounded set of server-side
+         * queries and rank the union locally.
+         */
+        val variants =
+            buildSearchVariants(
                 query
             )
 
-        /*
-         * One bounded fallback keeps multi-word queries useful when a
-         * server-side matcher cannot find the entire phrase in a single
-         * filename/folder.
-         */
-        if (
-            hits.isEmpty()
-        ) {
-
-            val fallback =
-                buildSearchFallbackQuery(
-                    query
-                )
-
-            if (
-                fallback.isNotBlank() &&
-                fallback != query
-            ) {
-
-                hits =
-                    nativeH5aiSearchHits(
-                        root,
-                        fallback
-                    )
+        val hits =
+            kotlinx.coroutines.coroutineScope {
+                variants
+                    .take(4)
+                    .map { variant ->
+                        async {
+                            nativeH5aiSearchHits(
+                                root,
+                                variant
+                            )
+                        }
+                    }
+                    .awaitAll()
+                    .flatten()
+                    .distinctBy {
+                        it.href.lowercase(
+                            Locale.getDefault()
+                        )
+                    }
             }
-        }
 
         if (
             hits.isEmpty()
@@ -1654,6 +1885,98 @@ class DhakaFTP : MainAPI() {
             parentEntries,
             query
         )
+    }
+
+    /*
+     * Builds a small, deterministic set of server-side search terms.
+     *
+     * Examples:
+     *     "Aquaman"   -> aquaman, aqua
+     *     "Aqua Man"  -> aqua man, aquaman, aqua, man
+     *     "100Days"   -> 100days, 100d
+     *     "Aqua:Man"  -> aqua man, aquaman, aqua, man
+     *
+     * The local scorer later compares compact forms, so spacing differences
+     * do not change relevance.
+     */
+    private fun buildSearchVariants(
+        query: String
+    ): List<String> {
+
+        val normalized =
+            normalizeSearchText(
+                query
+            )
+
+        if (
+            normalized.isBlank()
+        ) {
+            return emptyList()
+        }
+
+        val compact =
+            compactSearchText(
+                normalized
+            )
+
+        val tokens =
+            normalized
+                .split(" ")
+                .filter {
+                    it.length >= 2
+                }
+                .take(3)
+
+        val result =
+            LinkedHashSet<String>()
+
+        result.add(
+            normalized
+        )
+
+        if (
+            compact.isNotBlank()
+        ) {
+            result.add(
+                compact
+            )
+        }
+
+        /*
+         * Prefix search bridges "Aquaman" -> "Aqua Man".
+         */
+        if (
+            compact.length >= 5
+        ) {
+            result.add(
+                compact.take(4)
+            )
+        }
+
+        tokens.forEach {
+            result.add(it)
+        }
+
+        return result
+            .filter {
+                it.isNotBlank()
+            }
+            .take(4)
+    }
+
+    private fun compactSearchText(
+        value: String
+    ): String {
+
+        return normalizeSearchText(
+            value
+        )
+            .replace(
+                Regex(
+                    "[^\p{L}\p{N}]"
+                ),
+                ""
+            )
     }
 
     private fun buildSearchFallbackQuery(
@@ -2498,41 +2821,56 @@ class DhakaFTP : MainAPI() {
             return 0
         }
 
+        val compactQ =
+            compactSearchText(q)
+
+        val compactC =
+            compactSearchText(c)
+
         if (
-            c == q
+            q == c
         ) {
             return 7000
         }
 
+        /*
+         * Spacing/punctuation-insensitive exact match.
+         *
+         * "Aquaman" == "Aqua Man"
+         * "Aqua-Man" == "Aqua Man"
+         */
         if (
-            c.startsWith(
-                q
-            )
+            compactQ ==
+            compactC
+        ) {
+            return 6800
+        }
+
+        if (
+            c.startsWith(q) ||
+            compactC.startsWith(compactQ)
         ) {
             return 5800
         }
 
         if (
-            c.contains(
-                q
-            )
+            c.contains(q) ||
+            compactC.contains(compactQ)
         ) {
-            return 5000
+            return 5200
         }
 
         val qTokens =
-            q.split(
-                " "
-            ).filter {
-                it.isNotBlank()
-            }
+            q.split(" ")
+                .filter {
+                    it.isNotBlank()
+                }
 
         val cTokens =
-            c.split(
-                " "
-            ).filter {
-                it.isNotBlank()
-            }
+            c.split(" ")
+                .filter {
+                    it.isNotBlank()
+                }
 
         if (
             qTokens.isEmpty()
@@ -2546,9 +2884,10 @@ class DhakaFTP : MainAPI() {
         var total =
             0
 
-        qTokens.forEach { token ->
+        qTokens.forEach {
+            token ->
 
-            val best =
+            val bestToken =
                 cTokens.maxOfOrNull {
                     tokenSimilarityScore(
                         token,
@@ -2556,18 +2895,37 @@ class DhakaFTP : MainAPI() {
                     )
                 } ?: 0
 
+            val compactToken =
+                compactSearchText(
+                    token
+                )
+
+            val compactBonus =
+                if (
+                    compactToken.length >= 3 &&
+                    compactC.contains(
+                        compactToken
+                    )
+                ) {
+                    850
+                } else {
+                    0
+                }
+
+            val best =
+                maxOf(
+                    bestToken,
+                    compactBonus
+                )
+
             if (
                 best > 0
             ) {
                 matched++
-                total +=
-                    best
+                total += best
             }
         }
 
-        /*
-         * For 3+ query words, at least two meaningful terms must match.
-         */
         if (
             qTokens.size >= 3 &&
             matched < 2
@@ -2587,10 +2945,15 @@ class DhakaFTP : MainAPI() {
 
         return (
             total *
-                (0.60 + coverage * 0.40)
+                (
+                    0.60 +
+                        coverage *
+                        0.40
+                    )
             ).toInt() +
             if (
-                matched == qTokens.size
+                matched ==
+                    qTokens.size
             ) {
                 1000
             } else {
@@ -6076,42 +6439,73 @@ class DhakaFTP : MainAPI() {
         groups: List<FtpGroup>
     ): List<FtpGroup> {
 
-        return groups
-            .groupBy {
-                canonicalGroupKey(it)
-            }
-            .values
-            .mapNotNull { candidates ->
+        if (
+            groups.isEmpty()
+        ) {
+            return emptyList()
+        }
 
-                /*
-                 * Only candidates with the exact same canonical key
-                 * reach this point. Therefore Dual Audio can safely
-                 * win without collapsing different resolutions.
-                 */
-                candidates.maxWithOrNull(
-                    compareByDescending<FtpGroup> {
-                        if (
-                            it.hasDualAudio
-                        ) {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                        .thenByDescending {
-                            it.maxResolution
-                        }
-                        .thenByDescending {
-                            it.maxSizeBytes
-                        }
-                        .thenByDescending {
-                            it.modifiedAt
-                        }
-                        .thenBy {
-                            it.url
-                        }
-                )
+        /*
+         * NEVER use one generic title-only key across all categories.
+         *
+         * Movie:
+         *     same folder may legitimately contain multiple differently
+         *     encoded videos. Resolution-aware duplicate logic decides
+         *     whether a file is a true duplicate.
+         *
+         * TV:
+         *     the Season URL is the identity of a Season card.
+         *
+         * Anime:
+         *     same physical folder is the duplicate scope.
+         */
+        val byKind =
+            groups.groupBy {
+                it.kind
             }
+
+        val movie =
+            deduplicateMovieGroups(
+                byKind[
+                    ContentKind.MOVIE
+                ].orEmpty()
+            )
+
+        val anime =
+            deduplicateLazyGroups(
+                byKind[
+                    ContentKind.ANIME
+                ].orEmpty(),
+                ContentKind.ANIME
+            )
+
+        val series =
+            byKind[
+                ContentKind.SERIES
+            ].orEmpty()
+                .groupBy {
+                    normalizeDirectoryUrl(
+                        it.url
+                    )
+                }
+                .values
+                .mapNotNull {
+                    candidates ->
+                    candidates.maxWithOrNull(
+                        compareByDescending<FtpGroup> {
+                            it.modifiedAt
+                        }.thenByDescending {
+                            it.seasonNumber
+                                ?: 0
+                        }
+                    )
+                }
+
+        return (
+            movie +
+                anime +
+                series
+        )
             .sortedWith(
                 groupComparator()
             )
