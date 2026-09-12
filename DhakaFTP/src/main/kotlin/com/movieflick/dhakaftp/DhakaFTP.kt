@@ -310,6 +310,10 @@ class DhakaFTP : MainAPI() {
     private val cache =
         ConcurrentHashMap<String, CacheEntry>()
 
+    /* Reuse posters already discovered for Season cards. */
+    private val posterCache =
+        ConcurrentHashMap<String, String>()
+
     private val scanJobs =
         ConcurrentHashMap<String, Deferred<List<FtpGroup>>>()
 
@@ -2343,6 +2347,19 @@ class DhakaFTP : MainAPI() {
         val directKind =
             detectKind(folder)
 
+        /* A Season URL is already the final logical content endpoint. */
+        if (
+            directKind != ContentKind.MOVIE &&
+            isSeasonDirectory(
+                getFolderTitle(folder)
+            )
+        ) {
+            return loadSeasonFolder(
+                folder,
+                directKind
+            )
+        }
+
         if (
             directKind == ContentKind.SERIES &&
             !isSeasonDirectory(
@@ -2965,299 +2982,206 @@ class DhakaFTP : MainAPI() {
         rootRaw: String,
         desired: Int
     ): List<FtpGroup> {
-
         val root = normalizeDirectoryUrl(rootRaw)
 
-        /*
-         * First request only: h5ai already exposes folder/file modification
-         * times in the listing. Use that metadata to decide what to inspect
-         * next instead of breadth-first crawling dozens of old branches.
-         */
-        val rootEntries =
-            safeDirectoryEntries(
-                root,
-                1400L
-            )
+        // One root listing, then at most eight latest candidate folders.
+        val rootEntries = safeDirectoryEntries(root, 900L)
+        if (rootEntries.isEmpty()) return emptyList()
 
-        if (rootEntries.isEmpty()) {
-            return emptyList()
-        }
-
-        val immediateVideos =
-            rootEntries.filter { it.isVideo }
-
-        if (immediateVideos.isNotEmpty()) {
+        val direct = rootEntries.filter { it.isVideo }
+        if (direct.isNotEmpty()) {
             val poster = pickPoster(rootEntries)
-            return immediateVideos.mapIndexed { index, entry ->
-                val video = makeVideo(
-                    entry,
-                    poster,
-                    null,
-                    index.toLong()
-                )
-                FtpGroup(
-                    title = getFolderTitle(root),
-                    url = video.url,
-                    posterUrl = poster,
-                    modifiedAt = video.modifiedAt,
-                    videos = listOf(video),
-                    kind = ContentKind.MOVIE
-                )
-            }.let { deduplicateMovieGroups(it).take(desired) }
+            return deduplicateMovieGroups(
+                direct.mapIndexed { index, entry ->
+                    val video = makeVideo(entry, poster, null, index.toLong())
+                    FtpGroup(
+                        title = getFolderTitle(root),
+                        url = video.url,
+                        posterUrl = poster,
+                        modifiedAt = video.modifiedAt,
+                        videos = listOf(video),
+                        kind = ContentKind.MOVIE
+                    )
+                }
+            ).take(desired)
         }
 
-        val candidateDirs =
-            rootEntries
-                .filter { it.isDirectory }
-                .sortedWith(
-                    compareByDescending<FtpEntry> {
-                        directoryPriority(it)
-                    }.thenByDescending {
-                        it.modifiedAt ?: 0L
-                    }
-                )
-                .take(24)
+        val candidates = rootEntries
+            .filter { it.isDirectory }
+            .sortedWith(
+                compareByDescending<FtpEntry> { it.modifiedAt ?: 0L }
+                    .thenByDescending { directoryPriority(it) }
+            )
+            .take(8)
 
-        val groups =
-            coroutineScope {
-                candidateDirs.map { child ->
-                    async {
-                        val childUrl =
-                            normalizeDirectoryUrl(child.url)
-                        val entries =
-                            safeDirectoryEntries(
-                                childUrl,
-                                1250L
-                            )
-                        val poster =
-                            pickPoster(entries)
-                        entries
-                            .filter { it.isVideo }
-                            .mapIndexed { index, entry ->
-                                val video = makeVideo(
-                                    entry,
-                                    poster,
-                                    null,
-                                    child.order * 10000L + index
-                                )
-                                FtpGroup(
-                                    title = getFolderTitle(childUrl),
-                                    url = video.url,
-                                    posterUrl = poster,
-                                    modifiedAt =
-                                        maxOf(
-                                            child.modifiedAt ?: 0L,
-                                            video.modifiedAt
-                                        ),
-                                    videos = listOf(video),
-                                    kind = ContentKind.MOVIE
-                                )
-                            }
+        val firstWave = coroutineScope {
+            candidates.map { child ->
+                async {
+                    val childUrl = normalizeDirectoryUrl(child.url)
+                    val entries = safeDirectoryEntries(childUrl, 800L)
+                    val poster = pickPoster(entries)
+                    entries.filter { it.isVideo }.mapIndexed { index, entry ->
+                        val video = makeVideo(
+                            entry,
+                            poster,
+                            null,
+                            child.order * 10000L + index
+                        )
+                        FtpGroup(
+                            title = getFolderTitle(childUrl),
+                            url = video.url,
+                            posterUrl = poster,
+                            modifiedAt = maxOf(child.modifiedAt ?: 0L, video.modifiedAt),
+                            videos = listOf(video),
+                            kind = ContentKind.MOVIE
+                        )
                     }
-                }.awaitAll().flatten()
-            }
-
-        if (groups.size >= desired) {
-            return deduplicateMovieGroups(groups)
-                .take(desired)
+                }
+            }.awaitAll().flatten()
         }
 
-        /*
-         * One additional targeted level only when the first level is made of
-         * grouping folders such as years/categories. This keeps the first
-         * screen fast while still finding deep movie folders.
-         */
-        val nestedDirs =
-            coroutineScope {
-                candidateDirs.map { child ->
-                    async {
-                        val childUrl = normalizeDirectoryUrl(child.url)
-                        val entries = safeDirectoryEntries(childUrl, 900L)
-                        entries.filter { it.isDirectory }
-                            .sortedWith(
-                                compareByDescending<FtpEntry> {
-                                    directoryPriority(it)
-                                }.thenByDescending {
-                                    it.modifiedAt ?: 0L
-                                }
-                            )
-                            .take(12)
-                    }
-                }.awaitAll().flatten()
-            }
+        val first = deduplicateMovieGroups(firstWave)
+        if (first.size >= desired) return first.take(desired)
 
-        val nestedGroups =
-            coroutineScope {
-                nestedDirs.map { child ->
-                    async {
-                        val childUrl = normalizeDirectoryUrl(child.url)
-                        val entries = safeDirectoryEntries(childUrl, 1050L)
-                        val poster = pickPoster(entries)
-                        entries.filter { it.isVideo }
-                            .mapIndexed { index, entry ->
-                                val video = makeVideo(
-                                    entry,
-                                    poster,
-                                    null,
-                                    child.order * 10000L + index
-                                )
-                                FtpGroup(
-                                    title = getFolderTitle(childUrl),
-                                    url = video.url,
-                                    posterUrl = poster,
-                                    modifiedAt =
-                                        maxOf(
-                                            child.modifiedAt ?: 0L,
-                                            video.modifiedAt
-                                        ),
-                                    videos = listOf(video),
-                                    kind = ContentKind.MOVIE
-                                )
-                            }
-                    }
-                }.awaitAll().flatten()
-            }
+        // Single fallback depth for Root -> Year/Group -> Movie.
+        val nested = coroutineScope {
+            candidates.map { parent ->
+                async {
+                    safeDirectoryEntries(
+                        normalizeDirectoryUrl(parent.url),
+                        700L
+                    )
+                        .filter { it.isDirectory }
+                        .sortedWith(
+                            compareByDescending<FtpEntry> { it.modifiedAt ?: 0L }
+                                .thenByDescending { directoryPriority(it) }
+                        )
+                        .take(6)
+                }
+            }.awaitAll().flatten()
+        }
 
-        return deduplicateMovieGroups(
-            groups + nestedGroups
-        ).take(desired)
+        if (nested.isEmpty()) return first.take(desired)
+
+        val secondWave = coroutineScope {
+            nested.map { child ->
+                async {
+                    val childUrl = normalizeDirectoryUrl(child.url)
+                    val entries = safeDirectoryEntries(childUrl, 750L)
+                    val poster = pickPoster(entries)
+                    entries.filter { it.isVideo }.mapIndexed { index, entry ->
+                        val video = makeVideo(
+                            entry,
+                            poster,
+                            null,
+                            child.order * 10000L + index
+                        )
+                        FtpGroup(
+                            title = getFolderTitle(childUrl),
+                            url = video.url,
+                            posterUrl = poster,
+                            modifiedAt = maxOf(child.modifiedAt ?: 0L, video.modifiedAt),
+                            videos = listOf(video),
+                            kind = ContentKind.MOVIE
+                        )
+                    }
+                }
+            }.awaitAll().flatten()
+        }
+
+        return deduplicateMovieGroups(first + secondWave).take(desired)
     }
 
-    /*
-     * FAST TV HOMEPAGE BOOTSTRAP
-     *
-     * Season folders become visible cards. Episode files are loaded only
-     * after the Season card is opened.
-     */
     private suspend fun fastTvBootstrap(
         rootRaw: String,
         desired: Int
     ): List<FtpGroup> {
-
         val root = normalizeDirectoryUrl(rootRaw)
-        val rootEntries = safeDirectoryEntries(root, 1400L)
+        val rootEntries = safeDirectoryEntries(root, 900L)
         if (rootEntries.isEmpty()) return emptyList()
 
-        val candidateDirs =
-            rootEntries
-                .filter { it.isDirectory }
-                .sortedWith(
-                    compareByDescending<FtpEntry> {
-                        directoryPriority(it)
-                    }.thenByDescending {
-                        it.modifiedAt ?: 0L
+        val candidates = rootEntries
+            .filter { it.isDirectory }
+            .sortedWith(
+                compareByDescending<FtpEntry> { it.modifiedAt ?: 0L }
+                    .thenByDescending { directoryPriority(it) }
+            )
+            .take(8)
+
+        // First pass: Root -> Show -> Season. Do not fetch Season contents.
+        val directSeasons = coroutineScope {
+            candidates.map { show ->
+                async {
+                    val showUrl = normalizeDirectoryUrl(show.url)
+                    val entries = safeDirectoryEntries(showUrl, 800L)
+                    val showPoster = pickPoster(entries)
+                    entries.filter {
+                        it.isDirectory && isSeasonDirectory(it.name)
+                    }.map { seasonEntry ->
+                        val seasonUrl = normalizeDirectoryUrl(seasonEntry.url)
+                        val season = extractSeasonNumber(seasonEntry.name) ?: 1
+                        if (showPoster != null) posterCache[seasonUrl] = showPoster
+                        FtpGroup(
+                            title = "${getFolderTitle(showUrl)} Season $season",
+                            url = seasonUrl,
+                            posterUrl = showPoster,
+                            modifiedAt = seasonEntry.modifiedAt ?: 0L,
+                            videos = emptyList(),
+                            kind = ContentKind.SERIES,
+                            isSeasonCard = true,
+                            seasonNumber = season
+                        )
                     }
-                )
-                .take(24)
-
-        val seasonCandidates =
-            coroutineScope {
-                candidateDirs.map { child ->
-                    async {
-                        val childUrl = normalizeDirectoryUrl(child.url)
-                        val entries = safeDirectoryEntries(childUrl, 1050L)
-                        val localPoster = pickPoster(entries)
-
-                        val seasons = entries.filter {
-                            it.isDirectory &&
-                                isSeasonDirectory(it.name)
-                        }
-
-                        if (seasons.isNotEmpty()) {
-                            seasons.map { seasonEntry ->
-                                val seasonUrl =
-                                    normalizeDirectoryUrl(seasonEntry.url)
-                                val seasonEntries =
-                                    safeDirectoryEntries(
-                                        seasonUrl,
-                                        900L
-                                    )
-                                val poster =
-                                    pickPoster(seasonEntries) ?: localPoster
-                                val season =
-                                    extractSeasonNumber(seasonEntry.name) ?: 1
-
-                                FtpGroup(
-                                    title =
-                                        "${getFolderTitle(childUrl)} Season $season",
-                                    url = seasonUrl,
-                                    posterUrl = poster,
-                                    modifiedAt =
-                                        seasonEntry.modifiedAt ?: 0L,
-                                    videos = emptyList(),
-                                    kind = ContentKind.SERIES,
-                                    isSeasonCard = true,
-                                    seasonNumber = season
-                                )
-                            }
-                        } else {
-                            emptyList()
-                        }
-                    }
-                }.awaitAll().flatten()
-            }
-
-        if (seasonCandidates.isNotEmpty()) {
-            return latestSeasonPerShow(
-                seasonCandidates
-            ).take(desired)
+                }
+            }.awaitAll().flatten()
         }
 
-        /*
-         * Second targeted level for layouts like:
-         * TV root -> group folder -> show folder -> Season.
-         */
-        val showDirs =
-            coroutineScope {
-                candidateDirs.map { child ->
-                    async {
-                        val childUrl = normalizeDirectoryUrl(child.url)
-                        val entries = safeDirectoryEntries(childUrl, 850L)
-                        entries.filter { it.isDirectory }
-                            .take(12)
+        if (directSeasons.isNotEmpty()) {
+            return latestSeasonPerShow(directSeasons).take(desired)
+        }
+
+        // Second pass only when needed: Root -> Group -> Show -> Season.
+        val showDirs = coroutineScope {
+            candidates.map { group ->
+                async {
+                    safeDirectoryEntries(
+                        normalizeDirectoryUrl(group.url),
+                        700L
+                    )
+                        .filter { it.isDirectory }
+                        .take(8)
+                }
+            }.awaitAll().flatten()
+        }
+
+        val nestedSeasons = coroutineScope {
+            showDirs.map { showEntry ->
+                async {
+                    val showUrl = normalizeDirectoryUrl(showEntry.url)
+                    val showEntries = safeDirectoryEntries(showUrl, 750L)
+                    val showPoster = pickPoster(showEntries)
+                    showEntries.filter {
+                        it.isDirectory && isSeasonDirectory(it.name)
+                    }.map { seasonEntry ->
+                        val seasonUrl = normalizeDirectoryUrl(seasonEntry.url)
+                        val season = extractSeasonNumber(seasonEntry.name) ?: 1
+                        if (showPoster != null) posterCache[seasonUrl] = showPoster
+                        FtpGroup(
+                            title = "${getFolderTitle(showUrl)} Season $season",
+                            url = seasonUrl,
+                            posterUrl = showPoster,
+                            modifiedAt = seasonEntry.modifiedAt ?: 0L,
+                            videos = emptyList(),
+                            kind = ContentKind.SERIES,
+                            isSeasonCard = true,
+                            seasonNumber = season
+                        )
                     }
-                }.awaitAll().flatten()
-            }
+                }
+            }.awaitAll().flatten()
+        }
 
-        val nestedSeasonCandidates =
-            coroutineScope {
-                showDirs.map { showEntry ->
-                    async {
-                        val showUrl = normalizeDirectoryUrl(showEntry.url)
-                        val showEntries = safeDirectoryEntries(showUrl, 950L)
-                        val showPoster = pickPoster(showEntries)
-
-                        showEntries.filter {
-                            it.isDirectory &&
-                                isSeasonDirectory(it.name)
-                        }.map { seasonEntry ->
-                            val seasonUrl = normalizeDirectoryUrl(seasonEntry.url)
-                            val seasonEntries =
-                                safeDirectoryEntries(seasonUrl, 850L)
-                            val season =
-                                extractSeasonNumber(seasonEntry.name) ?: 1
-
-                            FtpGroup(
-                                title =
-                                    "${getFolderTitle(showUrl)} Season $season",
-                                url = seasonUrl,
-                                posterUrl =
-                                    pickPoster(seasonEntries) ?: showPoster,
-                                modifiedAt =
-                                    seasonEntry.modifiedAt ?: 0L,
-                                videos = emptyList(),
-                                kind = ContentKind.SERIES,
-                                isSeasonCard = true,
-                                seasonNumber = season
-                            )
-                        }
-                    }
-                }.awaitAll().flatten()
-            }
-
-        return latestSeasonPerShow(
-            nestedSeasonCandidates
-        ).take(desired)
+        return latestSeasonPerShow(nestedSeasons).take(desired)
     }
 
     private suspend fun scanLatestGroups(
@@ -4019,7 +3943,9 @@ class DhakaFTP : MainAPI() {
 
         queue.addLast(root to 0)
 
-        while (queue.isNotEmpty()) {
+        var visitedCount = 0
+
+        while (queue.isNotEmpty() && visitedCount < 32) {
 
             val (current, depth) =
                 queue.removeFirst()
@@ -4028,10 +3954,12 @@ class DhakaFTP : MainAPI() {
                 continue
             }
 
+            visitedCount++
+
             val entries =
                 safeDirectoryEntries(
                     current,
-                    SEARCH_DIRECTORY_TIMEOUT_MS
+                    800L
                 )
 
             entries
@@ -4045,7 +3973,7 @@ class DhakaFTP : MainAPI() {
                         candidates.add(
                             child to (entry.modifiedAt ?: 0L)
                         )
-                    } else if (depth < 10) {
+                    } else if (depth < 5) {
                         queue.addLast(
                             child to (depth + 1)
                         )
@@ -4103,14 +4031,13 @@ class DhakaFTP : MainAPI() {
             getFolderTitle(showRoot)
 
         val poster =
-            pickPoster(seasonEntries)
-                ?: safeDirectoryEntries(
-                    showRoot,
-                    900L
-                ).let(::pickPoster)
-                ?: findNearestPosterFast(
-                    showRoot
-                )
+            posterCache[seasonFolder]
+                ?: pickPoster(seasonEntries)
+                ?: posterCache[showRoot]
+
+        if (poster != null) {
+            posterCache[seasonFolder] = poster
+        }
 
         val directVideos =
             seasonEntries
