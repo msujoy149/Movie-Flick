@@ -245,7 +245,8 @@ class DhakaFTP : MainAPI() {
             get() =
                 when (kind) {
                     ContentKind.SERIES ->
-                        videos.size > 1 ||
+                        isSeasonCard ||
+                            videos.size > 1 ||
                             videos.any {
                                 it.season != null ||
                                     it.episode != null
@@ -630,29 +631,64 @@ class DhakaFTP : MainAPI() {
             combined.size <= offset
         ) {
 
-            val quick =
+            val sourceSkip =
+                offset / TV_SOURCE_BATCH
+
+            val quickFast =
                 coroutineScope {
 
                     val a =
                         async {
-                            scanLatestGroups(
+                            fastTvBootstrap(
                                 roots[0],
-                                offset +
-                                    TV_HOME_SIZE
+                                TV_SOURCE_BATCH,
+                                sourceSkip
                             )
                         }
 
                     val b =
                         async {
-                            scanLatestGroups(
+                            fastTvBootstrap(
                                 roots[1],
-                                offset +
-                                    TV_HOME_SIZE
+                                TV_SOURCE_BATCH,
+                                sourceSkip
                             )
                         }
 
                     a.await() to
                         b.await()
+                }
+
+            val quick =
+                if (
+                    quickFast.first.isNotEmpty() ||
+                    quickFast.second.isNotEmpty()
+                ) {
+                    quickFast
+                } else {
+                    coroutineScope {
+
+                        val a =
+                            async {
+                                scanLatestGroups(
+                                    roots[0],
+                                    offset +
+                                        TV_HOME_SIZE
+                                )
+                            }
+
+                        val b =
+                            async {
+                                scanLatestGroups(
+                                    roots[1],
+                                    offset +
+                                        TV_HOME_SIZE
+                                )
+                            }
+
+                        a.await() to
+                            b.await()
+                    }
                 }
 
             if (
@@ -3145,7 +3181,7 @@ class DhakaFTP : MainAPI() {
         val rootEntries =
             safeDirectoryEntries(
                 root,
-                800L
+                900L
             )
 
         if (
@@ -3159,6 +3195,10 @@ class DhakaFTP : MainAPI() {
                 root
             )
 
+        /*
+         * Cheapest possible path:
+         * files are already directly under the requested category.
+         */
         val directVideos =
             rootEntries.filter {
                 it.isVideo
@@ -3167,31 +3207,34 @@ class DhakaFTP : MainAPI() {
         if (
             directVideos.isNotEmpty()
         ) {
-
             return normalizeQuickBootstrapGroups(
                 buildGroupsFromVideoEntries(
-                    folderUrl = root,
-                    entries = directVideos,
-                    poster = pickPoster(rootEntries),
-                    kind = kind
+                    folderUrl =
+                        root,
+                    entries =
+                        directVideos
+                            .sortedByDescending {
+                                it.modifiedAt ?: 0L
+                            }
+                            .take(
+                                desired
+                            ),
+                    poster =
+                        pickPoster(rootEntries),
+                    kind =
+                        kind
                 )
             ).take(desired)
         }
 
         /*
-         * IMPORTANT:
+         * Inspect a SMALL number of newest/highest-priority root branches.
          *
-         * Do NOT fan out into 3 root branches + 8 nested branches.
-         * That was the reason each Home section could keep waiting.
-         *
-         * We select only ONE best root branch:
-         *   1) exact 2023
-         *   2) newest numbered year
-         *   3) latest modification time
-         *
-         * Then inspect only that branch's newest leaf folders.
+         * This is intentionally multi-lane rather than "pick one branch".
+         * English Movies in particular can contain multiple year/wrapper
+         * branches; one empty branch must not make the whole category vanish.
          */
-        val bestRoot =
+        val rootDirs =
             rootEntries
                 .filter {
                     it.isDirectory
@@ -3199,103 +3242,176 @@ class DhakaFTP : MainAPI() {
                 .sortedWith(
                     homepageDirectoryComparator()
                 )
-                .firstOrNull()
-                ?: return emptyList()
-
-        val bestUrl =
-            normalizeDirectoryUrl(
-                bestRoot.url
-            )
-
-        val bestEntries =
-            safeDirectoryEntries(
-                bestUrl,
-                900L
-            )
+                .take(3)
 
         if (
-            bestEntries.isEmpty()
+            rootDirs.isEmpty()
         ) {
             return emptyList()
-        }
-
-        val bestPoster =
-            pickPoster(
-                bestEntries
-            )
-
-        val directAtBest =
-            bestEntries.filter {
-                it.isVideo
-            }
-
-        if (
-            directAtBest.isNotEmpty()
-        ) {
-            return normalizeQuickBootstrapGroups(
-                buildGroupsFromVideoEntries(
-                    folderUrl = bestUrl,
-                    entries = directAtBest,
-                    poster = bestPoster,
-                    kind = kind
-                )
-            ).take(desired)
         }
 
         /*
-         * One leaf wave only. Six leaf requests are enough to make a
-         * six-card first screen while keeping the request budget bounded.
+         * Pass 1:
+         * root -> wrapper/show/year -> direct videos.
          */
-        val leaves =
-            bestEntries
-                .filter {
-                    it.isDirectory
-                }
-                .sortedWith(
-                    homepageDirectoryComparator()
-                )
-                .take(
-                    maxOf(
-                        desired,
-                        6
-                    )
-                )
-
-        if (
-            leaves.isEmpty()
-        ) {
-            return emptyList()
-        }
-
-        val fetched =
+        val firstWave =
             coroutineScope {
-                leaves.map {
-                    leaf ->
+                rootDirs.map {
+                    branch ->
                     async {
 
-                        val leafUrl =
+                        val branchUrl =
                             normalizeDirectoryUrl(
-                                leaf.url
+                                branch.url
                             )
 
                         val entries =
                             safeDirectoryEntries(
-                                leafUrl,
-                                1000L
+                                branchUrl,
+                                950L
                             )
 
                         val poster =
                             pickPoster(
                                 entries
-                            ) ?: bestPoster
+                            )
+
+                        val direct =
+                            entries.filter {
+                                it.isVideo
+                            }
+
+                        val directGroups =
+                            buildGroupsFromVideoEntries(
+                                folderUrl =
+                                    branchUrl,
+                                entries =
+                                    direct
+                                        .sortedByDescending {
+                                            it.modifiedAt
+                                                ?: 0L
+                                        }
+                                        .take(
+                                            desired
+                                        ),
+                                poster =
+                                    poster,
+                                kind =
+                                    kind
+                            )
+
+                        /*
+                         * If the branch itself is not a leaf, expose its
+                         * highest-priority child directories for pass 2.
+                         */
+                        val children =
+                            if (
+                                direct.isEmpty()
+                            ) {
+                                entries
+                                    .filter {
+                                        it.isDirectory
+                                    }
+                                    .sortedWith(
+                                        homepageDirectoryComparator()
+                                    )
+                                    .take(4)
+                            } else {
+                                emptyList()
+                            }
+
+                        Triple(
+                            directGroups,
+                            children,
+                            poster
+                        )
+                    }
+                }.awaitAll()
+            }
+
+        val firstGroups =
+            firstWave
+                .flatMap {
+                    it.first
+                }
+
+        val firstNormalized =
+            normalizeQuickBootstrapGroups(
+                firstGroups
+            )
+
+        if (
+            firstNormalized.size >= desired
+        ) {
+            return firstNormalized.take(
+                desired
+            )
+        }
+
+        /*
+         * Pass 2:
+         * root -> wrapper -> movie folder -> video.
+         *
+         * Only a handful of children are opened, in parallel.
+         */
+        val childCandidates =
+            firstWave
+                .flatMap {
+                    it.second
+                }
+                .distinctBy {
+                    normalizeDirectoryUrl(
+                        it.url
+                    )
+                }
+                .sortedWith(
+                    homepageDirectoryComparator()
+                )
+                .take(
+                    8
+                )
+
+        if (
+            childCandidates.isEmpty()
+        ) {
+            return firstNormalized.take(
+                desired
+            )
+        }
+
+        val secondWave =
+            coroutineScope {
+                childCandidates.map {
+                    child ->
+                    async {
+
+                        val childUrl =
+                            normalizeDirectoryUrl(
+                                child.url
+                            )
+
+                        val entries =
+                            safeDirectoryEntries(
+                                childUrl,
+                                1050L
+                            )
+
+                        val poster =
+                            pickPoster(
+                                entries
+                            )
 
                         buildGroupsFromVideoEntries(
                             folderUrl =
-                                leafUrl,
+                                childUrl,
                             entries =
                                 entries.filter {
                                     it.isVideo
-                                },
+                                }.sortedByDescending {
+                                    it.modifiedAt ?: 0L
+                                }.take(
+                                    desired
+                                ),
                             poster =
                                 poster,
                             kind =
@@ -3307,16 +3423,14 @@ class DhakaFTP : MainAPI() {
             }
 
         return normalizeQuickBootstrapGroups(
-            fetched
-        ).take(desired)
+            firstGroups +
+                secondWave
+        )
+            .take(
+                desired
+            )
     }
 
-    /*
-     * Build homepage groups from a set of real video entries.
-     *
-     * Movie categories keep every file as an individual card.
-     * Anime becomes episode-style only when the folder has 3+ videos.
-     */
     private fun buildGroupsFromVideoEntries(
         folderUrl: String,
         entries: List<FtpEntry>,
@@ -3483,7 +3597,8 @@ class DhakaFTP : MainAPI() {
 
     private suspend fun fastTvBootstrap(
         rootRaw: String,
-        desired: Int
+        desired: Int,
+        skipCandidates: Int = 0
     ): List<FtpGroup> {
         val root = normalizeDirectoryUrl(rootRaw)
         val rootEntries = safeDirectoryEntries(root, 900L)
@@ -3493,6 +3608,9 @@ class DhakaFTP : MainAPI() {
             .filter { it.isDirectory }
             .sortedWith(
                 homepageDirectoryComparator()
+            )
+            .drop(
+                skipCandidates.coerceAtLeast(0)
             )
             .take(3)
 
@@ -5670,118 +5788,140 @@ class DhakaFTP : MainAPI() {
     ): String {
 
         /*
-         * Movie / anime single-item cards:
-         *
-         * title + resolution are the duplicate identity.
-         *
-         * Dual Audio is intentionally NOT part of the key, because
-         * the Dual Audio copy must replace the non-Dual-Audio copy
-         * when everything else is the same.
-         *
-         * Resolution IS part of the key, so 720p and 1080p are never
-         * collapsed into one item.
+         * TV / Season cards are intentionally NOT deduplicated here.
+         * Their homepage collapsing is handled separately by
+         * latestSeasonPerShow()/collapseLatestTvAcrossSources().
          */
         if (
-            group.kind != ContentKind.SERIES &&
-            group.videos.size == 1
+            group.kind == ContentKind.SERIES
+        ) {
+            return group.kind.name +
+                ":TV:" +
+                normalizeDirectoryUrl(
+                    group.url
+                )
+        }
+
+        if (
+            group.videos.isEmpty()
+        ) {
+            return group.kind.name +
+                ":EMPTY:" +
+                normalizeDirectoryUrl(
+                    group.url
+                )
+        }
+
+        val video =
+            group.videos.first()
+
+        /*
+         * Anime:
+         * duplicate boundary remains the PHYSICAL FOLDER.
+         * Different folders with the same title must remain visible.
+         */
+        if (
+            group.kind == ContentKind.ANIME
         ) {
 
-            val video =
-                group.videos.first()
-
-            /*
-             * Anime duplicates are scoped to the physical containing folder.
-             * Same title in a different folder must remain visible.
-             */
             if (
-                group.kind == ContentKind.ANIME
+                group.videos.size >= 3
             ) {
-                val physicalFolder =
+                return "ANIME-SERIES:" +
                     normalizeDirectoryUrl(
-                        video.url.substringBeforeLast(
-                            "/"
-                        )
+                        group.url
                     )
-
-                val base =
-                    normalizeSearchText(
-                        video.title
-                    )
-                        .replace(
-                            Regex(
-                                "(?i)\\bdual\\s*audio\\b"
-                            ),
-                            " "
-                        )
-                        .replace(
-                            Regex(
-                                "(?i)\\bmulti\\s*audio\\b"
-                            ),
-                            " "
-                        )
-                        .replace(
-                            Regex(
-                                "\\s+"
-                            ),
-                            " "
-                        )
-                        .trim()
-
-                return "ANIME:" +
-                    physicalFolder +
-                    ":" +
-                    base +
-                    ":R" +
-                    video.resolution
             }
 
-            val base =
-                normalizeSearchText(
+            return "ANIME:" +
+                normalizeDirectoryUrl(
+                    video.url
+                        .substringBeforeLast(
+                            "/"
+                        )
+                ) +
+                ":" +
+                logicalMovieVariantKey(
                     video.title
-                )
-                    .replace(
-                        Regex(
-                            "(?i)\\bdual\\s*audio\\b"
-                        ),
-                        " "
-                    )
-                    .replace(
-                        Regex(
-                            "(?i)\\bmulti\\s*audio\\b"
-                        ),
-                        " "
-                    )
-                    .replace(
-                        Regex(
-                            "(?i)\\s+"
-                        ),
-                        " "
-                    )
-                    .trim()
-
-            return group.kind.name +
-                ":MOVIE:" +
-                base +
+                ) +
                 ":R" +
                 video.resolution
         }
 
         /*
-         * Series/show identity is intentionally conservative.
-         * Same title coming from two separate source paths is not
-         * treated as a duplicate automatically.
+         * MOVIE:
+         * - same logical title + same resolution -> one card
+         * - Dual Audio wins that duplicate
+         * - 720p vs 1080p remain separate
+         *
+         * Technical release tags are stripped from the comparison so
+         * slightly different filenames for the same uploaded movie still
+         * converge.
          */
-        return group.kind.name +
-            ":SERIES:" +
-            normalizeSearchText(
+        return "MOVIE:" +
+            logicalMovieVariantKey(
                 group.title
+                    .ifBlank {
+                        video.title
+                    }
             ) +
             ":" +
-            normalizeSearchText(
-                group.url
-            )
+            logicalMovieVariantKey(
+                video.title
+            ) +
+            ":R" +
+            video.resolution
     }
 
+    private fun logicalMovieVariantKey(
+        value: String
+    ): String {
+
+        return compactSearchText(
+            normalizeSearchText(
+                value
+            )
+        )
+            .replace(
+                Regex(
+                    "(?i)\\b(2160|1440|1080|720|576|480)\\s*p\\b"
+                ),
+                ""
+            )
+            .replace(
+                Regex(
+                    "(?i)\\b(x264|x265|h264|h265|hevc|av1|10bit|8bit|hdr10|hdr|sd)\\b"
+                ),
+                ""
+            )
+            .replace(
+                Regex(
+                    "(?i)\\b(bluray|blu\\s*ray|web\\s*-?\\s*dl|web\\s*-?\\s*rip|webrip|hdrip|brrip|dvdrip|hdtv|hdcam|hcx|camrip)\\b"
+                ),
+                ""
+            )
+            .replace(
+                Regex(
+                    "(?i)\\b(dual|multi)\\s*audio\\b"
+                ),
+                ""
+            )
+            .replace(
+                Regex(
+                    "\\b(5\\.1|7\\.1|2\\.0|aac2?\\.?\\d*|ddp?\\d*|ac3|dts|truehd)\\b"
+                ),
+                ""
+            )
+            .replace(
+                Regex(
+                    "\\d+(?:\\.\\d+)?\\s*(?:gb|mb|mbps|gbps)\\b"
+                ),
+                ""
+            )
+            .filter {
+                it.isLetterOrDigit()
+            }
+    }
 
     private fun findFolderModifiedTime(
         entries: List<FtpEntry>,
