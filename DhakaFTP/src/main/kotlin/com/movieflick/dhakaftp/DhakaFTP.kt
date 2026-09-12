@@ -637,6 +637,27 @@ class DhakaFTP : MainAPI() {
      * It performs only enough directory requests to reach the requested
      * number of cards. The cursor survives between page 1/page 2/page 3.
      */
+    /*
+     * TV wrapper for the same persistent lazy cursor used by the other
+     * categories. Keeping this as a thin adapter is intentional:
+     * - TV keeps its own per-root cursor/state.
+     * - page 1 uses the small first batch.
+     * - later pages continue the same cursor.
+     * - no full recursive scan is performed just to render the homepage.
+     */
+    private suspend fun loadTvLazyCategory(
+        root: String,
+        requestedTotal: Int
+    ): List<FtpGroup> {
+
+        return loadLazyCategory(
+            root = root,
+            requestedTotal = requestedTotal,
+            kind = ContentKind.SERIES,
+            firstBatch = requestedTotal <= TV_SOURCE_BATCH * 2
+        )
+    }
+
     private suspend fun loadLazyCategory(
         root: String,
         requestedTotal: Int,
