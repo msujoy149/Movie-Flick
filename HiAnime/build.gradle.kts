@@ -24,12 +24,12 @@ cloudstream {
     authors = listOf("Movie-Flick")
     status = 1
     tvTypes = listOf(
-        "Anime",
         "Movie",
-        "TvSeries"
+        "TvSeries",
+        "Anime"
     )
     language = "en"
-    iconUrl = "https://hianime.at/theme/images/logo.png"
+    iconUrl = "https://hianime.at/theme/images/icons-192.png"
     isCrossPlatform = true
 }
 
