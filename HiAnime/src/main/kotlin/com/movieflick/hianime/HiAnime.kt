@@ -55,6 +55,34 @@ class HiAnime : MainAPI() {
             ?.trim()
             .orEmpty()
 
+    private fun isMediaUrl(url: String): Boolean {
+        val value = url
+            .trim()
+            .lowercase(Locale.ROOT)
+            .substringBefore("#")
+
+        if (
+            !value.startsWith("http://") &&
+            !value.startsWith("https://")
+        ) {
+            return false
+        }
+
+        val path = value.substringBefore("?")
+
+        return path.endsWith(".m3u8") ||
+            path.endsWith(".mp4") ||
+            path.endsWith(".m3u") ||
+            path.endsWith(".mpd") ||
+            path.endsWith(".webm") ||
+            path.endsWith(".m4v") ||
+            path.endsWith(".mov") ||
+            path.endsWith(".mkv") ||
+            path.contains("/hls/") ||
+            path.contains("/dash/") ||
+            path.contains(".m3u8/")
+    }
+
     private fun cleanTitle(value: String?): String =
         cleanText(value)
             .replace(
