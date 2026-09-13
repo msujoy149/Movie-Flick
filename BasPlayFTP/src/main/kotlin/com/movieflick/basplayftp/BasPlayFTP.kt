@@ -526,7 +526,12 @@ class BasPlayFTP : MainAPI() {
             // tview.php page contains the real <video><source> and may establish
             // cookies/session state needed by the media request. Keep the exact
             // data-src as a fallback so the source is never lost.
-            val data = "basplay:episode:${encodeToken(episodePage)}:${encodeToken(playable)}"
+            // Store the episode's own direct media URL as the primary playback
+            // payload. BAS PLAY already exposes a real data-src for every episode,
+            // so play must use that exact file just like working movie playback.
+            // Keep the tview page as a fallback for sources that do not expose
+            // data-src in a future site layout.
+            val data = "basplay:episode:${encodeToken(playable)}:${encodeToken(episodePage)}"
 
             episodes += newEpisode(data) {
                 name = text
@@ -564,27 +569,28 @@ class BasPlayFTP : MainAPI() {
             input.startsWith("basplay:episode:") -> {
                 val payload = input.substringAfter("basplay:episode:")
                 val parts = payload.split(":", limit = 2)
-                val episodePage = decodeToken(parts.getOrNull(0).orEmpty())
-                val directFallback = decodeToken(parts.getOrNull(1).orEmpty())
+                val directMedia = decodeToken(parts.getOrNull(0).orEmpty())
+                val episodePage = decodeToken(parts.getOrNull(1).orEmpty())
 
-                val resolved = if (episodePage.isNotBlank()) {
-                    resolvePlayableFromPage(episodePage, callback)
-                } else {
-                    false
-                }
-
-                if (resolved) true else if (directFallback.isNotBlank()) {
+                // Primary path: use the exact per-episode data-src captured from
+                // BAS PLAY. This mirrors the working Movie implementation and
+                // avoids making playback depend on re-parsing the tview page.
+                if (directMedia.isNotBlank() && isPlayableMedia(directMedia)) {
                     val referer = canonicalTvReferer(episodePage.ifBlank { mainUrl })
                     emitMedia(
-                        directFallback,
+                        directMedia,
                         referer,
-                        tvMediaHeaders(referer),
+                        mediaHeaders(referer),
                         callback
                     )
-                    true
-                } else {
-                    false
+                    return true
                 }
+
+                // Fallback only when a future BAS PLAY page stops exposing data-src.
+                if (episodePage.isNotBlank()) {
+                    return resolvePlayableFromPage(episodePage, callback)
+                }
+                return false
             }
         }
 
@@ -814,14 +820,17 @@ class BasPlayFTP : MainAPI() {
         }
 
         val isTvMedia = referer.contains("tview.php", true) || clean.contains("/TV%20", true)
-        val inferredType = if (isTvMedia && type == ExtractorLinkType.VIDEO) null else type
 
+        // Use the same VIDEO link type for direct .mkv/.mp4 playback in TV and
+        // Movies. The Movie path is already proven to work in CloudStream, and
+        // leaving the type explicit avoids handing a null/ambiguous MIME hint to
+        // Media3 for TV episodes.
         callback(
             newExtractorLink(
                 source = name,
                 name = if (isTvMedia) "Bas Play TV" else "Bas Play Direct",
                 url = clean,
-                type = inferredType
+                type = type
             ) {
                 this.referer = referer
                 this.headers = headers
