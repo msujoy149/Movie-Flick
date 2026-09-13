@@ -455,72 +455,76 @@ class HiAnime : MainAPI() {
             "$mainUrl/"
         )
 
-        return document
-            .select(
-                "a.ssl-item[href], " +
-                    "a.ep-item[href], " +
-                    "#episodes-content a[href]"
-            )
-            .mapNotNull { link ->
-                val href = link.attr("href").trim()
-                val id = link.attr("data-id").trim()
+        val links = document.select(
+            "a.ssl-item[data-id][href], " +
+                "a.ep-item[data-id][href], " +
+                "#episodes-content a[data-id][href]"
+        )
 
-                if (href.isBlank() || id.isBlank()) {
-                    return@mapNotNull null
-                }
+        /*
+         * HiAnime's episode-list response is authoritative: every returned
+         * anchor has its own data-id and href. We never manufacture missing
+         * episodes from a numeric count.
+         */
+        return links.mapNotNull { link ->
+            val episodeId = link.attr("data-id").trim()
+            val href = link.attr("href").trim()
 
-                val number =
-                    link.attr("data-number")
-                        .toIntOrNull()
-                        ?: link.attr("data-episode-number")
-                            .toIntOrNull()
-                        ?: Regex(
-                            """(?:episode|ep\.?)\s*(\d+)""",
-                            RegexOption.IGNORE_CASE
-                        )
-                            .find(
-                                cleanText(
-                                    link.attr("title").ifBlank {
-                                        link.text()
-                                    }
-                                )
+            if (episodeId.isBlank() || href.isBlank()) {
+                return@mapNotNull null
+            }
+
+            val number =
+                link.attr("data-number").toIntOrNull()
+                    ?: link.attr("data-episode-number").toIntOrNull()
+                    ?: Regex(
+                        """(?:episode|ep\.?)\s*(\d+)""",
+                        RegexOption.IGNORE_CASE
+                    )
+                        .find(
+                            cleanText(
+                                link.attr("title").ifBlank {
+                                    link.text()
+                                }
                             )
-                            ?.groupValues
-                            ?.getOrNull(1)
-                            ?.toIntOrNull()
+                        )
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        ?.toIntOrNull()
 
-                val title = cleanText(
-                    link.attr("title").ifBlank {
-                        link.selectFirst(
-                            ".ep-name, .e-dynamic-name"
-                        )?.text().orEmpty()
-                    }.ifBlank {
-                        link.text()
-                    }
-                ).ifBlank {
-                    number?.let { "Episode $it" } ?: "Episode"
+            val title = cleanText(
+                link.selectFirst(
+                    ".ep-name.e-dynamic-name, " +
+                        ".ep-name, " +
+                        ".e-dynamic-name"
+                )?.text().orEmpty()
+            ).ifBlank {
+                cleanText(link.attr("title"))
+            }.ifBlank {
+                cleanText(link.text())
+            }.ifBlank {
+                number?.let { "Episode $it" } ?: "Episode"
+            }
+
+            newEpisode(
+                absoluteUrl(href)
+            ) {
+                name = title
+                episode = number
+                season = seasonNumber
+
+                // Save the exact site-provided episode ID.
+                data = "${absoluteUrl(href)}||$episodeId"
+            }
+        }
+            .distinctBy { it.data }
+            .sortedWith(
+                compareBy<Episode> {
+                    it.season ?: seasonNumber
+                }.thenBy {
+                    it.episode ?: Int.MAX_VALUE
                 }
-
-                newEpisode(
-                    absoluteUrl(href)
-                ) {
-                    name = title
-                    episode = number
-                    season = seasonNumber
-
-                    /*
-                     * Keep the exact episode id. It is required by the
-                     * fresh server/source resolver in loadLinks().
-                     */
-                    data = "${absoluteUrl(href)}||$id"
-                }
-            }
-            .distinctBy {
-                "${it.season ?: seasonNumber}:${it.episode}:${it.data}"
-            }
-            .sortedBy {
-                it.episode ?: Int.MAX_VALUE
-            }
+            )
     }
 
     private suspend fun getEpisodesFromApi(
@@ -528,23 +532,53 @@ class HiAnime : MainAPI() {
         seasonNumber: Int = 1,
         referer: String = "$mainUrl/"
     ): List<Episode> {
+
         val url = "$mainUrl/ajax/v2/episode/list/$animeId"
+
+        val requestHeaders = pageHeaders + mapOf(
+            "Referer" to referer,
+            "Accept" to "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With" to "XMLHttpRequest"
+        )
 
         val response = runCatching {
             app.get(
                 url,
-                headers = pageHeaders + mapOf(
-                    "Referer" to referer,
-                    "X-Requested-With" to "XMLHttpRequest"
-                )
+                headers = requestHeaders
             )
         }.getOrNull() ?: return emptyList()
 
-        val json = runCatching {
-            JSONObject(response.text)
-        }.getOrNull() ?: return emptyList()
+        val raw = response.text.trim()
+        if (raw.isBlank()) return emptyList()
 
-        val html = json.optString("html")
+        /*
+         * Normal response:
+         *   {"html":"<a class=\"ssl-item\" data-id=\"...\">...</a>"}
+         *
+         * Some deployments/API wrappers may return a different top-level
+         * JSON object, so first try the normal JSON "html" field, then scan
+         * the decoded object text for an HTML-looking fragment.
+         */
+        val html = runCatching {
+            JSONObject(raw)
+                .optString("html")
+                .takeIf { it.isNotBlank() }
+        }.getOrNull()
+            ?: runCatching {
+                JSONObject(raw)
+                    .keys()
+                    .asSequence()
+                    .mapNotNull { key ->
+                        JSONObject(raw).optString(key)
+                            .takeIf { value ->
+                                value.contains("ssl-item") ||
+                                    value.contains("data-id")
+                            }
+                    }
+                    .firstOrNull()
+            }.getOrNull()
+            ?: ""
+
         if (html.isBlank()) return emptyList()
 
         return parseEpisodeItems(
@@ -553,27 +587,18 @@ class HiAnime : MainAPI() {
         )
     }
 
-    private suspend fun getEpisodesFromApi(
-        animeId: String
-    ): List<Episode> {
-        val url = "$mainUrl/ajax/v2/episode/list/$animeId"
+    private fun episodeCountFromDocument(
+        document: Document
+    ): Int? {
+        val candidates = listOf(
+            document.selectFirst(".film-stats .tick-eps")?.text(),
+            document.selectFirst(".tick-eps")?.text(),
+            document.selectFirst(".fd-infor .tick-eps")?.text()
+        )
 
-        val response = runCatching {
-            app.get(
-                url,
-                headers = pageHeaders + mapOf(
-                    "Referer" to "$mainUrl/"
-                )
-            )
-        }.getOrNull() ?: return emptyList()
-
-        val json = runCatching {
-            JSONObject(response.text)
-        }.getOrNull() ?: return emptyList()
-
-        val html = json.optString("html")
-
-        return parseEpisodeItems(html)
+        return candidates
+            .mapNotNull { cleanText(it).toIntOrNull() }
+            .firstOrNull { it > 0 }
     }
 
     override suspend fun load(
@@ -693,29 +718,33 @@ class HiAnime : MainAPI() {
                 .substringBefore("?ep=")
                 .substringBefore("&ep=")
 
-            /*
-             * Determine the visible season from the "other-season" list.
-             * When unavailable, use season 1.
-             */
             val seasonNumber =
                 document
                     .selectFirst(
                         ".other-season .os-item.active .title"
                     )
                     ?.text()
-                    ?.let { textValue ->
+                    ?.let { seasonText ->
                         Regex(
                             """Season\s+(\d+)""",
                             RegexOption.IGNORE_CASE
                         )
-                            .find(textValue)
+                            .find(seasonText)
                             ?.groupValues
                             ?.getOrNull(1)
                             ?.toIntOrNull()
                     }
                     ?: 1
 
-            val episodes =
+            val expectedCount =
+                episodeCountFromDocument(document)
+
+            /*
+             * The episode-list endpoint is the source of truth for the
+             * individual episode IDs. The page's .tick-eps is only used as
+             * a validation check.
+             */
+            var episodes =
                 getEpisodesFromApi(
                     animeId = animeId,
                     seasonNumber = seasonNumber,
@@ -723,31 +752,48 @@ class HiAnime : MainAPI() {
                 )
 
             /*
-             * If the API is temporarily unavailable, keep the current
-             * episode as a TV episode rather than downgrading the page
-             * to a Movie. This preserves the correct CloudStream type.
+             * Retry once with a clean referer when the first AJAX request was
+             * intercepted or returned incomplete HTML.
              */
-            val finalEpisodes =
-                if (episodes.isNotEmpty()) {
-                    episodes
-                } else if (currentEpisodeId != null) {
-                    listOf(
-                        newEpisode(canonical) {
-                            name = "Episode ${episodeNumber ?: 1}"
-                            episode = episodeNumber ?: 1
-                            season = seasonNumber
-                            data = "$canonical||$currentEpisodeId"
-                        }
+            if (
+                episodes.isEmpty() ||
+                (
+                    expectedCount != null &&
+                        episodes.size < expectedCount
                     )
-                } else {
-                    emptyList()
-                }
+            ) {
+                episodes =
+                    getEpisodesFromApi(
+                        animeId = animeId,
+                        seasonNumber = seasonNumber,
+                        referer = pageUrl
+                    )
+            }
+
+            /*
+             * Do NOT create fake Episode 1 when the endpoint fails.
+             * That was the reason the previous build showed only one episode.
+             *
+             * If the site says 25 episodes but the API does not return the
+             * corresponding 25 episode records, we refuse to invent the
+             * missing IDs and return no TV series response rather than display
+             * incorrect episode data.
+             */
+            if (
+                episodes.isEmpty() ||
+                (
+                    expectedCount != null &&
+                        episodes.size != expectedCount
+                    )
+            ) {
+                return null
+            }
 
             return newTvSeriesLoadResponse(
                 title,
                 seriesUrl,
                 TvType.TvSeries,
-                finalEpisodes
+                episodes
             ) {
                 posterUrl = poster
                 this.plot = plot
