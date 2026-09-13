@@ -80,7 +80,12 @@ class HiAnime : MainAPI() {
             path.endsWith(".mkv") ||
             path.contains("/hls/") ||
             path.contains("/dash/") ||
-            path.contains(".m3u8/")
+            path.contains(".m3u8/") ||
+            value.contains("hls2.aniwatchtv.uk/") &&
+                (
+                    value.contains("/master.m3u8") ||
+                        value.contains("/index.m3u8")
+                )
     }
 
     private fun cleanTitle(value: String?): String =
@@ -1035,11 +1040,18 @@ class HiAnime : MainAPI() {
                 TvType.Anime
             }
 
+        /*
+         * IMPORTANT:
+         * Keep the original watch URL (including ?ep=...) as the playback data.
+         * Movie pages on HiAnime are backed by an internal episode/source id even
+         * though the CloudStream UI must remain a Movie. Dropping ?ep=... here
+         * makes loadLinks() lose the exact playable source id.
+         */
         return newMovieLoadResponse(
             title,
             canonical,
             pageType,
-            canonical
+            rawPageUrl
         ) {
             posterUrl = poster
             this.plot = plot
@@ -1423,6 +1435,7 @@ class HiAnime : MainAPI() {
 
     private suspend fun getEpisodeSources(
         serverId: String,
+        episodeId: String,
         referer: String
     ): List<String> {
         /*
@@ -1434,11 +1447,11 @@ class HiAnime : MainAPI() {
          * routing over time.
          */
         val endpoints = listOf(
+            "$mainUrl/api/theme/episode/sources?serverId=$serverId&episodeId=$episodeId",
+            "$mainUrl/api/theme/episode/source?serverId=$serverId&episodeId=$episodeId",
+            "$mainUrl/api/theme/episode/sources?id=$serverId&episodeId=$episodeId",
+            "$mainUrl/api/theme/episode/source?id=$serverId&episodeId=$episodeId",
             "$mainUrl/ajax/v2/episode/sources?id=$serverId",
-            "$mainUrl/api/theme/episode/sources?id=$serverId",
-            "$mainUrl/api/theme/episode/source?id=$serverId",
-            "$mainUrl/api/theme/episode/source?serverId=$serverId",
-            "$mainUrl/api/theme/episode/sources?serverId=$serverId",
             "$mainUrl/ajax/v2/episode/sources?serverId=$serverId"
         ).distinct()
 
@@ -1841,6 +1854,12 @@ class HiAnime : MainAPI() {
          */
         val episodeId =
             storedEpisodeId
+                ?: episodeIdFromUrl(pageData)
+                ?: watchResponse.document
+                    .selectFirst("[data-episode-id]")
+                    ?.attr("data-episode-id")
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
                 ?: watchResponse.document
                     .selectFirst("#ani_detail[data-id]")
                     ?.attr("data-id")
@@ -1898,6 +1917,7 @@ class HiAnime : MainAPI() {
         for (server in orderedServers) {
             val sources = getEpisodeSources(
                 serverId = server.id,
+                episodeId = episodeId,
                 referer = pageUrl
             )
 
