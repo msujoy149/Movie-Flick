@@ -11,7 +11,7 @@ import java.net.URLEncoder
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
-import android.util.Base64
+import java.util.Base64
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -1567,7 +1567,7 @@ class HiAnime : MainAPI() {
         encrypted: String
     ): String? {
         return runCatching {
-            val all = Base64.decode(encrypted, Base64.DEFAULT)
+            val all = Base64.getDecoder().decode(encrypted)
             if (all.size <= 16) return null
 
             val salt = all.copyOfRange(0, 16)
