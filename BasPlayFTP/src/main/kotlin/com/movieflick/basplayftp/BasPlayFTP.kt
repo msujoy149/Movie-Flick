@@ -64,12 +64,16 @@ class BasPlayFTP : MainAPI() {
     )
 
     private fun pageHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.9",
-        "Cache-Control" to "no-cache",
-        "Pragma" to "no-cache",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "Accept" to "*/*",
+        "Accept-Encoding" to "identity;q=1, *;q=0",
+        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
         "Referer" to referer
+    )
+
+    private data class PageFetch(
+        val document: Document,
+        val responseHeaders: Map<String, String> = emptyMap()
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -181,7 +185,7 @@ class BasPlayFTP : MainAPI() {
         val selectors = if (forceSeries) {
             ".cp-card, .movie-card, a[href*='tview.php']"
         } else {
-            ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='player.php'], a[href*='download.php']"
+            ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='player.php']"
         }
 
         val items = parseItems(
@@ -489,15 +493,11 @@ class BasPlayFTP : MainAPI() {
                 ?: extractSeasonNumber("$seriesUrl", seriesUrl)
                 ?: 1
 
-            val data = if (playable.isNotBlank()) {
-                // Keep the exact source present on BAS PLAY. This is the source
-                // used by the website itself for this episode.
-                "basplay:direct:${encodeToken(playable)}"
-            } else {
-                // For pages that do not expose a direct source in the list,
-                // resolve the episode page at playback time.
-                "basplay:episode:${encodeToken(episodePage)}"
-            }
+            // Always resolve an episode page at playback time. BAS PLAY's
+            // tview.php page contains the real <video><source> and may establish
+            // cookies/session state needed by the media request. Keep the exact
+            // data-src as a fallback so the source is never lost.
+            val data = "basplay:episode:${encodeToken(episodePage)}:${encodeToken(playable)}"
 
             episodes += newEpisode(data) {
                 name = text
@@ -523,7 +523,7 @@ class BasPlayFTP : MainAPI() {
             input.startsWith("basplay:direct:") -> {
                 val media = decodeToken(input.substringAfter("basplay:direct:"))
                 if (media.isBlank()) return false
-                emitMedia(media, mainUrl, callback)
+                emitMedia(media, mainUrl, mediaHeaders(mainUrl), callback)
                 return true
             }
 
@@ -533,13 +533,33 @@ class BasPlayFTP : MainAPI() {
             }
 
             input.startsWith("basplay:episode:") -> {
-                val episodePage = decodeToken(input.substringAfter("basplay:episode:"))
-                return resolvePlayableFromPage(episodePage, callback)
+                val payload = input.substringAfter("basplay:episode:")
+                val parts = payload.split(":", limit = 2)
+                val episodePage = decodeToken(parts.getOrNull(0).orEmpty())
+                val directFallback = decodeToken(parts.getOrNull(1).orEmpty())
+
+                val resolved = if (episodePage.isNotBlank()) {
+                    resolvePlayableFromPage(episodePage, callback)
+                } else {
+                    false
+                }
+
+                if (resolved) true else if (directFallback.isNotBlank()) {
+                    emitMedia(
+                        directFallback,
+                        episodePage.ifBlank { mainUrl },
+                        mediaHeaders(episodePage.ifBlank { mainUrl }),
+                        callback
+                    )
+                    true
+                } else {
+                    false
+                }
             }
         }
 
         if (isMediaUrl(input) && !isTrailerUrl(input)) {
-            emitMedia(input, mainUrl, callback)
+            emitMedia(input, mainUrl, mediaHeaders(mainUrl), callback)
             return true
         }
 
@@ -554,13 +574,85 @@ class BasPlayFTP : MainAPI() {
         pageUrl: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = getDocument(pageUrl) ?: return false
+        val normalized = pageUrl.trim()
+        if (normalized.isBlank()) return false
 
+        // Movie detail pages (view.php) do not contain the actual media source.
+        // Their real WATCH NOW target is player.php?id=..., which is what the
+        // browser opens before requesting the .mkv file.
+        if (normalized.contains("view.php", true)) {
+            val detail = getPage(normalized) ?: return false
+            val playerUrls = linkedSetOf<String>()
+
+            detail.document.select("a[href*='player.php']").forEach { a ->
+                val href = a.attr("href").trim()
+                if (href.isNotBlank()) {
+                    playerUrls += absoluteUrl(href, normalized)
+                }
+            }
+
+            // Defensive fallback for detail pages where the watch button is
+            // generated without a normal anchor in the parsed HTML.
+            if (playerUrls.isEmpty()) {
+                val id = Regex("[?&]id=(\\d+)", RegexOption.IGNORE_CASE)
+                    .find(normalized)?.groupValues?.getOrNull(1)
+                if (!id.isNullOrBlank()) {
+                    playerUrls += "$BASE_URL/player.php?id=$id"
+                }
+            }
+
+            for (playerUrl in playerUrls) {
+                if (resolvePlayableFromPlayerPage(playerUrl, normalized, callback)) {
+                    return true
+                }
+            }
+
+            // Some pages can expose a source directly even when the primary
+            // WATCH NOW link is unavailable.
+            if (resolvePlayableDocument(detail.document, normalized, detail.responseHeaders, callback)) {
+                return true
+            }
+
+            return false
+        }
+
+        val page = getPage(normalized) ?: return false
+        return resolvePlayableDocument(
+            page.document,
+            normalized,
+            page.responseHeaders,
+            callback
+        )
+    }
+
+    private suspend fun resolvePlayableFromPlayerPage(
+        playerUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val page = getPage(playerUrl) ?: return false
+        return resolvePlayableDocument(
+            page.document,
+            playerUrl,
+            page.responseHeaders,
+            callback,
+            preferredReferer = playerUrl.ifBlank { referer }
+        )
+    }
+
+    private suspend fun resolvePlayableDocument(
+        document: Document,
+        pageUrl: String,
+        responseHeaders: Map<String, String>,
+        callback: (ExtractorLink) -> Unit,
+        preferredReferer: String = pageUrl
+    ): Boolean {
         val mediaCandidates = linkedSetOf<String>()
 
-        // 1) DOM source/video tags — highest confidence.
+        // Highest-confidence source: the actual HTML5 video source used by
+        // BAS PLAY's browser player.
         document.select(
-            "video source[src], video[src], source[src], source[data-src], " +
+            "video source[src], video source[data-src], video[src], source[src], source[data-src], " +
                 "[data-src], [data-video], [data-file], [data-url], [data-source], " +
                 "[data-stream], [data-video-url], [data-manifest]"
         ).forEach { element ->
@@ -576,14 +668,13 @@ class BasPlayFTP : MainAPI() {
                 element.attr("data-manifest")
             ).forEach { value ->
                 val absolute = absoluteUrl(value, pageUrl)
-                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute)) {
-                    mediaCandidates.add(absolute)
+                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
+                    mediaCandidates += absolute
                 }
             }
         }
 
-        // 2) Player JavaScript fallback. This deliberately extracts the current
-        // URL/token from the page at playback time instead of hard-coding one.
+        // Player JS fallback. This catches sources assigned dynamically.
         val html = document.html()
             .replace("\\/", "/")
             .replace("\\u002F", "/")
@@ -593,23 +684,24 @@ class BasPlayFTP : MainAPI() {
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
 
-        val directRegex = Regex(
-            """(?i)(?:https?://|/|\.\.?/)[^\"'<>\s]+\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^\"'<>\s]*)?"""
-        )
-        directRegex.findAll(html).forEach {
-            val absolute = absoluteUrl(it.value, pageUrl)
-            if (isPlayableMedia(absolute) && !isTrailerUrl(absolute)) mediaCandidates.add(absolute)
+        Regex(
+            """(?i)(?:https?://|/|\.\.?/)[^"'<>\s]+\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^"'<>\s]*)?"""
+        ).findAll(html).forEach { match ->
+            val absolute = absoluteUrl(match.value, pageUrl)
+            if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
+                mediaCandidates += absolute
+            }
         }
 
-        val keyRegex = Regex(
-            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl|manifest|hls|dash)\s*[:=]\s*[\"']([^\"']+)[\"']"""
-        )
-        keyRegex.findAll(html).forEach {
-            val absolute = absoluteUrl(it.groupValues[1], pageUrl)
-            if (isPlayableMedia(absolute) && !isTrailerUrl(absolute)) mediaCandidates.add(absolute)
+        Regex(
+            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl|manifest|hls|dash)\s*[:=]\s*["']([^"']+)["']"""
+        ).findAll(html).forEach { match ->
+            val absolute = absoluteUrl(match.groupValues[1], pageUrl)
+            if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
+                mediaCandidates += absolute
+            }
         }
 
-        // 3) Prefer the actual player source, never Trailer/teaser/sample/download-only.
         val selected = mediaCandidates
             .filterNot(::isTrailerUrl)
             .filterNot(::isDownloadOnlyUrl)
@@ -617,13 +709,54 @@ class BasPlayFTP : MainAPI() {
             .firstOrNull()
             ?: return false
 
-        emitMedia(selected, pageUrl, callback)
+        val cookieHeader = cookieHeaderFromResponse(responseHeaders)
+        val headers = mediaHeaders(preferredReferer, cookieHeader).toMutableMap()
+
+        // BAS PLAY's browser media request uses a byte-range request together
+        // with the current media ETag. Preserve that validator when available;
+        // ExoPlayer will still control the Range header itself.
+        runCatching {
+            val probe = app.head(
+                selected,
+                headers = headers,
+                referer = preferredReferer
+            )
+            probe.headers["ETag"]?.takeIf { it.isNotBlank() }?.let {
+                headers["If-Range"] = it
+            }
+        }
+
+        emitMedia(selected, preferredReferer, headers, callback)
         return true
+    }
+
+    private fun mediaHeaders(
+        referer: String,
+        cookieHeader: String? = null
+    ): Map<String, String> {
+        val headers = linkedMapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+            "Accept" to "*/*",
+            "Accept-Encoding" to "identity;q=1, *;q=0",
+            "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+            "Referer" to referer
+        )
+        if (!cookieHeader.isNullOrBlank()) headers["Cookie"] = cookieHeader
+        return headers
+    }
+
+    private fun cookieHeaderFromResponse(headers: Map<String, String>): String? {
+        val raw = headers.entries.firstOrNull { it.key.equals("Set-Cookie", true) }?.value ?: return null
+        val cookies = raw.split(Regex("(?i)(?<=\\;)\\s*(?=[A-Za-z0-9_!%.-]+=)"))
+            .map { it.substringBefore(';').trim() }
+            .filter { it.contains('=') }
+        return cookies.joinToString("; ").ifBlank { null }
     }
 
     private suspend fun emitMedia(
         mediaUrl: String,
         referer: String,
+        headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit
     ) {
         val clean = mediaUrl.substringBefore("#").trim()
@@ -634,14 +767,6 @@ class BasPlayFTP : MainAPI() {
             lower.endsWith(".m3u8") -> ExtractorLinkType.M3U8
             lower.endsWith(".mpd") -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
-        }
-
-        // BAS PLAY serves the media from the same private HTTP host as the page.
-        // Keep the browser-like request headers and the originating page referer
-        // on the ExtractorLink so Android/ExoPlayer receives the same request
-        // context as the website player.
-        val headers = pageHeaders(referer).toMutableMap().apply {
-            this["Accept"] = "video/*,application/octet-stream;q=0.9,*/*;q=0.8"
         }
 
         callback(
@@ -688,7 +813,7 @@ class BasPlayFTP : MainAPI() {
         return score
     }
 
-    private suspend fun getDocument(url: String): Document? {
+    private suspend fun getPage(url: String): PageFetch? {
         val normalized = url.trim()
         if (normalized.isBlank()) return null
 
@@ -701,13 +826,19 @@ class BasPlayFTP : MainAPI() {
         }
 
         for (candidate in candidates) {
-            val document = runCatching {
-                app.get(candidate, headers = pageHeaders(candidate)).document
+            val page = runCatching {
+                val response = app.get(candidate, headers = pageHeaders(candidate))
+                PageFetch(
+                    document = response.document,
+                    responseHeaders = response.headers
+                )
             }.getOrNull()
-            if (document != null) return document
+            if (page != null) return page
         }
         return null
     }
+
+    private suspend fun getDocument(url: String): Document? = getPage(url)?.document
 
     private fun pagedUrl(base: String, page: Int): String {
         val clean = base.substringBefore("#")
@@ -867,7 +998,6 @@ class BasPlayFTP : MainAPI() {
         if (lower.contains("#")) return false
         return lower.contains("tview.php") ||
             lower.contains("player.php") ||
-            lower.contains("download.php") ||
             lower.contains("view.php")
     }
 
