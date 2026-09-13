@@ -408,51 +408,33 @@ class HiAnime : MainAPI() {
     private fun animeIdFromDocument(
         document: Document
     ): String? {
-        /*
-         * HiAnime exposes the parent anime id in several places depending
-         * on whether we are on the series page or an episode/watch page.
-         *
-         * The supplied source explicitly contains:
-         *   <div id="ani_detail" data-anime-id="240" ...>
-         *   <div class="anis-content" data-anime-id="240">
-         *
-         * Newer pages may also expose it through syncData.
-         */
-        document
-            .selectFirst("#ani_detail[data-anime-id]")
-            ?.attr("data-anime-id")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
+        val selectors = listOf(
+            "#ani_detail[data-anime-id]",
+            ".anis-content[data-anime-id]",
+            "[data-anime-id]"
+        )
 
-        document
-            .selectFirst(".anis-content[data-anime-id]")
-            ?.attr("data-anime-id")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-
-        document
-            .selectFirst("[data-anime-id]")
-            ?.attr("data-anime-id")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
+        for (selector in selectors) {
+            document
+                .selectFirst(selector)
+                ?.attr("data-anime-id")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
 
         /*
-         * Some HiAnime implementations expose the same id in a JSON
-         * script named syncData.
+         * Standard HiAnime watch pages also expose:
+         * <script id="syncData">{"anime_id":"..." ...}</script>
          */
-        val syncData = document
-            .selectFirst("script#syncData")
-            ?.data()
-            ?.trim()
+        document.select("script").forEach { script ->
+            val raw = script.data().trim()
+            if (raw.isBlank()) return@forEach
 
-        if (!syncData.isNullOrBlank()) {
             val match = Regex(
-                """"(?:anime_id|animeId|anime-id)"\s*:\s*"?(\d+)"?""",
+                """"anime_id"\s*:\s*"?(\d+)"?""",
                 RegexOption.IGNORE_CASE
-            ).find(syncData)
+            ).find(raw)
 
             match
                 ?.groupValues
@@ -493,14 +475,10 @@ class HiAnime : MainAPI() {
         val links = document.select(
             "a.ssl-item[data-id][href], " +
                 "a.ep-item[data-id][href], " +
+                "a[data-id][href*='/watch/'], " +
                 "#episodes-content a[data-id][href]"
         )
 
-        /*
-         * HiAnime's episode-list response is authoritative: every returned
-         * anchor has its own data-id and href. We never manufacture missing
-         * episodes from a numeric count.
-         */
         return links.mapNotNull { link ->
             val episodeId = link.attr("data-id").trim()
             val href = link.attr("href").trim()
@@ -532,7 +510,7 @@ class HiAnime : MainAPI() {
                     ".ep-name.e-dynamic-name, " +
                         ".ep-name, " +
                         ".e-dynamic-name"
-                )?.text().orEmpty()
+                )?.text()
             ).ifBlank {
                 cleanText(link.attr("title"))
             }.ifBlank {
@@ -547,8 +525,6 @@ class HiAnime : MainAPI() {
                 name = title
                 episode = number
                 season = seasonNumber
-
-                // Save the exact site-provided episode ID.
                 data = "${absoluteUrl(href)}||$episodeId"
             }
         }
@@ -562,19 +538,126 @@ class HiAnime : MainAPI() {
             )
     }
 
+    private fun episodesFromJson(
+        rawJson: String,
+        seasonNumber: Int
+    ): List<Episode> {
+        val result = ArrayList<Episode>()
+
+        val json = runCatching {
+            org.json.JSONObject(rawJson)
+        }.getOrNull() ?: return result
+
+        fun readArray(obj: org.json.JSONObject): org.json.JSONArray? {
+            val direct = obj.optJSONArray("episodes")
+            if (direct != null) return direct
+
+            val data = obj.optJSONObject("data")
+            data?.optJSONArray("episodes")?.let { return it }
+
+            val resultObj = obj.optJSONObject("result")
+            resultObj?.optJSONArray("episodes")?.let { return it }
+
+            return null
+        }
+
+        val array = readArray(json) ?: return result
+
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+
+            val id = item.optString(
+                "id",
+                item.optString(
+                    "episodeId",
+                    item.optString("episode_id")
+                )
+            ).trim()
+
+            if (id.isBlank()) continue
+
+            val number =
+                item.optInt(
+                    "number",
+                    item.optInt(
+                        "episodeNumber",
+                        item.optInt("episode_number", index + 1)
+                    )
+                )
+
+            val title =
+                cleanText(
+                    item.optString(
+                        "title",
+                        item.optString(
+                            "name",
+                            "Episode $number"
+                        )
+                    )
+                ).ifBlank {
+                    "Episode $number"
+                }
+
+            val href =
+                item.optString(
+                    "href",
+                    item.optString("url")
+                ).trim().ifBlank {
+                    null
+                }
+
+            val episodeUrl = if (href != null) {
+                absoluteUrl(href)
+            } else {
+                /*
+                 * Some API wrappers return the episode id but not href.
+                 * Only build the canonical watch URL when the response also
+                 * supplies a usable anime slug/path elsewhere.
+                 */
+                continue
+            }
+
+            result += newEpisode(episodeUrl) {
+                name = title
+                episode = number
+                season = seasonNumber
+                data = "$episodeUrl||$id"
+            }
+        }
+
+        return result
+            .distinctBy { it.data }
+            .sortedBy { it.episode ?: Int.MAX_VALUE }
+    }
+
     private suspend fun getEpisodesFromApi(
         animeId: String,
         seasonNumber: Int = 1,
         referer: String = "$mainUrl/"
     ): List<Episode> {
 
+        /*
+         * The HTML source supplied for hianime.at exposes both:
+         *   window.hianime_ajax.rest_url
+         *   window.hianime_ep_ajax.rest_url
+         * and the page loads watch.min.js.
+         *
+         * The deployed site is not guaranteed to expose the old hianime.to
+         * AJAX paths unchanged, so try the standard endpoint first and then
+         * the site's /api/theme/ REST-style variants.
+         */
         val endpoints = listOf(
             "$mainUrl/ajax/v2/episode/list/$animeId",
-            "$mainUrl/ajax/v2/episode/list?id=$animeId"
+            "$mainUrl/api/theme/episode/list/$animeId",
+            "$mainUrl/api/theme/episodes/$animeId",
+            "$mainUrl/api/theme/anime/$animeId/episodes",
+            "$mainUrl/api/theme/episode/list?anime_id=$animeId",
+            "$mainUrl/api/theme/episodes?anime_id=$animeId"
         ).distinct()
 
         val headers = pageHeaders + mapOf(
             "Referer" to referer,
+            "Origin" to mainUrl,
             "Accept" to "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With" to "XMLHttpRequest"
         )
@@ -590,13 +673,22 @@ class HiAnime : MainAPI() {
             val raw = response.text.trim()
             if (raw.isBlank()) continue
 
+            /*
+             * First: an HTML fragment returned by the classical HiAnime
+             * episode endpoint.
+             */
             val htmlCandidates = linkedSetOf<String>()
 
             runCatching {
-                val json = JSONObject(raw)
+                val json = org.json.JSONObject(raw)
 
                 json.optString("html")
                     .takeIf { it.isNotBlank() }
+                    ?.let { htmlCandidates.add(it) }
+
+                json.optJSONObject("data")
+                    ?.optString("html")
+                    ?.takeIf { it.isNotBlank() }
                     ?.let { htmlCandidates.add(it) }
 
                 json.keys().forEach { key ->
@@ -616,11 +708,6 @@ class HiAnime : MainAPI() {
                 }
             }
 
-            /*
-             * A few deployments can return the HTML fragment with a JSON
-             * content type. Accept it as-is when it already contains episode
-             * anchors.
-             */
             if (
                 raw.contains(
                     "ssl-item",
@@ -640,6 +727,19 @@ class HiAnime : MainAPI() {
                     return episodes
                 }
             }
+
+            /*
+             * Second: some API wrappers return a JSON array of episode
+             * objects instead of the HTML fragment.
+             */
+            val jsonEpisodes = episodesFromJson(
+                rawJson = raw,
+                seasonNumber = seasonNumber
+            )
+
+            if (jsonEpisodes.isNotEmpty()) {
+                return jsonEpisodes
+            }
         }
 
         return emptyList()
@@ -648,13 +748,21 @@ class HiAnime : MainAPI() {
     override suspend fun load(
         url: String
     ): LoadResponse? {
-        val pageUrl = absoluteUrl(
+        val rawPageUrl = absoluteUrl(
             url.substringBefore("||").trim()
         )
 
+        val pageUrl = rawPageUrl
+            .substringBefore("#")
+            .let { value ->
+                value
+                    .substringBefore("?ep=")
+                    .substringBefore("&ep=")
+            }
+
         val response = runCatching {
             app.get(
-                pageUrl,
+                rawPageUrl,
                 headers = pageHeaders + mapOf(
                     "Referer" to "$mainUrl/"
                 )
@@ -758,9 +866,7 @@ class HiAnime : MainAPI() {
             isTvPage &&
             animeId != null
         ) {
-            val seriesUrl = canonical
-                .substringBefore("?ep=")
-                .substringBefore("&ep=")
+            val seriesUrl = pageUrl
 
             val seasonNumber =
                 document
