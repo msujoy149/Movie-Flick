@@ -131,23 +131,19 @@ class HiAnime : MainAPI() {
 
         val text = cleanText(
             element
-                ?.selectFirst(".fd-infor, .film-stats, .fdi-item")
+                ?.selectFirst(".fd-infor, .film-stats, .fdi-item, .item")
                 ?.text()
         ).uppercase(Locale.ROOT)
 
         return when {
             text.contains("MOVIE") ||
-                path.contains("/movie") ->
+                path.matches(
+                    Regex(""".*/movie/.*""")
+                ) ->
                 TvType.Movie
 
             text.contains("TV") ||
-                path.contains("/tv") ||
-                path.contains("/watch/") && (
-                    element?.selectFirst(
-                        ".fdi-item, .film-stats .item"
-                    )?.text()
-                        ?.contains("TV", true) == true
-                    ) ->
+                path.contains("/tv") ->
                 TvType.TvSeries
 
             else ->
@@ -412,19 +408,58 @@ class HiAnime : MainAPI() {
     private fun animeIdFromDocument(
         document: Document
     ): String? {
+        /*
+         * HiAnime exposes the parent anime id in several places depending
+         * on whether we are on the series page or an episode/watch page.
+         *
+         * The supplied source explicitly contains:
+         *   <div id="ani_detail" data-anime-id="240" ...>
+         *   <div class="anis-content" data-anime-id="240">
+         *
+         * Newer pages may also expose it through syncData.
+         */
         document
-            .selectFirst("meta[name=hi-anime-id]")
-            ?.attr("content")
+            .selectFirst("#ani_detail[data-anime-id]")
+            ?.attr("data-anime-id")
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?.let { return it }
 
         document
-            .selectFirst("#ani_detail")
+            .selectFirst(".anis-content[data-anime-id]")
             ?.attr("data-anime-id")
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?.let { return it }
+
+        document
+            .selectFirst("[data-anime-id]")
+            ?.attr("data-anime-id")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        /*
+         * Some HiAnime implementations expose the same id in a JSON
+         * script named syncData.
+         */
+        val syncData = document
+            .selectFirst("script#syncData")
+            ?.data()
+            ?.trim()
+
+        if (!syncData.isNullOrBlank()) {
+            val match = Regex(
+                """"(?:anime_id|animeId|anime-id)"\s*:\s*"?(\d+)"?""",
+                RegexOption.IGNORE_CASE
+            ).find(syncData)
+
+            match
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
 
         return null
     }
@@ -533,72 +568,81 @@ class HiAnime : MainAPI() {
         referer: String = "$mainUrl/"
     ): List<Episode> {
 
-        val url = "$mainUrl/ajax/v2/episode/list/$animeId"
+        val endpoints = listOf(
+            "$mainUrl/ajax/v2/episode/list/$animeId",
+            "$mainUrl/ajax/v2/episode/list?id=$animeId"
+        ).distinct()
 
-        val requestHeaders = pageHeaders + mapOf(
+        val headers = pageHeaders + mapOf(
             "Referer" to referer,
             "Accept" to "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With" to "XMLHttpRequest"
         )
 
-        val response = runCatching {
-            app.get(
-                url,
-                headers = requestHeaders
-            )
-        }.getOrNull() ?: return emptyList()
+        for (url in endpoints) {
+            val response = runCatching {
+                app.get(
+                    url,
+                    headers = headers
+                )
+            }.getOrNull() ?: continue
 
-        val raw = response.text.trim()
-        if (raw.isBlank()) return emptyList()
+            val raw = response.text.trim()
+            if (raw.isBlank()) continue
 
-        /*
-         * Normal response:
-         *   {"html":"<a class=\"ssl-item\" data-id=\"...\">...</a>"}
-         *
-         * Some deployments/API wrappers may return a different top-level
-         * JSON object, so first try the normal JSON "html" field, then scan
-         * the decoded object text for an HTML-looking fragment.
-         */
-        val html = runCatching {
-            JSONObject(raw)
-                .optString("html")
-                .takeIf { it.isNotBlank() }
-        }.getOrNull()
-            ?: runCatching {
-                JSONObject(raw)
-                    .keys()
-                    .asSequence()
-                    .mapNotNull { key ->
-                        JSONObject(raw).optString(key)
-                            .takeIf { value ->
-                                value.contains("ssl-item") ||
-                                    value.contains("data-id")
-                            }
+            val htmlCandidates = linkedSetOf<String>()
+
+            runCatching {
+                val json = JSONObject(raw)
+
+                json.optString("html")
+                    .takeIf { it.isNotBlank() }
+                    ?.let { htmlCandidates.add(it) }
+
+                json.keys().forEach { key ->
+                    val value = json.optString(key)
+                    if (
+                        value.contains(
+                            "ssl-item",
+                            ignoreCase = true
+                        ) ||
+                        value.contains(
+                            "data-id",
+                            ignoreCase = true
+                        )
+                    ) {
+                        htmlCandidates.add(value)
                     }
-                    .firstOrNull()
-            }.getOrNull()
-            ?: ""
+                }
+            }
 
-        if (html.isBlank()) return emptyList()
+            /*
+             * A few deployments can return the HTML fragment with a JSON
+             * content type. Accept it as-is when it already contains episode
+             * anchors.
+             */
+            if (
+                raw.contains(
+                    "ssl-item",
+                    ignoreCase = true
+                )
+            ) {
+                htmlCandidates.add(raw)
+            }
 
-        return parseEpisodeItems(
-            html = html,
-            seasonNumber = seasonNumber
-        )
-    }
+            for (html in htmlCandidates) {
+                val episodes = parseEpisodeItems(
+                    html = html,
+                    seasonNumber = seasonNumber
+                )
 
-    private fun episodeCountFromDocument(
-        document: Document
-    ): Int? {
-        val candidates = listOf(
-            document.selectFirst(".film-stats .tick-eps")?.text(),
-            document.selectFirst(".tick-eps")?.text(),
-            document.selectFirst(".fd-infor .tick-eps")?.text()
-        )
+                if (episodes.isNotEmpty()) {
+                    return episodes
+                }
+            }
+        }
 
-        return candidates
-            .mapNotNull { cleanText(it).toIntOrNull() }
-            .firstOrNull { it > 0 }
+        return emptyList()
     }
 
     override suspend fun load(
@@ -736,13 +780,9 @@ class HiAnime : MainAPI() {
                     }
                     ?: 1
 
-            val expectedCount =
-                episodeCountFromDocument(document)
-
             /*
-             * The episode-list endpoint is the source of truth for the
-             * individual episode IDs. The page's .tick-eps is only used as
-             * a validation check.
+             * First try the live episode AJAX source. This is the
+             * authoritative source for the actual episode IDs.
              */
             var episodes =
                 getEpisodesFromApi(
@@ -752,43 +792,25 @@ class HiAnime : MainAPI() {
                 )
 
             /*
-             * Retry once with a clean referer when the first AJAX request was
-             * intercepted or returned incomplete HTML.
+             * If the AJAX endpoint is unavailable, the page may already
+             * contain an episode fragment (for example after an internal
+             * server-side render). Use only real anchors from that fragment.
              */
-            if (
-                episodes.isEmpty() ||
-                (
-                    expectedCount != null &&
-                        episodes.size < expectedCount
-                    )
-            ) {
-                episodes =
-                    getEpisodesFromApi(
-                        animeId = animeId,
-                        seasonNumber = seasonNumber,
-                        referer = pageUrl
-                    )
+            if (episodes.isEmpty()) {
+                episodes = parseEpisodeItems(
+                    html = document
+                        .selectFirst("#episodes-content")
+                        ?.html()
+                        .orEmpty(),
+                    seasonNumber = seasonNumber
+                )
             }
 
             /*
-             * Do NOT create fake Episode 1 when the endpoint fails.
-             * That was the reason the previous build showed only one episode.
-             *
-             * If the site says 25 episodes but the API does not return the
-             * corresponding 25 episode records, we refuse to invent the
-             * missing IDs and return no TV series response rather than display
-             * incorrect episode data.
+             * Never invent Episode 1. If there is no authoritative episode
+             * record we still know this is a TV page, so keep the correct
+             * TvSeries type instead of turning it into a Movie.
              */
-            if (
-                episodes.isEmpty() ||
-                (
-                    expectedCount != null &&
-                        episodes.size != expectedCount
-                    )
-            ) {
-                return null
-            }
-
             return newTvSeriesLoadResponse(
                 title,
                 seriesUrl,
