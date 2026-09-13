@@ -578,7 +578,7 @@ class BasPlayFTP : MainAPI() {
                     emitMedia(
                         directFallback,
                         referer,
-                        mediaHeaders(referer),
+                        tvMediaHeaders(referer),
                         callback
                     )
                     true
@@ -741,27 +741,17 @@ class BasPlayFTP : MainAPI() {
             .firstOrNull()
             ?: return false
 
-        // The website's browser player receives the media from the same origin,
-        // and in some sessions the server creates a small session/device cookie
-        // before serving the media. Pass any cookie issued by the current page.
-        // Do not hard-code the cookie because it can rotate between sessions.
-        var cookieHeader = cookieHeaderFromResponse(responseHeaders)
-
-        // For TV pages, the browser's media request is referred by the base
-        // tview.php URL rather than an invented episode URL. Refresh that page
-        // once when needed so its current session cookie can be captured.
-        if (cookieHeader.isNullOrBlank() && preferredReferer.contains("tview.php", true)) {
-            runCatching {
-                val refreshed = app.get(
-                    preferredReferer,
-                    headers = pageHeaders(preferredReferer),
-                    referer = mainUrl
-                )
-                cookieHeader = refreshed.headers["Set-Cookie"]?.takeIf { it.isNotBlank() }
-            }
+        // For TV, match the real browser media request captured from BAS PLAY.
+        // The captured request had no Cookie header, so do not manufacture or
+        // replay Set-Cookie attributes from the HTML response. This is important
+        // because Cookie attributes such as "Path=/" must never be sent back as
+        // request cookies and can cause the server to reject the media request.
+        val headers = if (preferredReferer.contains("tview.php", true) || pageUrl.contains("tview.php", true)) {
+            tvMediaHeaders(preferredReferer)
+        } else {
+            mediaHeaders(preferredReferer, null)
         }
 
-        val headers = mediaHeaders(preferredReferer, cookieHeader)
         emitMedia(selected, preferredReferer, headers, callback)
         return true
     }
@@ -771,6 +761,17 @@ class BasPlayFTP : MainAPI() {
         return removeQueryParam(url, "episode")
             .substringBefore("#")
     }
+
+    // BAS PLAY TV media requests observed in Chrome are intentionally minimal:
+    // Referer + browser UA + identity encoding. Keep this separate from Movie
+    // headers so the already-working Movie playback path is not altered.
+    private fun tvMediaHeaders(
+        referer: String
+    ): Map<String, String> = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "Accept-Encoding" to "identity;q=1, *;q=0",
+        "Referer" to referer
+    )
 
     private fun mediaHeaders(
         referer: String,
