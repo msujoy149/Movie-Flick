@@ -830,7 +830,10 @@ class BasPlayFTP : MainAPI() {
                 val response = app.get(candidate, headers = pageHeaders(candidate))
                 PageFetch(
                     document = response.document,
-                    responseHeaders = response.headers
+                    responseHeaders = mapOf(
+                        "Set-Cookie" to (response.headers["Set-Cookie"] ?: ""),
+                        "ETag" to (response.headers["ETag"] ?: "")
+                    ).filterValues { it.isNotBlank() }
                 )
             }.getOrNull()
             if (page != null) return page
