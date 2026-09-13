@@ -284,16 +284,24 @@ class HiAnime : MainAPI() {
          * The supplied HiAnime TV page identifies entries as TV series
          * and their detail pages provide the episode list.
          */
-        val forceTvType =
-            if (base.trimEnd('/').equals("$mainUrl/tv", true)) {
+        val normalizedBase = base
+            .trimEnd('/')
+            .lowercase(Locale.ROOT)
+
+        val forcedType = when {
+            normalizedBase == "$mainUrl/movie".lowercase(Locale.ROOT) ->
+                TvType.Movie
+
+            normalizedBase == "$mainUrl/tv".lowercase(Locale.ROOT) ->
                 TvType.TvSeries
-            } else {
+
+            else ->
                 null
-            }
+        }
 
         val items = parseCards(
             response.document,
-            forceType = forceTvType
+            forceType = forcedType
         )
 
         return newHomePageResponse(
@@ -937,7 +945,9 @@ class HiAnime : MainAPI() {
                 document
                     .selectFirst(".film-stats")
                     ?.text()
-                    ?.contains("MOVIE", true) == true
+                    ?.contains("MOVIE", true) == true ||
+                canonical.lowercase(Locale.ROOT)
+                    .contains("/movie/")
             ) {
                 TvType.Movie
             } else {
