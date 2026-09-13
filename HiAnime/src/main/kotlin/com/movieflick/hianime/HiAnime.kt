@@ -33,6 +33,9 @@ class HiAnime : MainAPI() {
         "$mainUrl/tv" to "TV Show"
     )
 
+    private val movieMarker = "mf_movie=1"
+    private val tvMarker = "mf_tv=1"
+
     private val pageHeaders: Map<String, String>
         get() = mapOf(
             "User-Agent" to
@@ -151,6 +154,41 @@ class HiAnime : MainAPI() {
         }
     }
 
+    private fun markUrl(
+        url: String,
+        type: TvType
+    ): String {
+        return when (type) {
+            TvType.Movie -> {
+                if (url.contains("?")) "$url&$movieMarker"
+                else "$url?$movieMarker"
+            }
+
+            TvType.TvSeries -> {
+                if (url.contains("?")) "$url&$tvMarker"
+                else "$url?$tvMarker"
+            }
+
+            else -> url
+        }
+    }
+
+    private fun hasMarker(
+        url: String,
+        marker: String
+    ): Boolean =
+        Regex(
+            """(?:\?|&)${Regex.escape(marker)}(?:&|$)"""
+        ).containsMatchIn(url)
+
+    private fun stripMarkers(url: String): String {
+        return url
+            .replace(Regex("""([?&])mf_movie=1(?=&|$)"""), "$1")
+            .replace(Regex("""([?&])mf_tv=1(?=&|$)"""), "$1")
+            .replace(Regex("""\?&"""), "?")
+            .replace(Regex("""[?&]$"""), "")
+    }
+
     private fun cardSearchResponse(
         title: String,
         url: String,
@@ -221,7 +259,7 @@ class HiAnime : MainAPI() {
 
             cardSearchResponse(
                 title = title,
-                url = url,
+                url = markUrl(url, type),
                 poster = poster,
                 type = type
             )
@@ -756,8 +794,19 @@ class HiAnime : MainAPI() {
     override suspend fun load(
         url: String
     ): LoadResponse? {
+        val rawInput = url.substringBefore("||").trim()
+
+        val forcedMovie = hasMarker(
+            rawInput,
+            movieMarker
+        )
+        val forcedTv = hasMarker(
+            rawInput,
+            tvMarker
+        )
+
         val rawPageUrl = absoluteUrl(
-            url.substringBefore("||").trim()
+            stripMarkers(rawInput)
         )
 
         val pageUrl = rawPageUrl
@@ -842,16 +891,19 @@ class HiAnime : MainAPI() {
                     ?.let { null }
 
         val isTvPage =
-            document
-                .selectFirst(".film-stats")
-                ?.text()
-                ?.contains("TV", true) == true ||
-                document
-                    .selectFirst("#main-wrapper")
-                    ?.classNames()
-                    ?.contains("layout-page-watchtv") == true ||
-                aniDetail?.attr("data-episode-number")
-                    ?.isNotBlank() == true
+            !forcedMovie && (
+                forcedTv ||
+                    document
+                        .selectFirst(".film-stats")
+                        ?.text()
+                        ?.contains("TV", true) == true ||
+                    document
+                        .selectFirst("#main-wrapper")
+                        ?.classNames()
+                        ?.contains("layout-page-watchtv") == true ||
+                    aniDetail?.attr("data-episode-number")
+                        ?.isNotBlank() == true
+            )
 
         val currentEpisodeId =
             aniDetail
@@ -942,6 +994,7 @@ class HiAnime : MainAPI() {
          */
         val pageType =
             if (
+                forcedMovie ||
                 document
                     .selectFirst(".film-stats")
                     ?.text()
