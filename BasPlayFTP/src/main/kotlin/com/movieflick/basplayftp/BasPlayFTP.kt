@@ -68,6 +68,8 @@ class BasPlayFTP : MainAPI() {
         "Accept" to "*/*",
         "Accept-Encoding" to "identity;q=1, *;q=0",
         "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
         "Referer" to referer
     )
 
@@ -265,38 +267,65 @@ class BasPlayFTP : MainAPI() {
         val q = query.trim()
         if (q.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        // BAS PLAY pages use ordinary server-rendered HTML. We search the main
-        // movie and TV indexes separately, then rank their visible card titles.
-        val sources = listOf(
-            SearchSource(MOVIES_URL, TvType.Movie, false),
-            SearchSource(TV_URL, TvType.TvSeries, true),
-            SearchSource(ANIME_MOVIES_URL, TvType.Anime, false),
-            SearchSource(ANIME_TV_URL, TvType.TvSeries, true)
-        )
+        // BAS PLAY exposes a real server-side search endpoint: search.php?q=...
+        // Prefer it so search is dynamic and does not depend only on the first
+        // page of the category indexes.
+        val searchUrl = setQueryParam("$BASE_URL/search.php", "q", q)
+        val searchDocument = getDocument(searchUrl)
 
-        val all = linkedMapOf<String, SiteItem>()
-        for (source in sources) {
-            val document = getDocument(source.url) ?: continue
+        val ranked = linkedMapOf<String, SiteItem>()
+        if (searchDocument != null) {
             parseItems(
-                candidates = document.select(
-                    ".cp-card, .movie-card, a[href*='view.php'], a[href*='player.php'], a[href*='tview.php']"
+                candidates = searchDocument.select(
+                    ".cp-card, .movie-card, .trend-card, a[href*='view.php'], " +
+                        "a[href*='player.php'], a[href*='tview.php']"
                 ),
-                sourceUrl = source.url,
-                defaultType = source.type,
-                forceSeries = source.forceSeries
-            )
-                .filter { source.forceSeries || !isSeriesUrl(it.url) }
-                .forEach { item ->
-                    all.putIfAbsent(
-                        if (item.type == TvType.Movie) movieDedupeKey(item) else itemKey(item),
-                        item
-                    )
+                sourceUrl = searchUrl,
+                defaultType = TvType.Movie,
+                forceSeries = false
+            ).forEach { item ->
+                // Search results themselves determine whether an item is a TV
+                // series by its URL; movies never absorb tview.php results.
+                if (item.type == TvType.TvSeries || !isSeriesUrl(item.url)) {
+                    val key = if (isSeriesUrl(item.url)) itemKey(item) else movieDedupeKey(item)
+                    ranked.putIfAbsent(key, item.copy(type = if (isSeriesUrl(item.url)) TvType.TvSeries else item.type))
                 }
+            }
         }
 
-        val ranked = all.values
-            .map { item -> item to searchScore(q, item.title) }
-            .filter { it.second >= 0.34 }
+        // Defensive fallback for deployments where search.php is unavailable
+        // or returns an empty page. Keep it bounded so search stays fast.
+        if (ranked.isEmpty()) {
+            val fallbackSources = listOf(
+                SearchSource(MOVIES_URL, TvType.Movie, false),
+                SearchSource(TV_URL, TvType.TvSeries, true),
+                SearchSource(ANIME_MOVIES_URL, TvType.Anime, false),
+                SearchSource(ANIME_TV_URL, TvType.TvSeries, true)
+            )
+
+            for (source in fallbackSources) {
+                val document = getDocument(source.url) ?: continue
+                parseItems(
+                    candidates = document.select(
+                        ".cp-card, .movie-card, .trend-card, a[href*='view.php'], " +
+                            "a[href*='player.php'], a[href*='tview.php']"
+                    ),
+                    sourceUrl = source.url,
+                    defaultType = source.type,
+                    forceSeries = source.forceSeries
+                )
+                    .filter { source.forceSeries || !isSeriesUrl(it.url) }
+                    .filter { searchScore(q, it.title) >= 0.25 }
+                    .forEach { item ->
+                        val key = if (item.type == TvType.Movie) movieDedupeKey(item) else itemKey(item)
+                        ranked.putIfAbsent(key, item)
+                    }
+            }
+        }
+
+        val ordered = ranked.values
+            .map { it to searchScore(q, it.title) }
+            .filter { it.second >= 0.20 }
             .sortedWith(
                 compareByDescending<Pair<SiteItem, Double>> { it.second }
                     .thenBy { it.first.title.lowercase(Locale.ROOT) }
@@ -305,11 +334,11 @@ class BasPlayFTP : MainAPI() {
 
         val pageSize = 24
         val offset = (page - 1).coerceAtLeast(0) * pageSize
-        val pageItems = ranked.drop(offset).take(pageSize)
+        val pageItems = ordered.drop(offset).take(pageSize)
 
         return newSearchResponseList(
             pageItems.map { it.toSearchResponse() },
-            offset + pageItems.size < ranked.size
+            offset + pageItems.size < ordered.size
         )
     }
 
@@ -545,10 +574,11 @@ class BasPlayFTP : MainAPI() {
                 }
 
                 if (resolved) true else if (directFallback.isNotBlank()) {
+                    val referer = canonicalTvReferer(episodePage.ifBlank { mainUrl })
                     emitMedia(
                         directFallback,
-                        episodePage.ifBlank { mainUrl },
-                        mediaHeaders(episodePage.ifBlank { mainUrl }),
+                        referer,
+                        mediaHeaders(referer),
                         callback
                     )
                     true
@@ -617,11 +647,13 @@ class BasPlayFTP : MainAPI() {
         }
 
         val page = getPage(normalized) ?: return false
+        val referer = canonicalTvReferer(normalized)
         return resolvePlayableDocument(
             page.document,
             normalized,
             page.responseHeaders,
-            callback
+            callback,
+            preferredReferer = referer
         )
     }
 
@@ -709,25 +741,35 @@ class BasPlayFTP : MainAPI() {
             .firstOrNull()
             ?: return false
 
-        val cookieHeader = cookieHeaderFromResponse(responseHeaders)
-        val headers = mediaHeaders(preferredReferer, cookieHeader).toMutableMap()
+        // The website's browser player receives the media from the same origin,
+        // and in some sessions the server creates a small session/device cookie
+        // before serving the media. Pass any cookie issued by the current page.
+        // Do not hard-code the cookie because it can rotate between sessions.
+        var cookieHeader = cookieHeaderFromResponse(responseHeaders)
 
-        // BAS PLAY's browser media request uses a byte-range request together
-        // with the current media ETag. Preserve that validator when available;
-        // ExoPlayer will still control the Range header itself.
-        runCatching {
-            val probe = app.head(
-                selected,
-                headers = headers,
-                referer = preferredReferer
-            )
-            probe.headers["ETag"]?.takeIf { it.isNotBlank() }?.let {
-                headers["If-Range"] = it
+        // For TV pages, the browser's media request is referred by the base
+        // tview.php URL rather than an invented episode URL. Refresh that page
+        // once when needed so its current session cookie can be captured.
+        if (cookieHeader.isNullOrBlank() && preferredReferer.contains("tview.php", true)) {
+            runCatching {
+                val refreshed = app.get(
+                    preferredReferer,
+                    headers = pageHeaders(preferredReferer),
+                    referer = mainUrl
+                )
+                cookieHeader = refreshed.headers["Set-Cookie"]?.takeIf { it.isNotBlank() }
             }
         }
 
+        val headers = mediaHeaders(preferredReferer, cookieHeader)
         emitMedia(selected, preferredReferer, headers, callback)
         return true
+    }
+
+    private fun canonicalTvReferer(url: String): String {
+        if (!url.contains("tview.php", true)) return url
+        return removeQueryParam(url, "episode")
+            .substringBefore("#")
     }
 
     private fun mediaHeaders(
@@ -739,6 +781,8 @@ class BasPlayFTP : MainAPI() {
             "Accept" to "*/*",
             "Accept-Encoding" to "identity;q=1, *;q=0",
             "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
             "Referer" to referer
         )
         if (!cookieHeader.isNullOrBlank()) headers["Cookie"] = cookieHeader
