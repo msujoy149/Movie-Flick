@@ -155,12 +155,30 @@ class HiAnime : MainAPI() {
         poster: String?,
         type: TvType
     ): SearchResponse {
-        return newMovieSearchResponse(
-            title = title,
-            url = url,
-            type = type,
-            posterUrl = poster
-        )
+        return when (type) {
+            TvType.TvSeries -> newTvSeriesSearchResponse(
+                title,
+                url,
+                TvType.TvSeries
+            ) {
+                posterUrl = poster
+            }
+
+            TvType.Anime -> newAnimeSearchResponse(
+                title,
+                url
+            ) {
+                posterUrl = poster
+            }
+
+            else -> newMovieSearchResponse(
+                title,
+                url,
+                TvType.Movie
+            ) {
+                posterUrl = poster
+            }
+        }
     }
 
     private fun parseCards(
@@ -449,7 +467,7 @@ class HiAnime : MainAPI() {
                         link.attr("title").ifBlank {
                             link.selectFirst(
                                 ".ep-name, .e-dynamic-name"
-                            )?.text()
+                            )?.text().orEmpty()
                         }.ifBlank {
                             link.text()
                         }
