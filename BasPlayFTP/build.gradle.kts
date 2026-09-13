@@ -1,4 +1,4 @@
-version = 1
+version = 6
 
 cloudstream {
     description = "Bas Play FTP provider for Movie-Flick"
