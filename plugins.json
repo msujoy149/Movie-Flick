@@ -1,10 +1,10 @@
 [
     {
-        "jarFileSize": 191490,
-        "fileHash": "sha256-e4ad6f53e3683beb68871f922f44ed2662e4799d8dcb753be4daf09a51bebbe1",
+        "jarFileSize": 191068,
+        "fileHash": "sha256-8ec6bf8a2bf1063562b6c4ad86e61d206c5762d86faf24da7aeaad10b79a2e31",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 47914,
+        "fileSize": 47697,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -15,13 +15,13 @@
             "TvSeries",
             "Anime"
         ],
-        "version": 6,
+        "version": 7,
         "internalName": "BasPlayFTP",
         "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.jar",
         "description": "Bas Play FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.cs3",
         "name": "BasPlayFTP",
-        "jarHash": "sha256-2d25cbb29dbf8c6d62b544cef0541ef6db92ddd0f3190ef150922728884f943d"
+        "jarHash": "sha256-e381cbde9d85562631d9da557496f5c7d2dfa5782856a43b104142d8459d8c68"
     },
     {
         "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
