@@ -348,10 +348,10 @@ class HiAnime : MainAPI() {
         document: Document
     ): List<Episode> {
         val links = document.select(
-            "#episodes-content a[href]",
-            ".ss-list a[href]",
-            ".ep-item[href]",
-            "a[href*='/watch/'][data-number]"
+            "#episodes-content a[href], " +
+                ".ss-list a[href], " +
+                ".ep-item[href], " +
+                "a[href*='/watch/'][data-number]"
         )
 
         if (links.isEmpty()) return emptyList()
@@ -520,7 +520,7 @@ class HiAnime : MainAPI() {
                 Qualities.P720.value
 
             "576" in lower ->
-                Qualities.P576.value
+                Qualities.P480.value
 
             "480" in lower ->
                 Qualities.P480.value
