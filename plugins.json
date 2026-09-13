@@ -95,6 +95,31 @@
         "name": "DhakaFTP"
     },
     {
+        "iconUrl": "https://hianime.at/theme/images/logo.png",
+        "jarFileSize": 84461,
+        "fileHash": "sha256-5201dd9d4f1048a6bbb89558c656c6a9d60ebbadaaf56849523ed93b4056c32e",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+        "fileSize": 23518,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "Movie-Flick"
+        ],
+        "tvTypes": [
+            "Anime",
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 1,
+        "internalName": "HiAnime",
+        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.jar",
+        "description": "Hi Anime provider for Movie-Flick",
+        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.cs3",
+        "name": "HiAnime",
+        "jarHash": "sha256-3d9a365c48f835624823533561230bb8a92cdad31a9a0460f7e95b80fbcedda6"
+    },
+    {
         "jarFileSize": 110432,
         "fileHash": "sha256-aed9a374f0e18880b91a63b0e2e7f52dca21798944ac6d17982f9f40a549cea0",
         "apiVersion": 1,
