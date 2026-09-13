@@ -8,6 +8,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 
@@ -1254,37 +1255,141 @@ class HiAnime : MainAPI() {
         return result.values.toList()
     }
 
+
+    private fun captureSetCookies(
+        headers: Headers,
+        cookieJar: MutableMap<String, String>
+    ) {
+        headers.values("Set-Cookie").forEach { raw ->
+            val pair = raw.substringBefore(';').trim()
+            val index = pair.indexOf('=')
+            if (index <= 0) return@forEach
+
+            val name = pair.substring(0, index).trim()
+            val value = pair.substring(index + 1).trim()
+
+            if (name.isNotBlank() && value.isNotBlank()) {
+                cookieJar[name] = value
+            }
+        }
+    }
+
+    private fun cookieHeader(
+        cookieJar: Map<String, String>
+    ): String =
+        cookieJar.entries
+            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+            .joinToString("; ") {
+                "${it.key}=${it.value}"
+            }
+
+    private fun csrfTokenFromCookies(
+        cookieJar: Map<String, String>
+    ): String? =
+        cookieJar["XSRF-TOKEN"]
+            ?.let {
+                runCatching {
+                    URLDecoder.decode(
+                        it,
+                        StandardCharsets.UTF_8.name()
+                    )
+                }.getOrNull()
+            }
+            ?.takeIf { it.isNotBlank() }
+
+    private fun sessionHeaders(
+        referer: String,
+        cookieJar: Map<String, String>
+    ): Map<String, String> {
+        val result = pageHeaders.toMutableMap()
+
+        result["Accept"] =
+            "application/json, text/javascript, */*; q=0.01"
+        result["Referer"] = referer
+        result["Origin"] = mainUrl
+        result["X-Requested-With"] = "XMLHttpRequest"
+
+        val cookie = cookieHeader(cookieJar)
+        if (cookie.isNotBlank()) {
+            result["Cookie"] = cookie
+        }
+
+        csrfTokenFromCookies(cookieJar)?.let {
+            result["X-XSRF-TOKEN"] = it
+        }
+
+        return result
+    }
+
+    private suspend fun createFreshSession(
+        pageUrl: String
+    ): MutableMap<String, String> {
+        val cookieJar = linkedMapOf<String, String>()
+
+        /*
+         * The current site explicitly reads XSRF-TOKEN from document.cookie
+         * and sends it as X-XSRF-TOKEN on AJAX requests. Bootstrap both the
+         * normal page and auth/state so the same cookie flow is reproduced.
+         */
+        val bootstrap = listOf(
+            pageUrl,
+            "$mainUrl/api/theme/auth/state"
+        )
+
+        for (url in bootstrap) {
+            val response = runCatching {
+                app.get(
+                    url,
+                    headers = pageHeaders + mapOf(
+                        "Referer" to
+                            if (url == pageUrl) "$mainUrl/" else pageUrl
+                    )
+                )
+            }.getOrNull() ?: continue
+
+            captureSetCookies(
+                response.headers,
+                cookieJar
+            )
+        }
+
+        return cookieJar
+    }
+
     private suspend fun getEpisodeServers(
         episodeId: String,
-        referer: String
+        referer: String,
+        cookieJar: MutableMap<String, String> = linkedMapOf()
     ): List<ServerInfo> {
-        /*
-         * This is the exact endpoint observed in the user's Chrome Network tab:
-         *
-         * GET https://hianime.at/api/theme/episode/servers?episodeId=13116
-         */
         val endpoints = listOf(
             "$mainUrl/api/theme/episode/servers?episodeId=$episodeId",
             "$mainUrl/ajax/v2/episode/servers?episodeId=$episodeId"
         ).distinct()
 
-        val headers = pageHeaders + mapOf(
-            "Referer" to referer,
-            "Origin" to mainUrl,
-            "Accept" to "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With" to "XMLHttpRequest"
-        )
-
         for (url in endpoints) {
             val response = runCatching {
                 app.get(
                     url,
-                    headers = headers
+                    headers = sessionHeaders(
+                        referer = referer,
+                        cookieJar = cookieJar
+                    )
                 )
             }.getOrNull() ?: continue
 
+            captureSetCookies(
+                response.headers,
+                cookieJar
+            )
+
             val raw = response.text.trim()
             if (raw.isBlank()) continue
+
+            val jsonServers = parseServerJson(raw)
+
+            if (jsonServers.isNotEmpty()) {
+                return jsonServers
+            }
 
             val htmlServers = runCatching {
                 JSONObject(raw).optString("html")
@@ -1294,11 +1399,6 @@ class HiAnime : MainAPI() {
 
             if (htmlServers.isNotEmpty()) {
                 return htmlServers
-            }
-
-            val jsonServers = parseServerJson(raw)
-            if (jsonServers.isNotEmpty()) {
-                return jsonServers
             }
 
             val directHtml = parseServerHtml(raw)
@@ -1436,31 +1536,22 @@ class HiAnime : MainAPI() {
     private suspend fun getEpisodeSources(
         serverId: String,
         episodeId: String,
-        referer: String
+        referer: String,
+        cookieJar: MutableMap<String, String> = linkedMapOf()
     ): List<String> {
         /*
-         * HiAnime's established source API:
-         *   /ajax/v2/episode/sources?id={serverId}
+         * Current HiAnime-compatible APIs use:
+         *   /api/theme/episode/sources?serverId={serverId}&episodeId={episodeId}
          *
-         * The current hianime.at site also exposes /api/theme/ routes.
-         * Try all known forms because the site has changed its backend
-         * routing over time.
+         * The browser flow is session/CSRF aware, so reuse the fresh cookies
+         * and X-XSRF-TOKEN gathered from the watch page.
          */
         val endpoints = listOf(
             "$mainUrl/api/theme/episode/sources?serverId=$serverId&episodeId=$episodeId",
             "$mainUrl/api/theme/episode/source?serverId=$serverId&episodeId=$episodeId",
             "$mainUrl/api/theme/episode/sources?id=$serverId&episodeId=$episodeId",
-            "$mainUrl/api/theme/episode/source?id=$serverId&episodeId=$episodeId",
-            "$mainUrl/ajax/v2/episode/sources?id=$serverId",
-            "$mainUrl/ajax/v2/episode/sources?serverId=$serverId"
+            "$mainUrl/ajax/v2/episode/sources?id=$serverId"
         ).distinct()
-
-        val headers = pageHeaders + mapOf(
-            "Referer" to referer,
-            "Origin" to mainUrl,
-            "Accept" to "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With" to "XMLHttpRequest"
-        )
 
         val links = linkedSetOf<String>()
 
@@ -1468,9 +1559,17 @@ class HiAnime : MainAPI() {
             val response = runCatching {
                 app.get(
                     url,
-                    headers = headers
+                    headers = sessionHeaders(
+                        referer = referer,
+                        cookieJar = cookieJar
+                    )
                 )
             }.getOrNull() ?: continue
+
+            captureSetCookies(
+                response.headers,
+                cookieJar
+            )
 
             val raw = response.text.trim()
             if (raw.isBlank()) continue
@@ -1481,23 +1580,6 @@ class HiAnime : MainAPI() {
 
             sourceLinkFromJson(raw).forEach {
                 links.add(it)
-            }
-
-            /*
-             * A source endpoint can occasionally return a JSON string or
-             * HTML fragment instead of an object.
-             */
-            if (
-                raw.startsWith("http://") ||
-                raw.startsWith("https://")
-            ) {
-                links.add(
-                    raw.trim(
-                        '"',
-                        '\'',
-                        ' '
-                    )
-                )
             }
 
             if (links.isNotEmpty()) {
@@ -1836,14 +1918,33 @@ class HiAnime : MainAPI() {
 
         val pageUrl = absoluteUrl(pageData)
 
+        /*
+         * Recreate a browser-like session on every Play action. This is
+         * important because the site issues XSRF/session cookies which are
+         * then required by the AJAX server/source calls.
+         */
+        val cookieJar = createFreshSession(pageUrl)
+
+        val watchHeaders = pageHeaders.toMutableMap()
+        watchHeaders["Referer"] = "$mainUrl/"
+
+        cookieHeader(cookieJar)
+            .takeIf { it.isNotBlank() }
+            ?.let {
+                watchHeaders["Cookie"] = it
+            }
+
         val watchResponse = runCatching {
             app.get(
                 pageUrl,
-                headers = pageHeaders + mapOf(
-                    "Referer" to "$mainUrl/"
-                )
+                headers = watchHeaders
             )
         }.getOrNull() ?: return false
+
+        captureSetCookies(
+            watchResponse.headers,
+            cookieJar
+        )
 
         /*
          * IMPORTANT:
@@ -1890,7 +1991,8 @@ class HiAnime : MainAPI() {
 
         val servers = getEpisodeServers(
             episodeId = episodeId,
-            referer = pageUrl
+            referer = pageUrl,
+            cookieJar = cookieJar
         )
 
         if (servers.isEmpty()) {
@@ -1918,7 +2020,8 @@ class HiAnime : MainAPI() {
             val sources = getEpisodeSources(
                 serverId = server.id,
                 episodeId = episodeId,
-                referer = pageUrl
+                referer = pageUrl,
+                cookieJar = cookieJar
             )
 
             if (sources.isEmpty()) continue
