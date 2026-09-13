@@ -1150,96 +1150,96 @@ class HiAnime : MainAPI() {
     private fun parseServerJson(
         raw: String
     ): List<ServerInfo> {
-        val result = ArrayList<ServerInfo>()
-
         val root = runCatching {
             JSONObject(raw)
-        }.getOrNull() ?: return result
+        }.getOrNull() ?: return emptyList()
 
-        fun consumeArray(
-            array: org.json.JSONArray?,
-            type: String
-        ) {
-            if (array == null) return
+        val result = linkedMapOf<String, ServerInfo>()
 
-            for (i in 0 until array.length()) {
-                val obj = array.optJSONObject(i) ?: continue
+        fun walk(value: Any?, inheritedType: String? = null) {
+            when (value) {
+                is JSONObject -> {
+                    val id = value.optString(
+                        "id",
+                        value.optString(
+                            "serverId",
+                            value.optString("server_id")
+                        )
+                    ).trim()
 
-                val id = obj.optString(
-                    "id",
-                    obj.optString(
-                        "serverId",
-                        obj.optString("server_id")
-                    )
-                ).trim()
-
-                if (id.isBlank()) continue
-
-                val name = cleanText(
-                    obj.optString(
-                        "name",
-                        obj.optString(
-                            "serverName",
-                            "Server $id"
+                    val name = cleanText(
+                        value.optString(
+                            "name",
+                            value.optString(
+                                "serverName",
+                                ""
+                            )
                         )
                     )
-                ).ifBlank {
-                    "Server $id"
+
+                    val type = cleanText(
+                        value.optString(
+                            "type",
+                            value.optString(
+                                "category",
+                                inheritedType.orEmpty()
+                            )
+                        )
+                    ).ifBlank {
+                        inheritedType ?: "sub"
+                    }
+
+                    if (
+                        id.isNotBlank() &&
+                        (
+                            name.isNotBlank() ||
+                                value.has("serverId") ||
+                                value.has("server_id")
+                            )
+                    ) {
+                        val key = "$id:$type"
+                        result[key] = ServerInfo(
+                            id = id,
+                            name = name.ifBlank { "Server $id" },
+                            type = type
+                        )
+                    }
+
+                    val keys = value.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val child = value.opt(key)
+
+                        val childType =
+                            when {
+                                key.equals("dub", true) -> "dub"
+                                key.equals("raw", true) -> "raw"
+                                key.equals("sub", true) -> "sub"
+                                key.equals("mixed", true) -> "mixed"
+                                else -> inheritedType
+                            }
+
+                        walk(
+                            child,
+                            childType
+                        )
+                    }
                 }
 
-                result += ServerInfo(
-                    id = id,
-                    name = name,
-                    type = type
-                )
+                is org.json.JSONArray -> {
+                    for (i in 0 until value.length()) {
+                        walk(
+                            value.opt(i),
+                            inheritedType
+                        )
+                    }
+                }
             }
         }
 
-        fun consumeObject(
-            obj: JSONObject?,
-            type: String
-        ) {
-            if (obj == null) return
+        walk(root)
 
-            consumeArray(
-                obj.optJSONArray("servers"),
-                type
-            )
-
-            consumeArray(
-                obj.optJSONArray("data"),
-                type
-            )
-
-            consumeArray(
-                obj.optJSONArray(type),
-                type
-            )
-        }
-
-        consumeObject(root.optJSONObject("data"), "sub")
-        consumeObject(root.optJSONObject("result"), "sub")
-
-        consumeArray(
-            root.optJSONArray("sub"),
-            "sub"
-        )
-        consumeArray(
-            root.optJSONArray("dub"),
-            "dub"
-        )
-        consumeArray(
-            root.optJSONArray("raw"),
-            "raw"
-        )
-        consumeArray(
-            root.optJSONArray("mixed"),
-            "mixed"
-        )
-
-        return result.distinctBy {
-            "${it.id}:${it.type}"
-        }
+        return result.values.toList()
     }
 
     private suspend fun getEpisodeServers(
@@ -1426,19 +1426,18 @@ class HiAnime : MainAPI() {
         referer: String
     ): List<String> {
         /*
-         * The established HiAnime source resolver is:
-         *
+         * HiAnime's established source API:
          *   /ajax/v2/episode/sources?id={serverId}
          *
-         * Current hianime.at also exposes /api/theme/ routes. Try the
-         * established endpoint first, then the current-site variants.
-         *
-         * Every call is fresh: no source URL is cached.
+         * The current hianime.at site also exposes /api/theme/ routes.
+         * Try all known forms because the site has changed its backend
+         * routing over time.
          */
         val endpoints = listOf(
             "$mainUrl/ajax/v2/episode/sources?id=$serverId",
             "$mainUrl/api/theme/episode/sources?id=$serverId",
             "$mainUrl/api/theme/episode/source?id=$serverId",
+            "$mainUrl/api/theme/episode/source?serverId=$serverId",
             "$mainUrl/api/theme/episode/sources?serverId=$serverId",
             "$mainUrl/ajax/v2/episode/sources?serverId=$serverId"
         ).distinct()
@@ -1463,19 +1462,29 @@ class HiAnime : MainAPI() {
             val raw = response.text.trim()
             if (raw.isBlank()) continue
 
-            /*
-             * Direct HLS/MP4/etc. embedded in JSON.
-             */
             directMediaFromJson(raw).forEach {
                 links.add(it)
             }
 
-            /*
-             * Standard HiAnime response:
-             * {"link":"https://..."}
-             */
             sourceLinkFromJson(raw).forEach {
                 links.add(it)
+            }
+
+            /*
+             * A source endpoint can occasionally return a JSON string or
+             * HTML fragment instead of an object.
+             */
+            if (
+                raw.startsWith("http://") ||
+                raw.startsWith("https://")
+            ) {
+                links.add(
+                    raw.trim(
+                        '"',
+                        '\'',
+                        ' '
+                    )
+                )
             }
 
             if (links.isNotEmpty()) {
@@ -1502,18 +1511,51 @@ class HiAnime : MainAPI() {
 
         val found = linkedMapOf<String, String>()
 
+        fun addCandidate(
+            value: String?,
+            sourceReferer: String = embedUrl
+        ) {
+            if (value.isNullOrBlank()) return
+
+            val normalized = value
+                .trim()
+                .replace("\\/", "/")
+                .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .trim(
+                    '"',
+                    '\'',
+                    '`',
+                    ',',
+                    ';',
+                    ')',
+                    ']',
+                    '}'
+                )
+
+            val resolved = absoluteUrl(
+                normalized,
+                embedUrl
+            )
+
+            if (isMediaUrl(resolved)) {
+                found.putIfAbsent(
+                    resolved,
+                    sourceReferer
+                )
+            }
+        }
+
         directMediaUrls(
             document = response.document,
             html = response.text,
             baseUrl = embedUrl
         ).forEach {
-            found.putIfAbsent(it, embedUrl)
+            addCandidate(it)
         }
 
-        /*
-         * Some player pages create the HLS URL inside JS rather than a
-         * <video> element. Scan the raw HTML for manifest URLs too.
-         */
         val normalized = response.text
             .replace("\\/", "/")
             .replace("\\u002F", "/")
@@ -1521,26 +1563,43 @@ class HiAnime : MainAPI() {
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
 
+        /*
+         * Generic absolute HLS/MP4 URLs.
+         */
         Regex(
-            """https?://[^"'<>\\\s]+?\.m3u8(?:\?[^"'<>\\\s]*)?"""
+            """https?://[^"'<>\\\s]+?\.(?:m3u8|mp4|mpd|webm|m4v|mov|mkv)(?:\?[^"'<>\\\s]*)?"""
         ).findAll(normalized).forEach {
-            found.putIfAbsent(
-                it.value,
-                embedUrl
-            )
+            addCandidate(it.value)
         }
 
+        /*
+         * Browser capture supplied by the user showed the final player
+         * manifest at hls2.aniwatchtv.uk/.../master.m3u8. Scan for that exact
+         * host/path family even if the JS stores it in an escaped string.
+         */
         Regex(
-            """https?://[^"'<>\\\s]+?\.mp4(?:\?[^"'<>\\\s]*)?"""
-        ).findAll(normalized).forEach {
-            found.putIfAbsent(
-                it.value,
-                embedUrl
-            )
-        }
+            """(?:https?:)?//hls2\.aniwatchtv\.uk/[^"'<>\\\s]+/master\.m3u8(?:\?[^"'<>\\\s]*)?"""
+        )
+            .findAll(normalized)
+            .forEach {
+                addCandidate(it.value)
+            }
 
-        return found.map { (url, ref) ->
-            url to ref
+        /*
+         * Some player configs store only a URL-bearing JSON property.
+         */
+        Regex(
+            """(?i)(?:file|url|source|src|stream|streamUrl|playlist|manifest)\s*[:=]\s*["']([^"']+)["']"""
+        )
+            .findAll(normalized)
+            .forEach { match ->
+                addCandidate(
+                    match.groupValues.getOrNull(1)
+                )
+            }
+
+        return found.map { (media, sourceRef) ->
+            media to sourceRef
         }
     }
 
@@ -1735,27 +1794,24 @@ class HiAnime : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         /*
-         * Fresh resolver:
+         * One fresh resolution per Play:
          *
-         *   episode id
-         *      -> fresh server list
-         *      -> fresh source link
-         *      -> fresh manifest
-         *
-         * No media URL is persisted between Play actions.
+         *   detail/watch URL
+         *       -> current episode id
+         *       -> fresh server list
+         *       -> fresh source/embed
+         *       -> current HLS/MP4
          */
         val pageData = data.substringBefore("||").trim()
         val storedEpisodeId =
             data.substringAfter(
                 "||",
                 ""
-            ).trim().takeIf { it.isNotBlank() }
+            ).trim()
+                .takeIf { it.isNotBlank() }
 
         if (pageData.isBlank()) return false
 
-        /*
-         * A direct media URL can be passed straight to CloudStream.
-         */
         if (isMediaUrl(pageData)) {
             emitDirect(
                 pageData,
@@ -1776,6 +1832,13 @@ class HiAnime : MainAPI() {
             )
         }.getOrNull() ?: return false
 
+        /*
+         * IMPORTANT:
+         * Movies on HiAnime also use an episode-style internal id on the
+         * watch page. The public HiAnime API exposes the same server/source
+         * pipeline for movies and TV episodes. Therefore do not require the
+         * UI to be a TvSeries before resolving the episode id.
+         */
         val episodeId =
             storedEpisodeId
                 ?: watchResponse.document
@@ -1785,11 +1848,10 @@ class HiAnime : MainAPI() {
                     ?.takeIf { it.isNotBlank() }
                 ?: episodeIdFromUrl(pageUrl)
 
-        /*
-         * For a standalone movie, first look for an actual file/manifest on
-         * the page. Never convert a movie into an episode list.
-         */
         if (episodeId.isNullOrBlank()) {
+            /*
+             * Last chance for a page-embedded direct media URL.
+             */
             val direct = directMediaUrls(
                 document = watchResponse.document,
                 html = watchResponse.text,
@@ -1807,11 +1869,6 @@ class HiAnime : MainAPI() {
             return direct.isNotEmpty()
         }
 
-        /*
-         * This endpoint is confirmed by the user's browser capture:
-         *
-         * GET /api/theme/episode/servers?episodeId=13116
-         */
         val servers = getEpisodeServers(
             episodeId = episodeId,
             referer = pageUrl
@@ -1826,13 +1883,18 @@ class HiAnime : MainAPI() {
                 when {
                     it.type.equals("sub", true) -> 0
                     it.type.equals("dub", true) -> 1
-                    else -> 2
+                    it.type.equals("raw", true) -> 2
+                    else -> 3
                 }
             }.thenBy {
                 it.name
             }
         )
 
+        /*
+         * Try every server. A dead HD-1 must not make the whole episode fail
+         * when HD-2/HD-3 has a working source.
+         */
         for (server in orderedServers) {
             val sources = getEpisodeSources(
                 serverId = server.id,
@@ -1844,12 +1906,11 @@ class HiAnime : MainAPI() {
             for (source in sources) {
                 val cleanSource = source
                     .replace("\\/", "/")
+                    .replace("\\u002F", "/")
+                    .replace("\\u0026", "&")
                     .replace("&amp;", "&")
                     .trim()
 
-                /*
-                 * Direct final media URL.
-                 */
                 if (isMediaUrl(cleanSource)) {
                     val streamReferer =
                         if (
@@ -1868,18 +1929,9 @@ class HiAnime : MainAPI() {
                         streamReferer,
                         callback
                     )
-
                     return true
                 }
 
-                /*
-                 * Current browser capture shows source playback going through
-                 * zokoanime.video and then to hls2.aniwatchtv.uk/master.m3u8.
-                 *
-                 * First try to resolve the embed page directly for its real
-                 * manifest. This avoids depending only on CloudStream's
-                 * optional extractor registry.
-                 */
                 if (
                     cleanSource.startsWith(
                         "http://",
@@ -1890,6 +1942,10 @@ class HiAnime : MainAPI() {
                         true
                     )
                 ) {
+                    /*
+                     * First try to discover the actual media manifest from
+                     * the embed page itself.
+                     */
                     val resolved = resolveEmbedMedia(
                         embedUrl = cleanSource,
                         referer = pageUrl
@@ -1903,14 +1959,12 @@ class HiAnime : MainAPI() {
                                 callback
                             )
                         }
-
                         return true
                     }
 
                     /*
-                     * Final fallback: use CloudStream extractor registry.
-                     * Only report success when the extractor actually calls
-                     * our callback.
+                     * Then let any installed CloudStream extractor handle
+                     * the provider-specific embed.
                      */
                     var emitted = false
 
@@ -1918,12 +1972,11 @@ class HiAnime : MainAPI() {
                         loadExtractor(
                             cleanSource,
                             pageUrl,
-                            subtitleCallback,
-                            { link ->
-                                emitted = true
-                                callback(link)
-                            }
-                        )
+                            subtitleCallback
+                        ) { link ->
+                            emitted = true
+                            callback(link)
+                        }
                     }
 
                     if (emitted) {
@@ -1933,7 +1986,25 @@ class HiAnime : MainAPI() {
             }
         }
 
-        return false
+        /*
+         * If the current page itself contains an HLS/MP4 URL, use it as a
+         * final fallback. This is still a fresh request made during playback.
+         */
+        val pageDirect = directMediaUrls(
+            document = watchResponse.document,
+            html = watchResponse.text,
+            baseUrl = pageUrl
+        )
+
+        pageDirect.forEach {
+            emitDirect(
+                it,
+                pageUrl,
+                callback
+            )
+        }
+
+        return pageDirect.isNotEmpty()
     }
 
 }
