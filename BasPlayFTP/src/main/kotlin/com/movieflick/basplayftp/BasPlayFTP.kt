@@ -95,7 +95,7 @@ class BasPlayFTP : MainAPI() {
         // The home page's trending rail is intentionally isolated from the
         // normal Movies grid so the sections do not get mixed.
         val candidates = document.select(
-            ".trend-row a, .trend-card, a.r-card, a[href*='player.php']"
+            ".trend-row .trend-card, .trend-row .cp-card, .trend-row a[href*='view.php'], .trend-row a[href*='player.php']"
         )
 
         val parsed = parseItems(
@@ -336,7 +336,7 @@ class BasPlayFTP : MainAPI() {
         val series = isSeriesUrl(input) || looksLikeSeriesPage(document)
 
         if (series) {
-            val episodes = parseEpisodes(document, input, poster)
+            val episodes = parseAllSeasonEpisodes(document, input, poster)
             if (episodes.isNotEmpty()) {
                 return newTvSeriesLoadResponse(
                     title,
@@ -371,66 +371,126 @@ class BasPlayFTP : MainAPI() {
         )
     }
 
-    private fun parseEpisodes(
-        document: Document,
+    private suspend fun parseAllSeasonEpisodes(
+        firstDocument: Document,
         seriesUrl: String,
         fallbackPoster: String?
     ): List<Episode> {
-        val episodes = mutableListOf<Episode>()
+        val seasonLinks = linkedSetOf<String>()
 
-        // Prefer real player/download anchors around episode rows. Trailer links
-        // are explicitly ignored.
-        val elements = document.select(
-            "a[href], [data-href], [data-url], [onclick], source[src], video source[src]"
-        )
-
-        for (element in elements) {
-            val raw = listOf(
-                element.attr("href"),
-                element.attr("data-href"),
-                element.attr("data-url"),
-                element.attr("onclick"),
-                element.attr("src")
-            ).firstOrNull { it.isNotBlank() } ?: continue
-
-            val absolute = absoluteUrl(extractUrlFromAttribute(raw) ?: raw, seriesUrl)
-            if (!isPlayableOrPlayerUrl(absolute)) continue
-            if (isTrailerUrl(absolute) || isDownloadOnlyUrl(absolute)) continue
-
-            val text = cleanTitle(
-                element.text()
-                    .ifBlank { element.attr("aria-label") }
-                    .ifBlank { element.attr("title") }
-                    .ifBlank { titleFromUrl(absolute) }
-            )
-            if (text.isBlank() || isNavigationTitle(text)) continue
-
-            val season = extractSeasonNumber(text, absolute)
-            val episode = extractEpisodeNumber(text, absolute) ?: continue
-            val direct = extractDirectMediaFromElement(element, seriesUrl)
-            val data = if (!direct.isNullOrBlank()) {
-                "basplay:direct:${encodeToken(direct)}"
-            } else {
-                "basplay:episode:${encodeToken(absolute)}"
-            }
-
-            episodes.add(
-                newEpisode(data) {
-                    name = text
-                    this.season = season ?: 1
-                    this.episode = episode
-                    posterUrl = extractPoster(findCard(element) ?: element, seriesUrl) ?: fallbackPoster
+        // The source page exposes the real season selector. Build the exact
+        // season URLs from those options instead of inventing season numbers.
+        firstDocument.select("#seasonSelect option, select[name*=season] option").forEach { option ->
+            val value = option.attr("value").trim()
+            if (value.isNotBlank()) {
+                seasonLinks += setQueryParam(seriesUrl, "season", value).let {
+                    removeQueryParam(it, "episode")
                 }
-            )
+            }
         }
 
-        return episodes
+        if (seasonLinks.isEmpty()) seasonLinks += removeQueryParam(seriesUrl, "episode")
+
+        val documents = linkedMapOf<String, Document>()
+        documents[removeQueryParam(seriesUrl, "episode")] = firstDocument
+
+        for (seasonUrl in seasonLinks) {
+            if (documents.containsKey(seasonUrl)) continue
+            getDocument(seasonUrl)?.let { documents[seasonUrl] = it }
+        }
+
+        val result = mutableListOf<Episode>()
+        for ((seasonUrl, document) in documents) {
+            result += parseEpisodesFromDocument(document, seasonUrl, fallbackPoster)
+        }
+
+        return result
             .distinctBy { "${it.season ?: 1}:${it.episode ?: 0}:${it.data}" }
             .sortedWith(
                 compareBy<Episode> { it.season ?: Int.MAX_VALUE }
                     .thenBy { it.episode ?: Int.MAX_VALUE }
                     .thenBy { (it.name ?: "").lowercase(Locale.ROOT) }
             )
+    }
+
+    private fun parseEpisodesFromDocument(
+        document: Document,
+        seriesUrl: String,
+        fallbackPoster: String?
+    ): List<Episode> {
+        val episodes = mutableListOf<Episode>()
+        val selectors = listOf(
+            ".ep-item[data-src]",
+            "a[data-epnum][data-src]",
+            "[data-episode][data-src]",
+            "a[href*=episode]"
+        )
+
+        val elements = linkedSetOf<Element>()
+        selectors.forEach { selector -> elements.addAll(document.select(selector)) }
+
+        for (element in elements) {
+            val directRaw = element.attr("data-src").trim()
+            val directMedia = if (directRaw.isNotBlank()) {
+                absoluteUrl(directRaw, seriesUrl)
+            } else {
+                extractDirectMediaFromElement(element, seriesUrl).orEmpty()
+            }
+
+            val hrefRaw = element.attr("href").trim()
+            val episodePage = if (hrefRaw.isNotBlank() && hrefRaw != "#") {
+                absoluteUrl(hrefRaw, seriesUrl)
+            } else {
+                setQueryParam(
+                    removeQueryParam(seriesUrl, "episode"),
+                    "episode",
+                    element.attr("data-epnum").trim()
+                )
+            }
+
+            val pageFallback = episodePage.takeIf { it.contains("tview.php", true) }
+            val playable = when {
+                isPlayableMedia(directMedia) && !isTrailerUrl(directMedia) -> directMedia
+                else -> ""
+            }
+
+            if (playable.isBlank() && pageFallback == null) continue
+            if (isTrailerUrl(playable) || isDownloadOnlyUrl(playable)) continue
+
+            val text = cleanTitle(
+                element.attr("title")
+                    .ifBlank { element.selectFirst(".text-sm, .cp-title, h1,h2,h3,h4,h5")?.text().orEmpty() }
+                    .ifBlank { element.text() }
+                    .ifBlank { titleFromUrl(playable.ifBlank { episodePage }) }
+            )
+            if (text.isBlank() || isNavigationTitle(text)) continue
+
+            val explicitEpisode = element.attr("data-epnum").toIntOrNull()
+            val episodeNumber = explicitEpisode ?: extractEpisodeNumber(text, playable.ifBlank { episodePage }) ?: continue
+            val season = element.attr("data-season").toIntOrNull()
+                ?: extractSeasonNumber(text, playable.ifBlank { episodePage })
+                ?: extractSeasonNumber("$seriesUrl", seriesUrl)
+                ?: 1
+
+            val data = if (playable.isNotBlank()) {
+                // Keep the exact source present on BAS PLAY. This is the source
+                // used by the website itself for this episode.
+                "basplay:direct:${encodeToken(playable)}"
+            } else {
+                // For pages that do not expose a direct source in the list,
+                // resolve the episode page at playback time.
+                "basplay:episode:${encodeToken(episodePage)}"
+            }
+
+            episodes += newEpisode(data) {
+                name = text
+                this.season = season
+                this.episode = episodeNumber
+                posterUrl = extractPoster(element, seriesUrl) ?: fallbackPoster
+            }
+        }
+
+        return episodes
     }
 
     override suspend fun loadLinks(
@@ -517,7 +577,7 @@ class BasPlayFTP : MainAPI() {
             .replace("&amp;", "&")
 
         val directRegex = Regex(
-            """(?i)(?:https?://|/|\.\.?/)[^\"'<>\\s]+\\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\\?[^\"'<>\\s]*)?"""
+            """(?i)(?:https?://|/|\.\.?/)[^\"'<>\s]+\.(?:m3u8|mpd|mp4|mkv|webm|mov|m4v|avi|flv|ts)(?:\?[^\"'<>\s]*)?"""
         )
         directRegex.findAll(html).forEach {
             val absolute = absoluteUrl(it.value, pageUrl)
@@ -525,7 +585,7 @@ class BasPlayFTP : MainAPI() {
         }
 
         val keyRegex = Regex(
-            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl|manifest|hls|dash)\\s*[:=]\\s*[\"']([^\"']+)[\"']"""
+            """(?i)(?:file|src|source|url|video|videoUrl|media|mediaUrl|fileUrl|video_url|stream|streamUrl|manifest|hls|dash)\s*[:=]\s*[\"']([^\"']+)[\"']"""
         )
         keyRegex.findAll(html).forEach {
             val absolute = absoluteUrl(it.groupValues[1], pageUrl)
@@ -694,13 +754,26 @@ class BasPlayFTP : MainAPI() {
     }
 
     private fun extractPoster(element: Element, baseUrl: String): String? {
-        val img = element.selectFirst("img[src], img[data-src], img[data-lazy-src]") ?: return null
-        val raw = listOf(
-            img.attr("src"),
-            img.attr("data-src"),
-            img.attr("data-lazy-src")
-        ).firstOrNull { it.isNotBlank() } ?: return null
-        return absoluteUrl(raw, baseUrl)
+        val img = element.selectFirst(
+            "img[src], img[data-src], img[data-lazy-src], img[data-original], img[srcset]"
+        ) ?: return null
+
+        val candidates = buildList {
+            add(img.attr("data-src"))
+            add(img.attr("data-lazy-src"))
+            add(img.attr("data-original"))
+            add(img.attr("src"))
+            val srcset = img.attr("srcset")
+            if (srcset.isNotBlank()) {
+                add(srcset.substringBefore(',').trim().substringBefore(' '))
+            }
+        }
+
+        return candidates
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map { absoluteUrl(it, baseUrl) }
+            .firstOrNull { it.isNotBlank() && !it.contains("dummyimage", true) && !it.startsWith("data:", true) }
     }
 
     private fun extractPageTitle(document: Document): String {
@@ -731,12 +804,33 @@ class BasPlayFTP : MainAPI() {
         }.getOrDefault("Untitled")
     }
 
+    private fun setQueryParam(url: String, key: String, value: String): String {
+        val clean = removeQueryParam(url, key)
+        val separator = if (clean.contains("?")) "&" else "?"
+        return "$clean${separator}${URLEncoder.encode(key, StandardCharsets.UTF_8.toString())}=${URLEncoder.encode(value, StandardCharsets.UTF_8.toString())}"
+    }
+
+    private fun removeQueryParam(url: String, key: String): String {
+        val hash = url.substringAfter("#", "")
+        val base = url.substringBefore("#")
+        val queryIndex = base.indexOf('?')
+        if (queryIndex < 0) return url
+        val path = base.substring(0, queryIndex)
+        val query = base.substring(queryIndex + 1)
+        val filtered = query.split('&')
+            .filter { it.isNotBlank() }
+            .filterNot { part -> part.substringBefore('=').equals(key, true) }
+        val rebuilt = if (filtered.isEmpty()) path else "$path?${filtered.joinToString("&")}"
+        return if (hash.isBlank()) rebuilt else "$rebuilt#$hash"
+    }
+
     private fun absoluteUrl(raw: String, base: String): String {
         val value = raw.trim().replace("&amp;", "&")
         if (value.isBlank()) return ""
         if (value.startsWith("http://", true) || value.startsWith("https://", true)) return value
-        return runCatching { URI(base).resolve(value).toString() }
-            .getOrElse { "$mainUrl/${value.trimStart('/')}" }
+        val safeValue = value.replace(" ", "%20")
+        return runCatching { URI(base).resolve(safeValue).toString() }
+            .getOrElse { "$mainUrl/${safeValue.trimStart('/')}" }
     }
 
     private fun isUsefulContentUrl(url: String): Boolean {
@@ -804,7 +898,10 @@ class BasPlayFTP : MainAPI() {
             element.attr("data-video"),
             element.attr("data-file"),
             element.attr("data-url"),
-            element.attr("data-source")
+            element.attr("data-source"),
+            element.attr("data-stream"),
+            element.attr("data-video-url"),
+            element.attr("data-manifest")
         )
         return candidates
             .map { absoluteUrl(it, baseUrl) }
