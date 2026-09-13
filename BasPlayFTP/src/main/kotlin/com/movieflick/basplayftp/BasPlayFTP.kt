@@ -92,10 +92,10 @@ class BasPlayFTP : MainAPI() {
     private suspend fun loadTrending(page: Int): PageResult {
         val document = getDocument(mainUrl) ?: return PageResult(emptyList(), false)
 
-        // The home page's trending rail is intentionally isolated from the
-        // normal Movies grid so the sections do not get mixed.
+        // BAS PLAY exposes Trending Now as a dedicated row of real movie cards.
+        // Parse that row only; never fall back to the full movie grid here.
         val candidates = document.select(
-            ".trend-row .trend-card, .trend-row .cp-card, .trend-row a[href*='view.php'], .trend-row a[href*='player.php']"
+            "#trendRow > a.trend-card, .trend-row > a.trend-card, .trend-row .trend-card, .trend-row .cp-card"
         )
 
         val parsed = parseItems(
@@ -103,25 +103,31 @@ class BasPlayFTP : MainAPI() {
             sourceUrl = mainUrl,
             defaultType = TvType.Movie,
             forceSeries = false
-        )
+        ).filterNot { isSeriesUrl(it.url) }
 
-        return paginate(parsed, page)
+        return paginate(parsed.distinctBy { movieDedupeKey(it) }, page)
     }
 
     private suspend fun loadMovies(page: Int): PageResult {
         val url = pagedUrl(MOVIES_URL, page)
         val document = getDocument(url) ?: return PageResult(emptyList(), false)
 
+        // Movies must remain movie-only. A TV item is never admitted to this row,
+        // even when the server markup happens to contain a generic .cp-card.
         val items = parseItems(
             candidates = document.select(
-                ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='player.php'], a[href*='download.php']"
+                ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='view.php'], a[href*='player.php']"
             ),
             sourceUrl = url,
             defaultType = TvType.Movie,
             forceSeries = false
         )
+            .filterNot { isSeriesUrl(it.url) }
+            .distinctBy { movieDedupeKey(it) }
 
-        return paginate(items, page)
+        val batch = paginate(items, page)
+        val hasServerNext = detectNextPage(document, page)
+        return batch.copy(hasNext = batch.hasNext || hasServerNext)
     }
 
     private suspend fun loadTv(page: Int): PageResult {
@@ -135,26 +141,32 @@ class BasPlayFTP : MainAPI() {
             sourceUrl = url,
             defaultType = TvType.TvSeries,
             forceSeries = true
-        )
+        ).map { it.copy(type = TvType.TvSeries) }
 
-        return paginate(items.map { it.copy(type = TvType.TvSeries) }, page)
+        val batch = paginate(items, page)
+        val hasServerNext = detectNextPage(document, page)
+        return batch.copy(hasNext = batch.hasNext || hasServerNext)
     }
 
     private suspend fun loadAnime(page: Int): PageResult {
-        // Anime is deliberately merged from both real website sources.
-        // Their natural order is preserved, while duplicates are removed by URL.
+        // Both configured Anime sources are fetched on every page request.
+        // Interleave them so one source cannot consume the whole initial row;
+        // the merged stream remains deterministic for stable lazy loading.
         val first = getCategoryPage(ANIME_MOVIES_URL, page, TvType.Anime, false)
         val second = getCategoryPage(ANIME_TV_URL, page, TvType.TvSeries, true)
 
-        val merged = linkedMapOf<String, SiteItem>()
-        first.items.forEach { merged.putIfAbsent(itemKey(it), it) }
-        second.items.forEach { merged.putIfAbsent(itemKey(it), it) }
-
-        val items = merged.values.toList()
-        return PageResult(
-            items = items,
-            hasNext = first.hasNext || second.hasNext
+        val merged = mergeInterleaved(
+            first.items.distinctBy { itemKey(it) },
+            second.items.distinctBy { itemKey(it) }
         )
+
+        val deduped = linkedMapOf<String, SiteItem>()
+        merged.forEach { item ->
+            deduped.putIfAbsent(itemKey(item), item)
+        }
+
+        val paged = paginate(deduped.values.toList(), page)
+        return paged.copy(hasNext = paged.hasNext || first.hasNext || second.hasNext)
     }
 
     private suspend fun getCategoryPage(
@@ -181,7 +193,7 @@ class BasPlayFTP : MainAPI() {
 
         return PageResult(
             items = items,
-            hasNext = detectNextPage(document, page)
+            hasNext = detectNextPage(document, page) || items.size >= CATEGORY_PAGE_SIZE
         )
     }
 
@@ -263,14 +275,19 @@ class BasPlayFTP : MainAPI() {
             val document = getDocument(source.url) ?: continue
             parseItems(
                 candidates = document.select(
-                    ".cp-card, .movie-card, a[href*='player.php'], a[href*='download.php'], a[href*='tview.php']"
+                    ".cp-card, .movie-card, a[href*='view.php'], a[href*='player.php'], a[href*='tview.php']"
                 ),
                 sourceUrl = source.url,
                 defaultType = source.type,
                 forceSeries = source.forceSeries
-            ).forEach { item ->
-                all.putIfAbsent(itemKey(item), item)
-            }
+            )
+                .filter { source.forceSeries || !isSeriesUrl(it.url) }
+                .forEach { item ->
+                    all.putIfAbsent(
+                        if (item.type == TvType.Movie) movieDedupeKey(item) else itemKey(item),
+                        item
+                    )
+                }
         }
 
         val ranked = all.values
@@ -610,13 +627,21 @@ class BasPlayFTP : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         val clean = mediaUrl.substringBefore("#").trim()
-        if (clean.isBlank() || isTrailerUrl(clean)) return
+        if (clean.isBlank() || isTrailerUrl(clean) || isDownloadOnlyUrl(clean)) return
 
         val lower = clean.substringBefore("?").lowercase(Locale.ROOT)
         val type = when {
             lower.endsWith(".m3u8") -> ExtractorLinkType.M3U8
             lower.endsWith(".mpd") -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
+        }
+
+        // BAS PLAY serves the media from the same private HTTP host as the page.
+        // Keep the browser-like request headers and the originating page referer
+        // on the ExtractorLink so Android/ExoPlayer receives the same request
+        // context as the website player.
+        val headers = pageHeaders(referer).toMutableMap().apply {
+            this["Accept"] = "video/*,application/octet-stream;q=0.9,*/*;q=0.8"
         }
 
         callback(
@@ -626,7 +651,9 @@ class BasPlayFTP : MainAPI() {
                 url = clean,
                 type = type
             ) {
-                quality = detectQuality(lower)
+                this.referer = referer
+                this.headers = headers
+                this.quality = detectQuality(lower)
             }
         )
     }
@@ -759,10 +786,10 @@ class BasPlayFTP : MainAPI() {
         ) ?: return null
 
         val candidates = buildList {
+            add(img.attr("src"))
             add(img.attr("data-src"))
             add(img.attr("data-lazy-src"))
             add(img.attr("data-original"))
-            add(img.attr("src"))
             val srcset = img.attr("srcset")
             if (srcset.isNotBlank()) {
                 add(srcset.substringBefore(',').trim().substringBefore(' '))
@@ -918,6 +945,25 @@ class BasPlayFTP : MainAPI() {
             val uri = URI(url)
             "${uri.host.orEmpty().lowercase(Locale.ROOT)}:${uri.path.orEmpty().lowercase(Locale.ROOT)}:${uri.query.orEmpty()}"
         }.getOrDefault(url.lowercase(Locale.ROOT))
+    }
+
+    private fun mergeInterleaved(
+        first: List<SiteItem>,
+        second: List<SiteItem>
+    ): List<SiteItem> {
+        val out = mutableListOf<SiteItem>()
+        val max = maxOf(first.size, second.size)
+        for (index in 0 until max) {
+            first.getOrNull(index)?.let(out::add)
+            second.getOrNull(index)?.let(out::add)
+        }
+        return out
+    }
+
+    private fun movieDedupeKey(item: SiteItem): String {
+        val normalizedTitle = normalizeSearch(item.title)
+        if (normalizedTitle.isNotBlank()) return "movie:title:$normalizedTitle"
+        return "movie:url:${itemKey(item)}"
     }
 
     private fun searchScore(query: String, title: String): Double {
