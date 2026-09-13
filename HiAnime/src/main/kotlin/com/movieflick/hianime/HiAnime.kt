@@ -11,6 +11,7 @@ import java.net.URLEncoder
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import okhttp3.Headers
 
 class HiAnime : MainAPI() {
 
