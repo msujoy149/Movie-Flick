@@ -136,12 +136,18 @@ class HiAnime : MainAPI() {
         ).uppercase(Locale.ROOT)
 
         return when {
-            path.contains("/movie") ||
-                text.contains("MOVIE") ->
+            text.contains("MOVIE") ||
+                path.contains("/movie") ->
                 TvType.Movie
 
             text.contains("TV") ||
-                path.contains("/tv") ->
+                path.contains("/tv") ||
+                path.contains("/watch/") && (
+                    element?.selectFirst(
+                        ".fdi-item, .film-stats .item"
+                    )?.text()
+                        ?.contains("TV", true) == true
+                    ) ->
                 TvType.TvSeries
 
             else ->
@@ -439,7 +445,8 @@ class HiAnime : MainAPI() {
     }
 
     private fun parseEpisodeItems(
-        html: String
+        html: String,
+        seasonNumber: Int = 1
     ): List<Episode> {
         if (html.isBlank()) return emptyList()
 
@@ -462,56 +469,88 @@ class HiAnime : MainAPI() {
                     return@mapNotNull null
                 }
 
-                val title =
-                    cleanText(
-                        link.attr("title").ifBlank {
-                            link.selectFirst(
-                                ".ep-name, .e-dynamic-name"
-                            )?.text().orEmpty()
-                        }.ifBlank {
-                            link.text()
-                        }
-                    )
-
-                if (title.isBlank()) return@mapNotNull null
-
                 val number =
                     link.attr("data-number")
                         .toIntOrNull()
+                        ?: link.attr("data-episode-number")
+                            .toIntOrNull()
                         ?: Regex(
                             """(?:episode|ep\.?)\s*(\d+)""",
                             RegexOption.IGNORE_CASE
                         )
-                            .find(title)
+                            .find(
+                                cleanText(
+                                    link.attr("title").ifBlank {
+                                        link.text()
+                                    }
+                                )
+                            )
                             ?.groupValues
                             ?.getOrNull(1)
                             ?.toIntOrNull()
+
+                val title = cleanText(
+                    link.attr("title").ifBlank {
+                        link.selectFirst(
+                            ".ep-name, .e-dynamic-name"
+                        )?.text().orEmpty()
+                    }.ifBlank {
+                        link.text()
+                    }
+                ).ifBlank {
+                    number?.let { "Episode $it" } ?: "Episode"
+                }
 
                 newEpisode(
                     absoluteUrl(href)
                 ) {
                     name = title
                     episode = number
-                    season = 1
+                    season = seasonNumber
 
                     /*
-                     * Store the real episode id together with the watch URL.
-                     * This lets loadLinks() call the site's server API fresh
-                     * on every Play action.
+                     * Keep the exact episode id. It is required by the
+                     * fresh server/source resolver in loadLinks().
                      */
-                    data = "${
-                        absoluteUrl(href)
-                    }||$id"
+                    data = "${absoluteUrl(href)}||$id"
                 }
             }
-            .distinctBy { it.data }
-            .sortedWith(
-                compareBy<Episode> {
-                    it.season ?: 1
-                }.thenBy {
-                    it.episode ?: Int.MAX_VALUE
-                }
+            .distinctBy {
+                "${it.season ?: seasonNumber}:${it.episode}:${it.data}"
+            }
+            .sortedBy {
+                it.episode ?: Int.MAX_VALUE
+            }
+    }
+
+    private suspend fun getEpisodesFromApi(
+        animeId: String,
+        seasonNumber: Int = 1,
+        referer: String = "$mainUrl/"
+    ): List<Episode> {
+        val url = "$mainUrl/ajax/v2/episode/list/$animeId"
+
+        val response = runCatching {
+            app.get(
+                url,
+                headers = pageHeaders + mapOf(
+                    "Referer" to referer,
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
             )
+        }.getOrNull() ?: return emptyList()
+
+        val json = runCatching {
+            JSONObject(response.text)
+        }.getOrNull() ?: return emptyList()
+
+        val html = json.optString("html")
+        if (html.isBlank()) return emptyList()
+
+        return parseEpisodeItems(
+            html = html,
+            seasonNumber = seasonNumber
+        )
     }
 
     private suspend fun getEpisodesFromApi(
@@ -537,29 +576,12 @@ class HiAnime : MainAPI() {
         return parseEpisodeItems(html)
     }
 
-    private fun episodeNumberFromWatchUrl(
-        url: String
-    ): Int? {
-        return runCatching {
-            URI(url).rawQuery
-                ?.split('&')
-                ?.firstOrNull {
-                    it.substringBefore('=')
-                        .equals("ep", true)
-                }
-                ?.substringAfter('=')
-                ?.toIntOrNull()
-        }.getOrNull()
-    }
-
     override suspend fun load(
         url: String
     ): LoadResponse? {
-        /*
-         * An episode data URL is "watchUrl||episodeId".
-         */
-        val originalUrl = url.substringBefore("||").trim()
-        val pageUrl = absoluteUrl(originalUrl)
+        val pageUrl = absoluteUrl(
+            url.substringBefore("||").trim()
+        )
 
         val response = runCatching {
             app.get(
@@ -572,13 +594,12 @@ class HiAnime : MainAPI() {
 
         val document = response.document
 
-        val canonical =
-            document
-                .selectFirst("link[rel=canonical]")
-                ?.attr("href")
-                ?.takeIf { it.isNotBlank() }
-                ?.let(::absoluteUrl)
-                ?: pageUrl
+        val canonical = document
+            .selectFirst("link[rel=canonical]")
+            ?.attr("href")
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::absoluteUrl)
+            ?: pageUrl
 
         val title = cleanTitle(
             document
@@ -587,7 +608,7 @@ class HiAnime : MainAPI() {
         ).ifBlank {
             cleanTitle(
                 document.selectFirst(
-                    "h2.film-name, .film-name, h1"
+                    ".film-name, h1"
                 )?.text()
             )
         }.ifBlank {
@@ -615,49 +636,145 @@ class HiAnime : MainAPI() {
         val year = extractYear(document)
 
         /*
-         * The episode list is lazy-loaded on HiAnime's watch page, so the
-         * important source is the anime ID from the page itself. The supplied
-         * page exposes it as hi-anime-id / data-anime-id.
+         * HiAnime's actual watch-page source identifies TV episodes with:
+         *
+         *   #ani_detail[data-anime-id="240"][data-id="4402"]
+         *   [data-episode-number="1"]
+         *
+         * and the page's film stats contain "TV".
+         *
+         * Therefore an episode URL such as:
+         *   /watch/attack-on-titan-240?ep=4402
+         * MUST resolve to the parent TV series, not a Movie response.
          */
+        val aniDetail = document.selectFirst("#ani_detail")
         val animeId = animeIdFromDocument(document)
+        val episodeNumber =
+            aniDetail
+                ?.attr("data-episode-number")
+                ?.toIntOrNull()
+                ?: episodeIdFromUrl(canonical)
+                    ?.let { null }
 
-        if (animeId != null) {
-            val episodes = getEpisodesFromApi(animeId)
+        val isTvPage =
+            document
+                .selectFirst(".film-stats")
+                ?.text()
+                ?.contains("TV", true) == true ||
+                document
+                    .selectFirst("#main-wrapper")
+                    ?.classNames()
+                    ?.contains("layout-page-watchtv") == true ||
+                aniDetail?.attr("data-episode-number")
+                    ?.isNotBlank() == true
 
-            if (episodes.isNotEmpty()) {
-                return newTvSeriesLoadResponse(
-                    name = title,
-                    url = canonical,
-                    type = TvType.TvSeries,
-                    episodes = episodes
-                ) {
-                    posterUrl = poster
-                    this.plot = plot
-                    this.year = year
+        val currentEpisodeId =
+            aniDetail
+                ?.attr("data-id")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: episodeIdFromUrl(canonical)
+
+        /*
+         * For TV:
+         *
+         * 1. Strip ?ep=... so CloudStream's series URL is stable.
+         * 2. Fetch the complete episode list from the site's episode API.
+         * 3. Always return TvSeries.
+         *
+         * This is the key fix for the "Play Movie / No Links Found" screen
+         * shown in the user's test.
+         */
+        if (
+            isTvPage &&
+            animeId != null
+        ) {
+            val seriesUrl = canonical
+                .substringBefore("?ep=")
+                .substringBefore("&ep=")
+
+            /*
+             * Determine the visible season from the "other-season" list.
+             * When unavailable, use season 1.
+             */
+            val seasonNumber =
+                document
+                    .selectFirst(
+                        ".other-season .os-item.active .title"
+                    )
+                    ?.text()
+                    ?.let { textValue ->
+                        Regex(
+                            """Season\s+(\d+)""",
+                            RegexOption.IGNORE_CASE
+                        )
+                            .find(textValue)
+                            ?.groupValues
+                            ?.getOrNull(1)
+                            ?.toIntOrNull()
+                    }
+                    ?: 1
+
+            val episodes =
+                getEpisodesFromApi(
+                    animeId = animeId,
+                    seasonNumber = seasonNumber,
+                    referer = seriesUrl
+                )
+
+            /*
+             * If the API is temporarily unavailable, keep the current
+             * episode as a TV episode rather than downgrading the page
+             * to a Movie. This preserves the correct CloudStream type.
+             */
+            val finalEpisodes =
+                if (episodes.isNotEmpty()) {
+                    episodes
+                } else if (currentEpisodeId != null) {
+                    listOf(
+                        newEpisode(canonical) {
+                            name = "Episode ${episodeNumber ?: 1}"
+                            episode = episodeNumber ?: 1
+                            season = seasonNumber
+                            data = "$canonical||$currentEpisodeId"
+                        }
+                    )
+                } else {
+                    emptyList()
                 }
+
+            return newTvSeriesLoadResponse(
+                title,
+                seriesUrl,
+                TvType.TvSeries,
+                finalEpisodes
+            ) {
+                posterUrl = poster
+                this.plot = plot
+                this.year = year
             }
         }
 
+        /*
+         * Normal non-TV content.
+         */
         val pageType =
             if (
-                document.selectFirst(
-                    ".film-stats .fdi-item"
-                )?.text()
+                document
+                    .selectFirst(".film-stats")
+                    ?.text()
                     ?.contains("MOVIE", true) == true
             ) {
                 TvType.Movie
             } else {
-                inferType(
-                    canonical,
-                    null
-                )
+                TvType.Anime
             }
 
         return newMovieLoadResponse(
-            name = title,
-            url = canonical,
-            type = pageType,
-            dataUrl = canonical
+            title,
+            canonical,
+            pageType,
+            canonical
         ) {
             posterUrl = poster
             this.plot = plot
