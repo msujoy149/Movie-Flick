@@ -36,6 +36,8 @@ class BasPlayFTP : MainAPI() {
     )
 
     private companion object {
+        const val BASE_URL = "http://10.20.30.40"
+
         const val INITIAL_BATCH = 6
         const val CONTINUE_BATCH = 10
         const val TV_PAGE_SIZE = 24
@@ -45,7 +47,6 @@ class BasPlayFTP : MainAPI() {
         const val TV_URL = "$BASE_URL/tv.php"
         const val ANIME_MOVIES_URL = "$BASE_URL/category.php?category=Animation"
         const val ANIME_TV_URL = "$BASE_URL/tv.php?category=ANIMATED+TV+SERIES"
-        const val BASE_URL = "http://10.20.30.40"
     }
 
     private data class SiteItem(
@@ -361,7 +362,7 @@ class BasPlayFTP : MainAPI() {
         }
     }
 
-    private fun fallbackLoadResponse(url: String): LoadResponse {
+    private suspend fun fallbackLoadResponse(url: String): LoadResponse {
         return newMovieLoadResponse(
             titleFromUrl(url),
             url,
@@ -600,7 +601,7 @@ class BasPlayFTP : MainAPI() {
         return score
     }
 
-    private fun getDocument(url: String): Document? {
+    private suspend fun getDocument(url: String): Document? {
         val normalized = url.trim()
         if (normalized.isBlank()) return null
 
