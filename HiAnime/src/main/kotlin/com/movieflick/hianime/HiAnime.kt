@@ -11,6 +11,11 @@ import java.net.URLEncoder
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import android.util.Base64
+import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import okhttp3.Headers
 
 class HiAnime : MainAPI() {
@@ -1098,7 +1103,8 @@ class HiAnime : MainAPI() {
     private data class ServerInfo(
         val id: String,
         val name: String,
-        val type: String
+        val type: String,
+        val serverId: String? = null
     )
 
     private fun parseServerHtml(
@@ -1151,10 +1157,21 @@ class HiAnime : MainAPI() {
                     }
                 }
 
+            val providerServerId =
+                item.attr("data-server-id")
+                    .ifBlank {
+                        item.attr("data-server")
+                    }
+                    .ifBlank {
+                        item.attr("data-serverid")
+                    }
+                    .takeIf { it.isNotBlank() }
+
             ServerInfo(
                 id = id,
                 name = name,
-                type = type
+                type = type,
+                serverId = providerServerId
             )
         }.distinctBy {
             "${it.id}:${it.type}"
@@ -1173,13 +1190,22 @@ class HiAnime : MainAPI() {
         fun walk(value: Any?, inheritedType: String? = null) {
             when (value) {
                 is JSONObject -> {
-                    val id = value.optString(
-                        "id",
-                        value.optString(
-                            "serverId",
-                            value.optString("server_id")
-                        )
+                    val rawId = value.optString(
+                        "id"
                     ).trim()
+
+                    val rawServerId = value.optString(
+                        "serverId",
+                        value.optString("server_id")
+                    ).trim()
+
+                    val id = rawId
+                        .ifBlank { rawServerId }
+
+                    val providerServerId =
+                        rawServerId
+                            .takeIf { it.isNotBlank() }
+                            ?.takeUnless { it == rawId }
 
                     val name = cleanText(
                         value.optString(
@@ -1215,7 +1241,8 @@ class HiAnime : MainAPI() {
                         result[key] = ServerInfo(
                             id = id,
                             name = name.ifBlank { "Server $id" },
-                            type = type
+                            type = type,
+                            serverId = providerServerId
                         )
                     }
 
@@ -1534,27 +1561,313 @@ class HiAnime : MainAPI() {
         return result.toList()
     }
 
+
+    private fun decryptAesCbcCompat(
+        key: String,
+        encrypted: String
+    ): String? {
+        return runCatching {
+            val all = Base64.decode(encrypted, Base64.DEFAULT)
+            if (all.size <= 16) return null
+
+            val salt = all.copyOfRange(0, 16)
+            val ciphertext = all.copyOfRange(16, all.size)
+
+            val derived = ArrayList<Byte>(48)
+            var previous = ByteArray(0)
+
+            while (derived.size < 48) {
+                val md5 = MessageDigest.getInstance("MD5")
+                md5.update(previous)
+                md5.update(
+                    key.toByteArray(
+                        StandardCharsets.UTF_8
+                    )
+                )
+                md5.update(salt)
+
+                previous = md5.digest()
+
+                previous.forEach {
+                    derived.add(it)
+                }
+            }
+
+            val aesKey = derived
+                .take(32)
+                .toByteArray()
+
+            val iv = derived
+                .drop(32)
+                .take(16)
+                .toByteArray()
+
+            val cipher = Cipher.getInstance(
+                "AES/CBC/PKCS5Padding"
+            )
+
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(
+                    aesKey,
+                    "AES"
+                ),
+                IvParameterSpec(iv)
+            )
+
+            String(
+                cipher.doFinal(ciphertext),
+                StandardCharsets.UTF_8
+            )
+        }.getOrNull()
+    }
+
+    private suspend fun extractEncryptedSourcePayload(
+        raw: String
+    ): List<String> {
+        val json = runCatching {
+            JSONObject(raw)
+        }.getOrNull() ?: return emptyList()
+
+        val sources = json.opt("sources")
+            ?: json.optJSONObject("data")
+                ?.opt("sources")
+            ?: return emptyList()
+
+        if (sources is org.json.JSONArray) {
+            return buildList {
+                for (i in 0 until sources.length()) {
+                    val obj =
+                        sources.optJSONObject(i)
+                            ?: continue
+
+                    val file = obj.optString(
+                        "file",
+                        obj.optString("url")
+                    ).trim()
+
+                    if (isMediaUrl(file)) {
+                        add(file)
+                    }
+                }
+            }
+        }
+
+        if (sources is String && sources.isNotBlank()) {
+            /*
+             * The established HiAnime/Megacloud-compatible implementation
+             * uses an AES-CBC payload derived from MD5(key + salt). The current
+             * response can be resolved with a runtime key fetched from the
+             * public key source, with a known fallback.
+             */
+            val keys = linkedSetOf<String>()
+
+            runCatching {
+                val keyResponse = app.get(
+                    "https://raw.githubusercontent.com/yogesh-hacker/MegacloudKeys/refs/heads/main/keys.json",
+                    headers = mapOf(
+                        "Accept" to "application/json"
+                    )
+                )
+
+                val keyJson = JSONObject(
+                    keyResponse.text
+                )
+
+                keyJson.optString("mega")
+                    .takeIf { it.isNotBlank() }
+                    ?.let { keys.add(it) }
+
+                keyJson.optString("vidplay")
+                    .takeIf { it.isNotBlank() }
+                    ?.let { keys.add(it) }
+            }
+
+            keys.add(
+                "80830978219438573984724834823458"
+            )
+
+            for (key in keys) {
+                val decrypted =
+                    decryptAesCbcCompat(
+                        key = key,
+                        encrypted = sources
+                    ) ?: continue
+
+                val nested = runCatching {
+                    org.json.JSONArray(decrypted)
+                }.getOrNull()
+
+                if (nested != null) {
+                    val result = buildList {
+                        for (i in 0 until nested.length()) {
+                            val obj =
+                                nested.optJSONObject(i)
+                                    ?: continue
+
+                            val file = obj.optString(
+                                "file",
+                                obj.optString("url")
+                            ).trim()
+
+                            if (isMediaUrl(file)) {
+                                add(file)
+                            }
+                        }
+                    }
+
+                    if (result.isNotEmpty()) {
+                        return result
+                    }
+                }
+
+                val nestedObj = runCatching {
+                    JSONObject(decrypted)
+                }.getOrNull()
+
+                if (nestedObj != null) {
+                    val result = linkedSetOf<String>()
+
+                    collectMediaUrls(
+                        nestedObj,
+                        result
+                    )
+
+                    if (result.isNotEmpty()) {
+                        return result.toList()
+                    }
+                }
+            }
+        }
+
+        return emptyList()
+    }
+
+    private fun fallbackProviderServerIds(
+        server: ServerInfo
+    ): List<String> {
+        val result = linkedSetOf<String>()
+
+        server.serverId
+            ?.takeIf { it.isNotBlank() }
+            ?.let { result.add(it) }
+
+        val normalized =
+            server.name
+                .lowercase(Locale.ROOT)
+                .replace(" ", "")
+                .replace("(", "")
+                .replace(")", "")
+
+        when {
+            normalized.contains("hd-1") ||
+                normalized.contains("hd1") ->
+                result.add("4")
+
+            normalized.contains("hd-2") ||
+                normalized.contains("hd2") ->
+                result.add("1")
+
+            normalized.contains("hd-3") ||
+                normalized.contains("hd3") ->
+                result.add("6")
+        }
+
+        return result.toList()
+    }
+
+    private suspend fun getMapperSources(
+        episodeId: String,
+        server: ServerInfo
+    ): List<String> {
+        /*
+         * Last-resort resolver. The mapper API exposes the same HiAnime
+         * episode -> server -> source relationship and returns a normalized
+         * HLS/MP4 URL. The first-party HiAnime endpoints remain preferred.
+         */
+        val ids = fallbackProviderServerIds(server)
+        if (ids.isEmpty()) return emptyList()
+
+        val encodedEpisode =
+            URLEncoder.encode(
+                episodeId,
+                StandardCharsets.UTF_8.name()
+            )
+
+        for (providerId in ids) {
+            val url =
+                "https://hianime-mapper.vercel.app/anime/sources" +
+                    "?serverId=$providerId" +
+                    "&episodeId=$encodedEpisode"
+
+            val response = runCatching {
+                app.get(
+                    url,
+                    headers = mapOf(
+                        "Accept" to "application/json"
+                    )
+                )
+            }.getOrNull() ?: continue
+
+            val raw = response.text.trim()
+            if (raw.isBlank()) continue
+
+            val found = linkedSetOf<String>()
+
+            runCatching {
+                val root = JSONObject(raw)
+                val data = root.optJSONObject("data")
+                    ?: root
+
+                val sourceArray =
+                    data.optJSONArray("sources")
+
+                if (sourceArray != null) {
+                    for (i in 0 until sourceArray.length()) {
+                        val obj =
+                            sourceArray.optJSONObject(i)
+                                ?: continue
+
+                        val urlValue = obj.optString(
+                            "url",
+                            obj.optString("file")
+                        ).trim()
+
+                        if (isMediaUrl(urlValue)) {
+                            found.add(urlValue)
+                        }
+                    }
+                }
+            }
+
+            if (found.isNotEmpty()) {
+                return found.toList()
+            }
+
+            directMediaFromJson(raw).forEach {
+                found.add(it)
+            }
+
+            if (found.isNotEmpty()) {
+                return found.toList()
+            }
+        }
+
+        return emptyList()
+    }
+
     private suspend fun getEpisodeSources(
         serverId: String,
         episodeId: String,
         referer: String,
         cookieJar: MutableMap<String, String> = linkedMapOf()
     ): List<String> {
-        /*
-         * Current HiAnime-compatible APIs use:
-         *   /api/theme/episode/sources?serverId={serverId}&episodeId={episodeId}
-         *
-         * The browser flow is session/CSRF aware, so reuse the fresh cookies
-         * and X-XSRF-TOKEN gathered from the watch page.
-         */
         val endpoints = listOf(
             "$mainUrl/api/theme/episode/sources?serverId=$serverId&episodeId=$episodeId",
             "$mainUrl/api/theme/episode/source?serverId=$serverId&episodeId=$episodeId",
             "$mainUrl/api/theme/episode/sources?id=$serverId&episodeId=$episodeId",
             "$mainUrl/ajax/v2/episode/sources?id=$serverId"
         ).distinct()
-
-        val links = linkedSetOf<String>()
 
         for (url in endpoints) {
             val response = runCatching {
@@ -1575,16 +1888,29 @@ class HiAnime : MainAPI() {
             val raw = response.text.trim()
             if (raw.isBlank()) continue
 
-            directMediaFromJson(raw).forEach {
-                links.add(it)
+            /*
+             * Direct sources[].file / sources[].url
+             */
+            val direct = directMediaFromJson(raw)
+            if (direct.isNotEmpty()) {
+                return direct
             }
 
-            sourceLinkFromJson(raw).forEach {
-                links.add(it)
+            /*
+             * Encrypted `sources` payload used by established HiAnime
+             * provider flows.
+             */
+            val decrypted = extractEncryptedSourcePayload(raw)
+            if (decrypted.isNotEmpty()) {
+                return decrypted
             }
 
+            /*
+             * Standard response often has a direct iframe/embed `link`.
+             */
+            val links = sourceLinkFromJson(raw)
             if (links.isNotEmpty()) {
-                return links.toList()
+                return links
             }
         }
 
@@ -2018,12 +2344,24 @@ class HiAnime : MainAPI() {
          * when HD-2/HD-3 has a working source.
          */
         for (server in orderedServers) {
-            val sources = getEpisodeSources(
+            var sources = getEpisodeSources(
                 serverId = server.id,
                 episodeId = episodeId,
                 referer = pageUrl,
                 cookieJar = cookieJar
             )
+
+            /*
+             * If the current site's source endpoint gives no playable source,
+             * ask the normalized HiAnime mapper before touching an embed page.
+             * This remains fresh per Play and avoids persisting expired URLs.
+             */
+            if (sources.isEmpty()) {
+                sources = getMapperSources(
+                    episodeId = episodeId,
+                    server = server
+                )
+            }
 
             if (sources.isEmpty()) continue
 
