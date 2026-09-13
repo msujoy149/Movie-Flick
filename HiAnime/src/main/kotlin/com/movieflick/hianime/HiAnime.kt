@@ -1426,16 +1426,21 @@ class HiAnime : MainAPI() {
         referer: String
     ): List<String> {
         /*
-         * The exact servers request is confirmed by the user's browser.
-         * Source implementations across the HiAnime ecosystem use the
-         * server-id -> episode/sources step. We try the current /api/theme/
-         * forms first and retain the established ajax/v2 fallback.
+         * The established HiAnime source resolver is:
+         *
+         *   /ajax/v2/episode/sources?id={serverId}
+         *
+         * Current hianime.at also exposes /api/theme/ routes. Try the
+         * established endpoint first, then the current-site variants.
+         *
+         * Every call is fresh: no source URL is cached.
          */
         val endpoints = listOf(
+            "$mainUrl/ajax/v2/episode/sources?id=$serverId",
             "$mainUrl/api/theme/episode/sources?id=$serverId",
             "$mainUrl/api/theme/episode/source?id=$serverId",
             "$mainUrl/api/theme/episode/sources?serverId=$serverId",
-            "$mainUrl/ajax/v2/episode/sources?id=$serverId"
+            "$mainUrl/ajax/v2/episode/sources?serverId=$serverId"
         ).distinct()
 
         val headers = pageHeaders + mapOf(
@@ -1458,14 +1463,17 @@ class HiAnime : MainAPI() {
             val raw = response.text.trim()
             if (raw.isBlank()) continue
 
+            /*
+             * Direct HLS/MP4/etc. embedded in JSON.
+             */
             directMediaFromJson(raw).forEach {
                 links.add(it)
             }
 
-            if (links.isNotEmpty()) {
-                return links.toList()
-            }
-
+            /*
+             * Standard HiAnime response:
+             * {"link":"https://..."}
+             */
             sourceLinkFromJson(raw).forEach {
                 links.add(it)
             }
@@ -1475,7 +1483,65 @@ class HiAnime : MainAPI() {
             }
         }
 
-        return links.toList()
+        return emptyList()
+    }
+
+    private suspend fun resolveEmbedMedia(
+        embedUrl: String,
+        referer: String
+    ): List<Pair<String, String>> {
+        val response = runCatching {
+            app.get(
+                embedUrl,
+                headers = pageHeaders + mapOf(
+                    "Referer" to referer,
+                    "Origin" to mainUrl
+                )
+            )
+        }.getOrNull() ?: return emptyList()
+
+        val found = linkedMapOf<String, String>()
+
+        directMediaUrls(
+            document = response.document,
+            html = response.text,
+            baseUrl = embedUrl
+        ).forEach {
+            found.putIfAbsent(it, embedUrl)
+        }
+
+        /*
+         * Some player pages create the HLS URL inside JS rather than a
+         * <video> element. Scan the raw HTML for manifest URLs too.
+         */
+        val normalized = response.text
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        Regex(
+            """https?://[^"'<>\\\s]+?\.m3u8(?:\?[^"'<>\\\s]*)?"""
+        ).findAll(normalized).forEach {
+            found.putIfAbsent(
+                it.value,
+                embedUrl
+            )
+        }
+
+        Regex(
+            """https?://[^"'<>\\\s]+?\.mp4(?:\?[^"'<>\\\s]*)?"""
+        ).findAll(normalized).forEach {
+            found.putIfAbsent(
+                it.value,
+                embedUrl
+            )
+        }
+
+        return found.map { (url, ref) ->
+            url to ref
+        }
     }
 
     private fun isEmbedUrl(
@@ -1669,17 +1735,14 @@ class HiAnime : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         /*
-         * Fresh resolution on EVERY Play:
+         * Fresh resolver:
          *
-         * watch page
-         *   -> episode id
-         *   -> /api/theme/episode/servers
-         *   -> fresh server id
-         *   -> fresh source request
-         *   -> current m3u8/mp4/embed
+         *   episode id
+         *      -> fresh server list
+         *      -> fresh source link
+         *      -> fresh manifest
          *
-         * Nothing is stored between Play actions, so expiring media tokens
-         * are not reused.
+         * No media URL is persisted between Play actions.
          */
         val pageData = data.substringBefore("||").trim()
         val storedEpisodeId =
@@ -1691,7 +1754,7 @@ class HiAnime : MainAPI() {
         if (pageData.isBlank()) return false
 
         /*
-         * Direct media URL.
+         * A direct media URL can be passed straight to CloudStream.
          */
         if (isMediaUrl(pageData)) {
             emitDirect(
@@ -1704,10 +1767,6 @@ class HiAnime : MainAPI() {
 
         val pageUrl = absoluteUrl(pageData)
 
-        /*
-         * Fresh watch-page request first. This also establishes the same
-         * site session/referer context used by the browser.
-         */
         val watchResponse = runCatching {
             app.get(
                 pageUrl,
@@ -1717,10 +1776,6 @@ class HiAnime : MainAPI() {
             )
         }.getOrNull() ?: return false
 
-        /*
-         * Prefer the episode ID already stored by parseEpisodeItems().
-         * If unavailable, recover it from the watch page or URL.
-         */
         val episodeId =
             storedEpisodeId
                 ?: watchResponse.document
@@ -1730,11 +1785,11 @@ class HiAnime : MainAPI() {
                     ?.takeIf { it.isNotBlank() }
                 ?: episodeIdFromUrl(pageUrl)
 
+        /*
+         * For a standalone movie, first look for an actual file/manifest on
+         * the page. Never convert a movie into an episode list.
+         */
         if (episodeId.isNullOrBlank()) {
-            /*
-             * Single movie fallback: if the page itself exposes a media
-             * URL, accept it. Otherwise there is no trustworthy source ID.
-             */
             val direct = directMediaUrls(
                 document = watchResponse.document,
                 html = watchResponse.text,
@@ -1753,61 +1808,50 @@ class HiAnime : MainAPI() {
         }
 
         /*
-         * Exact current endpoint observed in the user's browser.
+         * This endpoint is confirmed by the user's browser capture:
+         *
+         * GET /api/theme/episode/servers?episodeId=13116
          */
-        val servers =
-            getEpisodeServers(
-                episodeId = episodeId,
-                referer = pageUrl
-            )
+        val servers = getEpisodeServers(
+            episodeId = episodeId,
+            referer = pageUrl
+        )
 
         if (servers.isEmpty()) {
             return false
         }
 
-        /*
-         * Prefer normal SUB servers, then DUB, while still trying every
-         * available server when the first one cannot resolve.
-         */
-        val orderedServers =
-            servers.sortedWith(
-                compareBy<ServerInfo> {
-                    when {
-                        it.type.equals("sub", true) -> 0
-                        it.type.equals("dub", true) -> 1
-                        else -> 2
-                    }
-                }.thenBy {
-                    it.name
+        val orderedServers = servers.sortedWith(
+            compareBy<ServerInfo> {
+                when {
+                    it.type.equals("sub", true) -> 0
+                    it.type.equals("dub", true) -> 1
+                    else -> 2
                 }
-            )
+            }.thenBy {
+                it.name
+            }
+        )
 
         for (server in orderedServers) {
-            val sources =
-                getEpisodeSources(
-                    serverId = server.id,
-                    referer = pageUrl
-                )
+            val sources = getEpisodeSources(
+                serverId = server.id,
+                referer = pageUrl
+            )
 
-            if (sources.isEmpty()) {
-                continue
-            }
+            if (sources.isEmpty()) continue
 
             for (source in sources) {
-                val cleanSource =
-                    source
-                        .replace("\\/", "/")
-                        .replace("&amp;", "&")
-                        .trim()
+                val cleanSource = source
+                    .replace("\\/", "/")
+                    .replace("&amp;", "&")
+                    .trim()
 
                 /*
-                 * Best case: the source API gives the actual HLS/MP4 URL.
-                 * This is exactly what the browser ultimately requests:
-                 * master.m3u8 -> variant index.m3u8 -> .ts segments.
+                 * Direct final media URL.
                  */
                 if (isMediaUrl(cleanSource)) {
-                    emitDirect(
-                        cleanSource,
+                    val streamReferer =
                         if (
                             cleanSource.contains(
                                 "hls2.aniwatchtv.uk",
@@ -1817,7 +1861,11 @@ class HiAnime : MainAPI() {
                             "https://zokoanime.video/"
                         } else {
                             pageUrl
-                        },
+                        }
+
+                    emitDirect(
+                        cleanSource,
+                        streamReferer,
                         callback
                     )
 
@@ -1825,17 +1873,45 @@ class HiAnime : MainAPI() {
                 }
 
                 /*
-                 * Otherwise the source is an embed page. Let CloudStream's
-                 * extractor framework resolve it. This avoids treating an ad
-                 * page as a video URL.
+                 * Current browser capture shows source playback going through
+                 * zokoanime.video and then to hls2.aniwatchtv.uk/master.m3u8.
+                 *
+                 * First try to resolve the embed page directly for its real
+                 * manifest. This avoids depending only on CloudStream's
+                 * optional extractor registry.
                  */
                 if (
-                    isEmbedUrl(cleanSource) ||
+                    cleanSource.startsWith(
+                        "http://",
+                        true
+                    ) ||
                     cleanSource.startsWith(
                         "https://",
                         true
                     )
                 ) {
+                    val resolved = resolveEmbedMedia(
+                        embedUrl = cleanSource,
+                        referer = pageUrl
+                    )
+
+                    if (resolved.isNotEmpty()) {
+                        resolved.forEach { (mediaUrl, mediaReferer) ->
+                            emitDirect(
+                                mediaUrl,
+                                mediaReferer,
+                                callback
+                            )
+                        }
+
+                        return true
+                    }
+
+                    /*
+                     * Final fallback: use CloudStream extractor registry.
+                     * Only report success when the extractor actually calls
+                     * our callback.
+                     */
                     var emitted = false
 
                     runCatching {
@@ -1843,9 +1919,11 @@ class HiAnime : MainAPI() {
                             cleanSource,
                             pageUrl,
                             subtitleCallback,
-                            callback
+                            { link ->
+                                emitted = true
+                                callback(link)
+                            }
                         )
-                        emitted = true
                     }
 
                     if (emitted) {
