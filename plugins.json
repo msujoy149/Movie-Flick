@@ -96,11 +96,11 @@
     },
     {
         "iconUrl": "https://hianime.at/theme/images/icons-192.png",
-        "jarFileSize": 128876,
-        "fileHash": "sha256-a1d18183134fc4077d788afee4edeeab98d0d685aa9b1e418748302c89b9bf3e",
+        "jarFileSize": 135650,
+        "fileHash": "sha256-673dac9a9c3904906179cf0649bd863d93cd32587480a5e0d70d013ac1c36338",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 35981,
+        "fileSize": 38112,
         "status": 1,
         "language": "en",
         "authors": [
@@ -117,7 +117,7 @@
         "description": "Hi Anime provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.cs3",
         "name": "HiAnime",
-        "jarHash": "sha256-dc4bbf0c37696606d7a8d73b629da806a6bc9f6b5850cad7da52bfa863813adb"
+        "jarHash": "sha256-0f4e9d69956cff34d4925f5319fc40ec18f809eef0328c28465ad7b9b2d745a1"
     },
     {
         "jarFileSize": 110432,
