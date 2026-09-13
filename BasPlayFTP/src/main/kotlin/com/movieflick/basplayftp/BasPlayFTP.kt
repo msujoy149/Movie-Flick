@@ -769,8 +769,7 @@ class BasPlayFTP : MainAPI() {
         referer: String
     ): Map<String, String> = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-        "Accept-Encoding" to "identity;q=1, *;q=0",
-        "Referer" to referer
+        "Accept" to "*/*"
     )
 
     private fun mediaHeaders(
@@ -814,12 +813,15 @@ class BasPlayFTP : MainAPI() {
             else -> ExtractorLinkType.VIDEO
         }
 
+        val isTvMedia = referer.contains("tview.php", true) || clean.contains("/TV%20", true)
+        val inferredType = if (isTvMedia && type == ExtractorLinkType.VIDEO) null else type
+
         callback(
             newExtractorLink(
                 source = name,
-                name = "Bas Play Direct",
+                name = if (isTvMedia) "Bas Play TV" else "Bas Play Direct",
                 url = clean,
-                type = type
+                type = inferredType
             ) {
                 this.referer = referer
                 this.headers = headers
