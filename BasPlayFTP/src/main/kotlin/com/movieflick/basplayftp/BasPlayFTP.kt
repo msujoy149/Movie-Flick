@@ -5,7 +5,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -13,6 +17,7 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import kotlin.math.ceil
 
 class BasPlayFTP : MainAPI() {
     override var mainUrl = "http://10.20.30.40"
@@ -40,13 +45,18 @@ class BasPlayFTP : MainAPI() {
 
         const val INITIAL_BATCH = 6
         const val CONTINUE_BATCH = 10
-        const val TV_PAGE_SIZE = 24
-        const val CATEGORY_PAGE_SIZE = 24
+
+        // BAS PLAY category pages expose 24 cards per server page.
+        // CloudStream home rows use a different continuation size:
+        // first request = 6 items, every continuation = 10 items.
+        const val SERVER_PAGE_SIZE = 24
 
         const val MOVIES_URL = "$BASE_URL/index.php"
         const val TV_URL = "$BASE_URL/tv.php"
         const val ANIME_MOVIES_URL = "$BASE_URL/category.php?category=Animation"
         const val ANIME_TV_URL = "$BASE_URL/tv.php?category=ANIMATED+TV+SERIES"
+
+        const val SEARCH_SUGGEST_URL = "$BASE_URL/api/search_suggest.php"
     }
 
     private data class SiteItem(
@@ -80,6 +90,7 @@ class BasPlayFTP : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val pageNumber = page.coerceAtLeast(1)
+
         val result = when (request.data) {
             "basplay://trending" -> loadTrending(pageNumber)
             "basplay://movies" -> loadMovies(pageNumber)
@@ -95,13 +106,30 @@ class BasPlayFTP : MainAPI() {
         )
     }
 
+    /**
+     * CloudStream calls getMainPage(page=1), then asks for page=2, page=3, ...
+     * as the user reaches the end of a horizontal home row.
+     *
+     * The BAS PLAY website itself uses 24-card server pages, while the desired
+     * CloudStream UX is 6 cards initially and 10 cards on every continuation.
+     * Therefore we fetch only as many server pages as are needed to build the
+     * requested CloudStream slice, then return exactly that slice.
+     */
     private suspend fun loadTrending(page: Int): PageResult {
-        val document = getDocument(mainUrl) ?: return PageResult(emptyList(), false)
+        val document = getDocument(mainUrl)
+            ?: return PageResult(emptyList(), false)
 
-        // BAS PLAY exposes Trending Now as a dedicated row of real movie cards.
-        // Parse that row only; never fall back to the full movie grid here.
+        // The real homepage markup is:
+        // <div id="trendRow">
+        //   <a ... class="cp-card trend-card ...">
+        //
+        // Do not require a specific parent layout beyond the real trendRow.
+        // This also keeps the original BAS PLAY links and poster images intact.
         val candidates = document.select(
-            "#trendRow > a.trend-card, .trend-row > a.trend-card, .trend-row .trend-card, .trend-row .cp-card"
+            "#trendRow a.trend-card, " +
+                "#trendRow a.cp-card.trend-card, " +
+                ".trend-row a.trend-card, " +
+                "a.cp-card.trend-card"
         )
 
         val parsed = parseItems(
@@ -109,112 +137,170 @@ class BasPlayFTP : MainAPI() {
             sourceUrl = mainUrl,
             defaultType = TvType.Movie,
             forceSeries = false
-        ).filterNot { isSeriesUrl(it.url) }
+        )
+            .filterNot { isSeriesUrl(it.url) }
 
-        return paginate(parsed.distinctBy { movieDedupeKey(it) }, page)
+        val ordered = parsed.distinctBy { movieDedupeKey(it) }
+        val offset = homeOffset(page)
+        val take = homeTake(page)
+        val items = ordered.drop(offset).take(take)
+
+        return PageResult(
+            items = items,
+            hasNext = offset + items.size < ordered.size
+        )
     }
 
     private suspend fun loadMovies(page: Int): PageResult {
-        val url = pagedUrl(MOVIES_URL, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
-
-        // Movies must remain movie-only. A TV item is never admitted to this row,
-        // even when the server markup happens to contain a generic .cp-card.
-        val items = parseItems(
-            candidates = document.select(
-                ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='view.php'], a[href*='player.php']"
-            ),
-            sourceUrl = url,
+        val items = getCategoryItemsUpTo(
+            source = MOVIES_URL,
+            requiredCount = homeRequiredCount(page),
             defaultType = TvType.Movie,
             forceSeries = false
         )
             .filterNot { isSeriesUrl(it.url) }
+            // Movie-only de-duplication is intentionally limited to Movies.
             .distinctBy { movieDedupeKey(it) }
 
-        val batch = paginate(items, page)
-        val hasServerNext = detectNextPage(document, page)
-        return batch.copy(hasNext = batch.hasNext || hasServerNext)
+        return pageSlice(items, page)
     }
 
     private suspend fun loadTv(page: Int): PageResult {
-        val url = pagedUrl(TV_URL, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
-
-        val items = parseItems(
-            candidates = document.select(
-                ".cp-card, .movie-card, a[href*='tview.php']"
-            ),
-            sourceUrl = url,
+        val items = getCategoryItemsUpTo(
+            source = TV_URL,
+            requiredCount = homeRequiredCount(page),
             defaultType = TvType.TvSeries,
             forceSeries = true
         ).map { it.copy(type = TvType.TvSeries) }
 
-        val batch = paginate(items, page)
-        val hasServerNext = detectNextPage(document, page)
-        return batch.copy(hasNext = batch.hasNext || hasServerNext)
+        return pageSlice(items, page)
     }
 
-    private suspend fun loadAnime(page: Int): PageResult {
-        // Both configured Anime sources are fetched on every page request.
-        // Interleave them so one source cannot consume the whole initial row;
-        // the merged stream remains deterministic for stable lazy loading.
-        val first = getCategoryPage(ANIME_MOVIES_URL, page, TvType.Anime, false)
-        val second = getCategoryPage(ANIME_TV_URL, page, TvType.TvSeries, true)
+    private suspend fun loadAnime(page: Int): PageResult = coroutineScope {
+        val required = homeRequiredCount(page)
 
-        val merged = mergeInterleaved(
-            first.items.distinctBy { itemKey(it) },
-            second.items.distinctBy { itemKey(it) }
-        )
-
-        val deduped = linkedMapOf<String, SiteItem>()
-        merged.forEach { item ->
-            deduped.putIfAbsent(itemKey(item), item)
+        // Both Anime sources are fetched in parallel and merged into one stream.
+        // This prevents one source from monopolising the first row.
+        val firstDeferred = async {
+            getCategoryItemsUpTo(
+                source = ANIME_MOVIES_URL,
+                requiredCount = required,
+                defaultType = TvType.Anime,
+                forceSeries = false
+            )
         }
 
-        val paged = paginate(deduped.values.toList(), page)
-        return paged.copy(hasNext = paged.hasNext || first.hasNext || second.hasNext)
+        val secondDeferred = async {
+            getCategoryItemsUpTo(
+                source = ANIME_TV_URL,
+                requiredCount = required,
+                defaultType = TvType.TvSeries,
+                forceSeries = true
+            )
+        }
+
+        val first = firstDeferred.await()
+            .distinctBy { itemKey(it) }
+        val second = secondDeferred.await()
+            .distinctBy { itemKey(it) }
+
+        val merged = mergeInterleaved(first, second)
+            .distinctBy { itemKey(it) }
+
+        pageSlice(merged, page)
     }
 
-    private suspend fun getCategoryPage(
+    /**
+     * Fetch enough real BAS PLAY server pages to satisfy the CloudStream page.
+     *
+     * Example:
+     *   CloudStream page 1 -> first 6
+     *   CloudStream page 2 -> items 7..16
+     *   CloudStream page 3 -> items 17..26 (needs server pages 1 + 2)
+     *
+     * Server pages are fetched concurrently, so later continuation remains fast.
+     */
+    private suspend fun getCategoryItemsUpTo(
         source: String,
-        page: Int,
+        requiredCount: Int,
         defaultType: TvType,
         forceSeries: Boolean
-    ): PageResult {
-        val url = pagedUrl(source, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
+    ): List<SiteItem> = coroutineScope {
+        if (requiredCount <= 0) return@coroutineScope emptyList()
 
-        val selectors = if (forceSeries) {
-            ".cp-card, .movie-card, a[href*='tview.php']"
-        } else {
-            ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='player.php']"
-        }
+        val pagesNeeded = ceil(
+            requiredCount.toDouble() / SERVER_PAGE_SIZE.toDouble()
+        ).toInt().coerceAtLeast(1)
 
-        val items = parseItems(
-            candidates = document.select(selectors),
-            sourceUrl = url,
-            defaultType = defaultType,
-            forceSeries = forceSeries
-        )
+        val pages = (1..pagesNeeded).map { serverPage ->
+            async {
+                val url = pagedUrl(source, serverPage)
+                val document = getDocument(url)
 
-        return PageResult(
-            items = items,
-            hasNext = detectNextPage(document, page) || items.size >= CATEGORY_PAGE_SIZE
-        )
+                if (document == null) {
+                    emptyList()
+                } else {
+                    val selectors = if (forceSeries) {
+                        ".cp-card, .movie-card, a[href*='tview.php']"
+                    } else {
+                        ".cp-card, .movie-card, .movie-grid .movie-card, " +
+                            "a[href*='view.php'], a[href*='player.php']"
+                    }
+
+                    parseItems(
+                        candidates = document.select(selectors),
+                        sourceUrl = url,
+                        defaultType = defaultType,
+                        forceSeries = forceSeries
+                    )
+                }
+            }
+        }.awaitAll()
+
+        pages.asSequence()
+            .flatten()
+            .distinctBy { itemKey(it) }
+            .take(requiredCount)
+            .toList()
     }
 
-    private fun paginate(items: List<SiteItem>, page: Int): PageResult {
-        if (items.isEmpty()) return PageResult(emptyList(), false)
-
-        val offset = if (page <= 1) 0 else INITIAL_BATCH + ((page - 2) * CONTINUE_BATCH)
-        val take = if (page <= 1) INITIAL_BATCH else CONTINUE_BATCH
+    private fun pageSlice(
+        items: List<SiteItem>,
+        page: Int
+    ): PageResult {
+        val offset = homeOffset(page)
+        val take = homeTake(page)
         val batch = items.drop(offset).take(take)
+
+        // We deliberately return true while the source delivered enough data
+        // to satisfy the requested slice. CloudStream will request the next
+        // horizontal page, at which point we fetch whatever additional server
+        // page(s) are required.
+        val hasNext = batch.size == take ||
+            offset + batch.size < items.size
 
         return PageResult(
             items = batch,
-            hasNext = offset + batch.size < items.size
+            hasNext = hasNext
         )
     }
+
+    private fun homeRequiredCount(page: Int): Int =
+        if (page <= 1) {
+            INITIAL_BATCH
+        } else {
+            INITIAL_BATCH + ((page - 1) * CONTINUE_BATCH)
+        }
+
+    private fun homeOffset(page: Int): Int =
+        if (page <= 1) {
+            0
+        } else {
+            INITIAL_BATCH + ((page - 2) * CONTINUE_BATCH)
+        }
+
+    private fun homeTake(page: Int): Int =
+        if (page <= 1) INITIAL_BATCH else CONTINUE_BATCH
 
     private fun parseItems(
         candidates: List<Element>,
@@ -263,69 +349,95 @@ class BasPlayFTP : MainAPI() {
         return result.values.sortedBy { it.order }
     }
 
-    override suspend fun search(query: String, page: Int): SearchResponseList {
+    override suspend fun search(
+        query: String,
+        page: Int
+    ): SearchResponseList = coroutineScope {
         val q = query.trim()
-        if (q.isBlank()) return newSearchResponseList(emptyList(), false)
+        if (q.isBlank()) {
+            return@coroutineScope newSearchResponseList(
+                emptyList(),
+                false
+            )
+        }
 
-        // BAS PLAY exposes a real server-side search endpoint: search.php?q=...
-        // Prefer it so search is dynamic and does not depend only on the first
-        // page of the category indexes.
-        val searchUrl = setQueryParam("$BASE_URL/search.php", "q", q)
-        val searchDocument = getDocument(searchUrl)
+        /*
+         * FAST SEARCH:
+         *
+         * BAS PLAY's own live-search JavaScript uses:
+         *   POST /api/search_suggest.php
+         *   q=<query>&kind=all
+         *
+         * Use that native endpoint first. At the same time, query search.php
+         * so deployments where the suggestion endpoint is incomplete still
+         * get the full server-side search page. Both are cheap parallel calls.
+         */
+        val nativeDeferred = async {
+            fetchNativeSearch(q)
+        }
+
+        val pageDeferred = async {
+            val searchUrl = setQueryParam("$BASE_URL/search.php", "q", q)
+            getDocument(searchUrl)
+        }
+
+        val nativeResults = nativeDeferred.await()
+        val searchDocument = pageDeferred.await()
 
         val ranked = linkedMapOf<String, SiteItem>()
+
+        nativeResults.forEach { item ->
+            val key = if (isSeriesUrl(item.url)) {
+                itemKey(item)
+            } else {
+                movieDedupeKey(item)
+            }
+            ranked.putIfAbsent(key, item)
+        }
+
         if (searchDocument != null) {
             parseItems(
                 candidates = searchDocument.select(
-                    ".cp-card, .movie-card, .trend-card, a[href*='view.php'], " +
-                        "a[href*='player.php'], a[href*='tview.php']"
+                    ".cp-card, .movie-card, .trend-card, " +
+                        "a[href*='view.php'], a[href*='player.php'], " +
+                        "a[href*='tview.php']"
                 ),
-                sourceUrl = searchUrl,
+                sourceUrl = "$BASE_URL/search.php",
                 defaultType = TvType.Movie,
                 forceSeries = false
             ).forEach { item ->
-                // Search results themselves determine whether an item is a TV
-                // series by its URL; movies never absorb tview.php results.
-                if (item.type == TvType.TvSeries || !isSeriesUrl(item.url)) {
-                    val key = if (isSeriesUrl(item.url)) itemKey(item) else movieDedupeKey(item)
-                    ranked.putIfAbsent(key, item.copy(type = if (isSeriesUrl(item.url)) TvType.TvSeries else item.type))
+                if (item.title.isBlank()) return@forEach
+
+                val key = if (isSeriesUrl(item.url)) {
+                    itemKey(item)
+                } else {
+                    movieDedupeKey(item)
                 }
-            }
-        }
 
-        // Defensive fallback for deployments where search.php is unavailable
-        // or returns an empty page. Keep it bounded so search stays fast.
-        if (ranked.isEmpty()) {
-            val fallbackSources = listOf(
-                SearchSource(MOVIES_URL, TvType.Movie, false),
-                SearchSource(TV_URL, TvType.TvSeries, true),
-                SearchSource(ANIME_MOVIES_URL, TvType.Anime, false),
-                SearchSource(ANIME_TV_URL, TvType.TvSeries, true)
-            )
-
-            for (source in fallbackSources) {
-                val document = getDocument(source.url) ?: continue
-                parseItems(
-                    candidates = document.select(
-                        ".cp-card, .movie-card, .trend-card, a[href*='view.php'], " +
-                            "a[href*='player.php'], a[href*='tview.php']"
-                    ),
-                    sourceUrl = source.url,
-                    defaultType = source.type,
-                    forceSeries = source.forceSeries
+                ranked.putIfAbsent(
+                    key,
+                    item.copy(
+                        type = if (isSeriesUrl(item.url)) {
+                            TvType.TvSeries
+                        } else {
+                            item.type
+                        }
+                    )
                 )
-                    .filter { source.forceSeries || !isSeriesUrl(it.url) }
-                    .filter { searchScore(q, it.title) >= 0.25 }
-                    .forEach { item ->
-                        val key = if (item.type == TvType.Movie) movieDedupeKey(item) else itemKey(item)
-                        ranked.putIfAbsent(key, item)
-                    }
             }
         }
 
+        /*
+         * Ranking is deliberately tolerant:
+         * exact -> contains -> token/prefix -> edit-distance similarity.
+         * This makes nearby spellings useful instead of requiring an exact
+         * title match.
+         */
         val ordered = ranked.values
-            .map { it to searchScore(q, it.title) }
-            .filter { it.second >= 0.20 }
+            .map { item ->
+                item to searchScore(q, item.title)
+            }
+            .filter { (_, score) -> score >= 0.20 }
             .sortedWith(
                 compareByDescending<Pair<SiteItem, Double>> { it.second }
                     .thenBy { it.first.title.lowercase(Locale.ROOT) }
@@ -334,13 +446,106 @@ class BasPlayFTP : MainAPI() {
 
         val pageSize = 24
         val offset = (page - 1).coerceAtLeast(0) * pageSize
-        val pageItems = ordered.drop(offset).take(pageSize)
+        val pageItems = ordered
+            .drop(offset)
+            .take(pageSize)
 
-        return newSearchResponseList(
+        return@coroutineScope newSearchResponseList(
             pageItems.map { it.toSearchResponse() },
             offset + pageItems.size < ordered.size
         )
     }
+
+    private suspend fun fetchNativeSearch(query: String): List<SiteItem> {
+        val response = runCatching {
+            app.post(
+                SEARCH_SUGGEST_URL,
+                headers = pageHeaders("$BASE_URL/"),
+                data = mapOf(
+                    "q" to query,
+                    "kind" to "all"
+                )
+            )
+        }.getOrNull() ?: return emptyList()
+
+        return parseNativeSearchJson(
+            response.text,
+            query
+        )
+    }
+
+    private fun parseNativeSearchJson(
+        text: String,
+        query: String
+    ): List<SiteItem> {
+        if (text.isBlank()) return emptyList()
+
+        val mapper = ObjectMapper()
+        val root = runCatching {
+            mapper.readTree(text)
+        }.getOrNull() ?: return emptyList()
+
+        val array = when {
+            root.isArray -> root
+            root.has("results") && root["results"].isArray -> root["results"]
+            root.has("items") && root["items"].isArray -> root["items"]
+            root.has("data") && root["data"].isArray -> root["data"]
+            else -> return emptyList()
+        }
+
+        return array.mapNotNull { node ->
+            val id = node.textValueOrEmpty("id")
+            val rawUrl = node.textValueOrEmpty("url")
+                .ifBlank {
+                    if (id.isNotBlank()) "view.php?id=$id" else ""
+                }
+
+            val url = absoluteUrl(
+                rawUrl,
+                "$BASE_URL/"
+            )
+            if (!isUsefulContentUrl(url)) return@mapNotNull null
+
+            val title = node.textValueOrEmpty("title")
+                .ifBlank { titleFromUrl(url) }
+
+            if (title.isBlank() || isNavigationTitle(title)) {
+                return@mapNotNull null
+            }
+
+            val category = node.textValueOrEmpty("category")
+            val series =
+                isSeriesUrl(url) ||
+                    category.contains("tv", true) ||
+                    category.contains("series", true)
+
+            val type =
+                if (series) {
+                    TvType.TvSeries
+                } else {
+                    TvType.Movie
+                }
+
+            val posterRaw = node.textValueOrEmpty("poster")
+            val poster = posterRaw
+                .takeIf { it.isNotBlank() }
+                ?.let { absoluteUrl(it, "$BASE_URL/") }
+
+            SiteItem(
+                title = cleanTitle(title),
+                url = url,
+                poster = poster,
+                type = type
+            )
+        }
+            .filter { searchScore(query, it.title) >= 0.15 }
+    }
+
+    private fun JsonNode.textValueOrEmpty(name: String): String =
+        path(name).takeIf { !it.isMissingNode && !it.isNull }
+            ?.asText("")
+            ?.trim()
+            .orEmpty()
 
     private data class SearchSource(
         val url: String,
