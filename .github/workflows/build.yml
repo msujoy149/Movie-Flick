@@ -19,83 +19,61 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # --------------------------------------------------
-      # Checkout source repository
-      # --------------------------------------------------
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           path: src
           fetch-depth: 0
 
-      # --------------------------------------------------
-      # Setup Java 17
-      # --------------------------------------------------
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # --------------------------------------------------
-      # Setup Android SDK
-      # --------------------------------------------------
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: "yes"
+          log-accepted-android-sdk-licenses: "false"
 
-      # --------------------------------------------------
-      # Setup Gradle
-      # --------------------------------------------------
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install             "platform-tools"             "platforms;android-35"             "build-tools;35.0.0"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.11.1"
 
-      # --------------------------------------------------
-      # Build all CloudStream plugins
-      # --------------------------------------------------
       - name: Build plugins
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
-
-          # DhakaFTP-only TMDB credentials.
-          # These values come from GitHub Repository Secrets.
           TMDB_PRIMARY_API_KEY: ${{ secrets.TMDB_PRIMARY_API_KEY }}
           TMDB_PRIMARY_ACCESS_TOKEN: ${{ secrets.TMDB_PRIMARY_ACCESS_TOKEN }}
-
           TMDB_SECONDARY_API_KEY: ${{ secrets.TMDB_SECONDARY_API_KEY }}
           TMDB_SECONDARY_ACCESS_TOKEN: ${{ secrets.TMDB_SECONDARY_ACCESS_TOKEN }}
-
           TMDB_TERTIARY_API_KEY: ${{ secrets.TMDB_TERTIARY_API_KEY }}
           TMDB_TERTIARY_ACCESS_TOKEN: ${{ secrets.TMDB_TERTIARY_ACCESS_TOKEN }}
         run: |
           cd "$GITHUB_WORKSPACE/src"
-
           gradle make makePluginsJson --no-daemon
 
-      # --------------------------------------------------
-      # Prepare build output
-      # --------------------------------------------------
       - name: Prepare builds
         run: |
           rm -rf "$GITHUB_WORKSPACE/build-output"
           mkdir -p "$GITHUB_WORKSPACE/build-output"
 
-          # Copy all compiled CloudStream plugins
-          find "$GITHUB_WORKSPACE/src"             -type f             -name "*.cs3"             -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
+          find "$GITHUB_WORKSPACE/src" -type f -name "*.cs3" -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
 
-          # Copy generated plugins.json
           if [ -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
-            cp "$GITHUB_WORKSPACE/src/build/plugins.json"               "$GITHUB_WORKSPACE/build-output/plugins.json"
+            cp "$GITHUB_WORKSPACE/src/build/plugins.json" "$GITHUB_WORKSPACE/build-output/plugins.json"
           else
             echo "ERROR: plugins.json was not generated"
             exit 1
           fi
 
-          # --------------------------------------------------
-          # Generate repo.json directly
-          # --------------------------------------------------
           cat > "$GITHUB_WORKSPACE/build-output/repo.json" <<'EOF'
           {
             "name": "movieflick",
@@ -107,90 +85,43 @@ jobs:
           }
           EOF
 
-          echo "Build output:"
           ls -lah "$GITHUB_WORKSPACE/build-output"
-
-          echo ""
-          echo "Generated repo.json:"
           cat "$GITHUB_WORKSPACE/build-output/repo.json"
 
-      # --------------------------------------------------
-      # Prepare builds branch
-      # --------------------------------------------------
       - name: Prepare builds branch
         run: |
           cd "$GITHUB_WORKSPACE"
-
           rm -rf builds
-
-          git clone             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"             builds
-
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" builds
           cd builds
 
           if git ls-remote --exit-code --heads origin builds >/dev/null 2>&1; then
-            echo "builds branch exists"
-
             git fetch origin builds
             git checkout builds
-
             git rm -rf . || true
             git clean -fdx
-
           else
-            echo "builds branch does not exist"
-            echo "Creating builds branch"
-
             git checkout --orphan builds
-
             git rm -rf . || true
             git clean -fdx
           fi
 
-      # --------------------------------------------------
-      # Copy build files
-      # --------------------------------------------------
       - name: Copy build files
         run: |
-          cp -f "$GITHUB_WORKSPACE/build-output/"*             "$GITHUB_WORKSPACE/builds/"
-
+          cp -f "$GITHUB_WORKSPACE/build-output/"* "$GITHUB_WORKSPACE/builds/"
           cd "$GITHUB_WORKSPACE/builds"
-
-          echo "Final builds branch contents:"
           ls -lah
 
-          echo ""
-          echo "Checking required files..."
+          if [ -f "repo.json" ]; then echo "✓ repo.json found"; else echo "✗ repo.json missing"; exit 1; fi
+          if [ -f "plugins.json" ]; then echo "✓ plugins.json found"; else echo "✗ plugins.json missing"; exit 1; fi
 
-          if [ -f "repo.json" ]; then
-            echo "✓ repo.json found"
-          else
-            echo "✗ repo.json missing"
-            exit 1
-          fi
-
-          if [ -f "plugins.json" ]; then
-            echo "✓ plugins.json found"
-          else
-            echo "✗ plugins.json missing"
-            exit 1
-          fi
-
-          echo ""
-          echo "repo.json content:"
           cat repo.json
 
-      # --------------------------------------------------
-      # Push builds branch
-      # --------------------------------------------------
       - name: Push builds
         run: |
           cd "$GITHUB_WORKSPACE/builds"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add -A
-
-          git commit             -m "Build ${{ github.sha }}"             || echo "No changes to commit"
-
+          git commit -m "Build ${{ github.sha }}" || echo "No changes to commit"
           git push origin builds --force
