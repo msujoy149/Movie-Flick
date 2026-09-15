@@ -522,16 +522,13 @@ class BasPlayFTP : MainAPI() {
                 ?: extractSeasonNumber("$seriesUrl", seriesUrl)
                 ?: 1
 
-            // Always resolve an episode page at playback time. BAS PLAY's
-            // tview.php page contains the real <video><source> and may establish
-            // cookies/session state needed by the media request. Keep the exact
-            // data-src as a fallback so the source is never lost.
-            // Store the episode's own direct media URL as the primary playback
-            // payload. BAS PLAY already exposes a real data-src for every episode,
-            // so play must use that exact file just like working movie playback.
-            // Keep the tview page as a fallback for sources that do not expose
-            // data-src in a future site layout.
-            val data = "basplay:episode:${encodeToken(playable)}:${encodeToken(episodePage)}"
+            // Keep the episode page as the CloudStream episode data.
+            // loadLinks() will fetch this exact page again when the user presses
+            // Play, then collect that episode's current real <video><source> /
+            // data-src media URL. This mirrors the working Movie Haat pattern: the
+            // episode hands loadLinks() the source-of-truth endpoint, and the
+            // playable media link is emitted only at Play time.
+            val data = episodePage
 
             episodes += newEpisode(data) {
                 name = text
@@ -553,6 +550,15 @@ class BasPlayFTP : MainAPI() {
         val input = data.trim()
         if (input.isBlank()) return false
 
+        // Movie Haat-style direct media path: when an episode resolves to its
+        // actual media URL, emit that URL directly with the same simple
+        // ExtractorLink construction used by the working Movie implementation.
+        // Do not attach the previous TV-specific header profile here.
+        if (isMediaUrl(input) && !isTrailerUrl(input) && !isDownloadOnlyUrl(input)) {
+            emitDirectMedia(input, callback)
+            return true
+        }
+
         when {
             input.startsWith("basplay:direct:") -> {
                 val media = decodeToken(input.substringAfter("basplay:direct:"))
@@ -572,23 +578,13 @@ class BasPlayFTP : MainAPI() {
                 val directMedia = decodeToken(parts.getOrNull(0).orEmpty())
                 val episodePage = decodeToken(parts.getOrNull(1).orEmpty())
 
-                // Primary path: use the exact per-episode data-src captured from
-                // BAS PLAY. This mirrors the working Movie implementation and
-                // avoids making playback depend on re-parsing the tview page.
                 if (directMedia.isNotBlank() && isPlayableMedia(directMedia)) {
-                    val referer = canonicalTvReferer(episodePage.ifBlank { mainUrl })
-                    emitMedia(
-                        directMedia,
-                        referer,
-                        mediaHeaders(referer),
-                        callback
-                    )
+                    emitDirectMedia(directMedia, callback)
                     return true
                 }
 
-                // Fallback only when a future BAS PLAY page stops exposing data-src.
                 if (episodePage.isNotBlank()) {
-                    return resolvePlayableFromPage(episodePage, callback)
+                    return resolveTvEpisodeDirect(episodePage, callback)
                 }
                 return false
             }
@@ -599,11 +595,64 @@ class BasPlayFTP : MainAPI() {
             return true
         }
 
+        // BAS PLAY TV pages are episode source-of-truth pages. Fetch the
+        // selected tview.php page at Play time, find that episode's actual
+        // <video><source>/data-src, then emit the direct media URL using the
+        // same minimal ExtractorLink pattern as Movie Haat.
+        if (input.contains("tview.php", true)) {
+            return resolveTvEpisodeDirect(input, callback)
+        }
+
         if (looksLikePlayerOrContentPage(input)) {
             return resolvePlayableFromPage(input, callback)
         }
 
         return false
+    }
+
+    /**
+     * TV episode playback follows the source-of-truth tview.php page. The page
+     * is fetched every time the user presses Play so the current episode media
+     * URL is always discovered fresh. Once found, the URL is emitted using the
+     * same minimal direct ExtractorLink pattern used by Movie Haat.
+     */
+    private suspend fun resolveTvEpisodeDirect(
+        episodePage: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val page = getPage(episodePage) ?: return false
+        val document = page.document
+
+        val episodeNumber = Regex("(?i)[?&]episode=(\\d+)")
+            .find(episodePage)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        val candidates = linkedSetOf<String>()
+
+        document.select(".ep-item[data-src], a[data-epnum][data-src]").forEach { element ->
+            val number = element.attr("data-epnum").toIntOrNull()
+            if (episodeNumber == null || number == null || number == episodeNumber) {
+                val raw = element.attr("data-src").trim()
+                val absolute = absoluteUrl(raw, episodePage)
+                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
+                    candidates += absolute
+                }
+            }
+        }
+
+        document.select(
+            "video source[src], video source[data-src], video[src], source[src], source[data-src]"
+        ).forEach { element ->
+            listOf(element.attr("src"), element.attr("data-src")).forEach { raw ->
+                val absolute = absoluteUrl(raw, episodePage)
+                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
+                    candidates += absolute
+                }
+            }
+        }
+
+        val selected = candidates.firstOrNull() ?: return false
+        emitDirectMedia(selected, callback)
+        return true
     }
 
     private suspend fun resolvePlayableFromPage(
@@ -801,6 +850,36 @@ class BasPlayFTP : MainAPI() {
             .map { it.substringBefore(';').trim() }
             .filter { it.contains('=') }
         return cookies.joinToString("; ").ifBlank { null }
+    }
+
+    /**
+     * Exact direct-link emitter modeled on the working Movie Haat provider:
+     * no invented headers, no cookie replay, no extra TV-specific request profile.
+     */
+    private suspend fun emitDirectMedia(
+        url: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val clean = url.substringBefore("#").trim()
+        if (clean.isBlank() || isTrailerUrl(clean) || isDownloadOnlyUrl(clean)) return
+
+        val lowered = clean.substringBefore("?").lowercase(Locale.ROOT)
+        val type = when {
+            lowered.endsWith(".m3u8") -> ExtractorLinkType.M3U8
+            lowered.endsWith(".mpd") -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
+
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "Bas Play Direct",
+                url = clean,
+                type = type
+            ) {
+                quality = detectQuality(lowered)
+            }
+        )
     }
 
     private suspend fun emitMedia(
