@@ -720,13 +720,15 @@ class BasPlayFTP : MainAPI() {
                 ?: extractSeasonNumber("$seriesUrl", seriesUrl)
                 ?: 1
 
-            // Keep the episode page as the CloudStream episode data.
-            // loadLinks() will fetch this exact page again when the user presses
-            // Play, then collect that episode's current real <video><source> /
-            // data-src media URL. This mirrors the working Movie Haat pattern: the
-            // episode hands loadLinks() the source-of-truth endpoint, and the
-            // playable media link is emitted only at Play time.
-            val data = episodePage
+            // BAS PLAY already exposes the exact playable file in data-src.
+            // Use that original media URL as the primary episode payload so
+            // CloudStream can play the exact file directly. Keep the tview page
+            // as a fallback only when the source page has no direct media URL.
+            val data = if (playable.isNotBlank()) {
+                "basplay:episode:${encodeToken(playable)}:${encodeToken(episodePage)}"
+            } else {
+                episodePage
+            }
 
             episodes += newEpisode(data) {
                 name = text
