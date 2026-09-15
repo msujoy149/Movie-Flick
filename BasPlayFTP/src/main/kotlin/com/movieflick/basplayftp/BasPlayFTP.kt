@@ -834,7 +834,22 @@ class BasPlayFTP : MainAPI() {
         // <video><source>/data-src, then emit the direct media URL using the
         // same minimal ExtractorLink pattern as Movie Haat.
         if (input.contains("tview.php", true)) {
-            return resolveTvEpisodeDirect(input, callback)
+            val episodeNumber = Regex("(?i)[?&]episode=(\\d+)")
+                .find(input)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+
+            if (episodeNumber != null) {
+                val seriesPage = removeQueryParam(input, "episode").substringBefore("#")
+                return resolveTvEpisodeDirect(
+                    seriesPage = seriesPage,
+                    episodeNumber = episodeNumber,
+                    callback = callback
+                )
+            }
+
+            return false
         }
 
         if (looksLikePlayerOrContentPage(input)) {
