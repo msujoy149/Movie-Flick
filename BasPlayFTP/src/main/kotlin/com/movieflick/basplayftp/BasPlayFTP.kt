@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -13,6 +12,14 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 
 class BasPlayFTP : MainAPI() {
     override var mainUrl = "http://10.20.30.40"
@@ -29,7 +36,6 @@ class BasPlayFTP : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "basplay://trending" to "Trending Now",
         "basplay://movies" to "Movies",
         "basplay://tv" to "Tv Show",
         "basplay://anime" to "Anime"
@@ -40,7 +46,6 @@ class BasPlayFTP : MainAPI() {
 
         const val INITIAL_BATCH = 6
         const val CONTINUE_BATCH = 10
-        const val TV_PAGE_SIZE = 24
         const val CATEGORY_PAGE_SIZE = 24
 
         const val MOVIES_URL = "$BASE_URL/index.php"
@@ -63,6 +68,14 @@ class BasPlayFTP : MainAPI() {
         val hasNext: Boolean
     )
 
+    private data class CachedCategoryPage(
+        val items: List<SiteItem>,
+        val hasNext: Boolean
+    )
+
+    private val categoryPageCache = ConcurrentHashMap<String, CachedCategoryPage>()
+    private val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private fun pageHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
         "Accept" to "*/*",
@@ -81,7 +94,6 @@ class BasPlayFTP : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val pageNumber = page.coerceAtLeast(1)
         val result = when (request.data) {
-            "basplay://trending" -> loadTrending(pageNumber)
             "basplay://movies" -> loadMovies(pageNumber)
             "basplay://tv" -> loadTv(pageNumber)
             "basplay://anime" -> loadAnime(pageNumber)
@@ -95,126 +107,194 @@ class BasPlayFTP : MainAPI() {
         )
     }
 
-    private suspend fun loadTrending(page: Int): PageResult {
-        val document = getDocument(mainUrl) ?: return PageResult(emptyList(), false)
-
-        // BAS PLAY exposes Trending Now as a dedicated row of real movie cards.
-        // Parse that row only; never fall back to the full movie grid here.
-        val candidates = document.select(
-            "#trendRow > a.trend-card, .trend-row > a.trend-card, .trend-row .trend-card, .trend-row .cp-card"
-        )
-
-        val parsed = parseItems(
-            candidates = candidates,
-            sourceUrl = mainUrl,
-            defaultType = TvType.Movie,
-            forceSeries = false
-        ).filterNot { isSeriesUrl(it.url) }
-
-        return paginate(parsed.distinctBy { movieDedupeKey(it) }, page)
-    }
-
     private suspend fun loadMovies(page: Int): PageResult {
-        val url = pagedUrl(MOVIES_URL, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
-
-        // Movies must remain movie-only. A TV item is never admitted to this row,
-        // even when the server markup happens to contain a generic .cp-card.
-        val items = parseItems(
-            candidates = document.select(
-                ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='view.php'], a[href*='player.php']"
-            ),
-            sourceUrl = url,
+        val (items, sourceHasNext) = getCategoryItemsUpTo(
+            source = MOVIES_URL,
+            requiredCount = homeRequiredCount(page),
             defaultType = TvType.Movie,
             forceSeries = false
         )
+
+        val movieOnly = items
             .filterNot { isSeriesUrl(it.url) }
             .distinctBy { movieDedupeKey(it) }
 
-        val batch = paginate(items, page)
-        val hasServerNext = detectNextPage(document, page)
-        return batch.copy(hasNext = batch.hasNext || hasServerNext)
+        return pageSlice(movieOnly, page, sourceHasNext)
     }
 
     private suspend fun loadTv(page: Int): PageResult {
-        val url = pagedUrl(TV_URL, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
-
-        val items = parseItems(
-            candidates = document.select(
-                ".cp-card, .movie-card, a[href*='tview.php']"
-            ),
-            sourceUrl = url,
+        val (items, sourceHasNext) = getCategoryItemsUpTo(
+            source = TV_URL,
+            requiredCount = homeRequiredCount(page),
             defaultType = TvType.TvSeries,
             forceSeries = true
-        ).map { it.copy(type = TvType.TvSeries) }
-
-        val batch = paginate(items, page)
-        val hasServerNext = detectNextPage(document, page)
-        return batch.copy(hasNext = batch.hasNext || hasServerNext)
-    }
-
-    private suspend fun loadAnime(page: Int): PageResult {
-        // Both configured Anime sources are fetched on every page request.
-        // Interleave them so one source cannot consume the whole initial row;
-        // the merged stream remains deterministic for stable lazy loading.
-        val first = getCategoryPage(ANIME_MOVIES_URL, page, TvType.Anime, false)
-        val second = getCategoryPage(ANIME_TV_URL, page, TvType.TvSeries, true)
-
-        val merged = mergeInterleaved(
-            first.items.distinctBy { itemKey(it) },
-            second.items.distinctBy { itemKey(it) }
         )
 
-        val deduped = linkedMapOf<String, SiteItem>()
-        merged.forEach { item ->
-            deduped.putIfAbsent(itemKey(item), item)
-        }
+        val tvOnly = items
+            .filter { isSeriesUrl(it.url) }
+            .map { it.copy(type = TvType.TvSeries) }
+            .distinctBy { itemKey(it) }
 
-        val paged = paginate(deduped.values.toList(), page)
-        return paged.copy(hasNext = paged.hasNext || first.hasNext || second.hasNext)
+        return pageSlice(tvOnly, page, sourceHasNext)
     }
 
-    private suspend fun getCategoryPage(
-        source: String,
-        page: Int,
-        defaultType: TvType,
-        forceSeries: Boolean
-    ): PageResult {
-        val url = pagedUrl(source, page)
-        val document = getDocument(url) ?: return PageResult(emptyList(), false)
-
-        val selectors = if (forceSeries) {
-            ".cp-card, .movie-card, a[href*='tview.php']"
-        } else {
-            ".cp-card, .movie-card, .movie-grid .movie-card, a[href*='player.php']"
+    private suspend fun loadAnime(page: Int): PageResult = coroutineScope {
+        val firstDeferred = async {
+            getCategoryItemsUpTo(
+                source = ANIME_MOVIES_URL,
+                requiredCount = homeRequiredCount(page),
+                defaultType = TvType.Anime,
+                forceSeries = false
+            )
         }
 
-        val items = parseItems(
-            candidates = document.select(selectors),
-            sourceUrl = url,
+        val secondDeferred = async {
+            getCategoryItemsUpTo(
+                source = ANIME_TV_URL,
+                requiredCount = homeRequiredCount(page),
+                defaultType = TvType.TvSeries,
+                forceSeries = true
+            )
+        }
+
+        val (first, firstHasNext) = firstDeferred.await()
+        val (second, secondHasNext) = secondDeferred.await()
+
+        val merged = mergeInterleaved(
+            first.distinctBy { itemKey(it) },
+            second.distinctBy { itemKey(it) }
+        ).distinctBy { itemKey(it) }
+
+        pageSlice(
+            merged,
+            page,
+            firstHasNext || secondHasNext
+        )
+    }
+
+    private suspend fun getCategoryItemsUpTo(
+        source: String,
+        requiredCount: Int,
+        defaultType: TvType,
+        forceSeries: Boolean
+    ): Pair<List<SiteItem>, Boolean> = coroutineScope {
+        if (requiredCount <= 0) return@coroutineScope emptyList<SiteItem>() to false
+
+        val pagesNeeded = ((requiredCount + CATEGORY_PAGE_SIZE - 1) / CATEGORY_PAGE_SIZE).coerceAtLeast(1)
+
+        val pages = (1..pagesNeeded).map { serverPage ->
+            async {
+                fetchCategoryPage(
+                    source = source,
+                    page = serverPage,
+                    defaultType = defaultType,
+                    forceSeries = forceSeries
+                )
+            }
+        }.awaitAll()
+
+        val merged = pages.asSequence()
+            .flatMap { it.items.asSequence() }
+            .distinctBy { itemKey(it) }
+            .toList()
+
+        val hasSourceNext = pages.any { it.hasNext }
+
+        // Prepare the next server page without blocking the currently visible row.
+        prefetchCategoryPage(
+            source = source,
+            page = pagesNeeded + 1,
             defaultType = defaultType,
             forceSeries = forceSeries
         )
 
-        return PageResult(
-            items = items,
-            hasNext = detectNextPage(document, page) || items.size >= CATEGORY_PAGE_SIZE
-        )
+        merged.take(requiredCount) to (hasSourceNext || merged.size > requiredCount)
     }
 
-    private fun paginate(items: List<SiteItem>, page: Int): PageResult {
+    private suspend fun fetchCategoryPage(
+        source: String,
+        page: Int,
+        defaultType: TvType,
+        forceSeries: Boolean
+    ): CachedCategoryPage {
+        val url = pagedUrl(source, page)
+        categoryPageCache[url]?.let { return it }
+
+        val document = getDocument(url)
+        val selectors = if (forceSeries) {
+            ".cp-card, .movie-card, a[href*='tview.php']"
+        } else {
+            ".cp-card, .movie-card, .movie-grid .movie-card, " +
+                "a[href*='view.php'], a[href*='player.php']"
+        }
+
+        val items = document?.let {
+            parseItems(
+                candidates = it.select(selectors),
+                sourceUrl = url,
+                defaultType = defaultType,
+                forceSeries = forceSeries
+            )
+        }.orEmpty()
+
+        val result = CachedCategoryPage(
+            items = items,
+            hasNext = document?.let { detectNextPage(it, page) } == true ||
+                items.size >= CATEGORY_PAGE_SIZE
+        )
+
+        categoryPageCache.putIfAbsent(url, result)
+        return categoryPageCache[url] ?: result
+    }
+
+    private fun prefetchCategoryPage(
+        source: String,
+        page: Int,
+        defaultType: TvType,
+        forceSeries: Boolean
+    ) {
+        val url = pagedUrl(source, page)
+        if (categoryPageCache.containsKey(url)) return
+
+        prefetchScope.launch {
+            runCatching {
+                fetchCategoryPage(
+                    source = source,
+                    page = page,
+                    defaultType = defaultType,
+                    forceSeries = forceSeries
+                )
+            }
+        }
+    }
+
+    private fun pageSlice(
+        items: List<SiteItem>,
+        page: Int,
+        sourceHasNext: Boolean
+    ): PageResult {
         if (items.isEmpty()) return PageResult(emptyList(), false)
 
-        val offset = if (page <= 1) 0 else INITIAL_BATCH + ((page - 2) * CONTINUE_BATCH)
-        val take = if (page <= 1) INITIAL_BATCH else CONTINUE_BATCH
+        val offset = homeOffset(page)
+        val take = homeTake(page)
         val batch = items.drop(offset).take(take)
 
         return PageResult(
             items = batch,
-            hasNext = offset + batch.size < items.size
+            hasNext = sourceHasNext && batch.isNotEmpty()
         )
     }
+
+    private fun homeRequiredCount(page: Int): Int =
+        if (page <= 1) INITIAL_BATCH
+        else INITIAL_BATCH + ((page - 1) * CONTINUE_BATCH)
+
+    private fun homeOffset(page: Int): Int =
+        if (page <= 1) 0
+        else INITIAL_BATCH + ((page - 2) * CONTINUE_BATCH)
+
+    private fun homeTake(page: Int): Int =
+        if (page <= 1) INITIAL_BATCH else CONTINUE_BATCH
 
     private fun parseItems(
         candidates: List<Element>,
@@ -228,7 +308,6 @@ class BasPlayFTP : MainAPI() {
         for (element in candidates) {
             val href = extractContentUrl(element) ?: continue
             val absolute = absoluteUrl(href, sourceUrl)
-
             if (!isUsefulContentUrl(absolute)) continue
 
             val card = findCard(element)
@@ -247,7 +326,6 @@ class BasPlayFTP : MainAPI() {
 
             val poster = extractPoster(card ?: element, sourceUrl)
             val key = itemKeyFromUrl(absolute)
-
             result.putIfAbsent(
                 key,
                 SiteItem(
@@ -260,6 +338,8 @@ class BasPlayFTP : MainAPI() {
             )
         }
 
+        // Never alphabetize or randomize. Preserve the source page's order,
+        // which is the ordering supplied by BAS PLAY for newest uploads.
         return result.values.sortedBy { it.order }
     }
 
