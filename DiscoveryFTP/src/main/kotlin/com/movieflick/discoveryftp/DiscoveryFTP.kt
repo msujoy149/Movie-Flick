@@ -728,13 +728,10 @@ class DiscoveryFTP : MainAPI() {
                 index + 1
             )
 
-            val quality = detectQuality(mediaUrl)
-
             episodes += newEpisode(mediaUrl) {
                 name = episodeTitle
                 this.season = season
                 this.episode = episodeNumber
-                this.quality = quality
                 posterUrl = fallbackPoster
             }
         }
