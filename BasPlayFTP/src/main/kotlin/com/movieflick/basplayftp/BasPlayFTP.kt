@@ -17,6 +17,7 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.ceil
 
 class BasPlayFTP : MainAPI() {
@@ -34,7 +35,6 @@ class BasPlayFTP : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "basplay://trending" to "Trending Now",
         "basplay://movies" to "Movies",
         "basplay://tv" to "Tv Show",
         "basplay://anime" to "Anime"
@@ -88,11 +88,21 @@ class BasPlayFTP : MainAPI() {
         val responseHeaders: Map<String, String> = emptyMap()
     )
 
+    private data class CachedCategoryPage(
+        val items: List<SiteItem>,
+        val hasNext: Boolean
+    )
+
+    /**
+     * Per-source server-page cache. It keeps the first server pages in memory
+     * so horizontal lazy loading does not refetch the same pages repeatedly.
+     */
+    private val categoryPageCache = ConcurrentHashMap<String, CachedCategoryPage>()
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val pageNumber = page.coerceAtLeast(1)
 
         val result = when (request.data) {
-            "basplay://trending" -> loadTrending(pageNumber)
             "basplay://movies" -> loadMovies(pageNumber)
             "basplay://tv" -> loadTv(pageNumber)
             "basplay://anime" -> loadAnime(pageNumber)
@@ -107,80 +117,50 @@ class BasPlayFTP : MainAPI() {
     }
 
     /**
-     * CloudStream calls getMainPage(page=1), then asks for page=2, page=3, ...
-     * as the user reaches the end of a horizontal home row.
+     * CloudStream home-row paging:
+     *   page 1 = 6 items
+     *   page 2+ = 10 items per horizontal continuation
      *
-     * The BAS PLAY website itself uses 24-card server pages, while the desired
-     * CloudStream UX is 6 cards initially and 10 cards on every continuation.
-     * Therefore we fetch only as many server pages as are needed to build the
-     * requested CloudStream slice, then return exactly that slice.
+     * BAS PLAY category pages remain the source of truth. We fetch only the
+     * server pages needed for the requested slice, then keep the source order
+     * intact so the site's newest-first ordering is preserved.
      */
-    private suspend fun loadTrending(page: Int): PageResult {
-        val document = getDocument(mainUrl)
-            ?: return PageResult(emptyList(), false)
-
-        // The real homepage markup is:
-        // <div id="trendRow">
-        //   <a ... class="cp-card trend-card ...">
-        //
-        // Do not require a specific parent layout beyond the real trendRow.
-        // This also keeps the original BAS PLAY links and poster images intact.
-        val candidates = document.select(
-            "#trendRow a.trend-card, " +
-                "#trendRow a.cp-card.trend-card, " +
-                ".trend-row a.trend-card, " +
-                "a.cp-card.trend-card"
-        )
-
-        val parsed = parseItems(
-            candidates = candidates,
-            sourceUrl = mainUrl,
-            defaultType = TvType.Movie,
-            forceSeries = false
-        )
-            .filterNot { isSeriesUrl(it.url) }
-
-        val ordered = parsed.distinctBy { movieDedupeKey(it) }
-        val offset = homeOffset(page)
-        val take = homeTake(page)
-        val items = ordered.drop(offset).take(take)
-
-        return PageResult(
-            items = items,
-            hasNext = offset + items.size < ordered.size
-        )
-    }
-
     private suspend fun loadMovies(page: Int): PageResult {
-        val items = getCategoryItemsUpTo(
+        val (rawItems, sourceHasNext) = getCategoryItemsUpTo(
             source = MOVIES_URL,
             requiredCount = homeRequiredCount(page),
             defaultType = TvType.Movie,
             forceSeries = false
         )
+
+        val items = rawItems
             .filterNot { isSeriesUrl(it.url) }
-            // Movie-only de-duplication is intentionally limited to Movies.
             .distinctBy { movieDedupeKey(it) }
 
-        return pageSlice(items, page)
+        return pageSlice(items, page, sourceHasNext)
     }
 
     private suspend fun loadTv(page: Int): PageResult {
-        val items = getCategoryItemsUpTo(
+        val (items, sourceHasNext) = getCategoryItemsUpTo(
             source = TV_URL,
             requiredCount = homeRequiredCount(page),
             defaultType = TvType.TvSeries,
             forceSeries = true
-        ).map { it.copy(type = TvType.TvSeries) }
+        )
 
-        return pageSlice(items, page)
+        return pageSlice(
+            items.map { it.copy(type = TvType.TvSeries) },
+            page,
+            sourceHasNext
+        )
     }
 
     private suspend fun loadAnime(page: Int): PageResult = coroutineScope {
         val required = homeRequiredCount(page)
 
-        // Both Anime sources are fetched in parallel and merged into one stream.
-        // This prevents one source from monopolising the first row.
+        // Both Anime sources participate on every request. Their own source
+        // order is preserved, then the two streams are interleaved so neither
+        // source can starve the initial 6-card row or later lazy batches.
         val firstDeferred = async {
             getCategoryItemsUpTo(
                 source = ANIME_MOVIES_URL,
@@ -199,15 +179,20 @@ class BasPlayFTP : MainAPI() {
             )
         }
 
-        val first = firstDeferred.await()
-            .distinctBy { itemKey(it) }
-        val second = secondDeferred.await()
-            .distinctBy { itemKey(it) }
+        val (first, firstHasNext) = firstDeferred.await()
+        val (second, secondHasNext) = secondDeferred.await()
 
-        val merged = mergeInterleaved(first, second)
-            .distinctBy { itemKey(it) }
+        val merged = mergeInterleaved(
+            first.distinctBy { itemKey(it) },
+            second.distinctBy { itemKey(it) }
+        ).distinctBy { itemKey(it) }
 
-        pageSlice(merged, page)
+        val page = pageSlice(
+            merged,
+            page,
+            firstHasNext || secondHasNext
+        )
+        page
     }
 
     /**
@@ -225,63 +210,71 @@ class BasPlayFTP : MainAPI() {
         requiredCount: Int,
         defaultType: TvType,
         forceSeries: Boolean
-    ): List<SiteItem> = coroutineScope {
-        if (requiredCount <= 0) return@coroutineScope emptyList()
+    ): Pair<List<SiteItem>, Boolean> = coroutineScope {
+        if (requiredCount <= 0) return@coroutineScope emptyList<SiteItem>() to false
 
         val pagesNeeded = ceil(
             requiredCount.toDouble() / SERVER_PAGE_SIZE.toDouble()
         ).toInt().coerceAtLeast(1)
 
+        val selectors = if (forceSeries) {
+            ".cp-card, .movie-card, a[href*='tview.php']"
+        } else {
+            ".cp-card, .movie-card, .movie-grid .movie-card, " +
+                "a[href*='view.php'], a[href*='player.php']"
+        }
+
         val pages = (1..pagesNeeded).map { serverPage ->
             async {
-                val url = pagedUrl(source, serverPage)
-                val document = getDocument(url)
+                val pageUrl = pagedUrl(source, serverPage)
+                val cached = categoryPageCache[pageUrl]
+                if (cached != null) {
+                    return@async cached
+                }
 
-                if (document == null) {
+                val document = getDocument(pageUrl)
+                val parsed = if (document == null) {
                     emptyList()
                 } else {
-                    val selectors = if (forceSeries) {
-                        ".cp-card, .movie-card, a[href*='tview.php']"
-                    } else {
-                        ".cp-card, .movie-card, .movie-grid .movie-card, " +
-                            "a[href*='view.php'], a[href*='player.php']"
-                    }
-
                     parseItems(
                         candidates = document.select(selectors),
-                        sourceUrl = url,
+                        sourceUrl = pageUrl,
                         defaultType = defaultType,
                         forceSeries = forceSeries
                     )
                 }
+
+                val cachedPage = CachedCategoryPage(
+                    items = parsed,
+                    hasNext = document?.let { detectNextPage(it, serverPage) } == true ||
+                        parsed.size >= SERVER_PAGE_SIZE
+                )
+                categoryPageCache.putIfAbsent(pageUrl, cachedPage)
+                categoryPageCache[pageUrl] ?: cachedPage
             }
         }.awaitAll()
 
-        pages.asSequence()
-            .flatten()
+        val merged = pages.asSequence()
+            .flatMap { it.items.asSequence() }
             .distinctBy { itemKey(it) }
-            .take(requiredCount)
             .toList()
+
+        val hasSourceNext = pages.any { it.hasNext }
+        merged.take(requiredCount) to (hasSourceNext || merged.size > requiredCount)
     }
 
     private fun pageSlice(
         items: List<SiteItem>,
-        page: Int
+        page: Int,
+        sourceHasNext: Boolean
     ): PageResult {
         val offset = homeOffset(page)
         val take = homeTake(page)
         val batch = items.drop(offset).take(take)
 
-        // We deliberately return true while the source delivered enough data
-        // to satisfy the requested slice. CloudStream will request the next
-        // horizontal page, at which point we fetch whatever additional server
-        // page(s) are required.
-        val hasNext = batch.size == take ||
-            offset + batch.size < items.size
-
         return PageResult(
             items = batch,
-            hasNext = hasNext
+            hasNext = sourceHasNext && batch.isNotEmpty()
         )
     }
 
