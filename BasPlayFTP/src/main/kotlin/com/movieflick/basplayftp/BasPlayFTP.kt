@@ -574,29 +574,12 @@ class BasPlayFTP : MainAPI() {
             )
         }
 
-        val page = if (isSeriesUrl(input)) {
-            getTvSeriesPage(input) ?: getPage(input)
-        } else {
-            getPage(input)
-        }
-
-        val document = page?.document
+        val document = getDocument(input)
         if (document == null) {
-            // Never turn a TV series URL into a fake movie named "tview" when
-            // the first request fails. Keep the exact TV URL so a later retry
-            // still has the real series identity.
-            if (isSeriesUrl(input)) {
-                return newTvSeriesLoadResponse(
-                    titleFromSeriesUrl(input),
-                    input,
-                    TvType.TvSeries,
-                    emptyList()
-                )
-            }
             return fallbackLoadResponse(input)
         }
 
-        val title = extractPageTitle(document).ifBlank { titleFromSeriesUrl(input) }
+        val title = extractPageTitle(document).ifBlank { titleFromUrl(input) }
         val poster = extractPoster(document, input)
         val series = isSeriesUrl(input) || looksLikeSeriesPage(document)
 
@@ -625,80 +608,6 @@ class BasPlayFTP : MainAPI() {
         ) {
             posterUrl = poster
         }
-    }
-
-    private suspend fun getTvSeriesPage(url: String): PageFetch? {
-        val normalized = url.trim()
-        if (normalized.isBlank()) return null
-
-        val candidates = linkedSetOf<String>()
-        candidates += normalized.substringBefore("#")
-
-        // Rebuild the same tview URL with a clean query string. This prevents
-        // malformed/fragmented links from losing series/category parameters.
-        runCatching {
-            val uri = URI(normalized.substringBefore("#"))
-            if (uri.path.equals("/tview.php", true)) {
-                val series = uri.getQueryParameter("series")
-                val category = uri.getQueryParameter("category")
-                val season = uri.getQueryParameter("season")
-                val episode = uri.getQueryParameter("episode")
-                val params = buildList {
-                    if (!series.isNullOrBlank()) add("series=${URLEncoder.encode(series, StandardCharsets.UTF_8.toString())}")
-                    if (!category.isNullOrBlank()) add("category=${URLEncoder.encode(category, StandardCharsets.UTF_8.toString())}")
-                    if (!season.isNullOrBlank()) add("season=${URLEncoder.encode(season, StandardCharsets.UTF_8.toString())}")
-                    if (!episode.isNullOrBlank()) add("episode=${URLEncoder.encode(episode, StandardCharsets.UTF_8.toString())}")
-                }
-                if (params.isNotEmpty()) {
-                    candidates += "$BASE_URL/tview.php?${params.joinToString("&")}"
-                }
-            }
-        }.getOrNull()
-
-        val tvHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
-            "Referer" to "$BASE_URL/tv.php"
-        )
-
-        for (candidate in candidates) {
-            val page = runCatching {
-                val response = app.get(candidate, headers = tvHeaders)
-                PageFetch(
-                    document = response.document,
-                    responseHeaders = mapOf(
-                        "Set-Cookie" to (response.headers["Set-Cookie"] ?: ""),
-                        "ETag" to (response.headers["ETag"] ?: "")
-                    ).filterValues { it.isNotBlank() }
-                )
-            }.getOrNull()
-            if (page != null) return page
-        }
-
-        return null
-    }
-
-    private fun URI.getQueryParameter(name: String): String? {
-        val query = rawQuery ?: return null
-        return query.split('&')
-            .asSequence()
-            .mapNotNull { part ->
-                val key = part.substringBefore('=')
-                if (!key.equals(name, true)) return@mapNotNull null
-                val value = part.substringAfter('=', "")
-                runCatching { URLDecoder.decode(value, StandardCharsets.UTF_8.toString()) }.getOrDefault(value)
-            }
-            .firstOrNull()
-    }
-
-    private fun titleFromSeriesUrl(url: String): String {
-        runCatching {
-            val uri = URI(url.substringBefore("#"))
-            val series = uri.getQueryParameter("series")
-            if (!series.isNullOrBlank()) return series
-        }.getOrNull()
-        return titleFromUrl(url)
     }
 
     private suspend fun fallbackLoadResponse(url: String): LoadResponse {
@@ -735,7 +644,7 @@ class BasPlayFTP : MainAPI() {
 
         for (seasonUrl in seasonLinks) {
             if (documents.containsKey(seasonUrl)) continue
-            (getTvSeriesPage(seasonUrl)?.document ?: getDocument(seasonUrl))?.let { documents[seasonUrl] = it }
+            getDocument(seasonUrl)?.let { documents[seasonUrl] = it }
         }
 
         val result = mutableListOf<Episode>()
@@ -759,9 +668,9 @@ class BasPlayFTP : MainAPI() {
     ): List<Episode> {
         val episodes = mutableListOf<Episode>()
         val selectors = listOf(
-            ".ep-item",
-            "a[data-epnum]",
-            "[data-episode]",
+            ".ep-item[data-src]",
+            "a[data-epnum][data-src]",
+            "[data-episode][data-src]",
             "a[href*=episode]"
         )
 
@@ -869,14 +778,48 @@ class BasPlayFTP : MainAPI() {
                 val directMedia = decodeToken(parts.getOrNull(0).orEmpty())
                 val episodePage = decodeToken(parts.getOrNull(1).orEmpty())
 
-                if (directMedia.isNotBlank() && isPlayableMedia(directMedia)) {
+                /*
+                 * Always try a fresh source lookup first. The direct URL stored
+                 * in the episode payload is retained only as a safety fallback.
+                 * This gives us both:
+                 *   1) fresh resolution on every Play action, and
+                 *   2) reliable playback even if the TV HTML temporarily fails.
+                 */
+                if (episodePage.isNotBlank()) {
+                    val episodeNumber = Regex("(?i)[?&]episode=(\\d+)")
+                        .find(episodePage)
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        ?.toIntOrNull()
+
+                    if (episodeNumber != null) {
+                        val canonicalSeriesPage =
+                            removeQueryParam(episodePage, "episode").substringBefore("#")
+
+                        if (resolveTvEpisodeDirect(
+                                seriesPage = canonicalSeriesPage,
+                                episodeNumber = episodeNumber,
+                                callback = callback
+                            )
+                        ) {
+                            return true
+                        }
+                    }
+                }
+
+                /*
+                 * Final fallback: use the exact data-src captured from the
+                 * episode element when the fresh source lookup cannot be made.
+                 */
+                if (directMedia.isNotBlank() &&
+                    isPlayableMedia(directMedia) &&
+                    !isTrailerUrl(directMedia) &&
+                    !isDownloadOnlyUrl(directMedia)
+                ) {
                     emitDirectMedia(directMedia, callback)
                     return true
                 }
 
-                if (episodePage.isNotBlank()) {
-                    return resolveTvEpisodeDirect(episodePage, callback)
-                }
                 return false
             }
         }
@@ -908,42 +851,142 @@ class BasPlayFTP : MainAPI() {
      * same minimal direct ExtractorLink pattern used by Movie Haat.
      */
     private suspend fun resolveTvEpisodeDirect(
-        episodePage: String,
+        seriesPage: String,
+        episodeNumber: Int,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val page = getTvSeriesPage(episodePage) ?: getPage(episodePage) ?: return false
-        val document = page.document
+        /*
+         * BAS PLAY's actual TV page keeps all episodes together:
+         *   <a class="ep-item" data-epnum="N" data-src="/Data/...file.mkv">
+         *
+         * Do NOT depend on href="#" or on an invented ?episode=N page being
+         * rendered differently by the server. Fetch the canonical tview.php
+         * page and select the requested episode by its explicit data-epnum.
+         */
+        val canonical = removeQueryParam(seriesPage, "episode").substringBefore("#")
+        if (canonical.isBlank()) return false
 
-        val episodeNumber = Regex("(?i)[?&]episode=(\\d+)")
-            .find(episodePage)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val pageCandidates = linkedSetOf<String>()
+        pageCandidates += canonical
 
-        val candidates = linkedSetOf<String>()
+        /*
+         * Some installations are tolerant of an explicit episode query while
+         * others are not. Keep it as a secondary fetch shape only.
+         */
+        pageCandidates += setQueryParam(canonical, "episode", episodeNumber.toString())
 
-        document.select(".ep-item[data-src], a[data-epnum][data-src]").forEach { element ->
-            val number = element.attr("data-epnum").toIntOrNull()
-            if (episodeNumber == null || number == null || number == episodeNumber) {
-                val raw = element.attr("data-src").trim()
-                val absolute = absoluteUrl(raw, episodePage)
-                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
-                    candidates += absolute
+        for (pageUrl in pageCandidates) {
+            val page = getPage(pageUrl) ?: continue
+            val document = page.document
+
+            /*
+             * Priority 1: exact episode item -> data-src.
+             */
+            val episodeItems = document.select(
+                ".ep-item[data-src], " +
+                    "a[data-epnum][data-src], " +
+                    "[data-episode][data-src]"
+            )
+
+            for (element in episodeItems) {
+                val number =
+                    element.attr("data-epnum").toIntOrNull()
+                        ?: element.attr("data-episode").toIntOrNull()
+
+                if (number != episodeNumber) continue
+
+                val media = absoluteUrl(
+                    element.attr("data-src").trim(),
+                    pageUrl
+                )
+
+                if (isPlayableMedia(media) &&
+                    !isTrailerUrl(media) &&
+                    !isDownloadOnlyUrl(media)
+                ) {
+                    emitDirectMedia(media, callback)
+                    return true
+                }
+            }
+
+            /*
+             * Priority 2: identify the episode from its title/text and then
+             * use that element's data-src.
+             */
+            val textMatched = episodeItems.firstOrNull { element ->
+                val text = buildString {
+                    append(element.attr("title"))
+                    append(' ')
+                    append(element.attr("aria-label"))
+                    append(' ')
+                    append(element.text())
+                }
+
+                extractEpisodeNumber(text, pageUrl) == episodeNumber
+            }
+
+            if (textMatched != null) {
+                val media = absoluteUrl(
+                    textMatched.attr("data-src").trim(),
+                    pageUrl
+                )
+
+                if (isPlayableMedia(media) &&
+                    !isTrailerUrl(media) &&
+                    !isDownloadOnlyUrl(media)
+                ) {
+                    emitDirectMedia(media, callback)
+                    return true
+                }
+            }
+
+            /*
+             * Priority 3: direct browser-player source. This is especially
+             * useful for servers where the selected episode is reflected in
+             * <video><source> but data-src is omitted.
+             */
+            val videoSources = document.select(
+                "video#seriesPlayer source[src], " +
+                    "video#seriesPlayer source[data-src], " +
+                    "video source[src], " +
+                    "video source[data-src], " +
+                    "video[src]"
+            )
+
+            for (element in videoSources) {
+                listOf(
+                    element.attr("src"),
+                    element.attr("data-src")
+                ).forEach { raw ->
+                    val media = absoluteUrl(raw, pageUrl)
+
+                    if (!isPlayableMedia(media) ||
+                        isTrailerUrl(media) ||
+                        isDownloadOnlyUrl(media)
+                    ) {
+                        return@forEach
+                    }
+
+                    val lower = media.lowercase(Locale.ROOT)
+                    val explicitEpisodeMatch =
+                        Regex("(?i)\\bs\\d{1,2}e${episodeNumber}\\b")
+                            .containsMatchIn(lower) ||
+                        Regex("(?i)\\b(?:episode|ep|e)[ ._-]*${episodeNumber}\\b")
+                            .containsMatchIn(lower)
+
+                    /*
+                     * If only one browser source exists, accept it. Otherwise
+                     * require the filename to identify the requested episode.
+                     */
+                    if (videoSources.size == 1 || explicitEpisodeMatch) {
+                        emitDirectMedia(media, callback)
+                        return true
+                    }
                 }
             }
         }
 
-        document.select(
-            "video source[src], video source[data-src], video[src], source[src], source[data-src]"
-        ).forEach { element ->
-            listOf(element.attr("src"), element.attr("data-src")).forEach { raw ->
-                val absolute = absoluteUrl(raw, episodePage)
-                if (isPlayableMedia(absolute) && !isTrailerUrl(absolute) && !isDownloadOnlyUrl(absolute)) {
-                    candidates += absolute
-                }
-            }
-        }
-
-        val selected = candidates.firstOrNull() ?: return false
-        emitDirectMedia(selected, callback)
-        return true
+        return false
     }
 
     private suspend fun resolvePlayableFromPage(
