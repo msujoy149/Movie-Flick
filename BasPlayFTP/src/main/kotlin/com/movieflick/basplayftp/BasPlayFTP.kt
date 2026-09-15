@@ -574,12 +574,29 @@ class BasPlayFTP : MainAPI() {
             )
         }
 
-        val document = getDocument(input)
+        val page = if (isSeriesUrl(input)) {
+            getTvSeriesPage(input) ?: getPage(input)
+        } else {
+            getPage(input)
+        }
+
+        val document = page?.document
         if (document == null) {
+            // Never turn a TV series URL into a fake movie named "tview" when
+            // the first request fails. Keep the exact TV URL so a later retry
+            // still has the real series identity.
+            if (isSeriesUrl(input)) {
+                return newTvSeriesLoadResponse(
+                    titleFromSeriesUrl(input),
+                    input,
+                    TvType.TvSeries,
+                    emptyList()
+                )
+            }
             return fallbackLoadResponse(input)
         }
 
-        val title = extractPageTitle(document).ifBlank { titleFromUrl(input) }
+        val title = extractPageTitle(document).ifBlank { titleFromSeriesUrl(input) }
         val poster = extractPoster(document, input)
         val series = isSeriesUrl(input) || looksLikeSeriesPage(document)
 
@@ -608,6 +625,80 @@ class BasPlayFTP : MainAPI() {
         ) {
             posterUrl = poster
         }
+    }
+
+    private suspend fun getTvSeriesPage(url: String): PageFetch? {
+        val normalized = url.trim()
+        if (normalized.isBlank()) return null
+
+        val candidates = linkedSetOf<String>()
+        candidates += normalized.substringBefore("#")
+
+        // Rebuild the same tview URL with a clean query string. This prevents
+        // malformed/fragmented links from losing series/category parameters.
+        runCatching {
+            val uri = URI(normalized.substringBefore("#"))
+            if (uri.path.equals("/tview.php", true)) {
+                val series = uri.getQueryParameter("series")
+                val category = uri.getQueryParameter("category")
+                val season = uri.getQueryParameter("season")
+                val episode = uri.getQueryParameter("episode")
+                val params = buildList {
+                    if (!series.isNullOrBlank()) add("series=${URLEncoder.encode(series, StandardCharsets.UTF_8.toString())}")
+                    if (!category.isNullOrBlank()) add("category=${URLEncoder.encode(category, StandardCharsets.UTF_8.toString())}")
+                    if (!season.isNullOrBlank()) add("season=${URLEncoder.encode(season, StandardCharsets.UTF_8.toString())}")
+                    if (!episode.isNullOrBlank()) add("episode=${URLEncoder.encode(episode, StandardCharsets.UTF_8.toString())}")
+                }
+                if (params.isNotEmpty()) {
+                    candidates += "$BASE_URL/tview.php?${params.joinToString("&")}"
+                }
+            }
+        }.getOrNull()
+
+        val tvHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+            "Referer" to "$BASE_URL/tv.php"
+        )
+
+        for (candidate in candidates) {
+            val page = runCatching {
+                val response = app.get(candidate, headers = tvHeaders)
+                PageFetch(
+                    document = response.document,
+                    responseHeaders = mapOf(
+                        "Set-Cookie" to (response.headers["Set-Cookie"] ?: ""),
+                        "ETag" to (response.headers["ETag"] ?: "")
+                    ).filterValues { it.isNotBlank() }
+                )
+            }.getOrNull()
+            if (page != null) return page
+        }
+
+        return null
+    }
+
+    private fun URI.getQueryParameter(name: String): String? {
+        val query = rawQuery ?: return null
+        return query.split('&')
+            .asSequence()
+            .mapNotNull { part ->
+                val key = part.substringBefore('=')
+                if (!key.equals(name, true)) return@mapNotNull null
+                val value = part.substringAfter('=', "")
+                runCatching { URLDecoder.decode(value, StandardCharsets.UTF_8.toString()) }.getOrDefault(value)
+            }
+            .firstOrNull()
+    }
+
+    private fun titleFromSeriesUrl(url: String): String {
+        runCatching {
+            val uri = URI(url.substringBefore("#"))
+            val series = uri.getQueryParameter("series")
+            if (!series.isNullOrBlank()) return series
+        }.getOrNull()
+        return titleFromUrl(url)
     }
 
     private suspend fun fallbackLoadResponse(url: String): LoadResponse {
@@ -644,7 +735,7 @@ class BasPlayFTP : MainAPI() {
 
         for (seasonUrl in seasonLinks) {
             if (documents.containsKey(seasonUrl)) continue
-            getDocument(seasonUrl)?.let { documents[seasonUrl] = it }
+            (getTvSeriesPage(seasonUrl)?.document ?: getDocument(seasonUrl))?.let { documents[seasonUrl] = it }
         }
 
         val result = mutableListOf<Episode>()
@@ -668,9 +759,9 @@ class BasPlayFTP : MainAPI() {
     ): List<Episode> {
         val episodes = mutableListOf<Episode>()
         val selectors = listOf(
-            ".ep-item[data-src]",
-            "a[data-epnum][data-src]",
-            "[data-episode][data-src]",
+            ".ep-item",
+            "a[data-epnum]",
+            "[data-episode]",
             "a[href*=episode]"
         )
 
@@ -820,7 +911,7 @@ class BasPlayFTP : MainAPI() {
         episodePage: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val page = getPage(episodePage) ?: return false
+        val page = getTvSeriesPage(episodePage) ?: getPage(episodePage) ?: return false
         val document = page.document
 
         val episodeNumber = Regex("(?i)[?&]episode=(\\d+)")
