@@ -296,11 +296,9 @@ class DiscoveryFTP : MainAPI() {
             }
         }.awaitAll()
 
-        val merged = collapseByTitle(interleave(sourceLists))
-            .sortedWith(
-                compareByDescending<SiteItem> { viewId(it.url) ?: -1 }
-                    .thenBy { it.order }
-            )
+        val merged = collapseByTitle(
+            interleave(sourceLists)
+        )
 
         val offset = homeOffset(page)
         val take = homeTake(page)
@@ -338,7 +336,7 @@ class DiscoveryFTP : MainAPI() {
         var serverPage = 1
         var previousSignature: String? = null
 
-        while (result.size < requiredCount && serverPage <= 500) {
+        while (result.size < requiredCount) {
             val pageItems = fetchPage(source, serverPage)
 
             if (pageItems.isEmpty()) break
@@ -468,12 +466,13 @@ class DiscoveryFTP : MainAPI() {
                     return@mapNotNull null
                 }
 
-                val label = cleanQualityLabel(
+                val label = qualityLabelOrInfer(
                     firstNonBlank(
                         anchor.selectFirst(".movie_details_span_end")?.text(),
                         if (anchor.hasClass("movie_details_span_end")) anchor.text() else null,
                         anchor.attr("title")
-                    )
+                    ),
+                    absolute
                 )
 
                 SiteVariant(
@@ -485,7 +484,7 @@ class DiscoveryFTP : MainAPI() {
 
             val bestVariant = variants
                 .maxWithOrNull(
-                    compareBy<SiteVariant> { it.qualityRank }
+                    compareBy<SiteVariant> { variantSelectionPriority(it) }
                         .thenBy { it.url }
                 )
                 ?: return@forEachIndexed
@@ -541,13 +540,14 @@ class DiscoveryFTP : MainAPI() {
 
                     if (title.isBlank()) return@forEachIndexed
 
-                    val label = cleanQualityLabel(
+                    val label = qualityLabelOrInfer(
                         firstNonBlank(
                             anchor.selectFirst(".movie_details_span_end")?.text(),
                             if (anchor.hasClass("movie_details_span_end")) anchor.text() else null,
                             anchor.attr("title"),
                             card?.selectFirst(".poster[title]")?.attr("title")
-                        )
+                        ),
+                        absolute
                     )
 
                     val type = when (source.kind) {
@@ -1069,7 +1069,8 @@ class DiscoveryFTP : MainAPI() {
         if (isMediaUrl(input)) {
             emitMedia(
                 mediaUrl = normalizeMediaUrl(input),
-                callback = callback
+                callback = callback,
+                referer = "$mainUrl/"
             )
             return true
         }
@@ -1210,7 +1211,8 @@ class DiscoveryFTP : MainAPI() {
             .forEach { media ->
                 emitMedia(
                     mediaUrl = media,
-                    callback = callback
+                    callback = callback,
+                    referer = input
                 )
             }
 
@@ -1219,7 +1221,8 @@ class DiscoveryFTP : MainAPI() {
 
     private suspend fun emitMedia(
         mediaUrl: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        referer: String = "$mainUrl/"
     ) {
         val lower = mediaUrl.lowercase(Locale.ROOT)
 
@@ -1265,6 +1268,8 @@ class DiscoveryFTP : MainAPI() {
                 type = type
             ) {
                 this.quality = quality
+                this.referer = referer
+                this.headers = mediaHeaders()
             }
         )
     }
@@ -1307,14 +1312,24 @@ class DiscoveryFTP : MainAPI() {
     }
 
     private fun normalizeMediaUrl(url: String): String {
-        var value = url.trim()
-
-        if (value.startsWith("http://cdn", true)) {
-            value = "https://" + value.removePrefix("http://")
-        }
-
-        return value.replace(" ", "%20")
+        /*
+         * Keep the URL scheme published by Discovery. Some source files are
+         * published as HTTP while the WEB PLAY pages can publish HTTPS.
+         */
+        return url
+            .trim()
+            .replace(" ", "%20")
     }
+
+    private fun mediaHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/153.0.0.0 Safari/537.36",
+        "Accept" to "*/*",
+        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+        "Connection" to "keep-alive"
+    )
 
     private fun pagedUrl(
         baseUrl: String,
@@ -1382,11 +1397,57 @@ class DiscoveryFTP : MainAPI() {
     }
 
     private fun isBetterVariant(candidate: SiteItem, existing: SiteItem): Boolean {
-        if (candidate.qualityRank != existing.qualityRank) {
-            return candidate.qualityRank > existing.qualityRank
+        val candidatePriority = variantSelectionPriority(candidate)
+        val existingPriority = variantSelectionPriority(existing)
+
+        if (candidatePriority != existingPriority) {
+            return candidatePriority > existingPriority
         }
 
         return candidate.order < existing.order
+    }
+
+    private fun variantSelectionPriority(item: SiteItem): Int {
+        return variantSelectionPriority(
+            qualityLabel = item.qualityLabel,
+            qualityRank = item.qualityRank
+        )
+    }
+
+    private fun variantSelectionPriority(variant: SiteVariant): Int {
+        return variantSelectionPriority(
+            qualityLabel = variant.qualityLabel,
+            qualityRank = variant.qualityRank
+        )
+    }
+
+    private fun variantSelectionPriority(
+        qualityLabel: String,
+        qualityRank: Int
+    ): Int {
+        val lower = qualityLabel.lowercase(Locale.ROOT)
+
+        /*
+         * Discovery user preference:
+         * 1080P is the normal/default choice.
+         * 4K is a last-resort fallback when no other useful resolution exists.
+         */
+        val resolutionPriority = when {
+            "1080" in lower -> 900_000
+            "1440" in lower -> 850_000
+            "720" in lower -> 800_000
+            "480" in lower -> 700_000
+            "360" in lower -> 600_000
+            lower.contains("hd") -> 500_000
+            "2160" in lower || lower.contains("4k") -> 100_000
+            else -> 0
+        }
+
+        /*
+         * Keep the actual numeric quality as a tie-breaker only.
+         * It must never allow 4K to outrank a non-4K resolution.
+         */
+        return resolutionPriority + minOf(qualityRank, 99_999)
     }
 
     private fun contentKey(item: SiteItem): String =
@@ -1420,6 +1481,41 @@ class DiscoveryFTP : MainAPI() {
             .replace(Regex("\\s+"), " ")
             .trim()
             .replace(Regex("\\s{2,}"), " ")
+    }
+
+    private fun qualityLabelOrInfer(
+        rawLabel: String,
+        url: String
+    ): String {
+        val lower = "$rawLabel $url".lowercase(Locale.ROOT)
+
+        val resolution = when {
+            "2160" in lower || "4k" in lower -> "4K"
+            "1440" in lower -> "1440P"
+            "1080" in lower -> "1080P"
+            "720" in lower -> "720P"
+            "480" in lower -> "480P"
+            "360" in lower -> "360P"
+            "hd" in lower -> "HD"
+            else -> ""
+        }
+
+        if (resolution.isBlank()) {
+            return cleanQualityLabel(rawLabel)
+        }
+
+        val web = if (
+            "web-dl" in lower ||
+            "webdl" in lower
+        ) {
+            " WEB-DL"
+        } else {
+            ""
+        }
+
+        val dual = if ("dual" in lower) " DUAL" else ""
+
+        return "$resolution$web$dual".trim()
     }
 
     private fun qualityRank(label: String, url: String): Int {
