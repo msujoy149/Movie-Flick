@@ -18,7 +18,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class DiscoveryFTP : MainAPI() {
+class DiscoveryFTP : MainAPI() {\n\n    // TV playback fix v21: HTTPS-upgrade Discovery CDN media URLs.
 
     override var mainUrl = BASE_URL
     override var name = "Discovery FTP"
@@ -1272,7 +1272,7 @@ class DiscoveryFTP : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val request = parseEpisodePlaybackData(data)
-        val input = request.mediaUrl.trim()
+        val input = normalizeMediaUrl(request.mediaUrl)
 
         if (input.isBlank()) return false
 
@@ -1828,9 +1828,7 @@ class DiscoveryFTP : MainAPI() {
             )
         }
 
-        return mediaUrl
-            .trim()
-            .replace(" ", "%20") +
+        return normalizeMediaUrl(mediaUrl) +
             "#discovery_ref=$encodedReferer" +
             if (!encodedDetail.isNullOrBlank()) {
                 "#discovery_detail=$encodedDetail"
@@ -1961,6 +1959,17 @@ class DiscoveryFTP : MainAPI() {
             ) {
                 this.referer = playbackReferer
                 this.quality = quality
+
+                /*
+                 * Chrome's working CDN request is a normal browser GET with
+                 * a site Referer and a normal browser User-Agent. Keep the
+                 * player request simple: no synthetic Range header and no
+                 * custom transfer encoding.
+                 */
+                this.headers = mapOf(
+                    "User-Agent" to DISCOVERY_USER_AGENT,
+                    "Accept" to "*/*"
+                )
             }
         )
     }
@@ -2134,9 +2143,24 @@ class DiscoveryFTP : MainAPI() {
     }
 
     private fun normalizeMediaUrl(url: String): String {
-        return url
+        var normalized = url
             .trim()
             .replace(" ", "%20")
+
+        /*
+         * Discovery's TV season pages publish CDN links as HTTP, while the
+         * actual browser playback request is upgraded to HTTPS. Android can
+         * reject a clear-text HTTP media URL before it ever reaches the CDN,
+         * producing the exact IO_NETWORK/connection failure seen in the app.
+         *
+         * Always upgrade Discovery CDN media URLs to HTTPS.
+         */
+        normalized = normalized.replace(
+            Regex("(?i)^http://(cdn[1-5]\\.discoveryftp\\.net/)"),
+            "https://$1"
+        )
+
+        return normalized
     }
 
     private fun pagedUrl(
@@ -2490,7 +2514,7 @@ class DiscoveryFTP : MainAPI() {
             value.startsWith("http://", true) ||
             value.startsWith("https://", true)
         ) {
-            return value
+            return normalizeMediaUrl(value)
         }
 
         return runCatching {
