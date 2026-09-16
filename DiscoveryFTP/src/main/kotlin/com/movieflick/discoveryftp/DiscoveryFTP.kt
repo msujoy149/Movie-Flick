@@ -9,13 +9,14 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLDecoder
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class DiscoveryFTP : MainAPI() {
 
@@ -55,6 +56,7 @@ class DiscoveryFTP : MainAPI() {
         const val CONTINUE_BATCH = 10
         const val SOURCE_PREFETCH = 4
         const val SEARCH_MAX_PAGES = 5
+        const val DUPLICATE_INDEX_MAX_PAGES = 6
 
         val DUAL_SOURCES = listOf(
             Source("$BASE_URL/s/category/Dubbed", SourceKind.SERIES),
@@ -96,11 +98,18 @@ class DiscoveryFTP : MainAPI() {
         val poster: String?,
         val type: TvType,
         val source: String,
-        val order: Int
+        val order: Int,
+        val year: Int? = null,
+        val qualityLabel: String = "",
+        val qualityRank: Int = 0
     )
 
     private val pageCache =
         ConcurrentHashMap<String, List<SiteItem>>()
+
+    private val protectedIndexMutex = Mutex()
+    @Volatile
+    private var protectedDuplicateKeys: Set<String>? = null
 
     private val mediaExtensions = setOf(
         ".m3u8",
@@ -128,31 +137,55 @@ class DiscoveryFTP : MainAPI() {
     )
 
     private fun SiteItem.toSearchResponse(): SearchResponse {
+        val displayTitle = formattedDisplayTitle()
+
         return when (type) {
             TvType.TvSeries -> newTvSeriesSearchResponse(
-                title,
+                displayTitle,
                 url,
                 TvType.TvSeries
             ) {
                 posterUrl = poster
+                this.year = year
+                if (qualityLabel.isNotBlank()) {
+                    addQuality(qualityLabel)
+                }
             }
 
             TvType.Anime -> newMovieSearchResponse(
-                title,
+                displayTitle,
                 url,
                 TvType.Anime
             ) {
                 posterUrl = poster
+                this.year = year
+                if (qualityLabel.isNotBlank()) {
+                    addQuality(qualityLabel)
+                }
             }
 
             else -> newMovieSearchResponse(
-                title,
+                displayTitle,
                 url,
                 TvType.Movie
             ) {
                 posterUrl = poster
+                this.year = year
+                if (qualityLabel.isNotBlank()) {
+                    addQuality(qualityLabel)
+                }
             }
         }
+    }
+
+    private fun SiteItem.formattedDisplayTitle(): String {
+        val clean = title
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        if (qualityLabel.isBlank()) return clean
+
+        return "$clean [$qualityLabel]"
     }
 
     override suspend fun getMainPage(
@@ -165,7 +198,8 @@ class DiscoveryFTP : MainAPI() {
             "discovery://movies" -> buildSingleSourceHome(
                 request,
                 pageNumber,
-                Source("$BASE_URL/m", SourceKind.MOVIE)
+                Source("$BASE_URL/m", SourceKind.MOVIE),
+                excludeProtectedDuplicates = true
             )
 
             "discovery://dual" -> buildMergedHome(
@@ -177,7 +211,8 @@ class DiscoveryFTP : MainAPI() {
             "discovery://hindi" -> buildSingleSourceHome(
                 request,
                 pageNumber,
-                Source("$BASE_URL/m/dual/Hindi", SourceKind.MOVIE)
+                Source("$BASE_URL/m/dual/Hindi", SourceKind.MOVIE),
+                excludeProtectedDuplicates = true
             )
 
             "discovery://tv" -> buildSingleSourceHome(
@@ -203,10 +238,21 @@ class DiscoveryFTP : MainAPI() {
     private suspend fun buildSingleSourceHome(
         request: MainPageRequest,
         page: Int,
-        source: Source
+        source: Source,
+        excludeProtectedDuplicates: Boolean = false
     ): HomePageResponse {
         val required = requiredCount(page)
-        val all = getItemsUpTo(source, required)
+        val excluded = if (excludeProtectedDuplicates) {
+            getProtectedDuplicateKeys()
+        } else {
+            emptySet()
+        }
+
+        val all = getItemsUpTo(
+            source = source,
+            requiredCount = required,
+            excludedKeys = excluded
+        )
 
         val offset = homeOffset(page)
         val take = homeTake(page)
@@ -238,9 +284,9 @@ class DiscoveryFTP : MainAPI() {
         val required = requiredCount(page)
 
         /*
-         * Every source contributes in round-robin order.
-         * This preserves newest-first source order while preventing
-         * one source from filling the entire row.
+         * Every source contributes in round-robin order. The order within
+         * each source is preserved, so the site's newest-first ordering is
+         * not alphabetized or randomly shuffled.
          */
         val perSource = ((required + sources.size - 1) / sources.size) + SOURCE_PREFETCH
 
@@ -250,8 +296,7 @@ class DiscoveryFTP : MainAPI() {
             }
         }.awaitAll()
 
-        val merged = interleave(sourceLists)
-            .distinctBy { dedupeKey(it) }
+        val merged = collapseByTitle(interleave(sourceLists))
 
         val offset = homeOffset(page)
         val take = homeTake(page)
@@ -280,7 +325,8 @@ class DiscoveryFTP : MainAPI() {
 
     private suspend fun getItemsUpTo(
         source: Source,
-        requiredCount: Int
+        requiredCount: Int,
+        excludedKeys: Set<String> = emptySet()
     ): List<SiteItem> {
         if (requiredCount <= 0) return emptyList()
 
@@ -288,17 +334,19 @@ class DiscoveryFTP : MainAPI() {
         var serverPage = 1
 
         while (result.size < requiredCount && serverPage <= 50) {
-            result += fetchPage(source, serverPage)
+            val pageItems = fetchPage(source, serverPage)
 
-            if (fetchPage(source, serverPage).isEmpty()) {
-                break
+            if (pageItems.isEmpty()) break
+
+            result += pageItems.filterNot {
+                excludedKeys.contains(contentKey(it)) ||
+                    excludedKeys.contains(urlKey(it.url))
             }
 
             serverPage++
         }
 
-        return result
-            .distinctBy { dedupeKey(it) }
+        return collapseByTitle(result)
             .take(requiredCount)
     }
 
@@ -360,52 +408,73 @@ class DiscoveryFTP : MainAPI() {
         pageUrl: String,
         source: Source
     ): List<SiteItem> {
-        val result = linkedMapOf<String, SiteItem>()
+        val result = mutableListOf<SiteItem>()
+        val seenContainers = HashSet<String>()
 
         /*
-         * Movies use:
-         *   <a class="cfocus" href="/m/view/...">
-         *
-         * Series use:
-         *   <a ... href="/s/view/...">
-         *
-         * Search across both href patterns instead of relying on
-         * one particular card class.
+         * Discovery movie cards can contain several quality links inside one
+         * .quality_stack. Those links represent the SAME movie, not separate
+         * home cards. We therefore parse the card once and keep the highest
+         * quality variant as the playable URL.
          */
-        val anchors = document.select(
-            "a[href*='/m/view/'], " +
-                "a[href*='/s/view/']"
-        )
+        val containers = document.select("div.card, div.fcard")
 
-        anchors.forEachIndexed { index, anchor ->
-            val absolute = absoluteUrl(
-                anchor.attr("href").trim(),
-                pageUrl
+        containers.forEachIndexed { index, card ->
+            val cardIdentity = card.outerHtml().hashCode().toString()
+            if (!seenContainers.add(cardIdentity)) return@forEachIndexed
+
+            val viewAnchors = card.select(
+                "a[href*='/m/view/'], a[href*='/s/view/']"
             )
 
-            if (!absolute.contains("/m/view/") &&
-                !absolute.contains("/s/view/")
-            ) {
-                return@forEachIndexed
-            }
-
-            val card = findCard(anchor)
+            if (viewAnchors.isEmpty()) return@forEachIndexed
 
             val title = cleanTitle(
                 firstNonBlank(
-                    card?.selectFirst(".details h3")?.text(),
-                    card?.selectFirst(".ftitle")?.text(),
-                    anchor.attr("title"),
-                    anchor.text(),
-                    titleFromUrl(absolute)
+                    card.selectFirst(".details h3")?.text(),
+                    card.selectFirst(".ftitle")?.text(),
+                    card.selectFirst("h3")?.text(),
+                    card.selectFirst("h4")?.ownText()
                 )
             )
 
             if (title.isBlank()) return@forEachIndexed
 
-            val poster = card?.let {
-                extractPoster(it, pageUrl)
-            } ?: extractPoster(anchor, pageUrl)
+            val poster = extractPoster(card, pageUrl)
+
+            val variants = viewAnchors.mapNotNull { anchor ->
+                val absolute = absoluteUrl(
+                    anchor.attr("href").trim(),
+                    pageUrl
+                )
+
+                if (!absolute.contains("/m/view/") &&
+                    !absolute.contains("/s/view/")
+                ) {
+                    return@mapNotNull null
+                }
+
+                val label = cleanQualityLabel(
+                    firstNonBlank(
+                        anchor.selectFirst(".movie_details_span_end")?.text(),
+                        if (anchor.hasClass("movie_details_span_end")) anchor.text() else null,
+                        anchor.attr("title")
+                    )
+                )
+
+                SiteVariant(
+                    url = absolute,
+                    qualityLabel = label,
+                    qualityRank = qualityRank(label, absolute)
+                )
+            }
+
+            val bestVariant = variants
+                .maxWithOrNull(
+                    compareBy<SiteVariant> { it.qualityRank }
+                        .thenBy { it.url }
+                )
+                ?: return@forEachIndexed
 
             val type = when (source.kind) {
                 SourceKind.SERIES,
@@ -416,42 +485,99 @@ class DiscoveryFTP : MainAPI() {
                 SourceKind.MOVIE -> TvType.Movie
             }
 
-            result.putIfAbsent(
-                dedupeKey(absolute),
-                SiteItem(
-                    title = title,
-                    url = absolute,
-                    poster = poster,
-                    type = type,
-                    source = source.url,
-                    order = index
-                )
+            val year = card
+                .selectFirst(".details .feedback span[title='views']")
+                ?.text()
+                ?.trim()
+                ?.toIntOrNull()
+
+            result += SiteItem(
+                title = title,
+                url = bestVariant.url,
+                poster = poster,
+                type = type,
+                source = source.url,
+                order = index,
+                year = year,
+                qualityLabel = bestVariant.qualityLabel,
+                qualityRank = bestVariant.qualityRank
             )
         }
 
         /*
-         * Keep the website's ordering.
-         * The supplied Movies source shows newest entries first,
-         * so we do not alphabetize or randomly shuffle them.
+         * Fallback for unusual cards where no .card/.fcard wrapper exists.
          */
-        return result.values
-            .sortedBy { it.order }
-            .toList()
+        if (result.isEmpty()) {
+            document.select("a[href*='/m/view/'], a[href*='/s/view/']")
+                .forEachIndexed { index, anchor ->
+                    val absolute = absoluteUrl(anchor.attr("href").trim(), pageUrl)
+                    if (!absolute.contains("/m/view/") && !absolute.contains("/s/view/")) {
+                        return@forEachIndexed
+                    }
+
+                    val card = findCard(anchor)
+                    val title = cleanTitle(
+                        firstNonBlank(
+                            card?.selectFirst(".details h3")?.text(),
+                            card?.selectFirst(".ftitle")?.text(),
+                            anchor.attr("title"),
+                            titleFromUrl(absolute)
+                        )
+                    )
+
+                    if (title.isBlank()) return@forEachIndexed
+
+                    val label = cleanQualityLabel(
+                        firstNonBlank(
+                            anchor.selectFirst(".movie_details_span_end")?.text(),
+                            if (anchor.hasClass("movie_details_span_end")) anchor.text() else null,
+                            anchor.attr("title"),
+                            card?.selectFirst(".poster[title]")?.attr("title")
+                        )
+                    )
+
+                    val type = when (source.kind) {
+                        SourceKind.SERIES, SourceKind.ANIME_SERIES -> TvType.TvSeries
+                        SourceKind.ANIME_MOVIE -> TvType.Anime
+                        SourceKind.MOVIE -> TvType.Movie
+                    }
+
+                    result += SiteItem(
+                        title = title,
+                        url = absolute,
+                        poster = card?.let { extractPoster(it, pageUrl) }
+                            ?: extractPoster(anchor, pageUrl),
+                        type = type,
+                        source = source.url,
+                        order = index,
+                        qualityLabel = label,
+                        qualityRank = qualityRank(label, absolute)
+                    )
+                }
+        }
+
+        return collapseByTitle(result)
     }
+
+    private data class SiteVariant(
+        val url: String,
+        val qualityLabel: String,
+        val qualityRank: Int
+    )
 
     private fun findCard(anchor: Element): Element? {
         var current: Element? = anchor
 
-        repeat(8) {
+        repeat(10) {
             val element = current ?: return@repeat
+            val className = element.className().lowercase(Locale.ROOT)
 
-            val className = element.className()
-                .lowercase(Locale.ROOT)
+            if (className.contains("card") || className.contains("fcard")) {
+                return element
+            }
 
-            if (
-                element.select("img").isNotEmpty() ||
-                className.contains("card") ||
-                className.contains("fcard")
+            if (element.selectFirst(".details h3") != null ||
+                element.selectFirst(".ftitle") != null
             ) {
                 return element
             }
@@ -483,23 +609,30 @@ class DiscoveryFTP : MainAPI() {
         query: String,
         page: Int
     ): SearchResponseList {
-        val q = query.trim()
-        if (q.isBlank()) {
+        val rawQuery = query.trim()
+        if (rawQuery.isBlank()) {
             return newSearchResponseList(
                 emptyList(),
                 false
             )
         }
 
+        val q = normalizeSearchQuery(rawQuery)
+        if (q.isBlank()) {
+            return newSearchResponseList(emptyList(), false)
+        }
+
         val pageNumber = page.coerceAtLeast(1)
 
         /*
-         * The supplied site source exposes the search input but the
-         * backend search endpoint is not part of the provided source.
+         * The supplied site source exposes the search input, but the
+         * backend search endpoint itself is not part of the provided source.
+         * We therefore search the known listing sources locally.
          *
-         * To avoid inventing an unverified endpoint, search is performed
-         * against the same listing pages that are known from the supplied
-         * URLs. Results are matched locally and remain bounded.
+         * Season tokens such as "S1", "S01", "Season 1" are removed from
+         * the query so "Mirzapur", "Mirzapur S1" and "Mirzapur Season 3"
+         * can all resolve to the same base series. The load response then
+         * exposes all available seasons.
          */
         val allMatches = mutableListOf<SiteItem>()
 
@@ -508,20 +641,22 @@ class DiscoveryFTP : MainAPI() {
                 val items = fetchPage(source, serverPage)
 
                 allMatches += items.filter {
-                    it.title.contains(q, ignoreCase = true)
+                    val titleKey = normalizeTitleKey(it.title)
+                    titleKey.contains(q) || q.split(Regex("\\s+"))
+                        .filter { token -> token.isNotBlank() }
+                        .all { token -> titleKey.contains(token) }
                 }
 
                 if (items.isEmpty()) break
             }
         }
 
-        val ranked = allMatches
-            .distinctBy { dedupeKey(it) }
+        val ranked = collapseByTitle(allMatches)
             .sortedWith(
                 compareByDescending<SiteItem> {
-                    searchScore(q, it.title)
+                    searchScore(q, normalizeTitleKey(it.title))
                 }.thenBy {
-                    it.title.lowercase(Locale.ROOT)
+                    it.order
                 }
             )
 
@@ -606,13 +741,27 @@ class DiscoveryFTP : MainAPI() {
                 )
             }
 
+            val distinctEpisodes = episodes
+                .distinctBy { episodeKey(it) }
+
             return newTvSeriesLoadResponse(
                 title,
                 input,
                 TvType.TvSeries,
-                episodes.distinctBy { episodeKey(it) }
+                distinctEpisodes
             ) {
                 posterUrl = poster
+                seasonNames = seasonLinks
+                    .map { it.season }
+                    .distinct()
+                    .sortedDescending()
+                    .map { season ->
+                        SeasonData(
+                            season = season,
+                            name = "Season $season",
+                            displaySeason = season
+                        )
+                    }
             }
         }
 
@@ -728,11 +877,18 @@ class DiscoveryFTP : MainAPI() {
                 index + 1
             )
 
+            val episodeDisplayName = if (episodeTitle.isBlank()) {
+                "S$season | EP $episodeNumber"
+            } else {
+                "$episodeTitle [S$season | EP $episodeNumber]"
+            }
+
             episodes += newEpisode(mediaUrl) {
-                name = episodeTitle
+                name = episodeDisplayName
                 this.season = season
                 this.episode = episodeNumber
                 posterUrl = fallbackPoster
+                description = card?.selectFirst(".season_overview p")?.text()?.trim()
             }
         }
 
@@ -1041,8 +1197,123 @@ class DiscoveryFTP : MainAPI() {
         return result
     }
 
-    private fun dedupeKey(item: SiteItem): String =
-        dedupeKey(item.url)
+    private fun collapseByTitle(items: List<SiteItem>): List<SiteItem> {
+        if (items.isEmpty()) return emptyList()
+
+        val result = LinkedHashMap<String, SiteItem>()
+
+        items.forEach { item ->
+            val key = contentKey(item) + "|" + item.type.name
+            val existing = result[key]
+
+            if (existing == null || isBetterVariant(item, existing)) {
+                result[key] = if (existing == null) {
+                    item
+                } else {
+                    item.copy(order = minOf(item.order, existing.order))
+                }
+            }
+        }
+
+        return result.values.toList()
+    }
+
+    private fun isBetterVariant(candidate: SiteItem, existing: SiteItem): Boolean {
+        if (candidate.qualityRank != existing.qualityRank) {
+            return candidate.qualityRank > existing.qualityRank
+        }
+
+        return candidate.order < existing.order
+    }
+
+    private fun contentKey(item: SiteItem): String =
+        normalizeTitleKey(item.title)
+
+    private fun urlKey(url: String): String =
+        "url:" + dedupeKey(url)
+
+    private fun normalizeTitleKey(value: String): String {
+        return value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("\\(\\(\\d{4}\\)\\)"), " ")
+            .replace(Regex("\\(\\d{4}\\)"), " ")
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun normalizeSearchQuery(value: String): String {
+        return value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("\\bseason\\s*0*\\d+\\b"), " ")
+            .replace(Regex("\\bs\\s*0*\\d+\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .let { normalizeTitleKey(it) }
+    }
+
+    private fun cleanQualityLabel(value: String): String {
+        return value
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .replace(Regex("\\s{2,}"), " ")
+    }
+
+    private fun qualityRank(label: String, url: String): Int {
+        val lower = "$label $url".lowercase(Locale.ROOT)
+
+        return when {
+            "2160" in lower || "4k" in lower -> 2160
+            "1440" in lower -> 1440
+            "1080" in lower -> 1080
+            "720" in lower -> 720
+            "480" in lower -> 480
+            "360" in lower -> 360
+            "hd" in lower -> 720
+            else -> 0
+        }
+    }
+
+    private suspend fun getProtectedDuplicateKeys(): Set<String> {
+        protectedDuplicateKeys?.let { return it }
+
+        return protectedIndexMutex.withLock {
+            protectedDuplicateKeys?.let { return@withLock it }
+
+            val sources = buildList {
+                addAll(DUAL_SOURCES)
+                add(Source("$BASE_URL/s", SourceKind.SERIES))
+                addAll(ANIME_SOURCES)
+            }
+
+            val keys = coroutineScope {
+                sources.map { source ->
+                    async {
+                        val local = mutableSetOf<String>()
+                        var serverPage = 1
+
+                        while (serverPage <= DUPLICATE_INDEX_MAX_PAGES) {
+                            val items = fetchPage(source, serverPage)
+                            if (items.isEmpty()) break
+
+                            items.forEach { item ->
+                                local += contentKey(item)
+                                local += urlKey(item.url)
+                            }
+
+                            serverPage++
+                        }
+
+                        local
+                    }
+                }.awaitAll().fold(mutableSetOf()) { acc, set ->
+                    acc.apply { addAll(set) }
+                }
+            }
+
+            keys.also { protectedDuplicateKeys = it }
+        }
+    }
 
     private fun dedupeKey(url: String): String =
         url.substringBefore("#")
@@ -1206,30 +1477,4 @@ class DiscoveryFTP : MainAPI() {
         } * 10
     }
 
-    private fun detectQuality(url: String): Int {
-        val lower = url.lowercase(Locale.ROOT)
-
-        return when {
-            "2160" in lower || "4k" in lower ->
-                Qualities.P2160.value
-
-            "1440" in lower ->
-                Qualities.P1440.value
-
-            "1080" in lower ->
-                Qualities.P1080.value
-
-            "720" in lower ->
-                Qualities.P720.value
-
-            "480" in lower ->
-                Qualities.P480.value
-
-            "360" in lower ->
-                Qualities.P360.value
-
-            else ->
-                Qualities.Unknown.value
-        }
-    }
 }
