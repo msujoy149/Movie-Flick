@@ -95,11 +95,11 @@
         "name": "DhakaFTP"
     },
     {
-        "jarFileSize": 324791,
-        "fileHash": "sha256-dd6c231746a5a9b66607b55a79313819b846f8485319ec78e565cfe5b2439656",
+        "jarFileSize": 327266,
+        "fileHash": "sha256-8abbaac67acf21f1f65b2af8b59b6794dd3e0283ed053affb84391614c0953d0",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 71963,
+        "fileSize": 73553,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -116,7 +116,7 @@
         "description": "Discovery FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DiscoveryFTP.cs3",
         "name": "DiscoveryFTP",
-        "jarHash": "sha256-ff328a9c6b926480b210b5fd96bb9e1e05b24893ca1a26ccd6a544df6bb0ca99"
+        "jarHash": "sha256-680144b1a510bda24648848166ad5dfcaea26ee03b9a48960c1b60095558e6fe"
     },
     {
         "iconUrl": "https://hianime.at/theme/images/icons-192.png",
