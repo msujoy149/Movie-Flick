@@ -1286,32 +1286,38 @@ class DiscoveryFTP : MainAPI() {
                 addAll(ANIME_SOURCES)
             }
 
-            val keys = coroutineScope {
-                sources.map { source ->
-                    async {
-                        val local = mutableSetOf<String>()
-                        var serverPage = 1
+            val keys: MutableSet<String> = mutableSetOf()
 
-                        while (serverPage <= DUPLICATE_INDEX_MAX_PAGES) {
-                            val items = fetchPage(source, serverPage)
-                            if (items.isEmpty()) break
+            coroutineScope {
+                sources
+                    .map { source ->
+                        async {
+                            val local: MutableSet<String> = mutableSetOf()
+                            var serverPage = 1
 
-                            items.forEach { item ->
-                                local += contentKey(item)
-                                local += urlKey(item.url)
+                            while (serverPage <= DUPLICATE_INDEX_MAX_PAGES) {
+                                val items = fetchPage(source, serverPage)
+                                if (items.isEmpty()) break
+
+                                items.forEach { item ->
+                                    local.add(contentKey(item))
+                                    local.add(urlKey(item.url))
+                                }
+
+                                serverPage++
                             }
 
-                            serverPage++
+                            local
                         }
-
-                        local
                     }
-                }.awaitAll().fold(mutableSetOf()) { acc, set ->
-                    acc.apply { addAll(set) }
-                }
+                    .awaitAll()
+                    .forEach { localKeys ->
+                        keys.addAll(localKeys)
+                    }
             }
 
-            keys.also { protectedDuplicateKeys = it }
+            protectedDuplicateKeys = keys
+            keys
         }
     }
 
