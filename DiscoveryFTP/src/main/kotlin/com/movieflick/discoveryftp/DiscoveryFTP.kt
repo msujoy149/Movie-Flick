@@ -758,7 +758,7 @@ class DiscoveryFTP : MainAPI() {
                     .map { season ->
                         SeasonData(
                             season = season,
-                            name = "Season $season",
+                            name = null,
                             displaySeason = season
                         )
                     }
@@ -943,23 +943,27 @@ class DiscoveryFTP : MainAPI() {
 
     private fun findEpisodeCard(anchor: Element): Element? {
         var current: Element? = anchor
+        var fallback: Element? = null
 
-        repeat(10) {
+        repeat(12) {
             val element = current ?: return@repeat
-            val text = element.text().lowercase(Locale.ROOT)
+            val className = element.className().lowercase(Locale.ROOT)
 
-            if (
-                element.select("h5").isNotEmpty() ||
-                element.select("h4").isNotEmpty() ||
-                text.contains("ep ")
-            ) {
+            // Discovery puts each episode inside a .card container. Prefer
+            // that full card because it contains both the episode code (h5)
+            // and the actual episode title (h4).
+            if (className.contains("card") || className.contains("fcard")) {
                 return element
+            }
+
+            if (element.selectFirst("h4") != null) {
+                fallback = element
             }
 
             current = element.parent()
         }
 
-        return anchor.parent()
+        return fallback ?: anchor.parent()
     }
 
     override suspend fun loadLinks(
