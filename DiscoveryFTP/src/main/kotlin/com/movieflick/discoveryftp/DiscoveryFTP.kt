@@ -1908,13 +1908,26 @@ class DiscoveryFTP : MainAPI() {
         }
 
         /*
-         * Verified Discovery browser traffic sends Referer and User-Agent
-         * to the CDN. Range is intentionally not fixed here because the
-         * player must generate dynamic byte ranges for streaming/seek.
+         * Browser Network capture shows that Discovery's CDN files are
+         * requested with the SITE ROOT as Referer, not the movie/episode URL.
+         * This distinction matters for the CDN's request policy.
+         *
+         * Range is intentionally not fixed here. ExoPlayer generates the
+         * correct byte ranges dynamically while streaming and seeking.
          */
+        val isDiscoveryCdn = Regex(
+            "(?i)^https?://cdn[1-5]\\.discoveryftp\\.net/"
+        ).containsMatchIn(normalized)
+
+        val playbackReferer = if (isDiscoveryCdn) {
+            "$mainUrl/"
+        } else {
+            referer.ifBlank { "$mainUrl/" }
+        }
+
         val mediaHeaders = mapOf(
             "User-Agent" to DISCOVERY_USER_AGENT,
-            "Referer" to referer,
+            "Referer" to playbackReferer,
             "Accept" to "*/*",
             "Accept-Encoding" to "identity"
         )
@@ -1926,7 +1939,7 @@ class DiscoveryFTP : MainAPI() {
                 url = normalized,
                 type = type
             ) {
-                this.referer = referer
+                this.referer = playbackReferer
                 this.headers = mediaHeaders
                 this.quality = quality
             }
