@@ -1813,10 +1813,17 @@ class DiscoveryFTP : MainAPI() {
          * family is intended to serve both forms. Always use HTTPS for those
          * hosts so Android does not fall into a cleartext-network failure.
          */
-        return trimmed.replaceFirst(
-            Regex("(?i)^http://(cdn[1-5]\\.discoveryftp\\.net/)")
+        return if (
+            Regex("(?i)^http://cdn[1-5]\\.discoveryftp\\.net/")
+                .containsMatchIn(trimmed)
         ) {
-            "https://${it.groupValues[1]}"
+            trimmed.replaceFirst(
+                "http://",
+                "https://",
+                ignoreCase = true
+            )
+        } else {
+            trimmed
         }
     }
 
