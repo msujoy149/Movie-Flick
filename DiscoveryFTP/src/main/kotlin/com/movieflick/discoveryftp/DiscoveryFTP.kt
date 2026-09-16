@@ -1233,161 +1233,436 @@ class DiscoveryFTP : MainAPI() {
 
         if (input.isBlank()) return false
 
-        val referer = request.referer.ifBlank { "$mainUrl/" }
+        val referer = request.referer.ifBlank {
+            "$mainUrl/"
+        }
 
+        /*
+         * FAST PATH — an episode card or a movie variant already contains the
+         * real CDN file. Do not perform any extra page request in this case.
+         */
         if (isMediaUrl(input)) {
-            mediaCandidates(input).forEachIndexed { index, media ->
+            val mediaUrl = normalizeMediaUrl(input)
+
+            emitMedia(
+                mediaUrl = mediaUrl,
+                callback = callback,
+                referer = referer,
+                label = "Discovery FTP"
+            )
+
+            return true
+        }
+
+        /*
+         * DETAIL PAGE RESOLUTION ORDER
+         *
+         * Discovery's movie pages expose the same playable file through:
+         *   1) WEB Play
+         *   2) Download
+         *   3) Stream
+         *
+         * We deliberately try those paths in that order. A page can change
+         * which one contains the source, so the resolver does NOT stop just
+         * because one button exists — it keeps searching until a real media
+         * URL is extracted.
+         */
+        val document = getDocument(input)
+            ?: return false
+
+        /* 1) WEB Play */
+        val webPlayPages = document
+            .select("a[href]")
+            .mapNotNull { anchor ->
+                val href = anchor.attr("href").trim()
+                val text = anchor.text().trim().lowercase(Locale.ROOT)
+                val title = anchor.attr("title").trim().lowercase(Locale.ROOT)
+
+                val webPlay =
+                    href.contains("/m/play/", true) ||
+                        href.contains("/s/play/", true) ||
+                        text.contains("web play") ||
+                        title.contains("web play")
+
+                if (webPlay && href.isNotBlank()) {
+                    absoluteUrl(href, input)
+                } else {
+                    null
+                }
+            }
+            .distinct()
+
+        val mediaFromWebPlay = resolveMediaFromPages(
+            pageUrls = webPlayPages,
+            maxPages = 4,
+            pageReferer = input
+        )
+
+        if (mediaFromWebPlay.isNotEmpty()) {
+            mediaFromWebPlay.forEach { mediaUrl ->
                 emitMedia(
-                    mediaUrl = media,
+                    mediaUrl = mediaUrl,
                     callback = callback,
-                    referer = referer,
-                    label = if (index == 0) {
-                        "Discovery FTP Direct"
-                    } else {
-                        "Discovery FTP Scheme Fallback"
-                    }
+                    referer = input,
+                    label = "Discovery FTP"
                 )
             }
             return true
         }
 
-        val response = getDocument(input) ?: return false
-        val document = response
-        val mediaUrls = LinkedHashSet<String>()
+        /* 2) Download — the supplied Discovery source exposes direct .mkv here. */
+        val downloadMedia = extractDirectDownloadMedia(
+            document = document,
+            baseUrl = input
+        )
 
-        document.select("a[href]").forEach { anchor ->
-            val raw = anchor.attr("href").trim()
-            if (isMediaUrl(raw)) {
-                mediaUrls += normalizeMediaUrl(absoluteUrl(raw, input))
+        if (downloadMedia.isNotEmpty()) {
+            downloadMedia.forEach { mediaUrl ->
+                emitMedia(
+                    mediaUrl = mediaUrl,
+                    callback = callback,
+                    referer = input,
+                    label = "Discovery FTP"
+                )
+            }
+            return true
+        }
+
+        /*
+         * Some pages don't label the anchor "Download" in the DOM that
+         * CloudStream receives. Accept any direct CDN/media href as a second
+         * direct-media fallback before opening a Stream page.
+         */
+        val directMedia = extractAnyDirectMedia(
+            document = document,
+            baseUrl = input
+        )
+
+        if (directMedia.isNotEmpty()) {
+            directMedia.forEach { mediaUrl ->
+                emitMedia(
+                    mediaUrl = mediaUrl,
+                    callback = callback,
+                    referer = input,
+                    label = "Discovery FTP"
+                )
+            }
+            return true
+        }
+
+        /* 3) Stream / playlist */
+        val streamPages = document
+            .select("a[href]")
+            .mapNotNull { anchor ->
+                val href = anchor.attr("href").trim()
+                val text = anchor.text().trim().lowercase(Locale.ROOT)
+                val title = anchor.attr("title").trim().lowercase(Locale.ROOT)
+
+                val stream =
+                    href.contains("/m/playlist/", true) ||
+                        href.contains("/s/playlist/", true) ||
+                        href.contains("/m/stream/", true) ||
+                        href.contains("/s/stream/", true) ||
+                        text == "stream" ||
+                        text.contains("stream") ||
+                        title.contains("stream")
+
+                if (stream && href.isNotBlank()) {
+                    absoluteUrl(href, input)
+                } else {
+                    null
+                }
+            }
+            .distinct()
+
+        val mediaFromStream = resolveMediaFromPages(
+            pageUrls = streamPages,
+            maxPages = 4,
+            pageReferer = input
+        )
+
+        if (mediaFromStream.isNotEmpty()) {
+            mediaFromStream.forEach { mediaUrl ->
+                emitMedia(
+                    mediaUrl = mediaUrl,
+                    callback = callback,
+                    referer = input,
+                    label = "Discovery FTP"
+                )
+            }
+            return true
+        }
+
+        /*
+         * Final page-level fallback: scan the detail HTML itself for direct
+         * media strings, including escaped URLs and relative CDN paths.
+         */
+        val finalMedia = extractMediaFromHtml(
+            html = document.html(),
+            baseUrl = input
+        )
+
+        if (finalMedia.isEmpty()) {
+            return false
+        }
+
+        finalMedia.forEach { mediaUrl ->
+            emitMedia(
+                mediaUrl = mediaUrl,
+                callback = callback,
+                referer = input,
+                label = "Discovery FTP"
+            )
+        }
+
+        return true
+    }
+
+    private suspend fun resolveMediaFromPages(
+        pageUrls: List<String>,
+        maxPages: Int,
+        pageReferer: String
+    ): List<String> {
+        if (pageUrls.isEmpty()) return emptyList()
+
+        for (pageUrl in pageUrls.take(maxPages)) {
+            val pageDocument = getDocumentWithReferer(
+                url = pageUrl,
+                referer = pageReferer
+            ) ?: continue
+
+            val direct = extractAnyDirectMedia(
+                document = pageDocument,
+                baseUrl = pageUrl
+            )
+
+            if (direct.isNotEmpty()) {
+                return direct
+            }
+
+            /* iframe/player-page fallback */
+            val frames = pageDocument
+                .select("iframe[src], frame[src]")
+                .mapNotNull { frame ->
+                    val raw = frame.attr("src").trim()
+                    if (raw.isBlank()) null
+                    else absoluteUrl(raw, pageUrl)
+                }
+                .distinct()
+
+            for (frameUrl in frames.take(4)) {
+                val frameDocument = getDocumentWithReferer(
+                    url = frameUrl,
+                    referer = pageUrl
+                ) ?: continue
+
+                val frameMedia = extractAnyDirectMedia(
+                    document = frameDocument,
+                    baseUrl = frameUrl
+                )
+
+                if (frameMedia.isNotEmpty()) {
+                    return frameMedia
+                }
+
+                val frameScriptMedia = extractMediaFromHtml(
+                    html = frameDocument.html(),
+                    baseUrl = frameUrl
+                )
+
+                if (frameScriptMedia.isNotEmpty()) {
+                    return frameScriptMedia
+                }
+            }
+
+            val scriptMedia = extractMediaFromHtml(
+                html = pageDocument.html(),
+                baseUrl = pageUrl
+            )
+
+            if (scriptMedia.isNotEmpty()) {
+                return scriptMedia
             }
         }
 
-        document.select("video[src], video source[src], source[src]").forEach { element ->
-            val raw = element.attr("src").trim()
-            if (raw.isBlank()) return@forEach
-            val absolute = normalizeMediaUrl(absoluteUrl(raw, input))
-            if (isMediaUrl(absolute)) mediaUrls += absolute
+        return emptyList()
+    }
+
+    private suspend fun getDocumentWithReferer(
+        url: String,
+        referer: String
+    ): Document? {
+        val normalized = url.trim()
+        if (normalized.isBlank()) return null
+
+        val candidates = linkedSetOf<String>()
+        candidates += normalized
+
+        /* Always prefer HTTPS for Discovery web pages. */
+        if (normalized.startsWith("http://", true)) {
+            candidates += "https://" + normalized.removePrefix("http://")
         }
 
+        for (candidate in candidates) {
+            val result = runCatching {
+                app.get(
+                    candidate,
+                    headers = pageHeaders(referer)
+                ).document
+            }.getOrNull()
+
+            if (result != null) return result
+        }
+
+        return null
+    }
+
+    private fun extractDirectDownloadMedia(
+        document: Document,
+        baseUrl: String
+    ): List<String> {
+        val result = LinkedHashSet<String>()
+
+        document.select("a[href]").forEach { anchor ->
+            val href = anchor.attr("href").trim()
+            val text = anchor.text().trim().lowercase(Locale.ROOT)
+            val title = anchor.attr("title").trim().lowercase(Locale.ROOT)
+            val classes = anchor.classNames()
+                .joinToString(" ")
+                .lowercase(Locale.ROOT)
+
+            val looksLikeDownload =
+                text.contains("download") ||
+                    title.contains("download") ||
+                    classes.contains("download") ||
+                    anchor.selectFirst("ion-icon[name*='download']") != null
+
+            if (!looksLikeDownload) return@forEach
+
+            val absolute = normalizeMediaUrl(
+                absoluteUrl(href, baseUrl)
+            )
+
+            if (isMediaUrl(absolute)) {
+                result += absolute
+            }
+        }
+
+        return result.toList()
+    }
+
+    private fun extractAnyDirectMedia(
+        document: Document,
+        baseUrl: String
+    ): List<String> {
+        val result = LinkedHashSet<String>()
+
+        /* Anchors: Download / direct CDN links. */
+        document.select("a[href]").forEach { anchor ->
+            val raw = anchor.attr("href").trim()
+            if (raw.isBlank()) return@forEach
+
+            val absolute = normalizeMediaUrl(
+                absoluteUrl(raw, baseUrl)
+            )
+
+            if (isMediaUrl(absolute)) {
+                result += absolute
+            }
+        }
+
+        /* Native HTML5 player. */
+        document.select(
+            "video[src], video source[src], source[src]"
+        ).forEach { element ->
+            val raw = element.attr("src").trim()
+            if (raw.isBlank()) return@forEach
+
+            val absolute = normalizeMediaUrl(
+                absoluteUrl(raw, baseUrl)
+            )
+
+            if (isMediaUrl(absolute)) {
+                result += absolute
+            }
+        }
+
+        /* Lazy player attributes. */
         document.select(
             "[data-src], [data-video], [data-file], " +
-                "[data-default-src], [data-video-src]"
+                "[data-default-src], [data-video-src], " +
+                "[data-playback-url], [data-url]"
         ).forEach { element ->
             listOf(
                 element.attr("data-src"),
                 element.attr("data-video"),
                 element.attr("data-file"),
                 element.attr("data-default-src"),
-                element.attr("data-video-src")
+                element.attr("data-video-src"),
+                element.attr("data-playback-url"),
+                element.attr("data-url")
             ).forEach { raw ->
                 if (raw.isBlank()) return@forEach
-                val absolute = normalizeMediaUrl(absoluteUrl(raw, input))
-                if (isMediaUrl(absolute)) mediaUrls += absolute
+
+                val absolute = normalizeMediaUrl(
+                    absoluteUrl(raw, baseUrl)
+                )
+
+                if (isMediaUrl(absolute)) {
+                    result += absolute
+                }
             }
         }
 
-        if (mediaUrls.isEmpty()) {
-            val playPages = document.select("a[href]").mapNotNull { anchor ->
-                val href = anchor.attr("href").trim()
-                val label = anchor.text().trim().lowercase(Locale.ROOT)
-                val isPlayPage =
-                    href.contains("/m/play/", true) ||
-                        href.contains("/m/playlist/", true) ||
-                        href.contains("/s/play/", true) ||
-                        href.contains("/s/playlist/", true) ||
-                        label.contains("web play") ||
-                        label == "play" ||
-                        label.contains("download")
-                if (isPlayPage && href.isNotBlank()) {
-                    absoluteUrl(href, input)
-                } else null
-            }.distinct()
+        return result.toList()
+    }
 
-            for (playPage in playPages.take(6)) {
-                val playDocument = getDocument(playPage) ?: continue
+    private fun extractMediaFromHtml(
+        html: String,
+        baseUrl: String
+    ): List<String> {
+        val result = LinkedHashSet<String>()
 
-                playDocument.select(
-                    "video[src], video source[src], source[src]"
-                ).forEach { element ->
-                    val raw = element.attr("src").trim()
-                    if (raw.isBlank()) return@forEach
-                    val absolute = normalizeMediaUrl(
-                        absoluteUrl(raw, playPage)
-                    )
-                    if (isMediaUrl(absolute)) {
-                        mediaUrls += absolute
-                    }
-                }
+        val cleaned = html
+            .replace("\\/", "/")
+            .replace("&amp;", "&")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
 
-                if (mediaUrls.isEmpty()) {
-                    playDocument.select("iframe[src]")
-                        .map {
-                            absoluteUrl(
-                                it.attr("src").trim(),
-                                playPage
-                            )
-                        }
-                        .filter { it.isNotBlank() }
-                        .distinct()
-                        .take(4)
-                        .forEach { frameUrl ->
-                            val frameDocument = getDocument(frameUrl)
-                                ?: return@forEach
+        /* Absolute media URLs. */
+        val absoluteRegex = Regex(
+            """(?i)https?://[^\"'<>\s]+(?:${mediaExtensions.joinToString("|") { Regex.escape(it) }})(?:\?[^\"'<>\s]*)?"""
+        )
 
-                            frameDocument.select(
-                                "video[src], video source[src], source[src]"
-                            ).forEach { element ->
-                                val raw = element.attr("src").trim()
-                                if (raw.isBlank()) return@forEach
-
-                                val absolute = normalizeMediaUrl(
-                                    absoluteUrl(raw, frameUrl)
-                                )
-
-                                if (isMediaUrl(absolute)) {
-                                    mediaUrls += absolute
-                                }
-                            }
-                        }
-                }
-
-                if (mediaUrls.isNotEmpty()) break
-            }
-        }
-
-        if (mediaUrls.isEmpty()) {
-            val html = response.html()
-                .replace("\\\\/", "/")
-                .replace("&amp;", "&")
-
-            val regex = Regex(
-                """(?i)https?://[^"'<>\s]+(?:${mediaExtensions.joinToString("|").replace(".", "\\.")})(?:\?[^"'<>\s]*)?"""
+        absoluteRegex.findAll(cleaned).forEach { match ->
+            val media = normalizeMediaUrl(
+                cleanUrl(match.value)
             )
 
-            regex.findAll(html).forEach { match ->
-                val candidate = normalizeMediaUrl(cleanUrl(match.value))
-                if (isMediaUrl(candidate)) mediaUrls += candidate
+            if (isMediaUrl(media)) {
+                result += media
             }
         }
 
-        if (mediaUrls.isEmpty()) return false
+        /* Protocol-relative and relative media paths. */
+        val relativeRegex = Regex(
+            """(?i)(//[^\"'<>\s]+|/[^\"'<>\s]+)(?:${mediaExtensions.joinToString("|") { Regex.escape(it) }})(?:\?[^\"'<>\s]*)?"""
+        )
 
-        mediaUrls.distinct().forEach { media ->
-            mediaCandidates(media).forEachIndexed { index, candidate ->
-                emitMedia(
-                    mediaUrl = candidate,
-                    callback = callback,
-                    referer = referer.ifBlank { input },
-                    label = if (index == 0) {
-                        "Discovery FTP Direct"
-                    } else {
-                        "Discovery FTP Scheme Fallback"
-                    }
+        relativeRegex.findAll(cleaned).forEach { match ->
+            val media = normalizeMediaUrl(
+                absoluteUrl(
+                    match.value,
+                    baseUrl
                 )
+            )
+
+            if (isMediaUrl(media)) {
+                result += media
             }
         }
 
-        return true
+        return result.toList()
     }
 
     private data class EpisodePlaybackRequest(
@@ -1438,22 +1713,16 @@ class DiscoveryFTP : MainAPI() {
     private fun mediaCandidates(
         url: String
     ): List<String> {
-        val clean = normalizeMediaUrl(url)
-        val match = Regex(
-            """(?i)^(https?)://(cdn[1-5]\.discoveryftp\.net)(/.*)$"""
-        ).find(clean) ?: return listOf(clean)
-
-        val scheme = match.groupValues[1].lowercase(Locale.ROOT)
-        val host = match.groupValues[2]
-        val path = match.groupValues[3]
-
-        val alternate = if (scheme == "https") {
-            "http://$host$path"
-        } else {
-            "https://$host$path"
-        }
-
-        return linkedSetOf(clean, alternate).toList()
+        /*
+         * Discovery episode cards are often published as http://cdn5..., while
+         * the same CDN file is available through HTTPS. CloudStream/Android
+         * can reject cleartext HTTP, so the provider emits HTTPS for the
+         * Discovery CDN instead of presenting an HTTP "fallback" as a second
+         * playable source.
+         */
+        return listOf(
+            normalizeMediaUrl(url)
+        )
     }
 
     private suspend fun emitMedia(
@@ -1488,7 +1757,7 @@ class DiscoveryFTP : MainAPI() {
             ) {
                 this.quality = quality
                 this.referer = referer
-                this.headers = mediaHeaders()
+                this.headers = mediaHeaders(referer)
             }
         )
     }
@@ -1532,22 +1801,35 @@ class DiscoveryFTP : MainAPI() {
     }
 
     private fun normalizeMediaUrl(url: String): String {
-        /*
-         * Keep the URL scheme published by Discovery. Some source files are
-         * published as HTTP while the WEB PLAY pages can publish HTTPS.
-         */
-        return url
+        val trimmed = url
             .trim()
             .replace(" ", "%20")
+
+        if (trimmed.isBlank()) return trimmed
+
+        /*
+         * Discovery's own TV episode source uses http://cdn5... while the
+         * movie WEB PLAY source publishes https://cdn1.... The same CDN host
+         * family is intended to serve both forms. Always use HTTPS for those
+         * hosts so Android does not fall into a cleartext-network failure.
+         */
+        return trimmed.replaceFirst(
+            Regex("(?i)^http://(cdn[1-5]\\.discoveryftp\\.net/)")
+        ) {
+            "https://${it.groupValues[1]}"
+        }
     }
 
-    private fun mediaHeaders(): Map<String, String> = mapOf(
+    private fun mediaHeaders(
+        referer: String = "$mainUrl/"
+    ): Map<String, String> = mapOf(
         "User-Agent" to
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/153.0.0.0 Safari/537.36",
         "Accept" to "*/*",
-        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8"
+        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+        "Referer" to referer
     )
 
     private fun pagedUrl(
