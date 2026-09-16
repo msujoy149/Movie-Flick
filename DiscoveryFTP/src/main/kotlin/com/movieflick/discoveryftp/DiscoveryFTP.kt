@@ -1279,6 +1279,25 @@ class DiscoveryFTP : MainAPI() {
         if (input.isBlank()) return false
 
         /*
+         * Discovery's browser playback keeps the site's session cookie on the
+         * CDN request. Build the same lightweight session inside CloudStream:
+         *
+         *   site root -> content/detail page -> CDN media
+         *
+         * We capture only cookie name/value pairs from Set-Cookie and send the
+         * resulting Cookie header to the final media request.
+         */
+        val session = DiscoverySession()
+
+        runCatching {
+            fetchWithDiscoverySession(
+                url = "$mainUrl/",
+                referer = "$mainUrl/",
+                session = session
+            )
+        }
+
+        /*
          * A Discovery media URL is already the real CDN file.
          * Never turn it into another page URL and never require a token.
          */
@@ -1286,15 +1305,20 @@ class DiscoveryFTP : MainAPI() {
             emitMedia(
                 mediaUrl = input,
                 callback = callback,
-                referer = "$mainUrl/"
+                referer = "$mainUrl/",
+                cookieHeader = session.headerValue()
             )
             return true
         }
 
-        val document = getDocumentWithReferer(
+        val pageResult = fetchWithDiscoverySession(
             url = input,
-            referer = "$mainUrl/"
+            referer = "$mainUrl/",
+            session = session
         ) ?: return false
+
+        val document = pageResult.first
+        val pageCookieHeader = pageResult.second ?: session.headerValue()
 
         /*
          * Discovery detail pages expose the SAME playable file from several
@@ -1327,7 +1351,8 @@ class DiscoveryFTP : MainAPI() {
             emitMedia(
                 mediaUrl = media,
                 callback = callback,
-                referer = "$mainUrl/"
+                referer = "$mainUrl/",
+                cookieHeader = pageCookieHeader
             )
             return true
         }
@@ -1368,10 +1393,11 @@ class DiscoveryFTP : MainAPI() {
         val pageMedia = coroutineScope {
             linkedPages.map { pageUrl ->
                 async {
-                    val pageDocument = getDocumentWithReferer(
+                    val pageDocument = fetchWithDiscoverySession(
                         url = pageUrl,
-                        referer = "$mainUrl/"
-                    )
+                        referer = "$mainUrl/",
+                        session = session
+                    )?.first
 
                     if (pageDocument == null) {
                         emptyList()
@@ -1400,7 +1426,8 @@ class DiscoveryFTP : MainAPI() {
             emitMedia(
                 mediaUrl = media,
                 callback = callback,
-                referer = "$mainUrl/"
+                referer = "$mainUrl/",
+                cookieHeader = pageCookieHeader
             )
             return true
         }
@@ -1411,10 +1438,11 @@ class DiscoveryFTP : MainAPI() {
          * the media URL itself.
          */
         request.detailUrl?.let { detailUrl ->
-            val detailDocument = getDocumentWithReferer(
+            val detailDocument = fetchWithDiscoverySession(
                 url = detailUrl,
-                referer = "$mainUrl/"
-            )
+                referer = "$mainUrl/",
+                session = session
+            )?.first
 
             if (detailDocument != null) {
                 val candidates = linkedSetOf<String>()
@@ -1468,7 +1496,8 @@ class DiscoveryFTP : MainAPI() {
                 val nestedMedia = resolveMediaFromPages(
                     pageUrls = nestedPages,
                     maxPages = 8,
-                    pageReferer = "$mainUrl/"
+                    pageReferer = "$mainUrl/",
+                    session = session
                 )
 
                 pickBestMedia(nestedMedia)?.let { media ->
@@ -1496,10 +1525,11 @@ class DiscoveryFTP : MainAPI() {
             .distinct()
 
         for (frameUrl in frameUrls.take(8)) {
-            val frameDocument = getDocumentWithReferer(
+            val frameDocument = fetchWithDiscoverySession(
                 url = frameUrl,
-                referer = "$mainUrl/"
-            ) ?: continue
+                referer = input,
+                session = session
+            )?.first ?: continue
 
             val candidates = linkedSetOf<String>()
             candidates += extractAnyDirectMedia(
@@ -1515,7 +1545,8 @@ class DiscoveryFTP : MainAPI() {
                 emitMedia(
                     mediaUrl = media,
                     callback = callback,
-                    referer = "$mainUrl/"
+                    referer = "$mainUrl/",
+                    cookieHeader = session.headerValue()
                 )
                 return true
             }
@@ -1527,15 +1558,24 @@ class DiscoveryFTP : MainAPI() {
     private suspend fun resolveMediaFromPages(
         pageUrls: List<String>,
         maxPages: Int,
-        pageReferer: String
+        pageReferer: String,
+        session: DiscoverySession? = null
     ): List<String> {
         if (pageUrls.isEmpty()) return emptyList()
 
         for (pageUrl in pageUrls.take(maxPages)) {
-            val pageDocument = getDocumentWithReferer(
-                url = pageUrl,
-                referer = pageReferer
-            ) ?: continue
+            val pageDocument = if (session != null) {
+                fetchWithDiscoverySession(
+                    url = pageUrl,
+                    referer = pageReferer,
+                    session = session
+                )?.first
+            } else {
+                getDocumentWithReferer(
+                    url = pageUrl,
+                    referer = pageReferer
+                )
+            } ?: continue
 
             val direct = extractAnyDirectMedia(
                 document = pageDocument,
@@ -1592,6 +1632,43 @@ class DiscoveryFTP : MainAPI() {
         }
 
         return emptyList()
+    }
+
+    private suspend fun fetchWithDiscoverySession(
+        url: String,
+        referer: String,
+        session: DiscoverySession
+    ): Pair<Document, String?>? {
+        val normalized = url.trim()
+        if (normalized.isBlank()) return null
+
+        val candidates = linkedSetOf<String>()
+        candidates += normalized
+
+        if (normalized.startsWith("http://", true)) {
+            candidates += "https://" +
+                normalized.removePrefix("http://")
+        } else if (normalized.startsWith("https://", true)) {
+            candidates += "http://" +
+                normalized.removePrefix("https://")
+        }
+
+        for (candidate in candidates) {
+            val response = runCatching {
+                app.get(
+                    candidate,
+                    headers = pageHeaders(referer)
+                )
+            }.getOrNull() ?: continue
+
+            session.capture(
+                response.headers.values("Set-Cookie")
+            )
+
+            return response.document to session.headerValue()
+        }
+
+        return null
     }
 
     private suspend fun getDocumentWithReferer(
@@ -1805,6 +1882,37 @@ class DiscoveryFTP : MainAPI() {
         return result.toList()
     }
 
+    private data class DiscoverySession(
+        val cookies: MutableMap<String, String> = linkedMapOf()
+    ) {
+        fun headerValue(): String? {
+            if (cookies.isEmpty()) return null
+
+            return cookies.entries
+                .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+                .joinToString("; ") {
+                    "${it.key}=${it.value}"
+                }
+                .ifBlank { null }
+        }
+
+        fun capture(setCookieHeaders: List<String>) {
+            for (raw in setCookieHeaders) {
+                val pair = raw.substringBefore(';').trim()
+                val separator = pair.indexOf('=')
+
+                if (separator <= 0) continue
+
+                val name = pair.substring(0, separator).trim()
+                val value = pair.substring(separator + 1).trim()
+
+                if (name.isNotBlank() && value.isNotBlank()) {
+                    cookies[name] = value
+                }
+            }
+        }
+    }
+
     private data class EpisodePlaybackRequest(
         val mediaUrl: String,
         val referer: String,
@@ -1911,7 +2019,8 @@ class DiscoveryFTP : MainAPI() {
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit,
         referer: String = "$mainUrl/",
-        label: String = "Discovery FTP"
+        label: String = "Discovery FTP",
+        cookieHeader: String? = null
     ) {
         val normalized = normalizeMediaUrl(mediaUrl)
         if (!isMediaUrl(normalized)) return
@@ -1968,10 +2077,22 @@ class DiscoveryFTP : MainAPI() {
                  * player request simple: no synthetic Range header and no
                  * custom transfer encoding.
                  */
-                this.headers = mapOf(
-                    "User-Agent" to DISCOVERY_USER_AGENT,
-                    "Accept" to "*/*"
-                )
+                this.headers = linkedMapOf<String, String>().apply {
+                    put(
+                        "User-Agent",
+                        DISCOVERY_USER_AGENT
+                    )
+                    put(
+                        "Accept",
+                        "*/*"
+                    )
+                    if (!cookieHeader.isNullOrBlank()) {
+                        put(
+                            "Cookie",
+                            cookieHeader
+                        )
+                    }
+                }
             }
         )
     }
