@@ -297,6 +297,10 @@ class DiscoveryFTP : MainAPI() {
         }.awaitAll()
 
         val merged = collapseByTitle(interleave(sourceLists))
+            .sortedWith(
+                compareByDescending<SiteItem> { viewId(it.url) ?: -1 }
+                    .thenBy { it.order }
+            )
 
         val offset = homeOffset(page)
         val take = homeTake(page)
@@ -332,11 +336,21 @@ class DiscoveryFTP : MainAPI() {
 
         val result = mutableListOf<SiteItem>()
         var serverPage = 1
+        var previousSignature: String? = null
 
-        while (result.size < requiredCount && serverPage <= 50) {
+        while (result.size < requiredCount && serverPage <= 500) {
             val pageItems = fetchPage(source, serverPage)
 
             if (pageItems.isEmpty()) break
+
+            val pageSignature = pageItems
+                .joinToString("|") { dedupeKey(it.url) }
+
+            if (pageSignature.isNotBlank() && pageSignature == previousSignature) {
+                break
+            }
+
+            previousSignature = pageSignature
 
             result += pageItems.filterNot {
                 excludedKeys.contains(contentKey(it)) ||
@@ -711,9 +725,9 @@ class DiscoveryFTP : MainAPI() {
             input.contains("/s/category/", true)
 
         if (isSeries) {
-            val seasonLinks = extractSeasonLinks(
-                document,
-                input
+            val seasonLinks = discoverAllSeasonLinks(
+                document = document,
+                inputUrl = input
             )
 
             val episodes = if (seasonLinks.isNotEmpty()) {
@@ -743,6 +757,10 @@ class DiscoveryFTP : MainAPI() {
 
             val distinctEpisodes = episodes
                 .distinctBy { episodeKey(it) }
+                .sortedWith(
+                    compareByDescending<Episode> { it.season ?: 1 }
+                        .thenBy { it.episode ?: Int.MAX_VALUE }
+                )
 
             return newTvSeriesLoadResponse(
                 title,
@@ -782,6 +800,74 @@ class DiscoveryFTP : MainAPI() {
         val url: String,
         val season: Int
     )
+
+    private fun seriesBaseUrl(url: String): String {
+        val match = Regex(
+            """(?i)(https?://[^/]+/s/view/\d+)"""
+        ).find(url.trim())
+
+        return match?.groupValues?.getOrNull(1)
+            ?: url.trim().removeSuffix("/")
+    }
+
+    private fun seasonVariantUrl(
+        baseUrl: String,
+        season: Int
+    ): String {
+        return baseUrl.trimEnd('/') + "/" +
+            season.toString().padStart(2, '0')
+    }
+
+    private suspend fun discoverAllSeasonLinks(
+        document: Document,
+        inputUrl: String
+    ): List<SeasonLink> {
+        val baseUrl = seriesBaseUrl(inputUrl)
+        val discovered = LinkedHashMap<Int, SeasonLink>()
+
+        extractSeasonLinks(
+            document = document,
+            baseUrl = inputUrl
+        ).forEach { link ->
+            discovered[link.season] = link
+        }
+
+        /*
+         * If the server presents a season-specific URL without the complete
+         * season switcher, probe a bounded set of conventional season URLs.
+         * This keeps the system dynamic without hardcoding any specific show.
+         */
+        if (discovered.size <= 1 && inputUrl.contains("/s/view/", true)) {
+            coroutineScope {
+                (1..12)
+                    .filterNot { discovered.containsKey(it) }
+                    .map { season ->
+                        async {
+                            val candidate = seasonVariantUrl(baseUrl, season)
+                            val seasonDocument = getDocument(candidate)
+                            Triple(season, candidate, seasonDocument)
+                        }
+                    }
+                    .awaitAll()
+                    .forEach { (season, candidate, seasonDocument) ->
+                        if (seasonDocument != null &&
+                            seasonDocument.select(
+                                "a[href*='.mkv'], a[href*='.mp4'], " +
+                                    "a[href*='.m3u8'], video source[src]"
+                            ).isNotEmpty()
+                        ) {
+                            discovered.putIfAbsent(
+                                season,
+                                SeasonLink(candidate, season)
+                            )
+                        }
+                    }
+            }
+        }
+
+        return discovered.values
+            .sortedByDescending { it.season }
+    }
 
     private fun extractSeasonLinks(
         document: Document,
@@ -976,25 +1062,18 @@ class DiscoveryFTP : MainAPI() {
         if (input.isBlank()) return false
 
         /*
-         * TV episode source files supplied by the user are already direct
-         * CDN media URLs, so pass those exact URLs to CloudStream.
+         * Discovery's episode cards already expose direct CDN files.
+         * Normalize the CDN scheme to HTTPS because the supplied VLC source
+         * confirms that the same CDN files are available over HTTPS.
          */
         if (isMediaUrl(input)) {
             emitMedia(
-                mediaUrl = input,
+                mediaUrl = normalizeMediaUrl(input),
                 callback = callback
             )
             return true
         }
 
-        /*
-         * Movie detail page source explicitly publishes:
-         * <video>
-         *   <source src="https://cdn....mkv">
-         * </video>
-         *
-         * Resolve the exact published source only when Play is pressed.
-         */
         val response = runCatching {
             app.get(
                 input,
@@ -1002,18 +1081,38 @@ class DiscoveryFTP : MainAPI() {
             )
         }.getOrNull() ?: return false
 
+        val mediaUrls = LinkedHashSet<String>()
         val document = response.document
 
-        val mediaUrls = linkedSetOf<String>()
+        /*
+         * Primary Discovery movie path:
+         *
+         * /m/view/<id>
+         *   -> Download button
+         *   -> direct HTTPS CDN media file
+         *
+         * The supplied Bhooth Bangla source uses exactly this structure.
+         */
+        document.select("a[href]").forEach { anchor ->
+            val raw = anchor.attr("href").trim()
+            if (isMediaUrl(raw)) {
+                mediaUrls += normalizeMediaUrl(
+                    absoluteUrl(raw, input)
+                )
+            }
+        }
 
+        /*
+         * WEB PLAY / embedded-player fallback:
+         * the supplied Movie Play source contains <video><source src="...">
+         */
         document.select(
             "video[src], video source[src], source[src]"
         ).forEach { element ->
             val raw = element.attr("src").trim()
             if (raw.isNotBlank()) {
-                val absolute = absoluteUrl(
-                    raw,
-                    input
+                val absolute = normalizeMediaUrl(
+                    absoluteUrl(raw, input)
                 )
                 if (isMediaUrl(absolute)) {
                     mediaUrls += absolute
@@ -1022,7 +1121,7 @@ class DiscoveryFTP : MainAPI() {
         }
 
         /*
-         * A few deployments expose the media URL in data-src/data-video.
+         * Some pages expose the media in data-* attributes.
          */
         document.select(
             "[data-src], [data-video], [data-file]"
@@ -1034,9 +1133,8 @@ class DiscoveryFTP : MainAPI() {
             ).forEach { raw ->
                 if (raw.isBlank()) return@forEach
 
-                val absolute = absoluteUrl(
-                    raw,
-                    input
+                val absolute = normalizeMediaUrl(
+                    absoluteUrl(raw, input)
                 )
 
                 if (isMediaUrl(absolute)) {
@@ -1046,8 +1144,46 @@ class DiscoveryFTP : MainAPI() {
         }
 
         /*
-         * Last HTML-level fallback: scan the page source for direct media URLs.
-         * This is useful when the source is rendered inside inline JavaScript.
+         * If the detail page only exposes a WEB PLAY / playlist page, follow
+         * that page and extract its actual video source.
+         */
+        if (mediaUrls.isEmpty()) {
+            val playPages = document.select(
+                "a[href*='/m/play/'], a[href*='/m/playlist/']"
+            )
+                .map { absoluteUrl(it.attr("href").trim(), input) }
+                .filter { it.isNotBlank() }
+                .distinct()
+
+            for (playPage in playPages) {
+                val playDocument = runCatching {
+                    app.get(
+                        playPage,
+                        headers = pageHeaders(input)
+                    ).document
+                }.getOrNull() ?: continue
+
+                playDocument.select(
+                    "video[src], video source[src], source[src]"
+                ).forEach { element ->
+                    val raw = element.attr("src").trim()
+                    if (raw.isBlank()) return@forEach
+
+                    val absolute = normalizeMediaUrl(
+                        absoluteUrl(raw, playPage)
+                    )
+
+                    if (isMediaUrl(absolute)) {
+                        mediaUrls += absolute
+                    }
+                }
+
+                if (mediaUrls.isNotEmpty()) break
+            }
+        }
+
+        /*
+         * Last HTML fallback: scan inline JavaScript for direct media URLs.
          */
         val html = response.text
             .replace("\\/", "/")
@@ -1058,7 +1194,10 @@ class DiscoveryFTP : MainAPI() {
         )
 
         regex.findAll(html).forEach { match ->
-            val candidate = cleanUrl(match.value)
+            val candidate = normalizeMediaUrl(
+                cleanUrl(match.value)
+            )
+
             if (isMediaUrl(candidate)) {
                 mediaUrls += candidate
             }
@@ -1167,6 +1306,16 @@ class DiscoveryFTP : MainAPI() {
         return mediaExtensions.any { clean.endsWith(it) }
     }
 
+    private fun normalizeMediaUrl(url: String): String {
+        var value = url.trim()
+
+        if (value.startsWith("http://cdn", true)) {
+            value = "https://" + value.removePrefix("http://")
+        }
+
+        return value.replace(" ", "%20")
+    }
+
     private fun pagedUrl(
         baseUrl: String,
         page: Int
@@ -1174,6 +1323,16 @@ class DiscoveryFTP : MainAPI() {
         if (page <= 1) return baseUrl.removeSuffix("/")
 
         return baseUrl.removeSuffix("/") + "/$page"
+    }
+
+    private fun viewId(url: String): Int? {
+        return Regex(
+            """(?i)/(?:m|s)/view/(\d+)"""
+        )
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
     }
 
     private fun interleave(
