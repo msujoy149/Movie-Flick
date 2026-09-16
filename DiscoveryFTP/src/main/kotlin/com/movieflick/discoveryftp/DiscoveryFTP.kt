@@ -364,11 +364,17 @@ class DiscoveryFTP : MainAPI() {
 
     private suspend fun fetchPage(
         source: Source,
-        page: Int
+        page: Int,
+        keepAllVariants: Boolean = false
     ): List<SiteItem> {
         val url = pagedUrl(source.url, page)
+        val cacheKey = if (keepAllVariants) {
+            "search-variants::$url"
+        } else {
+            url
+        }
 
-        pageCache[url]?.let { return it }
+        pageCache[cacheKey]?.let { return it }
 
         val document = getDocument(url)
             ?: return emptyList()
@@ -376,11 +382,12 @@ class DiscoveryFTP : MainAPI() {
         val items = parseListing(
             document = document,
             pageUrl = url,
-            source = source
+            source = source,
+            keepAllVariants = keepAllVariants
         )
 
-        pageCache.putIfAbsent(url, items)
-        return pageCache[url] ?: items
+        pageCache.putIfAbsent(cacheKey, items)
+        return pageCache[cacheKey] ?: items
     }
 
     private suspend fun getDocument(url: String): Document? {
@@ -418,7 +425,8 @@ class DiscoveryFTP : MainAPI() {
     private fun parseListing(
         document: Document,
         pageUrl: String,
-        source: Source
+        source: Source,
+        keepAllVariants: Boolean = false
     ): List<SiteItem> {
         val result = mutableListOf<SiteItem>()
         val seenContainers = HashSet<String>()
@@ -429,26 +437,66 @@ class DiscoveryFTP : MainAPI() {
          * home cards. We therefore parse the card once and keep the highest
          * quality variant as the playable URL.
          */
-        val containers = document.select("div.card, div.fcard")
+        val rootFeed = isRootListingPage(pageUrl)
+
+        /*
+         * Root /s uses .row -> .fgrid -> .fcard for the real latest-upload
+         * feed. Root /m uses normal .card containers with .quality_stack for
+         * the real latest-upload feed. Featured content lives in the Owl
+         * carousel and is deliberately not selected here.
+         */
+        val containers: List<Element> = when {
+            rootFeed &&
+                (source.kind == SourceKind.SERIES ||
+                    source.kind == SourceKind.ANIME_SERIES) -> {
+                document.select("div.row .fgrid .fcard")
+            }
+
+            rootFeed && source.kind == SourceKind.MOVIE -> {
+                document.select("div.card")
+                    .filter { card ->
+                        card.selectFirst(".quality_stack") != null
+                    }
+            }
+
+            else -> {
+                document.select("div.card, div.fcard")
+            }
+        }
 
         containers.forEachIndexed { index, card ->
             val cardIdentity = card.outerHtml().hashCode().toString()
             if (!seenContainers.add(cardIdentity)) return@forEachIndexed
 
-            val viewAnchors = card.select(
-                "a[href*='/m/view/'], a[href*='/s/view/']"
-            )
+            val viewAnchors = listingViewAnchors(card)
 
             if (viewAnchors.isEmpty()) return@forEachIndexed
 
-            val title = cleanTitle(
-                firstNonBlank(
-                    card.selectFirst(".details h3")?.text(),
-                    card.selectFirst(".ftitle")?.text(),
-                    card.selectFirst("h3")?.text(),
-                    card.selectFirst("h4")?.ownText()
+            val isMainTvGrid =
+                rootFeed &&
+                    (source.kind == SourceKind.SERIES ||
+                        source.kind == SourceKind.ANIME_SERIES) &&
+                    card.selectFirst(".fdetails") != null
+
+            val title = if (isMainTvGrid) {
+                cleanTitle(
+                    firstNonBlank(
+                        card.selectFirst(".fdetails")?.ownText(),
+                        card.selectFirst(".fdetails")?.text(),
+                        card.selectFirst(".details h3")?.text(),
+                        card.selectFirst("h3")?.text()
+                    )
                 )
-            )
+            } else {
+                cleanTitle(
+                    firstNonBlank(
+                        card.selectFirst(".details h3")?.text(),
+                        card.selectFirst(".ftitle")?.text(),
+                        card.selectFirst("h3")?.text(),
+                        card.selectFirst("h4")?.ownText()
+                    )
+                )
+            }
 
             if (title.isBlank()) return@forEachIndexed
 
@@ -470,7 +518,10 @@ class DiscoveryFTP : MainAPI() {
                     firstNonBlank(
                         anchor.selectFirst(".movie_details_span_end")?.text(),
                         if (anchor.hasClass("movie_details_span_end")) anchor.text() else null,
-                        anchor.attr("title")
+                        anchor.attr("title"),
+                        card.selectFirst(".quality_stack .movie_details_span_end")?.text(),
+                        card.selectFirst(".ftitle span")?.text(),
+                        card.selectFirst(".poster[title]")?.attr("title")
                     ),
                     absolute
                 )
@@ -481,13 +532,6 @@ class DiscoveryFTP : MainAPI() {
                     qualityRank = qualityRank(label, absolute)
                 )
             }
-
-            val bestVariant = variants
-                .maxWithOrNull(
-                    compareBy<SiteVariant> { variantSelectionPriority(it) }
-                        .thenBy { it.url }
-                )
-                ?: return@forEachIndexed
 
             val type = when (source.kind) {
                 SourceKind.SERIES,
@@ -504,24 +548,69 @@ class DiscoveryFTP : MainAPI() {
                 ?.trim()
                 ?.toIntOrNull()
 
-            result += SiteItem(
-                title = title,
-                url = bestVariant.url,
-                poster = poster,
-                type = type,
-                source = source.url,
-                order = index,
-                year = year,
-                qualityLabel = bestVariant.qualityLabel,
-                qualityRank = bestVariant.qualityRank
-            )
+            if (keepAllVariants) {
+                variants.forEach { variant ->
+                    result += SiteItem(
+                        title = title,
+                        url = variant.url,
+                        poster = poster,
+                        type = type,
+                        source = source.url,
+                        order = index,
+                        year = year,
+                        qualityLabel = variant.qualityLabel,
+                        qualityRank = variant.qualityRank
+                    )
+                }
+            } else {
+                val bestVariant = variants
+                    .maxWithOrNull(
+                        compareBy<SiteVariant> { variantSelectionPriority(it) }
+                            .thenBy { it.url }
+                    )
+                    ?: return@forEachIndexed
+
+                result += SiteItem(
+                    title = title,
+                    url = bestVariant.url,
+                    poster = poster,
+                    type = type,
+                    source = source.url,
+                    order = index,
+                    year = year,
+                    qualityLabel = bestVariant.qualityLabel,
+                    qualityRank = bestVariant.qualityRank
+                )
+            }
         }
 
         /*
          * Fallback for unusual cards where no .card/.fcard wrapper exists.
          */
         if (result.isEmpty()) {
-            document.select("a[href*='/m/view/'], a[href*='/s/view/']")
+            document
+                .select("a[href*='/m/view/'], a[href*='/s/view/']")
+                .filter { anchor ->
+                    if (!rootFeed) {
+                        true
+                    } else {
+                        val card = findCard(anchor)
+                        when {
+                            source.kind == SourceKind.SERIES ||
+                                source.kind == SourceKind.ANIME_SERIES -> {
+                                card?.parents()?.any {
+                                    it.hasClass("fgrid")
+                                } == true
+                            }
+
+                            source.kind == SourceKind.MOVIE -> {
+                                card?.selectFirst(".quality_stack") != null
+                            }
+
+                            else -> false
+                        }
+                    }
+                }
                 .forEachIndexed { index, anchor ->
                     val absolute = absoluteUrl(anchor.attr("href").trim(), pageUrl)
                     if (!absolute.contains("/m/view/") && !absolute.contains("/s/view/")) {
@@ -531,6 +620,8 @@ class DiscoveryFTP : MainAPI() {
                     val card = findCard(anchor)
                     val title = cleanTitle(
                         firstNonBlank(
+                            card?.selectFirst(".fdetails")?.ownText(),
+                            card?.selectFirst(".fdetails")?.text(),
                             card?.selectFirst(".details h3")?.text(),
                             card?.selectFirst(".ftitle")?.text(),
                             anchor.attr("title"),
@@ -570,7 +661,11 @@ class DiscoveryFTP : MainAPI() {
                 }
         }
 
-        return collapseByTitle(result)
+        return if (keepAllVariants) {
+            result
+        } else {
+            collapseByTitle(result)
+        }
     }
 
     private data class SiteVariant(
@@ -578,6 +673,46 @@ class DiscoveryFTP : MainAPI() {
         val qualityLabel: String,
         val qualityRank: Int
     )
+
+    private fun isRootListingPage(url: String): Boolean {
+        val path = runCatching {
+            URI(url.trim()).path.orEmpty()
+        }.getOrDefault("")
+
+        val normalized = path
+            .trimEnd('/')
+            .lowercase(Locale.ROOT)
+
+        if (normalized == "/m" || normalized == "/s") {
+            return true
+        }
+
+        val parts = normalized
+            .split('/')
+            .filter { it.isNotBlank() }
+
+        return parts.size == 2 &&
+            (parts[0] == "m" || parts[0] == "s") &&
+            parts[1].toIntOrNull() != null
+    }
+
+    private fun listingViewAnchors(card: Element): List<Element> {
+        val anchors = LinkedHashSet<Element>()
+
+        card.select(
+            "a[href*='/m/view/'], a[href*='/s/view/']"
+        ).forEach { anchors.add(it) }
+
+        val parent = card.parent()
+        if (parent?.tagName()?.equals("a", true) == true) {
+            val href = parent.attr("href").trim()
+            if (href.contains("/m/view/") || href.contains("/s/view/")) {
+                anchors.add(parent)
+            }
+        }
+
+        return anchors.toList()
+    }
 
     private fun findCard(anchor: Element): Element? {
         var current: Element? = anchor
@@ -648,27 +783,52 @@ class DiscoveryFTP : MainAPI() {
          * can all resolve to the same base series. The load response then
          * exposes all available seasons.
          */
+        val qualityQuery = Regex(
+            "(?i)\\b(?:4k|2160p|1440p|1080p|720p|480p|360p|hd|web[- ]?dl|webdl|dual|cam[- ]?rip)\\b"
+        ).containsMatchIn(rawQuery)
+
         val allMatches = mutableListOf<SiteItem>()
 
         for (source in SEARCH_SOURCES) {
             for (serverPage in 1..SEARCH_MAX_PAGES) {
-                val items = fetchPage(source, serverPage)
+                val items = fetchPage(
+                    source,
+                    serverPage,
+                    keepAllVariants = qualityQuery
+                )
 
                 allMatches += items.filter {
                     val titleKey = normalizeTitleKey(it.title)
-                    titleKey.contains(q) || q.split(Regex("\\s+"))
-                        .filter { token -> token.isNotBlank() }
-                        .all { token -> titleKey.contains(token) }
+                    val qualityKey = normalizeTitleKey(it.qualityLabel)
+                    val searchable = "$titleKey $qualityKey"
+
+                    searchable.contains(q) ||
+                        q.split(Regex("\\s+"))
+                            .filter { token -> token.isNotBlank() }
+                            .all { token -> searchable.contains(token) }
                 }
 
                 if (items.isEmpty()) break
             }
         }
 
-        val ranked = collapseByTitle(allMatches)
+        val rankedBase = if (qualityQuery) {
+            allMatches.distinctBy {
+                it.url.lowercase(Locale.ROOT)
+            }
+        } else {
+            collapseByTitle(allMatches)
+        }
+
+        val ranked = rankedBase
             .sortedWith(
                 compareByDescending<SiteItem> {
-                    searchScore(q, normalizeTitleKey(it.title))
+                    searchScore(
+                        q,
+                        normalizeTitleKey(
+                            "${it.title} ${it.qualityLabel}"
+                        )
+                    )
                 }.thenBy {
                     it.order
                 }
@@ -969,7 +1129,12 @@ class DiscoveryFTP : MainAPI() {
                 "$episodeTitle [S$season | EP $episodeNumber]"
             }
 
-            episodes += newEpisode(mediaUrl) {
+            episodes += newEpisode(
+                buildEpisodePlaybackData(
+                    mediaUrl = mediaUrl,
+                    referer = seasonUrl
+                )
+            ) {
                 name = episodeDisplayName
                 this.season = season
                 this.episode = episodeNumber
@@ -1004,7 +1169,12 @@ class DiscoveryFTP : MainAPI() {
                     )
                 )
 
-                episodes += newEpisode(absolute) {
+                episodes += newEpisode(
+                    buildEpisodePlaybackData(
+                        mediaUrl = absolute,
+                        referer = seasonUrl
+                    )
+                ) {
                     name = text
                     season = parseSeasonNumber(
                         text,
@@ -1058,212 +1228,261 @@ class DiscoveryFTP : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val input = data.trim()
+        val request = parseEpisodePlaybackData(data)
+        val input = request.mediaUrl.trim()
+
         if (input.isBlank()) return false
 
-        /*
-         * Discovery's episode cards already expose direct CDN files.
-         * Normalize the CDN scheme to HTTPS because the supplied VLC source
-         * confirms that the same CDN files are available over HTTPS.
-         */
+        val referer = request.referer.ifBlank { "$mainUrl/" }
+
         if (isMediaUrl(input)) {
-            emitMedia(
-                mediaUrl = normalizeMediaUrl(input),
-                callback = callback,
-                referer = "$mainUrl/"
-            )
+            mediaCandidates(input).forEachIndexed { index, media ->
+                emitMedia(
+                    mediaUrl = media,
+                    callback = callback,
+                    referer = referer,
+                    label = if (index == 0) {
+                        "Discovery FTP Direct"
+                    } else {
+                        "Discovery FTP Scheme Fallback"
+                    }
+                )
+            }
             return true
         }
 
-        val response = runCatching {
-            app.get(
-                input,
-                headers = pageHeaders(input)
-            )
-        }.getOrNull() ?: return false
-
+        val response = getDocument(input) ?: return false
+        val document = response
         val mediaUrls = LinkedHashSet<String>()
-        val document = response.document
 
-        /*
-         * Primary Discovery movie path:
-         *
-         * /m/view/<id>
-         *   -> Download button
-         *   -> direct HTTPS CDN media file
-         *
-         * The supplied Bhooth Bangla source uses exactly this structure.
-         */
         document.select("a[href]").forEach { anchor ->
             val raw = anchor.attr("href").trim()
             if (isMediaUrl(raw)) {
-                mediaUrls += normalizeMediaUrl(
-                    absoluteUrl(raw, input)
-                )
+                mediaUrls += normalizeMediaUrl(absoluteUrl(raw, input))
             }
         }
 
-        /*
-         * WEB PLAY / embedded-player fallback:
-         * the supplied Movie Play source contains <video><source src="...">
-         */
-        document.select(
-            "video[src], video source[src], source[src]"
-        ).forEach { element ->
+        document.select("video[src], video source[src], source[src]").forEach { element ->
             val raw = element.attr("src").trim()
-            if (raw.isNotBlank()) {
-                val absolute = normalizeMediaUrl(
-                    absoluteUrl(raw, input)
-                )
-                if (isMediaUrl(absolute)) {
-                    mediaUrls += absolute
-                }
-            }
+            if (raw.isBlank()) return@forEach
+            val absolute = normalizeMediaUrl(absoluteUrl(raw, input))
+            if (isMediaUrl(absolute)) mediaUrls += absolute
         }
 
-        /*
-         * Some pages expose the media in data-* attributes.
-         */
         document.select(
-            "[data-src], [data-video], [data-file]"
+            "[data-src], [data-video], [data-file], " +
+                "[data-default-src], [data-video-src]"
         ).forEach { element ->
             listOf(
                 element.attr("data-src"),
                 element.attr("data-video"),
-                element.attr("data-file")
+                element.attr("data-file"),
+                element.attr("data-default-src"),
+                element.attr("data-video-src")
             ).forEach { raw ->
                 if (raw.isBlank()) return@forEach
-
-                val absolute = normalizeMediaUrl(
-                    absoluteUrl(raw, input)
-                )
-
-                if (isMediaUrl(absolute)) {
-                    mediaUrls += absolute
-                }
+                val absolute = normalizeMediaUrl(absoluteUrl(raw, input))
+                if (isMediaUrl(absolute)) mediaUrls += absolute
             }
         }
 
-        /*
-         * If the detail page only exposes a WEB PLAY / playlist page, follow
-         * that page and extract its actual video source.
-         */
         if (mediaUrls.isEmpty()) {
-            val playPages = document.select(
-                "a[href*='/m/play/'], a[href*='/m/playlist/']"
-            )
-                .map { absoluteUrl(it.attr("href").trim(), input) }
-                .filter { it.isNotBlank() }
-                .distinct()
+            val playPages = document.select("a[href]").mapNotNull { anchor ->
+                val href = anchor.attr("href").trim()
+                val label = anchor.text().trim().lowercase(Locale.ROOT)
+                val isPlayPage =
+                    href.contains("/m/play/", true) ||
+                        href.contains("/m/playlist/", true) ||
+                        href.contains("/s/play/", true) ||
+                        href.contains("/s/playlist/", true) ||
+                        label.contains("web play") ||
+                        label == "play" ||
+                        label.contains("download")
+                if (isPlayPage && href.isNotBlank()) {
+                    absoluteUrl(href, input)
+                } else null
+            }.distinct()
 
-            for (playPage in playPages) {
-                val playDocument = runCatching {
-                    app.get(
-                        playPage,
-                        headers = pageHeaders(input)
-                    ).document
-                }.getOrNull() ?: continue
+            for (playPage in playPages.take(6)) {
+                val playDocument = getDocument(playPage) ?: continue
 
                 playDocument.select(
                     "video[src], video source[src], source[src]"
                 ).forEach { element ->
                     val raw = element.attr("src").trim()
                     if (raw.isBlank()) return@forEach
-
                     val absolute = normalizeMediaUrl(
                         absoluteUrl(raw, playPage)
                     )
-
                     if (isMediaUrl(absolute)) {
                         mediaUrls += absolute
                     }
+                }
+
+                if (mediaUrls.isEmpty()) {
+                    playDocument.select("iframe[src]")
+                        .map {
+                            absoluteUrl(
+                                it.attr("src").trim(),
+                                playPage
+                            )
+                        }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                        .take(4)
+                        .forEach { frameUrl ->
+                            val frameDocument = getDocument(frameUrl)
+                                ?: return@forEach
+
+                            frameDocument.select(
+                                "video[src], video source[src], source[src]"
+                            ).forEach { element ->
+                                val raw = element.attr("src").trim()
+                                if (raw.isBlank()) return@forEach
+
+                                val absolute = normalizeMediaUrl(
+                                    absoluteUrl(raw, frameUrl)
+                                )
+
+                                if (isMediaUrl(absolute)) {
+                                    mediaUrls += absolute
+                                }
+                            }
+                        }
                 }
 
                 if (mediaUrls.isNotEmpty()) break
             }
         }
 
-        /*
-         * Last HTML fallback: scan inline JavaScript for direct media URLs.
-         */
-        val html = response.text
-            .replace("\\/", "/")
-            .replace("&amp;", "&")
+        if (mediaUrls.isEmpty()) {
+            val html = response.html()
+                .replace("\\\\/", "/")
+                .replace("&amp;", "&")
 
-        val regex = Regex(
-            """(?i)https?://[^"'<>\\s]+(?:${mediaExtensions.joinToString("|").replace(".", "\\.")})(?:\\?[^"'<>\\s]*)?"""
-        )
-
-        regex.findAll(html).forEach { match ->
-            val candidate = normalizeMediaUrl(
-                cleanUrl(match.value)
+            val regex = Regex(
+                """(?i)https?://[^"'<>\s]+(?:${mediaExtensions.joinToString("|").replace(".", "\\.")})(?:\?[^"'<>\s]*)?"""
             )
 
-            if (isMediaUrl(candidate)) {
-                mediaUrls += candidate
+            regex.findAll(html).forEach { match ->
+                val candidate = normalizeMediaUrl(cleanUrl(match.value))
+                if (isMediaUrl(candidate)) mediaUrls += candidate
             }
         }
 
         if (mediaUrls.isEmpty()) return false
 
-        mediaUrls
-            .distinct()
-            .forEach { media ->
+        mediaUrls.distinct().forEach { media ->
+            mediaCandidates(media).forEachIndexed { index, candidate ->
                 emitMedia(
-                    mediaUrl = media,
+                    mediaUrl = candidate,
                     callback = callback,
-                    referer = input
+                    referer = referer.ifBlank { input },
+                    label = if (index == 0) {
+                        "Discovery FTP Direct"
+                    } else {
+                        "Discovery FTP Scheme Fallback"
+                    }
                 )
             }
+        }
 
         return true
+    }
+
+    private data class EpisodePlaybackRequest(
+        val mediaUrl: String,
+        val referer: String
+    )
+
+    private fun buildEpisodePlaybackData(
+        mediaUrl: String,
+        referer: String
+    ): String {
+        val encodedReferer = java.net.URLEncoder.encode(
+            referer,
+            StandardCharsets.UTF_8.toString()
+        )
+        return normalizeMediaUrl(mediaUrl) +
+            "#discovery_ref=$encodedReferer"
+    }
+
+    private fun parseEpisodePlaybackData(
+        data: String
+    ): EpisodePlaybackRequest {
+        val raw = data.trim()
+        val marker = "#discovery_ref="
+
+        if (!raw.contains(marker)) {
+            return EpisodePlaybackRequest(
+                mediaUrl = raw.substringBefore("#").trim(),
+                referer = "$mainUrl/"
+            )
+        }
+
+        val media = raw.substringBefore(marker).trim()
+        val encoded = raw.substringAfter(marker, "")
+        val referer = runCatching {
+            URLDecoder.decode(
+                encoded,
+                StandardCharsets.UTF_8.toString()
+            )
+        }.getOrDefault("$mainUrl/")
+
+        return EpisodePlaybackRequest(
+            mediaUrl = media,
+            referer = referer
+        )
+    }
+
+    private fun mediaCandidates(
+        url: String
+    ): List<String> {
+        val clean = normalizeMediaUrl(url)
+        val match = Regex(
+            """(?i)^(https?)://(cdn[1-5]\.discoveryftp\.net)(/.*)$"""
+        ).find(clean) ?: return listOf(clean)
+
+        val scheme = match.groupValues[1].lowercase(Locale.ROOT)
+        val host = match.groupValues[2]
+        val path = match.groupValues[3]
+
+        val alternate = if (scheme == "https") {
+            "http://$host$path"
+        } else {
+            "https://$host$path"
+        }
+
+        return linkedSetOf(clean, alternate).toList()
     }
 
     private suspend fun emitMedia(
         mediaUrl: String,
         callback: (ExtractorLink) -> Unit,
-        referer: String = "$mainUrl/"
+        referer: String = "$mainUrl/",
+        label: String = "Discovery FTP"
     ) {
         val lower = mediaUrl.lowercase(Locale.ROOT)
-
         val type = when {
-            ".m3u8" in lower ->
-                ExtractorLinkType.M3U8
-
-            ".mpd" in lower ->
-                ExtractorLinkType.DASH
-
-            else ->
-                ExtractorLinkType.VIDEO
+            ".m3u8" in lower -> ExtractorLinkType.M3U8
+            ".mpd" in lower -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
         }
 
         val quality = when {
-            "2160" in lower || "4k" in lower ->
-                Qualities.P2160.value
-
-            "1440" in lower ->
-                Qualities.P1440.value
-
-            "1080" in lower ->
-                Qualities.P1080.value
-
-            "720" in lower ->
-                Qualities.P720.value
-
-            "480" in lower ->
-                Qualities.P480.value
-
-            "360" in lower ->
-                Qualities.P360.value
-
-            else ->
-                Qualities.Unknown.value
+            "2160" in lower || "4k" in lower -> Qualities.P2160.value
+            "1440" in lower -> Qualities.P1440.value
+            "1080" in lower -> Qualities.P1080.value
+            "720" in lower -> Qualities.P720.value
+            "480" in lower -> Qualities.P480.value
+            "360" in lower -> Qualities.P360.value
+            else -> Qualities.Unknown.value
         }
 
         callback(
             newExtractorLink(
                 source = name,
-                name = "Discovery FTP",
+                name = label,
                 url = mediaUrl,
                 type = type
             ) {
@@ -1306,6 +1525,7 @@ class DiscoveryFTP : MainAPI() {
     private fun isMediaUrl(url: String): Boolean {
         val clean = url
             .substringBefore('?')
+            .substringBefore('#')
             .lowercase(Locale.ROOT)
 
         return mediaExtensions.any { clean.endsWith(it) }
@@ -1327,8 +1547,7 @@ class DiscoveryFTP : MainAPI() {
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/153.0.0.0 Safari/537.36",
         "Accept" to "*/*",
-        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
-        "Connection" to "keep-alive"
+        "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8"
     )
 
     private fun pagedUrl(
@@ -1338,16 +1557,6 @@ class DiscoveryFTP : MainAPI() {
         if (page <= 1) return baseUrl.removeSuffix("/")
 
         return baseUrl.removeSuffix("/") + "/$page"
-    }
-
-    private fun viewId(url: String): Int? {
-        return Regex(
-            """(?i)/(?:m|s)/view/(\d+)"""
-        )
-            .find(url)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
     }
 
     private fun interleave(
