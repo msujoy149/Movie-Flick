@@ -1285,10 +1285,15 @@ class DiscoveryFTP : MainAPI() {
          * supplied BasPlay implementation follows this same architecture:
          * direct media -> ExtractorLink -> player.
          *
+         * Discovery publishes actual video files (.mkv/.mp4/etc.) in the
+         * episode/movie anchors. Once such a URL is present, it is already the
+         * playable source and must not be filtered through a page-only or
+         * "download-only" classifier.
+         *
          * This removes the failing page-resolution step that was causing some
          * episodes to end in "No Links Found".
          */
-        if (isMediaUrl(input) && !isTrailerUrl(input) && !isDownloadOnlyUrl(input)) {
+        if (isMediaUrl(input)) {
             emitMedia(
                 mediaUrl = input,
                 callback = callback,
