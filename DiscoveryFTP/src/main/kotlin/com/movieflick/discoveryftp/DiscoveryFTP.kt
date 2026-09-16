@@ -58,6 +58,11 @@ class DiscoveryFTP : MainAPI() {
         const val SEARCH_MAX_PAGES = 5
         const val DUPLICATE_INDEX_MAX_PAGES = 6
 
+        const val DISCOVERY_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/153.0.0.0 Safari/537.36"
+
         val DUAL_SOURCES = listOf(
             Source("$BASE_URL/s/category/Dubbed", SourceKind.SERIES),
             Source("$BASE_URL/m/dual/Animation", SourceKind.MOVIE),
@@ -125,10 +130,7 @@ class DiscoveryFTP : MainAPI() {
     )
 
     private fun pageHeaders(referer: String = "$mainUrl/"): Map<String, String> = mapOf(
-        "User-Agent" to
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/153.0.0.0 Safari/537.36",
+        "User-Agent" to DISCOVERY_USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
         "Cache-Control" to "no-cache",
@@ -1277,7 +1279,8 @@ class DiscoveryFTP : MainAPI() {
         if (isMediaUrl(input)) {
             emitMedia(
                 mediaUrl = input,
-                callback = callback
+                callback = callback,
+                referer = request.referer
             )
             return true
         }
@@ -1313,7 +1316,8 @@ class DiscoveryFTP : MainAPI() {
         if (downloadMedia != null) {
             emitMedia(
                 mediaUrl = downloadMedia,
-                callback = callback
+                callback = callback,
+                referer = input
             )
             return true
         }
@@ -1333,7 +1337,8 @@ class DiscoveryFTP : MainAPI() {
         if (directMedia != null) {
             emitMedia(
                 mediaUrl = directMedia,
-                callback = callback
+                callback = callback,
+                referer = input
             )
             return true
         }
@@ -1349,7 +1354,8 @@ class DiscoveryFTP : MainAPI() {
         if (inlineMedia != null) {
             emitMedia(
                 mediaUrl = inlineMedia,
-                callback = callback
+                callback = callback,
+                referer = input
             )
             return true
         }
@@ -1391,7 +1397,8 @@ class DiscoveryFTP : MainAPI() {
         if (webPlayMedia != null) {
             emitMedia(
                 mediaUrl = webPlayMedia,
-                callback = callback
+                callback = callback,
+                referer = input
             )
             return true
         }
@@ -1436,7 +1443,8 @@ class DiscoveryFTP : MainAPI() {
         if (streamMedia != null) {
             emitMedia(
                 mediaUrl = streamMedia,
-                callback = callback
+                callback = callback,
+                referer = input
             )
             return true
         }
@@ -1467,7 +1475,8 @@ class DiscoveryFTP : MainAPI() {
                 if (detailMedia != null) {
                     emitMedia(
                         mediaUrl = detailMedia,
-                        callback = callback
+                        callback = callback,
+                        referer = detailUrl
                     )
                     return true
                 }
@@ -1505,7 +1514,8 @@ class DiscoveryFTP : MainAPI() {
                 if (frameMedia != null) {
                     emitMedia(
                         mediaUrl = frameMedia,
-                        callback = callback
+                        callback = callback,
+                        referer = frameUrl
                     )
                     return true
                 }
@@ -1876,11 +1886,6 @@ class DiscoveryFTP : MainAPI() {
         referer: String = "$mainUrl/",
         label: String = "Discovery FTP"
     ) {
-        @Suppress("UNUSED_PARAMETER")
-        val ignoredReferer = referer
-        @Suppress("UNUSED_PARAMETER")
-        val ignoredLabel = label
-
         val normalized = normalizeMediaUrl(mediaUrl)
         if (!isMediaUrl(normalized)) return
 
@@ -1902,6 +1907,18 @@ class DiscoveryFTP : MainAPI() {
             else -> Qualities.Unknown.value
         }
 
+        /*
+         * Verified Discovery browser traffic sends Referer and User-Agent
+         * to the CDN. Range is intentionally not fixed here because the
+         * player must generate dynamic byte ranges for streaming/seek.
+         */
+        val mediaHeaders = mapOf(
+            "User-Agent" to DISCOVERY_USER_AGENT,
+            "Referer" to referer,
+            "Accept" to "*/*",
+            "Accept-Encoding" to "identity"
+        )
+
         callback(
             newExtractorLink(
                 source = name,
@@ -1909,6 +1926,8 @@ class DiscoveryFTP : MainAPI() {
                 url = normalized,
                 type = type
             ) {
+                this.referer = referer
+                this.headers = mediaHeaders
                 this.quality = quality
             }
         )
