@@ -18,7 +18,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class DiscoveryFTP : MainAPI() {\n\n    // TV playback fix v21: HTTPS-upgrade Discovery CDN media URLs.
+class DiscoveryFTP : MainAPI() {
+
+    // TV playback fix v22: HTTPS-upgrade Discovery CDN media URLs.
 
     override var mainUrl = BASE_URL
     override var name = "Discovery FTP"
