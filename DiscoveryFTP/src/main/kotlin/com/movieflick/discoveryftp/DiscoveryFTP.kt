@@ -967,7 +967,10 @@ class DiscoveryFTP : MainAPI() {
             title,
             input,
             if (anime) TvType.Anime else TvType.Movie,
-            directMovieMedia ?: input
+            buildMoviePlaybackData(
+                mediaUrl = directMovieMedia ?: input,
+                detailUrl = input
+            )
         ) {
             posterUrl = poster
             this.plot = plot
@@ -1289,17 +1292,40 @@ class DiscoveryFTP : MainAPI() {
          */
         val session = DiscoverySession()
 
-        runCatching {
-            fetchWithDiscoverySession(
-                url = "$mainUrl/",
-                referer = "$mainUrl/",
-                session = session
-            )
+        /*
+         * Establish the same lightweight web session used by the browser.
+         * Start with the site root, then revisit the exact originating/detail
+         * page before sending the final CDN request.
+         */
+        val bootstrapPages = linkedSetOf<String>().apply {
+            add("$mainUrl/")
+
+            request.referer
+                .takeIf { it.startsWith(mainUrl, true) }
+                ?.let(::add)
+
+            request.detailUrl
+                ?.takeIf { it.startsWith(mainUrl, true) }
+                ?.let(::add)
+
+            if (!isMediaUrl(input) && input.startsWith(mainUrl, true)) {
+                add(input)
+            }
+        }
+
+        for (pageUrl in bootstrapPages) {
+            runCatching {
+                fetchWithDiscoverySession(
+                    url = pageUrl,
+                    referer = "$mainUrl/",
+                    session = session
+                )
+            }
         }
 
         /*
-         * A Discovery media URL is already the real CDN file.
-         * Never turn it into another page URL and never require a token.
+         * For a real CDN file, do not turn it into another synthetic URL.
+         * Pass the exact .mkv/.mp4 URL straight to CloudStream.
          */
         if (isMediaUrl(input)) {
             emitMedia(
@@ -1311,14 +1337,17 @@ class DiscoveryFTP : MainAPI() {
             return true
         }
 
+        /*
+         * Non-media playback data points to a Discovery page. Fetch that page
+         * with the same session so any refreshed MOVIESID is retained.
+         */
         val pageResult = fetchWithDiscoverySession(
             url = input,
-            referer = "$mainUrl/",
+            referer = request.referer.ifBlank { "$mainUrl/" },
             session = session
         ) ?: return false
 
         val document = pageResult.first
-        val pageCookieHeader = pageResult.second ?: session.headerValue()
 
         /*
          * Discovery detail pages expose the SAME playable file from several
@@ -1352,7 +1381,7 @@ class DiscoveryFTP : MainAPI() {
                 mediaUrl = media,
                 callback = callback,
                 referer = "$mainUrl/",
-                cookieHeader = pageCookieHeader
+                cookieHeader = session.headerValue()
             )
             return true
         }
@@ -1427,7 +1456,7 @@ class DiscoveryFTP : MainAPI() {
                 mediaUrl = media,
                 callback = callback,
                 referer = "$mainUrl/",
-                cookieHeader = pageCookieHeader
+                cookieHeader = session.headerValue()
             )
             return true
         }
@@ -1463,7 +1492,8 @@ class DiscoveryFTP : MainAPI() {
                     emitMedia(
                         mediaUrl = media,
                         callback = callback,
-                        referer = "$mainUrl/"
+                        referer = "$mainUrl/",
+                        cookieHeader = session.headerValue()
                     )
                     return true
                 }
@@ -1504,7 +1534,8 @@ class DiscoveryFTP : MainAPI() {
                     emitMedia(
                         mediaUrl = media,
                         callback = callback,
-                        referer = "$mainUrl/"
+                        referer = "$mainUrl/",
+                        cookieHeader = session.headerValue()
                     )
                     return true
                 }
@@ -1654,10 +1685,22 @@ class DiscoveryFTP : MainAPI() {
         }
 
         for (candidate in candidates) {
+            val headers = linkedMapOf<String, String>().apply {
+                putAll(pageHeaders(referer))
+
+                /*
+                 * Carry the valid name=value cookies captured from the
+                 * previous Discovery response into the next request.
+                 */
+                session.headerValue()?.let { cookie ->
+                    put("Cookie", cookie)
+                }
+            }
+
             val response = runCatching {
                 app.get(
                     candidate,
-                    headers = pageHeaders(referer)
+                    headers = headers
                 )
             }.getOrNull() ?: continue
 
@@ -1919,6 +1962,17 @@ class DiscoveryFTP : MainAPI() {
         val detailUrl: String? = null
     )
 
+    private fun buildMoviePlaybackData(
+        mediaUrl: String,
+        detailUrl: String
+    ): String {
+        return buildEpisodePlaybackData(
+            mediaUrl = mediaUrl,
+            referer = "$mainUrl/",
+            detailUrl = detailUrl
+        )
+    }
+
     private fun buildEpisodePlaybackData(
         mediaUrl: String,
         referer: String,
@@ -2072,20 +2126,14 @@ class DiscoveryFTP : MainAPI() {
                 this.quality = quality
 
                 /*
-                 * Chrome's working CDN request is a normal browser GET with
-                 * a site Referer and a normal browser User-Agent. Keep the
-                 * player request simple: no synthetic Range header and no
-                 * custom transfer encoding.
+                 * Follow the direct-media approach used by the supplied
+                 * BasPlay provider: no synthetic Range, transfer-encoding,
+                 * CORS, or browser-only headers.
+                 *
+                 * Discovery-specific: retain the real site session cookie
+                 * when the page established one.
                  */
                 this.headers = linkedMapOf<String, String>().apply {
-                    put(
-                        "User-Agent",
-                        DISCOVERY_USER_AGENT
-                    )
-                    put(
-                        "Accept",
-                        "*/*"
-                    )
                     if (!cookieHeader.isNullOrBlank()) {
                         put(
                             "Cookie",
