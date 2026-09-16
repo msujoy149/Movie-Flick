@@ -1151,13 +1151,9 @@ class DiscoveryFTP : MainAPI() {
             }
 
             episodes += newEpisode(
-                buildEpisodePlaybackData(
+                buildDirectEpisodePlaybackData(
                     mediaUrl = mediaUrl,
-                    referer = seasonUrl,
-                    detailUrl = episodeDetailUrl(
-                        card = card,
-                        baseUrl = seasonUrl
-                    )
+                    referer = seasonUrl
                 )
             ) {
                 name = episodeDisplayName
@@ -1282,14 +1278,25 @@ class DiscoveryFTP : MainAPI() {
         if (input.isBlank()) return false
 
         /*
-         * Discovery's browser playback keeps the site's session cookie on the
-         * CDN request. Build the same lightweight session inside CloudStream:
+         * IMPORTANT FAST PATH:
+         * If the episode/movie data is already the real CDN media URL, do not
+         * fetch another webpage first. Discovery's TV source explicitly
+         * publishes the exact .mkv in the episode/download anchor, and the
+         * supplied BasPlay implementation follows this same architecture:
+         * direct media -> ExtractorLink -> player.
          *
-         *   site root -> content/detail page -> CDN media
-         *
-         * We capture only cookie name/value pairs from Set-Cookie and send the
-         * resulting Cookie header to the final media request.
+         * This removes the failing page-resolution step that was causing some
+         * episodes to end in "No Links Found".
          */
+        if (isMediaUrl(input) && !isTrailerUrl(input) && !isDownloadOnlyUrl(input)) {
+            emitMedia(
+                mediaUrl = input,
+                callback = callback,
+                referer = request.referer.ifBlank { "$mainUrl/" }
+            )
+            return true
+        }
+
         val session = DiscoverySession()
 
         /*
@@ -1321,20 +1328,6 @@ class DiscoveryFTP : MainAPI() {
                     session = session
                 )
             }
-        }
-
-        /*
-         * For a real CDN file, do not turn it into another synthetic URL.
-         * Pass the exact .mkv/.mp4 URL straight to CloudStream.
-         */
-        if (isMediaUrl(input)) {
-            emitMedia(
-                mediaUrl = input,
-                callback = callback,
-                referer = "$mainUrl/",
-                cookieHeader = session.headerValue()
-            )
-            return true
         }
 
         /*
@@ -1973,6 +1966,25 @@ class DiscoveryFTP : MainAPI() {
         )
     }
 
+    private fun buildDirectEpisodePlaybackData(
+        mediaUrl: String,
+        referer: String
+    ): String {
+        /*
+         * The Discovery season HTML itself contains the real CDN .mkv link.
+         * Keep that URL as the episode's source-of-truth. The ref marker is
+         * preserved only so loadLinks can supply the website Referer; no
+         * second episode-page lookup is required.
+         */
+        val encodedReferer = java.net.URLEncoder.encode(
+            referer,
+            StandardCharsets.UTF_8.toString()
+        )
+
+        return normalizeMediaUrl(mediaUrl) +
+            "#discovery_ref=$encodedReferer"
+    }
+
     private fun buildEpisodePlaybackData(
         mediaUrl: String,
         referer: String,
@@ -2126,20 +2138,17 @@ class DiscoveryFTP : MainAPI() {
                 this.quality = quality
 
                 /*
-                 * Follow the direct-media approach used by the supplied
-                 * BasPlay provider: no synthetic Range, transfer-encoding,
-                 * CORS, or browser-only headers.
+                 * Keep the direct-media request minimal, matching the supplied
+                 * BasPlay provider. No synthetic Range, Accept-Encoding,
+                 * CORS, or forced browser headers are added.
                  *
-                 * Discovery-specific: retain the real site session cookie
-                 * when the page established one.
+                 * A real Discovery session cookie is included only when the
+                 * non-direct page resolver actually established one.
                  */
-                this.headers = linkedMapOf<String, String>().apply {
-                    if (!cookieHeader.isNullOrBlank()) {
-                        put(
-                            "Cookie",
-                            cookieHeader
-                        )
-                    }
+                if (!cookieHeader.isNullOrBlank()) {
+                    this.headers = mapOf(
+                        "Cookie" to cookieHeader
+                    )
                 }
             }
         )
