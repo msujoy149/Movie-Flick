@@ -1323,7 +1323,11 @@ class DiscoveryFTP : MainAPI() {
             extractAnyDirectMedia(
                 document = document,
                 baseUrl = input
-            )
+            ) +
+                extractMediaFromHtml(
+                    html = document.html(),
+                    baseUrl = input
+                )
         )
 
         if (directMedia != null) {
@@ -1507,15 +1511,6 @@ class DiscoveryFTP : MainAPI() {
                 }
             }
 
-            val loaded = runCatching {
-                loadExtractor(
-                    frameUrl,
-                    subtitleCallback,
-                    callback
-                )
-            }.getOrDefault(false)
-
-            if (loaded) return true
         }
 
         return false
@@ -1917,6 +1912,93 @@ class DiscoveryFTP : MainAPI() {
                 this.quality = quality
             }
         )
+    }
+
+    /**
+     * Select the most appropriate direct media URL from candidates.
+     *
+     * Container priority:
+     * MKV -> MP4 -> M3U8 -> MPD -> other supported video formats.
+     *
+     * When multiple candidates use the same container, prefer 1080P over 4K.
+     * 4K remains a fallback rather than the primary selection.
+     */
+    private fun pickBestMedia(
+        mediaUrls: List<String>
+    ): String? {
+        val candidates = mediaUrls
+            .asSequence()
+            .map { normalizeMediaUrl(it) }
+            .filter { it.isNotBlank() }
+            .filter { isMediaUrl(it) }
+            .distinct()
+
+        fun extensionRank(url: String): Int {
+            val clean = url
+                .substringBefore('?')
+                .substringBefore('#')
+                .lowercase(Locale.ROOT)
+
+            return when {
+                clean.endsWith(".mkv") -> 0
+                clean.endsWith(".mp4") -> 1
+                clean.endsWith(".m3u8") -> 2
+                clean.endsWith(".mpd") -> 3
+                clean.endsWith(".webm") -> 4
+                clean.endsWith(".mov") -> 5
+                clean.endsWith(".m4v") -> 6
+                clean.endsWith(".ts") -> 7
+                clean.endsWith(".avi") -> 8
+                clean.endsWith(".flv") -> 9
+                else -> 99
+            }
+        }
+
+        fun resolutionRank(url: String): Int {
+            val lower = url.lowercase(Locale.ROOT)
+
+            return when {
+                Regex("""(?<![a-z0-9])1080p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 0
+                Regex("""(?<![a-z0-9])720p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 1
+                Regex("""(?<![a-z0-9])2160p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 3
+                Regex("""(?<![a-z0-9])4k(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 3
+                Regex("""(?<![a-z0-9])1440p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 4
+                Regex("""(?<![a-z0-9])480p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 5
+                Regex("""(?<![a-z0-9])360p(?![a-z0-9])""")
+                    .containsMatchIn(lower) -> 6
+                else -> 2
+            }
+        }
+
+        fun sourceRank(url: String): Int {
+            val lower = url.lowercase(Locale.ROOT)
+
+            return when {
+                "web-dl" in lower || "webdl" in lower -> 0
+                "dual" in lower -> 1
+                "webrip" in lower -> 2
+                "bluray" in lower -> 3
+                "hd" in lower -> 4
+                "cam-rip" in lower || "camrip" in lower -> 8
+                else -> 5
+            }
+        }
+
+        return candidates
+            .sortedWith(
+                compareBy<String>(
+                    ::resolutionRank,
+                    ::extensionRank,
+                    ::sourceRank
+                )
+            )
+            .firstOrNull()
     }
 
     private fun extractDetailPoster(
