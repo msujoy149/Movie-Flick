@@ -946,11 +946,21 @@ class DiscoveryFTP : MainAPI() {
         val anime = input.contains("/dual/Animation", true) ||
             input.contains("/category/Animation", true)
 
+        val directMovieMedia =
+            extractDirectDownloadMedia(
+                document = document,
+                baseUrl = input
+            ).firstOrNull()
+                ?: extractAnyDirectMedia(
+                    document = document,
+                    baseUrl = input
+                ).firstOrNull()
+
         return newMovieLoadResponse(
             title,
             input,
             if (anime) TvType.Anime else TvType.Movie,
-            input
+            directMovieMedia ?: input
         ) {
             posterUrl = poster
         }
@@ -1132,7 +1142,11 @@ class DiscoveryFTP : MainAPI() {
             episodes += newEpisode(
                 buildEpisodePlaybackData(
                     mediaUrl = mediaUrl,
-                    referer = seasonUrl
+                    referer = seasonUrl,
+                    detailUrl = episodeDetailUrl(
+                        card = card,
+                        baseUrl = seasonUrl
+                    )
                 )
             ) {
                 name = episodeDisplayName
@@ -1222,6 +1236,29 @@ class DiscoveryFTP : MainAPI() {
         return fallback ?: anchor.parent()
     }
 
+    private fun episodeDetailUrl(
+        card: Element?,
+        baseUrl: String
+    ): String? {
+        val clickable = card?.selectFirst("[onClick*='view(']")
+            ?: return null
+
+        val onclick = clickable.attr("onClick").trim()
+
+        val id = Regex(
+            """(?i)view\(\s*['"]([0-9]+)['"]\s*\)"""
+        )
+            .find(onclick)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: return null
+
+        return absoluteUrl(
+            "/s/view/$id",
+            baseUrl
+        )
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -1242,7 +1279,10 @@ class DiscoveryFTP : MainAPI() {
          * real CDN file. Do not perform any extra page request in this case.
          */
         if (isMediaUrl(input)) {
-            val mediaUrl = normalizeMediaUrl(input)
+            val mediaUrl = choosePlayableMediaUrl(
+                url = input,
+                referer = referer
+            ) ?: return false
 
             emitMedia(
                 mediaUrl = mediaUrl,
@@ -1299,15 +1339,20 @@ class DiscoveryFTP : MainAPI() {
         )
 
         if (mediaFromWebPlay.isNotEmpty()) {
-            mediaFromWebPlay.forEach { mediaUrl ->
+            val selected = choosePlayableMediaUrl(
+                url = mediaFromWebPlay.first(),
+                referer = input
+            )
+
+            if (!selected.isNullOrBlank()) {
                 emitMedia(
-                    mediaUrl = mediaUrl,
+                    mediaUrl = selected,
                     callback = callback,
                     referer = input,
                     label = "Discovery FTP"
                 )
+                return true
             }
-            return true
         }
 
         /* 2) Download — the supplied Discovery source exposes direct .mkv here. */
@@ -1317,15 +1362,20 @@ class DiscoveryFTP : MainAPI() {
         )
 
         if (downloadMedia.isNotEmpty()) {
-            downloadMedia.forEach { mediaUrl ->
+            val selected = choosePlayableMediaUrl(
+                url = downloadMedia.first(),
+                referer = input
+            )
+
+            if (!selected.isNullOrBlank()) {
                 emitMedia(
-                    mediaUrl = mediaUrl,
+                    mediaUrl = selected,
                     callback = callback,
                     referer = input,
                     label = "Discovery FTP"
                 )
+                return true
             }
-            return true
         }
 
         /*
@@ -1339,15 +1389,20 @@ class DiscoveryFTP : MainAPI() {
         )
 
         if (directMedia.isNotEmpty()) {
-            directMedia.forEach { mediaUrl ->
+            val selected = choosePlayableMediaUrl(
+                url = directMedia.first(),
+                referer = input
+            )
+
+            if (!selected.isNullOrBlank()) {
                 emitMedia(
-                    mediaUrl = mediaUrl,
+                    mediaUrl = selected,
                     callback = callback,
                     referer = input,
                     label = "Discovery FTP"
                 )
+                return true
             }
-            return true
         }
 
         /* 3) Stream / playlist */
@@ -1382,15 +1437,20 @@ class DiscoveryFTP : MainAPI() {
         )
 
         if (mediaFromStream.isNotEmpty()) {
-            mediaFromStream.forEach { mediaUrl ->
+            val selected = choosePlayableMediaUrl(
+                url = mediaFromStream.first(),
+                referer = input
+            )
+
+            if (!selected.isNullOrBlank()) {
                 emitMedia(
-                    mediaUrl = mediaUrl,
+                    mediaUrl = selected,
                     callback = callback,
                     referer = input,
                     label = "Discovery FTP"
                 )
+                return true
             }
-            return true
         }
 
         /*
@@ -1406,16 +1466,58 @@ class DiscoveryFTP : MainAPI() {
             return false
         }
 
-        finalMedia.forEach { mediaUrl ->
+        val selected = choosePlayableMediaUrl(
+            url = finalMedia.first(),
+            referer = input
+        )
+
+        if (!selected.isNullOrBlank()) {
             emitMedia(
-                mediaUrl = mediaUrl,
+                mediaUrl = selected,
                 callback = callback,
                 referer = input,
                 label = "Discovery FTP"
             )
+            return true
         }
 
-        return true
+        request.detailUrl?.let { detailUrl ->
+            val detailDocument = getDocumentWithReferer(
+                url = detailUrl,
+                referer = referer
+            )
+
+            if (detailDocument != null) {
+                val detailMedia =
+                    extractDirectDownloadMedia(
+                        document = detailDocument,
+                        baseUrl = detailUrl
+                    ).firstOrNull()
+                        ?: extractAnyDirectMedia(
+                            document = detailDocument,
+                            baseUrl = detailUrl
+                        ).firstOrNull()
+
+                if (!detailMedia.isNullOrBlank()) {
+                    val selected = choosePlayableMediaUrl(
+                        url = detailMedia,
+                        referer = detailUrl
+                    )
+
+                    if (!selected.isNullOrBlank()) {
+                        emitMedia(
+                            mediaUrl = selected,
+                            callback = callback,
+                            referer = detailUrl,
+                            label = "Discovery FTP"
+                        )
+                        return true
+                    }
+                }
+            }
+        }
+
+        return false
     }
 
     private suspend fun resolveMediaFromPages(
@@ -1667,62 +1769,167 @@ class DiscoveryFTP : MainAPI() {
 
     private data class EpisodePlaybackRequest(
         val mediaUrl: String,
-        val referer: String
+        val referer: String,
+        val detailUrl: String? = null
     )
 
     private fun buildEpisodePlaybackData(
         mediaUrl: String,
-        referer: String
+        referer: String,
+        detailUrl: String? = null
     ): String {
         val encodedReferer = java.net.URLEncoder.encode(
             referer,
             StandardCharsets.UTF_8.toString()
         )
-        return normalizeMediaUrl(mediaUrl) +
-            "#discovery_ref=$encodedReferer"
+
+        val encodedDetail = detailUrl?.takeIf {
+            it.isNotBlank()
+        }?.let {
+            java.net.URLEncoder.encode(
+                it,
+                StandardCharsets.UTF_8.toString()
+            )
+        }
+
+        return mediaUrl
+            .trim()
+            .replace(" ", "%20") +
+            "#discovery_ref=$encodedReferer" +
+            if (!encodedDetail.isNullOrBlank()) {
+                "#discovery_detail=$encodedDetail"
+            } else {
+                ""
+            }
     }
 
     private fun parseEpisodePlaybackData(
         data: String
     ): EpisodePlaybackRequest {
         val raw = data.trim()
-        val marker = "#discovery_ref="
+        val refMarker = "#discovery_ref="
+        val detailMarker = "#discovery_detail="
 
-        if (!raw.contains(marker)) {
+        if (!raw.contains(refMarker)) {
             return EpisodePlaybackRequest(
                 mediaUrl = raw.substringBefore("#").trim(),
                 referer = "$mainUrl/"
             )
         }
 
-        val media = raw.substringBefore(marker).trim()
-        val encoded = raw.substringAfter(marker, "")
+        val media = raw.substringBefore("#").trim()
+
+        val refStart = raw.indexOf(refMarker) +
+            refMarker.length
+
+        val refEnd = raw.indexOf(
+            detailMarker,
+            startIndex = refStart
+        ).let {
+            if (it >= 0) it else raw.length
+        }
+
+        val encodedReferer = raw.substring(
+            refStart,
+            refEnd
+        )
+
         val referer = runCatching {
             URLDecoder.decode(
-                encoded,
+                encodedReferer,
                 StandardCharsets.UTF_8.toString()
             )
         }.getOrDefault("$mainUrl/")
 
+        val detailUrl = if (raw.contains(detailMarker)) {
+            runCatching {
+                URLDecoder.decode(
+                    raw.substringAfter(detailMarker, ""),
+                    StandardCharsets.UTF_8.toString()
+                )
+            }.getOrNull()
+        } else {
+            null
+        }
+
         return EpisodePlaybackRequest(
             mediaUrl = media,
-            referer = referer
+            referer = referer,
+            detailUrl = detailUrl
         )
     }
 
     private fun mediaCandidates(
         url: String
     ): List<String> {
+        val clean = normalizeMediaUrl(url)
+
+        val match = Regex(
+            """(?i)^(https?)://(cdn[1-5]\.discoveryftp\.net)(/.*)$"""
+        ).find(clean)
+
+        if (match == null) {
+            return listOf(clean)
+        }
+
+        val scheme = match.groupValues[1].lowercase(Locale.ROOT)
+        val host = match.groupValues[2]
+        val path = match.groupValues[3]
+
+        val alternate = if (scheme == "https") {
+            "http://$host$path"
+        } else {
+            "https://$host$path"
+        }
+
+        return linkedSetOf(clean, alternate).toList()
+    }
+
+    private suspend fun choosePlayableMediaUrl(
+        url: String,
+        referer: String
+    ): String? {
+        val candidates = mediaCandidates(url)
+
+        for (candidate in candidates) {
+            val code = runCatching {
+                app.head(
+                    candidate,
+                    headers = mediaHeaders(referer),
+                    referer = referer,
+                    timeout = 5L
+                ).code
+            }.getOrNull()
+
+            if (code != null && code in 200..399) {
+                return candidate
+            }
+        }
+
         /*
-         * Discovery episode cards are often published as http://cdn5..., while
-         * the same CDN file is available through HTTPS. CloudStream/Android
-         * can reject cleartext HTTP, so the provider emits HTTPS for the
-         * Discovery CDN instead of presenting an HTTP "fallback" as a second
-         * playable source.
+         * Some file servers reject HEAD while accepting Range GET.
+         * This requests only the first two bytes.
          */
-        return listOf(
-            normalizeMediaUrl(url)
-        )
+        for (candidate in candidates) {
+            val code = runCatching {
+                app.get(
+                    candidate,
+                    headers = mediaHeaders(referer) + mapOf(
+                        "Range" to "bytes=0-1"
+                    )
+                ).code
+            }.getOrNull()
+
+            if (code != null && code in 200..399) {
+                return candidate
+            }
+        }
+
+        /*
+         * Never convert a real Discovery source into "No Links Found"
+         * solely because a probe was rejected.
+         */
+        return candidates.firstOrNull()
     }
 
     private suspend fun emitMedia(
@@ -1801,30 +2008,9 @@ class DiscoveryFTP : MainAPI() {
     }
 
     private fun normalizeMediaUrl(url: String): String {
-        val trimmed = url
+        return url
             .trim()
             .replace(" ", "%20")
-
-        if (trimmed.isBlank()) return trimmed
-
-        /*
-         * Discovery's own TV episode source uses http://cdn5... while the
-         * movie WEB PLAY source publishes https://cdn1.... The same CDN host
-         * family is intended to serve both forms. Always use HTTPS for those
-         * hosts so Android does not fall into a cleartext-network failure.
-         */
-        return if (
-            Regex("(?i)^http://cdn[1-5]\\.discoveryftp\\.net/")
-                .containsMatchIn(trimmed)
-        ) {
-            trimmed.replaceFirst(
-                "http://",
-                "https://",
-                ignoreCase = true
-            )
-        } else {
-            trimmed
-        }
     }
 
     private fun mediaHeaders(
