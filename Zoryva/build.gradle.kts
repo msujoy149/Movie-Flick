@@ -15,7 +15,7 @@ cloudstream {
         "TvSeries",
         "Anime"
     )
-    language = "en"
+    language = "hi"
     iconUrl = "https://zoryva.me/icon-512.png"
     isCrossPlatform = true
     setRepo(
