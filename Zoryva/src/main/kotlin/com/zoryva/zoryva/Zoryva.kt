@@ -632,16 +632,21 @@ class Zoryva : MainAPI() {
                 "$BASE_URL/sitemap-index.xml"
             )
 
-            val rootDocument = roots
-                .asSequence()
-                .mapNotNull { getDocument(it) }
-                .firstOrNull { it.select("loc").isNotEmpty() }
-                ?: return@withLock emptyList()
+            var rootDocument: org.jsoup.nodes.Document? = null
+            for (root in roots) {
+                val candidate = runCatching { getDocument(root) }.getOrNull()
+                if (candidate != null && candidate.select("loc").isNotEmpty()) {
+                    rootDocument = candidate
+                    break
+                }
+            }
+
+            val document = rootDocument ?: return@withLock emptyList()
 
             val direct = linkedSetOf<String>()
             val childUrls = linkedSetOf<String>()
 
-            rootDocument.select("loc").forEach { element ->
+            document.select("loc").forEach { element ->
                 val url = element.text().trim()
                 if (url.isBlank()) return@forEach
                 val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
