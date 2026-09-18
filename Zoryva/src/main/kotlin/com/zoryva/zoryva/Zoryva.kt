@@ -6,12 +6,15 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Zoryva CloudStream provider.
@@ -47,6 +50,8 @@ class Zoryva : MainAPI() {
         const val MAX_CRAWL_DEPTH = 2
         const val SOURCE_PROBE_TIMEOUT_MS = 7000L
         const val SERVER_PAGE_TIMEOUT_MS = 9000L
+        const val HOME_PREFETCH_TIMEOUT_MS = 5000L
+        const val HOME_CATALOG_CACHE_TTL_MS = 15000L
 
         // Advanced search tuning. Normal searches should finish from the
         // website's native search page; the heavier global fallback is used
@@ -131,7 +136,7 @@ class Zoryva : MainAPI() {
 
     override var mainUrl: String = BASE_URL
     override var name: String = "Zoryva"
-    override var lang: String = "en"
+    override var lang: String = "hi"
 
     override val hasMainPage: Boolean = true
     override val hasQuickSearch: Boolean = true
@@ -208,6 +213,21 @@ class Zoryva : MainAPI() {
         val variants: List<Pair<String, Int>>
     )
 
+    private data class CachedCatalog(
+        val createdAt: Long,
+        val items: List<SiteItem>
+    )
+
+    private val catalogCache = ConcurrentHashMap<String, CachedCatalog>()
+    private val catalogPrefetchMutex = Mutex()
+
+    private val homeRoutes = listOf(
+        TRENDING,
+        MOVIES,
+        TV_SHOW,
+        ANIME
+    )
+
     // ---------------------------------------------------------------------
     // HOME
     // ---------------------------------------------------------------------
@@ -219,22 +239,185 @@ class Zoryva : MainAPI() {
         val route = request.data
         val currentPage = page.coerceAtLeast(1)
 
-        val pageUrl = buildBrowseUrl(route, currentPage)
-        val document = getDocument(pageUrl) ?: return newHomePageResponse(
-            request,
-            emptyList(),
-            false
-        )
+        if (currentPage == 1) {
+            /*
+             * Prefetch all four Home sections together the first time Home is
+             * opened. The cache contains catalog metadata only; it never stores
+             * playback URLs or signed media tokens. This lets Trending, Movies,
+             * TV Show and Anime become available together instead of waiting for
+             * four independent cold starts.
+             */
+            prefetchHomeCatalogs()
 
-        val items = parseBrowseItems(document)
-            .distinctBy { cleanUrl(it.url) }
-            .take(MAX_HOME_ITEMS)
+            val cached = getCachedCatalog(route)
+            val items = cached?.items ?: run {
+                val document = getDocument(route) ?: return newHomePageResponse(
+                    request,
+                    emptyList(),
+                    false
+                )
+
+                parseBrowseItems(document, route)
+                    .distinctBy { cleanUrl(it.url) }
+                    .also { storeCatalog(route, it) }
+            }
+
+            val visible = items.take(MAX_HOME_ITEMS)
+
+            return newHomePageResponse(
+                request,
+                visible.map { it.toSearchResponse() },
+                items.size > MAX_HOME_ITEMS || visible.size >= MAX_HOME_ITEMS
+            )
+        }
+
+        /*
+         * Later scroll pages are requested concurrently. We use the site's
+         * normal ?page=N route and, when that route simply repeats the first
+         * catalog, fall back to a deterministic window over the initial live
+         * catalog. This prevents duplicate cards on client-side paginated builds.
+         */
+        val pagedUrl = buildBrowseUrl(route, currentPage)
+        val (baseDocument, pagedDocument) = coroutineScope {
+            val baseJob = async {
+                getCachedCatalog(route)?.let { cached ->
+                    if (System.currentTimeMillis() - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS) {
+                        null
+                    } else {
+                        getDocument(route)
+                    }
+                } ?: getDocument(route)
+            }
+            val pagedJob = async { getDocument(pagedUrl) }
+            baseJob.await() to pagedJob.await()
+        }
+
+        val baseItems = getCachedCatalog(route)?.items
+            ?: baseDocument
+                ?.let { parseBrowseItems(it, route) }
+                ?.distinctBy { cleanUrl(it.url) }
+                .orEmpty()
+
+        if (baseItems.isNotEmpty()) {
+            storeCatalog(route, baseItems)
+        }
+
+        val pagedItems = pagedDocument
+            ?.let { parseBrowseItems(it, pagedUrl) }
+            ?.distinctBy { cleanUrl(it.url) }
+            .orEmpty()
+
+        val serverPaginationWorks =
+            pagedItems.isNotEmpty() && !sameCatalog(pagedItems, baseItems)
+
+        val visible = if (serverPaginationWorks) {
+            pagedItems.take(MAX_HOME_ITEMS)
+        } else {
+            baseItems
+                .drop((currentPage - 1) * MAX_HOME_ITEMS)
+                .take(MAX_HOME_ITEMS)
+        }
+
+        val hasMore = if (serverPaginationWorks) {
+            pagedItems.size >= MAX_HOME_ITEMS || hasExplicitNextPage(pagedDocument)
+        } else {
+            baseItems.size > currentPage * MAX_HOME_ITEMS
+        }
 
         return newHomePageResponse(
             request,
-            items.map { it.toSearchResponse() },
-            hasMoreBrowsePage(document, items)
+            visible.map { it.toSearchResponse() },
+            hasMore && visible.isNotEmpty()
         )
+    }
+
+    private suspend fun prefetchHomeCatalogs() {
+        val now = System.currentTimeMillis()
+        val hasFreshCatalog = homeRoutes.all { route ->
+            val cached = catalogCache[route]
+            cached != null && now - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS
+        }
+
+        if (hasFreshCatalog) return
+
+        catalogPrefetchMutex.withLock {
+            val lockedNow = System.currentTimeMillis()
+            val stillFresh = homeRoutes.all { route ->
+                val cached = catalogCache[route]
+                cached != null && lockedNow - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS
+            }
+            if (stillFresh) return
+
+            val fetched = coroutineScope {
+                homeRoutes.map { route ->
+                    async {
+                        route to withTimeoutOrNull(HOME_PREFETCH_TIMEOUT_MS) {
+                            getDocument(route)
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            fetched.forEach { (route, document) ->
+                document ?: return@forEach
+                val items = parseBrowseItems(document, route)
+                    .distinctBy { cleanUrl(it.url) }
+                if (items.isNotEmpty()) {
+                    storeCatalog(route, items)
+                }
+            }
+        }
+    }
+
+    private fun getCachedCatalog(
+        route: String
+    ): CachedCatalog? {
+        val cached = catalogCache[route] ?: return null
+        return if (System.currentTimeMillis() - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS) {
+            cached
+        } else {
+            catalogCache.remove(route)
+            null
+        }
+    }
+
+    private fun storeCatalog(
+        route: String,
+        items: List<SiteItem>
+    ) {
+        if (items.isEmpty()) return
+        catalogCache[route] = CachedCatalog(
+            createdAt = System.currentTimeMillis(),
+            items = items
+        )
+    }
+
+    private fun hasExplicitNextPage(
+        document: Document?
+    ): Boolean {
+        if (document == null) return false
+
+        return document.select("a[href]").any { anchor ->
+            val text = anchor.text().trim().lowercase(Locale.ROOT)
+            val aria = anchor.attr("aria-label").trim().lowercase(Locale.ROOT)
+            text == "next" ||
+                text.contains("next page") ||
+                aria.contains("next")
+        }
+    }
+
+    private fun sameCatalog(
+        first: List<SiteItem>,
+        second: List<SiteItem>
+    ): Boolean {
+        if (first.isEmpty() || second.isEmpty()) return false
+
+        val firstKeys = first.take(12).map { cleanUrl(it.url) }.toSet()
+        val secondKeys = second.take(12).map { cleanUrl(it.url) }.toSet()
+        if (firstKeys.isEmpty() || secondKeys.isEmpty()) return false
+
+        val overlap = firstKeys.intersect(secondKeys).size
+        return overlap >= maxOf(1, minOf(firstKeys.size, secondKeys.size) * 0.75).toInt()
     }
 
     private fun buildBrowseUrl(
@@ -243,15 +426,13 @@ class Zoryva : MainAPI() {
     ): String {
         if (page <= 1) return route
 
-        return if (route.contains("?")) {
-            "$route&page=$page"
-        } else {
-            "$route?page=$page"
-        }
+        val separator = if (route.contains("?")) "&" else "?"
+        return "$route${separator}page=$page"
     }
 
     private fun parseBrowseItems(
-        document: Document
+        document: Document,
+        baseUrl: String = BASE_URL
     ): List<SiteItem> {
         val result = linkedMapOf<String, SiteItem>()
 
@@ -260,7 +441,8 @@ class Zoryva : MainAPI() {
          * on one generated CSS class and instead look for canonical media links.
          */
         document.select("a[href]").forEach { anchor ->
-            val absolute = absoluteUrl(anchor.absUrl("href")) ?: return@forEach
+            val rawHref = anchor.attr("href").trim()
+            val absolute = normalizeExtractedUrl(rawHref, baseUrl) ?: return@forEach
             val path = runCatching { URI(absolute).path.orEmpty() }.getOrDefault("")
 
             val type = when {
@@ -274,7 +456,7 @@ class Zoryva : MainAPI() {
                 .ifBlank { titleFromPath(path) }
                 .ifBlank { return@forEach }
 
-            val poster = extractCardPoster(anchor)
+            val poster = extractCardPoster(anchor, baseUrl)
             val key = cleanUrl(absolute)
 
             result.putIfAbsent(
@@ -288,6 +470,54 @@ class Zoryva : MainAPI() {
             )
         }
 
+        if (result.isNotEmpty()) {
+            return result.values.toList()
+        }
+
+        /*
+         * Next.js Flight/RSC can carry canonical href strings even when a
+         * renderer changes the final DOM shape. Use a conservative fallback
+         * over the raw HTML so a future class-name/layout change does not make
+         * an entire Home section disappear.
+         */
+        val html = document.html()
+        val hrefRegex = Regex("(?i)(?:href=\"|href=')((?:/|https?://)[^\"']+?/((?:movie)|(?:tv)|(?:anime))/[A-Za-z0-9_-]+(?:/[^\"']*)?)")
+        hrefRegex.findAll(html).forEach { match ->
+            val raw = match.groupValues[1]
+            val absolute = normalizeExtractedUrl(raw, baseUrl) ?: return@forEach
+            val path = runCatching { URI(absolute).path.orEmpty() }.getOrDefault("")
+            val type = when {
+                isMoviePath(path) -> TvType.Movie
+                isAnimePath(path) -> TvType.Anime
+                isTvPath(path) && !isEpisodePath(path) -> TvType.TvSeries
+                else -> return@forEach
+            }
+
+            val nearby = html.substring(
+                maxOf(0, match.range.first - 1800),
+                minOf(html.length, match.range.last + 1800)
+            )
+            val title = Regex("(?is)<img[^>]+(?:alt|title)=\"([^\"]+)\"|<img[^>]+(?:alt|title)='([^']+)'")
+                .find(nearby)
+                ?.let { firstNonBlank(it.groupValues[1], it.groupValues[2]) }
+                ?.let(::cleanCardTitle)
+                .orEmpty()
+                .ifBlank { titleFromPath(path) }
+
+            if (title.isBlank()) return@forEach
+
+            val posterRaw = Regex("(?i)(?:src|data-src|data-lazy-src)=[\"']([^\"']+)[\"']")
+                .find(nearby)
+                ?.groupValues
+                ?.getOrNull(1)
+            val poster = normalizeExtractedUrl(posterRaw, baseUrl)
+
+            result.putIfAbsent(
+                cleanUrl(absolute),
+                SiteItem(title, absolute, poster, type)
+            )
+        }
+
         return result.values.toList()
     }
 
@@ -295,22 +525,8 @@ class Zoryva : MainAPI() {
         document: Document,
         items: List<SiteItem>
     ): Boolean {
-        val next = document.select("a[href]").any { anchor ->
-            val text = anchor.text().trim().lowercase(Locale.ROOT)
-            val aria = anchor.attr("aria-label").trim().lowercase(Locale.ROOT)
-            val href = anchor.absUrl("href").trim()
-
-            text == "next" ||
-                text.contains("next page") ||
-                aria.contains("next") ||
-                href.contains("page=") && text.contains("next")
-        }
-
-        /*
-         * Some builds of the site do not render a numbered paginator in the
-         * initial HTML. If the page is full, allow one more lazy page attempt.
-         */
-        return next || items.size >= MAX_HOME_ITEMS
+        if (items.isEmpty()) return false
+        return hasExplicitNextPage(document)
     }
 
     // ---------------------------------------------------------------------
@@ -357,7 +573,7 @@ class Zoryva : MainAPI() {
         val exactDocument = getDocument(exactUrl)
 
         if (exactDocument != null) {
-            val exactItems = parseBrowseItems(exactDocument)
+            val exactItems = parseBrowseItems(exactDocument, exactUrl)
                 .distinctBy { cleanUrl(it.url) }
             val ranked = rankSearchItems(original, exactItems)
 
@@ -407,9 +623,10 @@ class Zoryva : MainAPI() {
         }
 
         val merged = linkedMapOf<String, SiteItem>()
-        documents.forEach { document ->
-            document ?: return@forEach
-            parseBrowseItems(document).forEach { item ->
+        documents.forEachIndexed { index, document ->
+            document ?: return@forEachIndexed
+            val variantUrl = buildSearchUrl(variants.getOrNull(index) ?: original)
+            parseBrowseItems(document, variantUrl).forEach { item ->
                 merged.putIfAbsent(cleanUrl(item.url), item)
             }
         }
@@ -567,7 +784,7 @@ class Zoryva : MainAPI() {
         val url = "$BASE_URL${normalizePathForSearch(path)}"
         val document = getDocument(url) ?: return null
 
-        val parsed = parseBrowseItems(document)
+        val parsed = parseBrowseItems(document, url)
             .firstOrNull { cleanUrl(it.url) == cleanUrl(url) }
             ?: run {
                 parseDetail(document, url)?.let { info ->
@@ -1897,18 +2114,19 @@ class Zoryva : MainAPI() {
     }
 
     private fun extractCardPoster(
-        anchor: Element
+        anchor: Element,
+        baseUrl: String
     ): String? {
         val img = anchor.selectFirst("img") ?: return null
 
-        return firstNonBlank(
-            img.absUrl("src"),
-            img.absUrl("data-src"),
+        val raw = firstNonBlank(
             img.attr("src"),
             img.attr("data-src"),
             img.attr("data-lazy-src"),
             img.attr("srcset")?.substringBefore(',')?.substringBefore(' ')
         )
+
+        return normalizeExtractedUrl(raw, baseUrl)
     }
 
     private fun SiteItem.toSearchResponse(): SearchResponse {
@@ -1946,16 +2164,27 @@ class Zoryva : MainAPI() {
     private suspend fun getDocument(
         url: String
     ): Document? {
-        return try {
+        val clean = cleanUrl(url)
+        if (clean.isBlank()) return null
+
+        return runCatching {
             val response = app.get(
-                cleanUrl(url),
-                headers = PAGE_HEADERS
+                clean,
+                headers = PAGE_HEADERS + mapOf(
+                    "Referer" to "$BASE_URL/"
+                )
             )
 
-            if (response.code !in 200..399) null else response.document
-        } catch (_: Throwable) {
-            null
-        }
+            if (response.code !in 200..399) {
+                null
+            } else {
+                response.document.apply {
+                    if (baseUri().isBlank()) {
+                        setBaseUri(clean)
+                    }
+                }
+            }
+        }.getOrNull()
     }
 
     private fun normalizeExtractedUrl(
