@@ -8,6 +8,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -45,6 +46,9 @@ class Zoryva : MainAPI() {
         const val ANIME = "$BASE_URL/browse/anime"
 
         const val MAX_HOME_ITEMS = 24
+        const val INITIAL_HOME_ITEMS = 8
+        const val HOME_SITEMAP_CACHE_TTL_MS = 120_000L
+        const val HOME_SITEMAP_CHILD_LIMIT = 32
         const val MAX_SEARCH_ITEMS = 50
         const val MAX_SERVER_PAGES = 12
         const val MAX_CRAWL_DEPTH = 2
@@ -220,6 +224,9 @@ class Zoryva : MainAPI() {
 
     private val catalogCache = ConcurrentHashMap<String, CachedCatalog>()
     private val catalogPrefetchMutex = Mutex()
+    private val sitemapPathCache = mutableListOf<String>()
+    @Volatile private var sitemapCacheAt: Long = 0L
+    private val sitemapMutex = Mutex()
 
     private val homeRoutes = listOf(
         TRENDING,
@@ -241,93 +248,96 @@ class Zoryva : MainAPI() {
 
         if (currentPage == 1) {
             /*
-             * Prefetch all four Home sections together the first time Home is
-             * opened. The cache contains catalog metadata only; it never stores
-             * playback URLs or signed media tokens. This lets Trending, Movies,
-             * TV Show and Anime become available together instead of waiting for
-             * four independent cold starts.
+             * Warm every requested Home section together from the server-rendered
+             * Next.js Home RSC payload. This is the reliable catalog bootstrap
+             * path for the current Zoryva website: the visible browse pages are
+             * client shells and may contain only a loading state in raw HTML.
              */
             prefetchHomeCatalogs()
 
             val cached = getCachedCatalog(route)
-            val items = cached?.items ?: run {
-                val document = getDocument(route) ?: return newHomePageResponse(
-                    request,
-                    emptyList(),
-                    false
-                )
-
-                parseBrowseItems(document, route)
-                    .distinctBy { cleanUrl(it.url) }
-                    .also { storeCatalog(route, it) }
+            val items = if (!cached?.items.isNullOrEmpty()) {
+                cached?.items.orEmpty()
+            } else {
+                loadHomeSitemapPage(route, 1)
+                    .also { fallback ->
+                        if (fallback.isNotEmpty()) {
+                            storeCatalog(route, fallback)
+                        }
+                    }
             }
 
-            val visible = items.take(MAX_HOME_ITEMS)
+            val visible = items.take(INITIAL_HOME_ITEMS)
 
             return newHomePageResponse(
                 request,
                 visible.map { it.toSearchResponse() },
-                items.size > MAX_HOME_ITEMS || visible.size >= MAX_HOME_ITEMS
+                items.size > visible.size
             )
         }
 
         /*
-         * Later scroll pages are requested concurrently. We use the site's
-         * normal ?page=N route and, when that route simply repeats the first
-         * catalog, fall back to a deterministic window over the initial live
-         * catalog. This prevents duplicate cards on client-side paginated builds.
+         * First try the website's conventional page parameter. Some deployments
+         * expose server pagination even when the first HTML response is a client
+         * shell, so this remains the cheapest lazy path.
          */
-        val pagedUrl = buildBrowseUrl(route, currentPage)
-        val (baseDocument, pagedDocument) = coroutineScope {
-            val baseJob = async {
-                getCachedCatalog(route)?.let { cached ->
-                    if (System.currentTimeMillis() - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS) {
-                        null
-                    } else {
-                        getDocument(route)
+        val candidateUrls = listOf(
+            buildBrowseUrl(route, currentPage),
+            "$route?limit=$MAX_HOME_ITEMS&page=$currentPage",
+            "$route?page=$currentPage&limit=$MAX_HOME_ITEMS",
+            "$route?offset=${(currentPage - 1) * MAX_HOME_ITEMS}&limit=$MAX_HOME_ITEMS"
+        ).distinct()
+
+        val fetchedPages = coroutineScope {
+            candidateUrls.map { candidate ->
+                async {
+                    withTimeoutOrNull(HOME_PREFETCH_TIMEOUT_MS) {
+                        getDocument(candidate)
                     }
-                } ?: getDocument(route)
+                }
+            }.awaitAll()
+        }
+
+        val pageItems = fetchedPages
+            .mapIndexed { index, document ->
+                document?.let {
+                    buildBrowseItemsFromDocument(
+                        it,
+                        candidateUrls.getOrNull(index) ?: route
+                    )
+                }.orEmpty()
             }
-            val pagedJob = async { getDocument(pagedUrl) }
-            baseJob.await() to pagedJob.await()
+            .flatten()
+            .distinctBy { cleanUrl(it.url) }
+
+        val baseItems = getCachedCatalog(route)?.items.orEmpty()
+        val nonDuplicatePageItems = pageItems.filterNot { item ->
+            baseItems.any { cleanUrl(it.url) == cleanUrl(item.url) }
         }
 
-        val baseItems = getCachedCatalog(route)?.items
-            ?: baseDocument
-                ?.let { parseBrowseItems(it, route) }
-                ?.distinctBy { cleanUrl(it.url) }
-                .orEmpty()
-
-        if (baseItems.isNotEmpty()) {
-            storeCatalog(route, baseItems)
+        if (nonDuplicatePageItems.isNotEmpty()) {
+            return newHomePageResponse(
+                request,
+                nonDuplicatePageItems.take(MAX_HOME_ITEMS).map { it.toSearchResponse() },
+                nonDuplicatePageItems.size >= MAX_HOME_ITEMS
+            )
         }
 
-        val pagedItems = pagedDocument
-            ?.let { parseBrowseItems(it, pagedUrl) }
-            ?.distinctBy { cleanUrl(it.url) }
-            .orEmpty()
-
-        val serverPaginationWorks =
-            pagedItems.isNotEmpty() && !sameCatalog(pagedItems, baseItems)
-
-        val visible = if (serverPaginationWorks) {
-            pagedItems.take(MAX_HOME_ITEMS)
-        } else {
-            baseItems
-                .drop((currentPage - 1) * MAX_HOME_ITEMS)
-                .take(MAX_HOME_ITEMS)
-        }
-
-        val hasMore = if (serverPaginationWorks) {
-            pagedItems.size >= MAX_HOME_ITEMS || hasExplicitNextPage(pagedDocument)
-        } else {
-            baseItems.size > currentPage * MAX_HOME_ITEMS
-        }
+        /*
+         * The current browse pages are client-rendered. Use the site's sitemap
+         * as a real-content index for subsequent lazy pages. Only metadata and
+         * canonical Zoryva URLs are cached; every candidate detail page is
+         * verified before it becomes a Home result.
+         */
+        val sitemapItems = loadHomeSitemapPage(
+            route = route,
+            page = currentPage
+        )
 
         return newHomePageResponse(
             request,
-            visible.map { it.toSearchResponse() },
-            hasMore && visible.isNotEmpty()
+            sitemapItems.map { it.toSearchResponse() },
+            sitemapItems.size >= MAX_HOME_ITEMS
         )
     }
 
@@ -348,24 +358,325 @@ class Zoryva : MainAPI() {
             }
             if (stillFresh) return
 
-            val fetched = coroutineScope {
-                homeRoutes.map { route ->
-                    async {
-                        route to withTimeoutOrNull(HOME_PREFETCH_TIMEOUT_MS) {
-                            getDocument(route)
+            /*
+             * One Home request provides initialRows + initialHeroItems for all
+             * four sections. This is both faster and more reliable than trying
+             * to scrape the client-only /browse pages on the first frame.
+             */
+            val homepage = withTimeoutOrNull(7000L) {
+                getDocument(BASE_URL)
+            }
+
+            val rscCatalogs = homepage
+                ?.let { parseHomepageRscCatalogs(it) }
+                .orEmpty()
+
+            rscCatalogs.forEach { (route, items) ->
+                if (items.isNotEmpty()) {
+                    storeCatalog(route, items.distinctBy { cleanUrl(it.url) })
+                }
+            }
+
+            /*
+             * Keep the real browse routes as a secondary source. If the site
+             * changes back to SSR cards in the future, the parser can merge them
+             * immediately without changing the Home API.
+             */
+            val fallbackRoutes = homeRoutes.filter { route ->
+                getCachedCatalog(route)?.items.isNullOrEmpty()
+            }
+
+            if (fallbackRoutes.isNotEmpty()) {
+                val fetched = coroutineScope {
+                    fallbackRoutes.map { route ->
+                        async {
+                            route to withTimeoutOrNull(HOME_PREFETCH_TIMEOUT_MS) {
+                                getDocument(route)
+                            }
                         }
+                    }.awaitAll()
+                }
+
+                fetched.forEach { (route, document) ->
+                    document ?: return@forEach
+                    val items = buildBrowseItemsFromDocument(document, route)
+                        .distinctBy { cleanUrl(it.url) }
+                    if (items.isNotEmpty()) {
+                        storeCatalog(route, items)
                     }
+                }
+            }
+        }
+    }
+
+    private fun parseHomepageRscCatalogs(
+        document: Document
+    ): Map<String, List<SiteItem>> {
+        val decoded = decodeRscForCatalog(document.html())
+        if (!decoded.contains("\"initialRows\":", true)) {
+            return emptyMap()
+        }
+
+        val heroItems = extractRscArray(decoded, "\"initialHeroItems\":")
+            ?.let(::parseRscMediaArray)
+            .orEmpty()
+
+        val rows = extractRscArray(decoded, "\"initialRows\":") ?: return emptyMap()
+        val rowsArray = runCatching { JSONArray(rows) }.getOrNull() ?: return emptyMap()
+
+        val routeRows = linkedMapOf<String, MutableList<SiteItem>>()
+
+        for (i in 0 until rowsArray.length()) {
+            val row = rowsArray.optJSONObject(i) ?: continue
+            val key = row.optString("key").trim().lowercase(Locale.ROOT)
+            if (key.isBlank()) continue
+
+            val items = row.optJSONArray("items") ?: continue
+            val target = when {
+                key == "trending" -> TRENDING
+                key == "popular-movies" || key == "new-releases" ||
+                    key == "top-rated" || key == "recently-added" -> MOVIES
+                key == "popular-tv" -> TV_SHOW
+                key == "popular-anime" || key == "trending-anime" -> ANIME
+                else -> null
+            } ?: continue
+
+            val output = routeRows.getOrPut(target) { mutableListOf() }
+
+            for (j in 0 until items.length()) {
+                val value = items.opt(j)
+                val media = when (value) {
+                    is JSONObject -> value
+                    is String -> resolveRscHeroReference(value, heroItems)
+                    else -> null
+                } ?: continue
+
+                val item = rscMediaToSiteItem(media, key) ?: continue
+
+                val belongsToCategory = when (target) {
+                    MOVIES -> item.type == TvType.Movie
+                    TV_SHOW -> item.type == TvType.TvSeries
+                    ANIME -> item.type == TvType.Anime
+                    TRENDING -> true
+                    else -> false
+                }
+                if (!belongsToCategory) continue
+
+                if (output.none { cleanUrl(it.url) == cleanUrl(item.url) }) {
+                    output += item
+                }
+            }
+        }
+
+        return routeRows.mapValues { it.value.toList() }
+    }
+
+    private fun resolveRscHeroReference(
+        value: String,
+        heroItems: List<JSONObject>
+    ): JSONObject? {
+        val marker = "initialHeroItems:"
+        val index = value.lastIndexOf(marker)
+        if (index < 0) return null
+        val heroIndex = value.substring(index + marker.length).toIntOrNull() ?: return null
+        return heroItems.getOrNull(heroIndex)
+    }
+
+    private fun rscMediaToSiteItem(
+        media: JSONObject,
+        rowKey: String
+    ): SiteItem? {
+        val title = media.optString("title")
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?: return null
+
+        val mediaType = media.optString("mediaType")
+            .trim()
+            .lowercase(Locale.ROOT)
+
+        val type = when {
+            rowKey.contains("anime") -> TvType.Anime
+            mediaType == "movie" -> TvType.Movie
+            mediaType == "tv" || mediaType == "series" -> TvType.TvSeries
+            else -> return null
+        }
+
+        val externalId = when (val raw = media.opt("externalId")) {
+            is Number -> raw.toLong().toString()
+            is String -> raw.trim().takeIf { it.isNotBlank() }
+            else -> null
+        } ?: media.optString("id")
+            .substringAfterLast("-")
+            .takeIf { it.matches(Regex("\\d+")) }
+            ?: return null
+
+        val path = when (type) {
+            TvType.Movie -> "movie"
+            TvType.TvSeries -> "tv"
+            TvType.Anime -> "anime"
+            else -> return null
+        }
+
+        val poster = media.optString("posterPath")
+            .trim()
+            .takeIf { it.startsWith("http", true) }
+
+        return SiteItem(
+            title = cleanCardTitle(title),
+            url = "$BASE_URL/$path/$externalId",
+            poster = poster,
+            type = type
+        )
+    }
+
+    private fun extractRscArray(
+        decoded: String,
+        marker: String
+    ): String? {
+        val index = decoded.indexOf(marker)
+        if (index < 0) return null
+        val start = decoded.indexOf('[', index + marker.length)
+        if (start < 0) return null
+        return extractBalancedJson(decoded, start, '[', ']')
+    }
+
+    private fun parseRscMediaArray(
+        arrayJson: String
+    ): List<JSONObject> {
+        val array = runCatching { JSONArray(arrayJson) }.getOrNull() ?: return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                array.optJSONObject(i)?.let(::add)
+            }
+        }
+    }
+
+    private fun decodeRscForCatalog(
+        input: String
+    ): String {
+        var text = input
+        repeat(2) {
+            text = decodeRscOneLayer(text)
+                .replace("\\:", ":")
+                .replace("\\.", ".")
+        }
+        return text
+    }
+
+    private fun buildBrowseItemsFromDocument(
+        document: Document,
+        baseUrl: String
+    ): List<SiteItem> {
+        return parseBrowseItems(document, baseUrl)
+            .distinctBy { cleanUrl(it.url) }
+    }
+
+    private suspend fun loadHomeSitemapPage(
+        route: String,
+        page: Int
+    ): List<SiteItem> {
+        val paths = getSitemapMediaPaths()
+        if (paths.isEmpty()) return emptyList()
+
+        val filtered = paths.filter { path ->
+            when (route) {
+                MOVIES -> isMoviePath(path)
+                TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
+                ANIME -> isAnimePath(path) && !isEpisodePath(path)
+                TRENDING -> true
+                else -> false
+            }
+        }
+
+        val existing = getCachedCatalog(route)?.items.orEmpty()
+        val existingKeys = existing.map { cleanUrl(it.url) }.toSet()
+        val uniquePaths = filtered.filterNot { path ->
+            existingKeys.contains(cleanUrl("$BASE_URL${normalizePathForSearch(path)}"))
+        }
+
+        val start = when {
+            page <= 1 -> 0
+            else -> (page - 2) * MAX_HOME_ITEMS
+        }
+        if (start >= uniquePaths.size) return emptyList()
+
+        val slice = uniquePaths
+            .drop(start)
+            .take(MAX_HOME_ITEMS)
+
+        return coroutineScope {
+            slice.map { path ->
+                async {
+                    verifySitemapCandidate(path)
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }
+
+    private suspend fun getSitemapMediaPaths(): List<String> {
+        val now = System.currentTimeMillis()
+        if (now - sitemapCacheAt <= HOME_SITEMAP_CACHE_TTL_MS) {
+            return synchronized(sitemapPathCache) { sitemapPathCache.toList() }
+        }
+
+        return sitemapMutex.withLock {
+            val lockedNow = System.currentTimeMillis()
+            if (lockedNow - sitemapCacheAt <= HOME_SITEMAP_CACHE_TTL_MS) {
+                return@withLock synchronized(sitemapPathCache) { sitemapPathCache.toList() }
+            }
+
+            val roots = listOf(
+                "$BASE_URL/sitemap.xml",
+                "$BASE_URL/sitemap_index.xml",
+                "$BASE_URL/sitemap-index.xml"
+            )
+
+            val rootDocument = roots
+                .asSequence()
+                .mapNotNull { getDocument(it) }
+                .firstOrNull { it.select("loc").isNotEmpty() }
+                ?: return@withLock emptyList()
+
+            val direct = linkedSetOf<String>()
+            val childUrls = linkedSetOf<String>()
+
+            rootDocument.select("loc").forEach { element ->
+                val url = element.text().trim()
+                if (url.isBlank()) return@forEach
+                val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
+                if (isSearchContentPath(path)) {
+                    direct += normalizePathForSearch(path)
+                } else if (url.endsWith(".xml", true) || url.contains("sitemap", true)) {
+                    childUrls += cleanUrl(url)
+                }
+            }
+
+            val children = coroutineScope {
+                childUrls.take(HOME_SITEMAP_CHILD_LIMIT).map { url ->
+                    async { getDocument(url) }
                 }.awaitAll()
             }
 
-            fetched.forEach { (route, document) ->
+            children.forEach { document ->
                 document ?: return@forEach
-                val items = parseBrowseItems(document, route)
-                    .distinctBy { cleanUrl(it.url) }
-                if (items.isNotEmpty()) {
-                    storeCatalog(route, items)
+                document.select("loc").forEach { element ->
+                    val url = element.text().trim()
+                    if (url.isBlank()) return@forEach
+                    val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
+                    if (isSearchContentPath(path)) {
+                        direct += normalizePathForSearch(path)
+                    }
                 }
             }
+
+            val result = direct.toList()
+            synchronized(sitemapPathCache) {
+                sitemapPathCache.clear()
+                sitemapPathCache.addAll(result)
+            }
+            sitemapCacheAt = lockedNow
+            result
         }
     }
 
@@ -436,10 +747,7 @@ class Zoryva : MainAPI() {
     ): List<SiteItem> {
         val result = linkedMapOf<String, SiteItem>()
 
-        /*
-         * The website is a Next.js application. We therefore avoid depending
-         * on one generated CSS class and instead look for canonical media links.
-         */
+        /* Standard SSR/DOM links. */
         document.select("a[href]").forEach { anchor ->
             val rawHref = anchor.attr("href").trim()
             val absolute = normalizeExtractedUrl(rawHref, baseUrl) ?: return@forEach
@@ -456,69 +764,112 @@ class Zoryva : MainAPI() {
                 .ifBlank { titleFromPath(path) }
                 .ifBlank { return@forEach }
 
-            val poster = extractCardPoster(anchor, baseUrl)
-            val key = cleanUrl(absolute)
-
             result.putIfAbsent(
-                key,
+                cleanUrl(absolute),
                 SiteItem(
                     title = title,
                     url = absolute,
-                    poster = poster,
+                    poster = extractCardPoster(anchor, baseUrl),
                     type = type
                 )
             )
         }
 
-        if (result.isNotEmpty()) {
-            return result.values.toList()
-        }
+        /*
+         * Next.js client-rendered browse pages may contain no media anchors at
+         * all. The RSC payload can still expose canonical media objects.
+         */
+        val decoded = decodeRscForCatalog(document.html())
+        addDecodedRscMediaObjects(
+            decoded = decoded,
+            defaultRoute = baseUrl,
+            result = result
+        )
 
         /*
-         * Next.js Flight/RSC can carry canonical href strings even when a
-         * renderer changes the final DOM shape. Use a conservative fallback
-         * over the raw HTML so a future class-name/layout change does not make
-         * an entire Home section disappear.
+         * Some captured/escaped payloads contain literal markdown-wrapped
+         * hrefs. Accept those too, but always normalize them back to the real
+         * canonical Zoryva URL before emitting a result.
          */
         val html = document.html()
-        val hrefRegex = Regex("(?i)(?:href=\"|href=')((?:/|https?://)[^\"']+?/((?:movie)|(?:tv)|(?:anime))/[A-Za-z0-9_-]+(?:/[^\"']*)?)")
-        hrefRegex.findAll(html).forEach { match ->
-            val raw = match.groupValues[1]
-            val absolute = normalizeExtractedUrl(raw, baseUrl) ?: return@forEach
+        val markdownHrefRegex = Regex(
+            """(?i)href=\"\[/((?:movie|tv|anime)/[^\"\\]]+)\]\((https?://[^\)]+)\)\""""
+        )
+        markdownHrefRegex.findAll(html).forEach { match ->
+            val absolute = normalizeExtractedUrl(match.groupValues[2], baseUrl) ?: return@forEach
             val path = runCatching { URI(absolute).path.orEmpty() }.getOrDefault("")
             val type = when {
                 isMoviePath(path) -> TvType.Movie
-                isAnimePath(path) -> TvType.Anime
+                isAnimePath(path) && !isEpisodePath(path) -> TvType.Anime
                 isTvPath(path) && !isEpisodePath(path) -> TvType.TvSeries
                 else -> return@forEach
             }
-
             val nearby = html.substring(
                 maxOf(0, match.range.first - 1800),
                 minOf(html.length, match.range.last + 1800)
             )
-            val title = Regex("(?is)<img[^>]+(?:alt|title)=\"([^\"]+)\"|<img[^>]+(?:alt|title)='([^']+)'")
+            val title = Regex("(?is)(?:alt|title)=\\\"([^\\\"]+)\\\"")
                 .find(nearby)
-                ?.let { firstNonBlank(it.groupValues[1], it.groupValues[2]) }
+                ?.groupValues
+                ?.getOrNull(1)
                 ?.let(::cleanCardTitle)
                 .orEmpty()
                 .ifBlank { titleFromPath(path) }
 
-            if (title.isBlank()) return@forEach
-
-            val posterRaw = Regex("(?i)(?:src|data-src|data-lazy-src)=[\"']([^\"']+)[\"']")
-                .find(nearby)
-                ?.groupValues
-                ?.getOrNull(1)
-            val poster = normalizeExtractedUrl(posterRaw, baseUrl)
-
-            result.putIfAbsent(
-                cleanUrl(absolute),
-                SiteItem(title, absolute, poster, type)
-            )
+            if (title.isNotBlank()) {
+                result.putIfAbsent(
+                    cleanUrl(absolute),
+                    SiteItem(
+                        title = title,
+                        url = absolute,
+                        poster = null,
+                        type = type
+                    )
+                )
+            }
         }
 
         return result.values.toList()
+    }
+
+    private fun addDecodedRscMediaObjects(
+        decoded: String,
+        defaultRoute: String,
+        result: MutableMap<String, SiteItem>
+    ) {
+        val seenStarts = HashSet<Int>()
+        val marker = "\"mediaType\":\""
+        var searchStart = 0
+
+        while (true) {
+            val mediaTypeIndex = decoded.indexOf(marker, searchStart)
+            if (mediaTypeIndex < 0) break
+
+            val objectStart = decoded.lastIndexOf('{', mediaTypeIndex)
+            if (objectStart < 0 || !seenStarts.add(objectStart)) {
+                searchStart = mediaTypeIndex + marker.length
+                continue
+            }
+
+            val json = extractBalancedJson(decoded, objectStart, '{', '}')
+            if (json != null) {
+                val media = runCatching { JSONObject(json) }.getOrNull()
+                val typeHint = runCatching { URI(defaultRoute).path.orEmpty() }
+                    .getOrDefault("")
+                    .trim('/')
+                    .split('/')
+                    .firstOrNull()
+                    .orEmpty()
+                if (media != null) {
+                    val item = rscMediaToSiteItem(media, typeHint)
+                    if (item != null) {
+                        result.putIfAbsent(cleanUrl(item.url), item)
+                    }
+                }
+            }
+
+            searchStart = mediaTypeIndex + marker.length
+        }
     }
 
     private fun hasMoreBrowsePage(
