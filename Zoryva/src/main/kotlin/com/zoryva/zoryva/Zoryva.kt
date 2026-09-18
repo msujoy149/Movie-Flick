@@ -1,4 +1,4 @@
-package com.movieflick.zoryva
+package com.zoryva.zoryva
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -49,6 +49,18 @@ class Zoryva : MainAPI() {
         const val SOURCE_PROBE_TIMEOUT_MS = 7000L
         const val SERVER_PAGE_TIMEOUT_MS = 9000L
 
+        // Advanced search tuning. Normal searches should finish from the
+        // website's native search page; the heavier global fallback is used
+        // only when native search cannot produce a useful match.
+        const val SEARCH_RESULT_LIMIT = 50
+        const val SEARCH_NATIVE_TIMEOUT_MS = 4500L
+        const val SEARCH_FALLBACK_TIMEOUT_MS = 8500L
+        const val SEARCH_SITEMAP_LIMIT = 5000
+        const val SEARCH_SITEMAP_CHILD_LIMIT = 16
+        const val SEARCH_VERIFY_LIMIT = 8
+        const val STRONG_SEARCH_SCORE = 0.78
+        const val NORMAL_SEARCH_SCORE = 0.42
+
         const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13; Mobile) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -85,6 +97,13 @@ class Zoryva : MainAPI() {
             "featurette",
             "behind-the-scenes",
             "behind the scenes"
+        )
+
+        val SEARCH_METADATA_WORDS = setOf(
+            "movie", "movies", "film", "films", "series",
+            "season", "seasons", "episode", "episodes", "ep",
+            "hd", "hdtc", "web", "webdl", "webrip", "bluray",
+            "dual", "audio", "dub", "dublado", "sub"
         )
 
         val IGNORED_HOST_PARTS = listOf(
@@ -300,18 +319,307 @@ class Zoryva : MainAPI() {
     // ---------------------------------------------------------------------
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val q = query.trim()
-        if (q.isBlank()) return emptyList()
+        val original = query.trim()
+        if (original.isBlank()) return emptyList()
 
-        val encoded = URLEncoder.encode(q, "UTF-8")
-        val document = getDocument("$BASE_URL/search?q=$encoded")
-            ?: return emptyList()
+        /*
+         * SEARCH STRATEGY
+         *
+         * 1) Ask Zoryva's own /search route first. This is the fastest path
+         *    because the website itself already knows its live catalog.
+         * 2) Rank those real site results locally with exact, token, partial,
+         *    typo-tolerant and order-independent matching.
+         * 3) If native search cannot produce a useful match, retry a very small
+         *    set of normalized query variants concurrently.
+         * 4) Only when those still fail, use a lightweight sitemap fallback.
+         *    Sitemap entries are real Zoryva media URLs, not invented results.
+         *    The best fuzzy candidates are then verified against their actual
+         *    Zoryva detail pages so the emitted title/poster come from the site.
+         *
+         * No external catalog is used and no media URL is fabricated here.
+         */
+        val native = withTimeoutOrNull(SEARCH_NATIVE_TIMEOUT_MS) {
+            searchNative(original)
+        }
+
+        if (!native.isNullOrEmpty()) {
+            return native
+        }
+
+        return withTimeoutOrNull(SEARCH_FALLBACK_TIMEOUT_MS) {
+            searchFallback(original)
+        }.orEmpty()
+    }
+
+    private suspend fun searchNative(
+        original: String
+    ): List<SearchResponse> {
+        val exactUrl = buildSearchUrl(original)
+        val exactDocument = getDocument(exactUrl)
+
+        if (exactDocument != null) {
+            val exactItems = parseBrowseItems(exactDocument)
+                .distinctBy { cleanUrl(it.url) }
+            val ranked = rankSearchItems(original, exactItems)
+
+            /*
+             * Strong native matches are trusted immediately. This keeps normal
+             * searches fast and avoids unnecessary extra network requests.
+             */
+            if (ranked.any { it.second >= STRONG_SEARCH_SCORE }) {
+                return ranked
+                    .take(SEARCH_RESULT_LIMIT)
+                    .map { it.first.toSearchResponse() }
+            }
+
+            /*
+             * The site returned real results, even if the local scorer was not
+             * confident enough. Keep those results rather than manufacturing a
+             * fuzzy hit from unrelated pages.
+             */
+            if (exactItems.isNotEmpty()) {
+                val useful = ranked
+                    .filter { it.second >= NORMAL_SEARCH_SCORE }
+                    .take(SEARCH_RESULT_LIMIT)
+
+                if (useful.isNotEmpty()) {
+                    return useful.map { it.first.toSearchResponse() }
+                }
+            }
+        }
+
+        /*
+         * Small concurrent variant pass. These are normalization variants only;
+         * they are not a full-site crawl and therefore remain quick.
+         */
+        val variants = buildSearchVariants(original)
+            .drop(1)
+            .take(3)
+            .toList()
+
+        if (variants.isEmpty()) return emptyList()
+
+        val documents = coroutineScope {
+            variants.map { variant ->
+                async {
+                    getDocument(buildSearchUrl(variant))
+                }
+            }.awaitAll()
+        }
+
+        val merged = linkedMapOf<String, SiteItem>()
+        documents.forEach { document ->
+            document ?: return@forEach
+            parseBrowseItems(document).forEach { item ->
+                merged.putIfAbsent(cleanUrl(item.url), item)
+            }
+        }
+
+        val ranked = rankSearchItems(original, merged.values.toList())
+        if (ranked.isEmpty()) return emptyList()
+
+        return ranked
+            .take(SEARCH_RESULT_LIMIT)
+            .map { it.first.toSearchResponse() }
+    }
+
+    private suspend fun searchFallback(
+        original: String
+    ): List<SearchResponse> {
+        val paths = fetchSearchSitemapPaths()
+        if (paths.isEmpty()) return emptyList()
+
+        val rankedPaths = paths
+            .map { path ->
+                val titleGuess = titleFromPath(path)
+                path to searchScore(original, titleGuess)
+            }
+            .filter { it.second >= NORMAL_SEARCH_SCORE }
+            .sortedWith(
+                compareByDescending<Pair<String, Double>> { it.second }
+                    .thenBy { it.first }
+            )
+            .take(SEARCH_VERIFY_LIMIT * 2)
+
+        if (rankedPaths.isEmpty()) return emptyList()
+
+        /*
+         * Verify the highest-confidence sitemap candidates against their real
+         * Zoryva detail pages. This prevents a fuzzy slug-only match from being
+         * returned unless the actual page exists and exposes a usable title.
+         */
+        val verified = coroutineScope {
+            rankedPaths.map { (path, score) ->
+                async {
+                    val item = verifySitemapCandidate(path)
+                    if (item == null) null else item to score
+                }
+            }.awaitAll().filterNotNull()
+        }
+
+        return verified
+            .sortedWith(
+                compareByDescending<Pair<SiteItem, Double>> { pair ->
+                    /* Re-score against the verified title for better ordering. */
+                    maxOf(pair.second, searchScore(original, pair.first.title))
+                }.thenBy { pair ->
+                    pair.first.title.lowercase(Locale.ROOT)
+                }
+            )
+            .take(SEARCH_RESULT_LIMIT)
+            .map { it.first.toSearchResponse() }
+    }
+
+    private fun buildSearchUrl(
+        query: String
+    ): String {
+        return "$BASE_URL/search?q=${encode(query)}"
+    }
+
+    private fun rankSearchItems(
+        original: String,
+        items: List<SiteItem>
+    ): List<Pair<SiteItem, Double>> {
+        return items
+            .map { item ->
+                item to searchScore(original, item.title)
+            }
+            .filter { it.second >= NORMAL_SEARCH_SCORE }
+            .sortedWith(
+                compareByDescending<Pair<SiteItem, Double>> { it.second }
+                    .thenBy { it.first.title.lowercase(Locale.ROOT) }
+            )
+    }
+
+    private suspend fun fetchSearchSitemapPaths(): List<String> {
+        val roots = listOf(
+            "$BASE_URL/sitemap.xml",
+            "$BASE_URL/sitemap_index.xml",
+            "$BASE_URL/sitemap-index.xml"
+        )
+
+        var indexDocument: Document? = null
+        for (root in roots) {
+            val document = getDocument(root) ?: continue
+            if (document.select("loc").isNotEmpty()) {
+                indexDocument = document
+                break
+            }
+        }
+
+        val document = indexDocument ?: return emptyList()
+        val locs = document.select("loc")
+            .mapNotNull { it.text().trim().takeIf(String::isNotBlank) }
+
+        val directPaths = linkedSetOf<String>()
+        val childSitemaps = ArrayList<String>()
+
+        for (loc in locs) {
+            val path = runCatching {
+                URI(loc).path.orEmpty()
+            }.getOrDefault("")
+
+            if (isSearchContentPath(path)) {
+                directPaths += normalizePathForSearch(path)
+            } else if (
+                path.endsWith(".xml", true) ||
+                    path.contains("sitemap", true)
+            ) {
+                childSitemaps += cleanUrl(loc)
+            }
+        }
+
+        if (directPaths.size >= SEARCH_SITEMAP_LIMIT || childSitemaps.isEmpty()) {
+            return directPaths.take(SEARCH_SITEMAP_LIMIT)
+        }
+
+        val children = childSitemaps
+            .distinct()
+            .take(SEARCH_SITEMAP_CHILD_LIMIT)
+
+        val childDocuments = coroutineScope {
+            children.map { child ->
+                async { getDocument(child) }
+            }.awaitAll()
+        }
+
+        childDocuments.forEach { child ->
+            child ?: return@forEach
+            child.select("loc").forEach { loc ->
+                val value = loc.text().trim()
+                if (value.isBlank()) return@forEach
+
+                val path = runCatching {
+                    URI(value).path.orEmpty()
+                }.getOrDefault("")
+
+                if (isSearchContentPath(path)) {
+                    directPaths += normalizePathForSearch(path)
+                }
+            }
+        }
+
+        return directPaths.take(SEARCH_SITEMAP_LIMIT)
+    }
+
+    private suspend fun verifySitemapCandidate(
+        path: String
+    ): SiteItem? {
+        val url = "$BASE_URL${normalizePathForSearch(path)}"
+        val document = getDocument(url) ?: return null
 
         val parsed = parseBrowseItems(document)
-            .sortedByDescending { searchScore(q, it.title) }
-            .take(MAX_SEARCH_ITEMS)
+            .firstOrNull { cleanUrl(it.url) == cleanUrl(url) }
+            ?: run {
+                parseDetail(document, url)?.let { info ->
+                    SiteItem(
+                        title = info.title,
+                        url = url,
+                        poster = info.poster,
+                        type = info.type
+                    )
+                }
+            }
 
-        return parsed.map { it.toSearchResponse() }
+        return parsed ?: run {
+            val title = firstNonBlank(
+                extractMeta(document, "property=og:title"),
+                document.selectFirst("h1")?.text(),
+                document.title()
+            )?.let(::cleanDetailTitle)
+                ?.takeIf { it.isNotBlank() }
+                ?: return null
+
+            SiteItem(
+                title = title,
+                url = url,
+                poster = firstNonBlank(
+                    extractMeta(document, "property=og:image"),
+                    extractMeta(document, "name=twitter:image")
+                ),
+                type = typeFromContentPath(path)
+            )
+        }
+    }
+
+    private fun buildSearchVariants(
+        query: String
+    ): LinkedHashSet<String> {
+        val normalized = normalizeSearch(query)
+        val compact = normalized.replace(" ", "")
+        val reduced = normalized
+            .split(' ')
+            .filterNot {
+                it in SEARCH_METADATA_WORDS
+            }
+            .joinToString(" ")
+
+        return linkedSetOf<String>().apply {
+            add(query)
+            if (normalized.isNotBlank()) add(normalized)
+            if (reduced.isNotBlank()) add(reduced)
+            if (compact.isNotBlank()) add(compact)
+        }
     }
 
     private fun searchScore(
@@ -321,26 +629,164 @@ class Zoryva : MainAPI() {
         val q = normalizeSearch(query)
         val t = normalizeSearch(title)
 
+        if (q.isBlank() || t.isBlank()) return 0.0
         if (q == t) return 1.0
-        if (t.contains(q)) return 0.95
+
+        var score = 0.0
+        val qCompact = q.replace(" ", "")
+        val tCompact = t.replace(" ", "")
+
+        if (t.contains(q)) {
+            val ratio = q.length.toDouble() / t.length.coerceAtLeast(1)
+            score = maxOf(score, 0.96 + minOf(0.04, ratio * 0.04))
+        }
+
+        if (qCompact.isNotBlank() && tCompact.contains(qCompact)) {
+            val ratio = qCompact.length.toDouble() /
+                tCompact.length.coerceAtLeast(1).toDouble()
+            score = maxOf(score, 0.88 + minOf(0.10, ratio * 0.10))
+        }
 
         val qTokens = q.split(' ').filter { it.length >= 2 }
         val tTokens = t.split(' ').filter { it.length >= 2 }
 
-        if (qTokens.isEmpty() || tTokens.isEmpty()) return 0.0
+        if (qTokens.isEmpty() || tTokens.isEmpty()) {
+            return maxOf(score, fullStringSimilarity(q, t))
+                .coerceIn(0.0, 1.0)
+        }
 
-        val tokenScore = qTokens.map { qt ->
+        val tokenScores = qTokens.map { qt ->
             tTokens.maxOfOrNull { tt ->
                 when {
-                    tt == qt -> 1.0
-                    tt.startsWith(qt) || qt.startsWith(tt) -> 0.92
-                    else -> similarity(qt, tt)
+                    qt == tt -> 1.0
+                    tt.startsWith(qt) || qt.startsWith(tt) -> 0.94
+                    tt.contains(qt) || qt.contains(tt) -> 0.90
+                    else -> tokenSimilarity(qt, tt)
                 }
             } ?: 0.0
-        }.average()
+        }
 
-        return tokenScore.coerceIn(0.0, 1.0)
+        val average = tokenScores.average()
+        score = maxOf(score, average * 0.94)
+
+        val covered = tokenScores.count { it >= 0.62 }
+        val coverage = covered.toDouble() / qTokens.size.toDouble()
+        score = maxOf(score, 0.45 + coverage * 0.50)
+
+        /* Reward order-independent adjacency of the main query words. */
+        val orderedQuery = qTokens.joinToString("")
+        val orderedTitle = tTokens.joinToString("")
+        if (orderedTitle.contains(orderedQuery)) {
+            score = maxOf(score, 0.91)
+        }
+
+        /* Acronym/initials support for titles such as "Game of Thrones". */
+        val initials = tTokens
+            .mapNotNull { it.firstOrNull() }
+            .joinToString("")
+        if (qCompact == initials || initials.startsWith(qCompact)) {
+            score = maxOf(score, 0.90)
+        }
+
+        val queryYear = Regex("\\b(19|20)\\d{2}\\b")
+            .find(q)
+            ?.value
+            ?.toIntOrNull()
+
+        if (queryYear != null) {
+            val titleYear = Regex("\\b(19|20)\\d{2}\\b")
+                .find(t)
+                ?.value
+                ?.toIntOrNull()
+
+            when {
+                titleYear == queryYear -> score = maxOf(score, 0.97)
+                titleYear != null -> score *= 0.92
+            }
+        }
+
+        return score.coerceIn(0.0, 1.0)
     }
+
+    private fun tokenSimilarity(
+        a: String,
+        b: String
+    ): Double {
+        if (a == b) return 1.0
+        if (a.isBlank() || b.isBlank()) return 0.0
+
+        val distance = levenshtein(a, b)
+        val longest = maxOf(a.length, b.length)
+        if (longest == 0) return 1.0
+
+        var result = 1.0 - distance.toDouble() / longest.toDouble()
+
+        /* One adjacent transposition is a very common human typo. */
+        if (result < 0.85 && a.length == b.length && a.length >= 2) {
+            var mismatch = -1
+            for (i in 0 until a.length) {
+                if (a[i] != b[i]) {
+                    mismatch = i
+                    break
+                }
+            }
+
+            if (
+                mismatch >= 0 &&
+                    mismatch + 1 < a.length &&
+                    a[mismatch] == b[mismatch + 1] &&
+                    a[mismatch + 1] == b[mismatch]
+            ) {
+                result = maxOf(result, 0.92)
+            }
+        }
+
+        return result.coerceIn(0.0, 1.0)
+    }
+
+    private fun fullStringSimilarity(
+        a: String,
+        b: String
+    ): Double {
+        if (a == b) return 1.0
+        if (a.isBlank() || b.isBlank()) return 0.0
+
+        val distance = levenshtein(a, b)
+        val longest = maxOf(a.length, b.length)
+        return if (longest == 0) {
+            1.0
+        } else {
+            1.0 - distance.toDouble() / longest.toDouble()
+        }
+    }
+
+    private fun typeFromContentPath(
+        path: String
+    ): TvType {
+        return when {
+            isAnimePath(path) -> TvType.Anime
+            isTvPath(path) -> TvType.TvSeries
+            else -> TvType.Movie
+        }
+    }
+
+    private fun isSearchContentPath(
+        path: String
+    ): Boolean {
+        if (path.isBlank()) return false
+        if (isEpisodePath(path)) return false
+        return isMoviePath(path) || isTvPath(path) || isAnimePath(path)
+    }
+
+    private fun normalizePathForSearch(
+        path: String
+    ): String {
+        val normalized = path.trim()
+            .removePrefix(BASE_URL)
+            .trim()
+        return if (normalized.startsWith("/")) normalized else "/$normalized"
+    }
+
 
     // ---------------------------------------------------------------------
     // DETAIL / EPISODES
@@ -369,24 +815,24 @@ class Zoryva : MainAPI() {
 
             TvType.Anime,
             TvType.TvSeries -> {
-                val episodes = info.episodes.map { episode ->
+                val episodes = info.episodes.map { ep ->
                     val episodeUrl = buildEpisodeUrl(
                         baseUrl = clean,
                         title = info.title,
-                        season = episode.season,
-                        episode = episode.episode
+                        season = ep.season,
+                        episode = ep.episode
                     )
 
                     newEpisode(
-                        if (episode.id.isNullOrBlank()) {
+                        if (ep.id.isNullOrBlank()) {
                             episodeUrl
                         } else {
-                            "$episodeUrl||${episode.id}"
+                            "$episodeUrl||${ep.id}"
                         }
                     ) {
-                        name = episode.name
-                        season = episode.season
-                        episode = episode.episode
+                        name = ep.name
+                        season = ep.season
+                        episode = ep.episode
                     }
                 }
 
@@ -618,7 +1064,6 @@ class Zoryva : MainAPI() {
         }
 
         val usable = results
-            .flatten()
             .filter { result -> result.sources.isNotEmpty() }
             .sortedBy { it.latencyMs }
 
