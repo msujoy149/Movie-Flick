@@ -417,7 +417,7 @@ class Zoryva : MainAPI() {
         if (firstKeys.isEmpty() || secondKeys.isEmpty()) return false
 
         val overlap = firstKeys.intersect(secondKeys).size
-        return overlap >= maxOf(1, minOf(firstKeys.size, secondKeys.size) * 0.75).toInt()
+        return overlap >= maxOf(1, (minOf(firstKeys.size, secondKeys.size) * 0.75).toInt())
     }
 
     private fun buildBrowseUrl(
