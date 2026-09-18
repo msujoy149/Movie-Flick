@@ -11,7 +11,6 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
-import android.util.Base64
 import java.util.Locale
 
 /**
@@ -1484,6 +1483,47 @@ class Zoryva : MainAPI() {
         }
     }
 
+    /**
+     * Small dependency-free URL-safe Base64 encoder.
+     *
+     * This deliberately avoids android.util.Base64 because the CloudStream
+     * build also validates Zoryva's cross-platform JAR.
+     */
+    private fun base64UrlNoPadding(input: ByteArray): String {
+        val alphabet =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        val output = StringBuilder(((input.size + 2) / 3) * 4)
+        var index = 0
+
+        while (index + 2 < input.size) {
+            val b0 = input[index].toInt() and 0xFF
+            val b1 = input[index + 1].toInt() and 0xFF
+            val b2 = input[index + 2].toInt() and 0xFF
+
+            output.append(alphabet[b0 ushr 2])
+            output.append(alphabet[((b0 and 0x03) shl 4) or (b1 ushr 4)])
+            output.append(alphabet[((b1 and 0x0F) shl 2) or (b2 ushr 6)])
+            output.append(alphabet[b2 and 0x3F])
+
+            index += 3
+        }
+
+        val remaining = input.size - index
+        if (remaining == 1) {
+            val b0 = input[index].toInt() and 0xFF
+            output.append(alphabet[b0 ushr 2])
+            output.append(alphabet[(b0 and 0x03) shl 4])
+        } else if (remaining == 2) {
+            val b0 = input[index].toInt() and 0xFF
+            val b1 = input[index + 1].toInt() and 0xFF
+            output.append(alphabet[b0 ushr 2])
+            output.append(alphabet[((b0 and 0x03) shl 4) or (b1 ushr 4)])
+            output.append(alphabet[(b1 and 0x0F) shl 2])
+        }
+
+        return output.toString()
+    }
+
     private fun buildZoryvaProxyUrl(
         sourceUrl: String,
         referer: String,
@@ -1500,9 +1540,8 @@ class Zoryva : MainAPI() {
             .put("Accept-Language", "en-US,en;q=0.9")
             .toString()
 
-        val h = Base64.encodeToString(
-            headersJson.toByteArray(Charsets.UTF_8),
-            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+        val h = base64UrlNoPadding(
+            headersJson.toByteArray(Charsets.UTF_8)
         )
 
         return buildString {
