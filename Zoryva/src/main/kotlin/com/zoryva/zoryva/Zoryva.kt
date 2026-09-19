@@ -2055,6 +2055,22 @@ class Zoryva : MainAPI() {
             }
         }
 
+        /*
+         * Always include Zoryva's own embedded-player route as a fresh fallback.
+         * This mirrors the website's browser flow instead of relying only on
+         * server buttons that may be populated dynamically by JavaScript.
+         */
+        buildZoryvaEmbedUrls(playbackContext).forEach { embedUrl ->
+            targetMap.putIfAbsent(
+                embedUrl,
+                VidrockServerTarget(
+                    url = embedUrl,
+                    name = "Zoryva Embedded Player",
+                    referer = pageUrl
+                )
+            )
+        }
+
         vidrock.servers.forEach { target ->
             targetMap.putIfAbsent(cleanUrl(target.url), target)
         }
@@ -2324,6 +2340,27 @@ class Zoryva : MainAPI() {
             season = null,
             episode = null
         )
+    }
+
+    private fun buildZoryvaEmbedUrls(
+        context: PlaybackContext?
+    ): List<String> {
+        context ?: return emptyList()
+
+        val type = if (context.type.equals("movie", true)) "movie" else "tv"
+        val base = "$BASE_URL/Api/Embedded"
+        val query = StringBuilder()
+            .append("?id=")
+            .append(URLEncoder.encode(context.tmdbId, "UTF-8"))
+            .append("&type=")
+            .append(URLEncoder.encode(type, "UTF-8"))
+
+        if (type == "tv" && context.season != null && context.episode != null) {
+            query.append("&season=").append(context.season)
+            query.append("&episode=").append(context.episode)
+        }
+
+        return listOf(base + query.toString())
     }
 
     private suspend fun resolveVidrock(
@@ -3456,20 +3493,14 @@ class Zoryva : MainAPI() {
                 }
 
                 if (head != null && head.code in 200..399) {
-                    val contentType = head.headers["Content-Type"].orEmpty()
-                    val acceptRanges = head.headers["Accept-Ranges"].orEmpty()
-                    val contentRange = head.headers["Content-Range"].orEmpty()
-
-                    val looksVideoType =
-                        contentType.startsWith("video/", true) ||
-                            contentType.startsWith("audio/", true) ||
-                            contentType.contains("mpegurl", true) ||
-                            contentType.contains("octet-stream", true)
-
-                    val hasRangeSupport =
-                        head.code == 206 ||
-                            acceptRanges.contains("bytes", true) ||
-                            contentRange.startsWith("bytes ", true)
+                    /*
+                     * NiceHttp exposes response headers through its own Headers
+                     * type. We intentionally do not depend on Map operators here.
+                     * The status code plus the URL shape is enough for this
+                     * lightweight capability check, while the ranged GET below
+                     * performs the second validation pass.
+                     */
+                    val hasRangeSupport = head.code == 206
 
                     val disguisedStaticReverie = clean.contains(
                         "staticreverie.site/",
@@ -3479,7 +3510,7 @@ class Zoryva : MainAPI() {
                         RegexOption.IGNORE_CASE
                     ).containsMatchIn(clean)
 
-                    if (looksVideoType || hasRangeSupport || disguisedStaticReverie) {
+                    if (hasRangeSupport || disguisedStaticReverie || MEDIA_EXTENSIONS.any { clean.contains(it, true) }) {
                         return true
                     }
                 }
@@ -3498,18 +3529,11 @@ class Zoryva : MainAPI() {
 
                 if (response.code !in 200..399) return false
 
-                val contentType = response.headers["Content-Type"].orEmpty()
-
-                val contentRange = response.headers["Content-Range"].orEmpty()
-
-                val looksVideoType =
-                    contentType.startsWith("video/", true) ||
-                        contentType.startsWith("audio/", true) ||
-                        contentType.contains("mpegurl", true) ||
-                        contentType.contains("octet-stream", true)
-
-                if (looksVideoType || response.code == 206) return true
-                if (contentRange.startsWith("bytes ", true)) return true
+                /*
+                 * Do not inspect NiceHttp.Headers with Map accessors here.
+                 * A 206 ranged response is a strong direct-media signal.
+                 */
+                if (response.code == 206) return true
 
                 val disguisedStaticReverie = clean.contains(
                     "staticreverie.site/",
