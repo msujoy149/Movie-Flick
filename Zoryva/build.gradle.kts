@@ -4,7 +4,8 @@ plugins {
     id("com.lagradost.cloudstream3.gradle")
 }
 
-version = 1
+// Version bumped so CloudStream does not keep the previous resolver build.
+version = 2
 
 cloudstream {
     description = "Zoryva CloudStream provider"
