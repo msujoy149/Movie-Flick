@@ -2330,6 +2330,10 @@ class Zoryva : MainAPI() {
         result["User-Agent"] = USER_AGENT
         result["Accept"] = ACCEPT
         result["Accept-Language"] = "en-US,en;q=0.9"
+        val sourceReferer = source.referer.trim()
+        if (sourceReferer.startsWith("http", true)) {
+            result["Referer"] = sourceReferer
+        }
         val sourceOrigin = source.origin.trim()
         if (sourceOrigin.startsWith("http", true)) {
             result["Origin"] = sourceOrigin
@@ -2444,9 +2448,9 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
-        val safeDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+        val pageDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        val mediaObject = extractInitialMediaObject(safeDocument)
+        val mediaObject = extractInitialMediaObject(pageDocument)
 
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
@@ -2518,9 +2522,9 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
-        val safeDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+        val pageDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        val mediaObject = extractInitialMediaObject(safeDocument)
+        val mediaObject = extractInitialMediaObject(pageDocument)
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
             "tv", "anime" -> "tv"
@@ -2674,20 +2678,26 @@ class Zoryva : MainAPI() {
                 else -> qualityFromUrl(clean, qualityHint.ifBlank { label })
             }
 
-            direct.putIfAbsent(
-                normalizeMediaIdentity(clean),
-                MediaCandidate(
-                    url = clean,
-                    referer = finalReferer,
-                    origin = finalOrigin,
-                    quality = quality,
-                    label = qualityHint.ifBlank { label },
-                    server = label.ifBlank { "Zoryva Extract" },
-                    latencyMs = 0L,
-                    isHlsMaster = false,
-                    audioLabel = ""
+            val variants = expandPeakstormHlsVariants(clean)
+            for (variant in variants) {
+                if (!isPlayableMedia(variant)) continue
+
+                val variantQuality = qualityFromUrl(variant, qualityHint.ifBlank { label })
+                direct.putIfAbsent(
+                    normalizeMediaIdentity(variant),
+                    MediaCandidate(
+                        url = variant,
+                        referer = finalReferer,
+                        origin = finalOrigin,
+                        quality = maxOf(quality, variantQuality),
+                        label = qualityHint.ifBlank { label },
+                        server = label.ifBlank { "Zoryva Extract" },
+                        latencyMs = 0L,
+                        isHlsMaster = false,
+                        audioLabel = ""
+                    )
                 )
-            )
+            }
         }
 
         fun addServer(
@@ -3952,7 +3962,7 @@ class Zoryva : MainAPI() {
         val clean = cleanUrl(candidate.url)
         if (clean.isBlank()) return false
 
-        val headers = mapOf(
+        val headers = linkedMapOf<String, String>(
             "User-Agent" to USER_AGENT,
             "Accept" to if (clean.contains(".m3u8", true)) {
                 "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
@@ -3960,11 +3970,16 @@ class Zoryva : MainAPI() {
                 ACCEPT
             },
             "Accept-Language" to "en-US,en;q=0.9",
-            "Referer" to candidate.referer,
-            "Origin" to candidate.origin,
             "Cache-Control" to "no-cache",
             "Pragma" to "no-cache"
         )
+
+        candidate.referer.takeIf { it.startsWith("http", true) }?.let {
+            headers["Referer"] = it
+        }
+        candidate.origin.takeIf { it.startsWith("http", true) }?.let {
+            headers["Origin"] = it
+        }
 
         return try {
             if (clean.contains(".m3u8", true)) {
@@ -5021,11 +5036,49 @@ class Zoryva : MainAPI() {
         url: String,
         currentReferer: String
     ): String {
-        return if (url.contains("peakstorm.top/", true)) {
-            "https://speedracelight.com/"
-        } else {
-            currentReferer.ifBlank { "$BASE_URL/" }
+        return when {
+            url.contains("sun.peakstorm.top/", true) ->
+                "https://speedracelight.com/"
+
+            url.contains("moon.peakstorm.top/vd/", true) ->
+                currentReferer.takeUnless { it.equals("$BASE_URL/", true) }
+                    .orEmpty()
+
+            url.contains("peakstorm.top/", true) ->
+                "https://speedracelight.com/"
+
+            else ->
+                currentReferer.ifBlank { "$BASE_URL/" }
         }
+    }
+
+    private fun expandPeakstormHlsVariants(
+        url: String
+    ): List<String> {
+        val clean = cleanUrl(url)
+        if (!clean.contains("moon.peakstorm.top/vd/", true)) {
+            return listOf(clean)
+        }
+
+        val marker = Regex(
+            """(?i)(.*?/)(index-s)(360|480|720|1080|1440|2160)(p-v1-a1\.m3u8)(?:\?.*)?$"""
+        ).find(clean) ?: return listOf(clean)
+
+        val prefix = marker.groupValues[1]
+        val middle = marker.groupValues[2]
+        val suffix = marker.groupValues[4]
+        val query = Regex("""\?.*$""").find(clean)?.value.orEmpty()
+
+        return listOf(
+            2160,
+            1440,
+            1080,
+            720,
+            480,
+            360
+        ).map { height ->
+            "$prefix$middle${height}$suffix$query"
+        }.distinct()
     }
 
     private fun buildPlaybackOutput(
