@@ -5,7 +5,7 @@ plugins {
 }
 
 // Version bumped so CloudStream does not keep the previous resolver build.
-version = 2
+version = 3
 
 cloudstream {
     description = "Zoryva CloudStream provider"
