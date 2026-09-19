@@ -73,8 +73,8 @@ class Zoryva : MainAPI() {
         const val VIDROCK_SCRIPT_TIMEOUT_MS = 3500L
         const val VIDROCK_SCRIPT_LIMIT = 18
         const val VIDROCK_MAX_SERVERS = 12
-        const val ZORYVA_EXTRACT_TIMEOUT_MS = 9000L
-        const val ZORYVA_SCRAPED_TIMEOUT_MS = 6000L
+        const val ZORYVA_EXTRACT_TIMEOUT_MS = 15000L
+        const val ZORYVA_SCRAPED_TIMEOUT_MS = 7000L
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
         const val MAX_EMITTED_FALLBACKS = 8
@@ -2030,17 +2030,58 @@ class Zoryva : MainAPI() {
          * Every CloudStream Play action performs a new request here. No
          * signed/tokenized media URL is cached between Play actions.
          */
-        val directPage = withTimeoutOrNull(6500L) {
-            getDocument(pageUrl)
+        /*
+         * Do not wait for the HTML detail page before starting playback
+         * extraction. The browser's /api/extract call can take several seconds
+         * (the captured Spider-Man request took about 9.4s), so serializing a
+         * page fetch first and then putting the API call under another short
+         * timeout can cancel the real extraction before it returns.
+         *
+         * Start both operations in parallel. The extract resolver can use the
+         * URL slug immediately, and if that is not sufficient we retry with the
+         * exact metadata from the detail page that finished in parallel.
+         */
+        val (initialExtract, directPage) = coroutineScope {
+            val extractJob = async {
+                withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
+                    resolveZoryvaExtract(
+                        document = null,
+                        pageUrl = pageUrl,
+                        context = playbackContext,
+                        preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
+                        allowSoftFallback = false
+                    )
+                }
+            }
+
+            val pageJob = async {
+                withTimeoutOrNull(5000L) {
+                    getDocument(pageUrl)
+                }
+            }
+
+            extractJob.await() to pageJob.await()
         }
 
-        val extractResolution = withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
-            resolveZoryvaExtract(
-                document = directPage,
-                pageUrl = pageUrl,
-                context = playbackContext
-            )
-        } ?: ZoryvaExtractResolution(emptyList(), emptyList())
+        var extractResolution =
+            initialExtract ?: ZoryvaExtractResolution(emptyList(), emptyList())
+
+        /*
+         * If the slug-only request was not accepted or returned no usable
+         * source, use the exact title/IMDb/runtime metadata from the fresh
+         * Zoryva page and try /api/extract once more.
+         */
+        if (extractResolution.directSources.isEmpty() && directPage != null) {
+            extractResolution = withTimeoutOrNull(15000L) {
+                resolveZoryvaExtract(
+                    document = directPage,
+                    pageUrl = pageUrl,
+                    context = playbackContext,
+                    preferredTitle = null,
+                    allowSoftFallback = true
+                )
+            } ?: extractResolution
+        }
 
         /*
          * When the website explicitly says a source is OK, do not throw it
@@ -2484,7 +2525,9 @@ class Zoryva : MainAPI() {
     private suspend fun resolveZoryvaExtract(
         document: Document?,
         pageUrl: String,
-        context: PlaybackContext?
+        context: PlaybackContext?,
+        preferredTitle: String? = null,
+        allowSoftFallback: Boolean = true
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
@@ -2499,6 +2542,7 @@ class Zoryva : MainAPI() {
         val title = firstNonBlank(
             mediaObject?.optString("title"),
             document?.selectFirst("h1")?.text(),
+            preferredTitle,
             titleFromPath(URI(pageUrl).path.orEmpty())
         ).orEmpty()
 
@@ -2549,10 +2593,12 @@ class Zoryva : MainAPI() {
             includeSoft = true
         )
 
-        val endpoints = listOf(
-            "$BASE_URL/api/extract?$exactQuery",
-            "$BASE_URL/api/extract?$softQuery"
-        ).distinct()
+        val endpoints = buildList {
+            add("$BASE_URL/api/extract?$exactQuery")
+            if (allowSoftFallback) {
+                add("$BASE_URL/api/extract?$softQuery")
+            }
+        }.distinct()
 
         for (endpoint in endpoints) {
             val response = withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
@@ -2756,8 +2802,9 @@ class Zoryva : MainAPI() {
             val finalReferer = if (clean.contains("peakstorm.top/", true)) {
                 firstNonBlank(
                     extractProxyParameter(clean0, "referer"),
-                    sourceReferer
-                ).orEmpty().ifBlank { "https://speedracelight.com/" }
+                    sourceReferer.takeUnless { it.contains("zoryva.me", true) },
+                    "https://speedracelight.com/"
+                ).orEmpty()
             } else {
                 sourceReferer.ifBlank { referer }
             }
@@ -2765,8 +2812,9 @@ class Zoryva : MainAPI() {
             val finalOrigin = if (clean.contains("peakstorm.top/", true)) {
                 firstNonBlank(
                     extractProxyParameter(clean0, "origin"),
-                    sourceOrigin
-                ).orEmpty().ifBlank { originOf(finalReferer) }
+                    sourceOrigin.takeUnless { it.contains("zoryva.me", true) },
+                    originOf(finalReferer)
+                ).orEmpty()
             } else {
                 sourceOrigin.ifBlank { originOf(finalReferer) }
             }
@@ -2832,15 +2880,35 @@ class Zoryva : MainAPI() {
         ) {
             when (value) {
                 is JSONObject -> {
+                    fun nestedHeader(vararg wanted: String): String? {
+                        val keys = value.keys()
+                        while (keys.hasNext()) {
+                            val key = keys.next()
+                            if (!key.equals("headers", true)) continue
+                            val headerObject = value.optJSONObject(key) ?: continue
+                            val headerKeys = headerObject.keys()
+                            while (headerKeys.hasNext()) {
+                                val headerKey = headerKeys.next()
+                                if (wanted.any { headerKey.equals(it, true) }) {
+                                    return headerObject.optString(headerKey).trim()
+                                        .takeIf { it.isNotBlank() }
+                                }
+                            }
+                        }
+                        return null
+                    }
+
                     val objectReferer = firstNonBlank(
                         value.optString("referer"),
                         value.optString("referrer"),
-                        value.optString("httpReferer")
+                        value.optString("httpReferer"),
+                        nestedHeader("Referer", "Referrer", "httpReferer")
                     ).orEmpty().ifBlank { parentReferer }
 
                     val objectOrigin = firstNonBlank(
                         value.optString("origin"),
-                        value.optString("httpOrigin")
+                        value.optString("httpOrigin"),
+                        nestedHeader("Origin", "httpOrigin")
                     ).orEmpty().ifBlank { parentOrigin }
 
                     val objectLabel = firstNonBlank(
