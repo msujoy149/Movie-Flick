@@ -1827,8 +1827,7 @@ class Zoryva : MainAPI() {
         } else {
             mergeEpisodeMetadata(
                 embedded = parseEpisodes(mediaObject),
-                linked = parseEpisodeLinks(document, pageUrl),
-                generated = emptyList()
+                linked = parseEpisodeLinks(document, pageUrl)
             )
         }
 
@@ -1924,8 +1923,7 @@ class Zoryva : MainAPI() {
 
     private fun mergeEpisodeMetadata(
         embedded: List<EpisodeInfo>,
-        linked: List<EpisodeInfo>,
-        generated: List<EpisodeInfo>
+        linked: List<EpisodeInfo>
     ): List<EpisodeInfo> {
         val result = linkedMapOf<String, EpisodeInfo>()
 
@@ -1943,7 +1941,6 @@ class Zoryva : MainAPI() {
 
         linked.forEach(::add)
         embedded.forEach(::add)
-        generated.forEach(::add)
 
         return result.values
             .sortedWith(compareBy<EpisodeInfo> { it.season }.thenBy { it.episode })
@@ -2039,13 +2036,23 @@ class Zoryva : MainAPI() {
                         pageUrl = pageUrl,
                         context = playbackContext,
                         preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
-                        allowSoftFallback = false
+                        allowSoftFallback = false,
+                        episodeId = episodeId
                     )
                 }
             }
 
             val pageJob = async {
-                withTimeoutOrNull(5000L) {
+                val timeout = if (
+                    playbackContext.season != null &&
+                    playbackContext.episode != null
+                ) {
+                    12000L
+                } else {
+                    7000L
+                }
+
+                withTimeoutOrNull(timeout) {
                     getDocument(pageUrl)
                 }
             }
@@ -2068,7 +2075,8 @@ class Zoryva : MainAPI() {
                     pageUrl = pageUrl,
                     context = playbackContext,
                     preferredTitle = null,
-                    allowSoftFallback = true
+                    allowSoftFallback = true,
+                    episodeId = episodeId
                 )
             } ?: extractResolution
         }
@@ -2117,7 +2125,7 @@ class Zoryva : MainAPI() {
                                     isHls = true,
                                     audioTracks = mergeAudioTrackCandidates(
                                         source.audioTracks,
-                                        emptyList()
+                                        hlsInfo.audioTracks
                                     )
                                 )
                             } else {
@@ -2173,7 +2181,13 @@ class Zoryva : MainAPI() {
              * 2160/1440/1080/720/480/etc sources when Zoryva actually returned
              * those URLs.
              */
-            val audioTrackPool = extractResolution.audioTracks
+            val hlsAudioTrackPool = checks
+                .flatMap { it.hls?.audioTracks.orEmpty() }
+
+            val audioTrackPool = mergeAudioTrackCandidates(
+                extractResolution.audioTracks,
+                hlsAudioTrackPool
+            )
 
             val enrichedChecks = checks.map { check ->
                 if (audioTrackPool.isEmpty()) {
@@ -2484,7 +2498,33 @@ class Zoryva : MainAPI() {
         val emitted = linkedSetOf<String>()
         val subtitleSeen = linkedSetOf<String>()
 
-        for ((server, source) in usable) {
+        for ((server, rawSource) in usable) {
+            val source = if (
+                rawSource.isHls ||
+                looksLikeHlsUrl(rawSource.url)
+            ) {
+                val hls = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                    inspectHls(rawSource)
+                }
+
+                if (hls != null) {
+                    rawSource.copy(
+                        quality = maxOf(rawSource.quality, hls.maxQuality),
+                        isHlsMaster = hls.isMaster,
+                        audioLabel = hls.audioLabel,
+                        isHls = true,
+                        audioTracks = mergeAudioTrackCandidates(
+                            rawSource.audioTracks,
+                            hls.audioTracks
+                        )
+                    )
+                } else {
+                    rawSource
+                }
+            } else {
+                rawSource
+            }
+
             for ((language, subtitleUrl) in server.subtitles) {
                 val key = "$language|$subtitleUrl"
                 if (subtitleSeen.add(key)) {
@@ -2528,6 +2568,40 @@ class Zoryva : MainAPI() {
         ) {
             try {
                 val audioFile = newAudioFile(track.url)
+
+                /*
+                 * AudioFile is deliberately created through CloudStream's
+                 * supported factory. Some CloudStream builds expose optional
+                 * metadata/header properties while others keep the model lean.
+                 * We therefore attach only what the concrete runtime object
+                 * actually exposes, without hard-coding a constructor.
+                 */
+                val runtimeClass = audioFile::class.java
+
+                runCatching {
+                    val labelField = runtimeClass.declaredFields.firstOrNull {
+                        it.name.equals("name", true) ||
+                            it.name.equals("label", true) ||
+                            it.name.equals("language", true)
+                    }
+
+                    if (labelField != null && track.label.isNotBlank()) {
+                        labelField.isAccessible = true
+                        runCatching { labelField.set(audioFile, track.label) }
+                    }
+                }
+
+                runCatching {
+                    val headersField = runtimeClass.declaredFields.firstOrNull {
+                        it.name.equals("headers", true)
+                    }
+
+                    if (headersField != null && track.headers.isNotEmpty()) {
+                        headersField.isAccessible = true
+                        runCatching { headersField.set(audioFile, track.headers) }
+                    }
+                }
+
                 if (audioFiles.none { it.url == audioFile.url }) {
                     audioFiles.add(audioFile)
                 }
@@ -2767,7 +2841,8 @@ class Zoryva : MainAPI() {
         pageUrl: String,
         context: PlaybackContext?,
         preferredTitle: String? = null,
-        allowSoftFallback: Boolean = true
+        allowSoftFallback: Boolean = true,
+        episodeId: String? = null
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
@@ -2775,7 +2850,8 @@ class Zoryva : MainAPI() {
 
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
-            "tv", "anime" -> "tv"
+            "tv" -> "tv"
+            "anime" -> "anime"
             else -> return ZoryvaExtractResolution(emptyList(), emptyList())
         }
 
@@ -2837,19 +2913,57 @@ class Zoryva : MainAPI() {
             add("$BASE_URL/api/extract?$exactQuery")
 
             if (
-                mediaType == "tv" &&
                 context.season != null &&
                 context.episode != null
             ) {
-                val minimalTvQuery = buildString {
-                    append("mediaType=tv")
+                /*
+                 * The website embeds a real episode id such as s161571-e1.
+                 * Pass it as an additional bounded attempt so an extractor that
+                 * indexes episodes independently can resolve the exact episode.
+                 */
+                if (!episodeId.isNullOrBlank()) {
+                    add(
+                        "$BASE_URL/api/extract?" +
+                            exactQuery +
+                            "&episodeId=" +
+                            encode(episodeId)
+                    )
+                }
+
+                /*
+                 * ID-only compatibility request. Keep the real section type
+                 * for Anime; a TV retry is still retained because some backend
+                 * deployments store anime/TV under the same resolver.
+                 */
+                val minimalQuery = buildString {
+                    append("mediaType=").append(mediaType)
                     append("&externalId=").append(encode(context.tmdbId))
                     append("&season=").append(context.season)
                     append("&episode=").append(context.episode)
+                    if (!episodeId.isNullOrBlank()) {
+                        append("&episodeId=").append(encode(episodeId))
+                    }
                 }
-                add("$BASE_URL/api/extract?$minimalTvQuery")
+                add("$BASE_URL/api/extract?$minimalQuery")
+
+                if (mediaType != "tv") {
+                    val tvCompatibilityQuery = buildString {
+                        append("mediaType=tv")
+                        append("&externalId=").append(encode(context.tmdbId))
+                        append("&season=").append(context.season)
+                        append("&episode=").append(context.episode)
+                        if (!episodeId.isNullOrBlank()) {
+                            append("&episodeId=").append(encode(episodeId))
+                        }
+                    }
+                    add("$BASE_URL/api/extract?$tvCompatibilityQuery")
+                }
             }
 
+            /*
+             * The soft retry remains last so the normal exact request always
+             * wins when it returns the website's structured source list.
+             */
             if (allowSoftFallback) {
                 add("$BASE_URL/api/extract?$softQuery")
             }
@@ -2896,7 +3010,8 @@ class Zoryva : MainAPI() {
         val mediaObject = extractInitialMediaObject(pageDocument)
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
-            "tv", "anime" -> "tv"
+            "tv" -> "tv"
+            "anime" -> "anime"
             else -> return ZoryvaExtractResolution(emptyList(), emptyList())
         }
 
@@ -3008,11 +3123,31 @@ class Zoryva : MainAPI() {
         val subtitles = linkedMapOf<String, Pair<String, String>>()
         val audioTracks = linkedMapOf<String, AudioTrackCandidate>()
 
-        fun isSuccessfulStatus(value: String): Boolean {
+        fun isRejectedStatus(value: String): Boolean {
             val status = value.trim().lowercase(Locale.ROOT)
-            return status.isBlank() || status in setOf(
-                "ok", "ready", "available", "success", "working", "active"
+            if (status.isBlank()) return false
+
+            val explicitFailures = setOf(
+                "error",
+                "failed",
+                "failure",
+                "broken",
+                "disabled",
+                "offline",
+                "unavailable",
+                "no-sources",
+                "no_source",
+                "dead",
+                "invalid",
+                "rejected"
             )
+
+            return status in explicitFailures ||
+                status.contains("failed") ||
+                status.contains("error") ||
+                status.contains("broken") ||
+                status.contains("disabled") ||
+                status.contains("unavailable")
         }
 
         fun isSubtitleUrl(url: String): Boolean {
@@ -3248,8 +3383,13 @@ class Zoryva : MainAPI() {
 
                     val broken = value.optBoolean("broken", false)
                     val disabled = value.optBoolean("disabled", false)
-                    val statusOk = isSuccessfulStatus(value.optString("status"))
-                    val approved = parentApproved && !broken && !disabled && statusOk
+                    val rejected = isRejectedStatus(value.optString("status"))
+                    /*
+                     * Unknown/in-progress statuses must not veto a child object
+                     * that already contains an exact media URL. Only explicit
+                     * failure states propagate down the JSON tree.
+                     */
+                    val approved = parentApproved && !broken && !disabled && !rejected
 
                     val qualityHint = firstNonBlank(
                         value.optString("quality"),
