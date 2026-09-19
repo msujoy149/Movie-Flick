@@ -326,11 +326,11 @@
     },
     {
         "iconUrl": "https://zoryva.me/icon-512.png",
-        "jarFileSize": 839428,
-        "fileHash": "sha256-e2f810dac1d6f59a743c1c19e0b3400b5984a277264f8aca176e0e1ed57147e1",
+        "jarFileSize": 851950,
+        "fileHash": "sha256-dec39f056e036fc69e6d369f1995fa69d10d741a6f57d15dd6cf93cbbc89205b",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 165115,
+        "fileSize": 167720,
         "status": 1,
         "language": "hi",
         "authors": [
@@ -341,12 +341,12 @@
             "TvSeries",
             "Anime"
         ],
-        "version": 15,
+        "version": 16,
         "internalName": "Zoryva",
         "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.jar",
         "description": "Zoryva CloudStream provider",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.cs3",
         "name": "Zoryva",
-        "jarHash": "sha256-7149fee998b3c58ef4fa8fc5d70d9a4028aa7f96e9d18bc1a71f7bd7ca1812a6"
+        "jarHash": "sha256-c4d4921eea336231cdb1d8e600cd3c8134109a3b18864ea714266aee1dcc0dff"
     }
 ]
