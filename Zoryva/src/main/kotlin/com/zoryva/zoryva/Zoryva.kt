@@ -16,6 +16,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Locale
@@ -77,6 +78,7 @@ class Zoryva : MainAPI() {
         const val ZORYVA_SCRAPED_TIMEOUT_MS = 7000L
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
+        const val HLS_SEGMENT_PROBE_TIMEOUT_MS = 3000L
         const val MAX_EMITTED_FALLBACKS = 8
 
         // Advanced search tuning. Normal searches should finish from the
@@ -3724,9 +3726,9 @@ class Zoryva : MainAPI() {
             derived.addAll(previous.toList())
         }
 
-        val aesKey = derived.take(32).toByteArray()
+        val aesKey = ByteArray(32) { index -> derived[index] }
         val iv = ivOverride?.let(::base64DecodeAny)?.takeIf { it.size == 16 }
-            ?: derived.drop(32).take(16).toByteArray()
+            ?: ByteArray(16) { index -> derived[32 + index] }
 
         return runCatching {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
@@ -4285,11 +4287,23 @@ class Zoryva : MainAPI() {
                 } ?: return false
 
                 if (response.code !in 200..399) return false
-                if (!response.text.contains("#EXTM3U", true)) return false
 
-                hlsInfo != null ||
-                    response.text.contains("#EXTINF", true) ||
-                    response.text.contains("#EXT-X-STREAM-INF", true)
+                val manifest = response.text
+                if (!manifest.contains("#EXTM3U", true)) return false
+
+                /*
+                 * A manifest can return HTTP 200 while still being unusable by
+                 * CloudStream/Media3. In particular, some HLS providers expose
+                 * pseudo-segments ending in .html. CloudStream has a documented
+                 * 2004 failure mode for this pattern even when browser/VLC
+                 * playback succeeds. Validate the first actual child playlist /
+                 * segment instead of trusting the manifest status alone.
+                 */
+                isCloudStreamCompatibleHls(
+                    manifestUrl = clean,
+                    manifestBody = manifest,
+                    headers = headers
+                )
             } else {
                 val head = withTimeoutOrNull(PLAYABILITY_HEAD_TIMEOUT_MS) {
                     runCatching {
@@ -4385,6 +4399,125 @@ class Zoryva : MainAPI() {
         } catch (_: Throwable) {
             false
         }
+    }
+
+    private suspend fun isCloudStreamCompatibleHls(
+        manifestUrl: String,
+        manifestBody: String,
+        headers: Map<String, String>,
+        depth: Int = 0
+    ): Boolean {
+        if (depth > 2) return true
+
+        val manifestBaseUrl = extractProxyParameter(
+            manifestUrl,
+            "url"
+        )?.takeIf { it.startsWith("http", true) } ?: manifestUrl
+
+        val lines = manifestBody
+            .replace("\r", "")
+            .lines()
+            .map { it.trim() }
+
+        if (lines.none { it.isNotBlank() && !it.startsWith("#") }) {
+            return false
+        }
+
+        /*
+         * Master playlist:
+         * fetch one real child playlist and inspect that playlist's first
+         * media segment. This catches 200-OK master playlists whose child
+         * segments are rejected by Media3.
+         */
+        val variantUrl = lines
+            .asSequence()
+            .filter { it.isNotBlank() && !it.startsWith("#") }
+            .mapNotNull { absoluteUrlLocal(it, manifestBaseUrl) }
+            .firstOrNull { it.startsWith("http", true) }
+
+        val isMaster = manifestBody.contains("#EXT-X-STREAM-INF", true)
+
+        if (isMaster) {
+            variantUrl ?: return false
+
+            val variant = withTimeoutOrNull(PLAYABILITY_GET_TIMEOUT_MS) {
+                runCatching {
+                    app.get(
+                        variantUrl,
+                        headers = headers
+                    )
+                }.getOrNull()
+            } ?: return false
+
+            if (variant.code !in 200..399) return false
+            if (!variant.text.contains("#EXTM3U", true)) return false
+
+            return isCloudStreamCompatibleHls(
+                manifestUrl = variantUrl,
+                manifestBody = variant.text,
+                headers = headers,
+                depth = depth + 1
+            )
+        }
+
+        /*
+         * Media playlist:
+         * find the first media URI. CloudStream's known 2004 case uses
+         * pseudo-segment URLs ending in .html; reject those before they reach
+         * ExoPlayer because VLC/browser can accept them while Media3 cannot.
+         */
+        val segmentUrl = lines
+            .asSequence()
+            .filter { it.isNotBlank() && !it.startsWith("#") }
+            .mapNotNull { absoluteUrlLocal(it, manifestBaseUrl) }
+            .firstOrNull { it.startsWith("http", true) }
+
+        segmentUrl ?: return false
+
+        val segmentPath = runCatching {
+            URI(segmentUrl).path.orEmpty().lowercase(Locale.ROOT)
+        }.getOrDefault("")
+
+        val pseudoHtmlSegment =
+            segmentPath.endsWith(".html") ||
+                segmentPath.endsWith(".htm") ||
+                Regex(
+                    """/page-\d+\.html$""",
+                    RegexOption.IGNORE_CASE
+                ).containsMatchIn(segmentPath)
+
+        if (pseudoHtmlSegment) return false
+
+        /*
+         * Do a small HEAD check for the first normal media segment. A 4xx/5xx
+         * here means the manifest itself is not enough to make the link playable.
+         * HEAD is used intentionally so we do not download an actual segment.
+         *
+         * A server that does not implement HEAD is not rejected solely for that
+         * reason; the filename/manifest checks above remain authoritative.
+         */
+        val segmentHead = withTimeoutOrNull(HLS_SEGMENT_PROBE_TIMEOUT_MS) {
+            runCatching {
+                app.head(
+                    segmentUrl,
+                    headers = headers + ("Range" to "bytes=0-0")
+                )
+            }.getOrNull()
+        }
+
+        if (segmentHead != null) {
+            if (segmentHead.code in 400..599) return false
+
+            val contentType = segmentHead.headers["Content-Type"].orEmpty()
+            if (contentType.contains("text/html", true)) return false
+
+            val bodyLength = segmentHead.headers["Content-Length"]
+                ?.toLongOrNull()
+
+            if (bodyLength == 0L) return false
+        }
+
+        return true
     }
 
     private fun isSafePlaybackHeader(
@@ -4610,7 +4743,7 @@ class Zoryva : MainAPI() {
             ?: USER_AGENT
 
         val h = base64UrlNoPadding(
-            headersJson.toByteArray(Charsets.UTF_8)
+            headersJson.toString().toByteArray(Charsets.UTF_8)
         )
 
         return buildString {
@@ -5574,7 +5707,7 @@ class Zoryva : MainAPI() {
                 val pieces = part.split('=', limit = 2)
                 if (pieces.size != 2) return@firstNotNullOfOrNull null
                 if (!pieces[0].equals(name, true)) return@firstNotNullOfOrNull null
-                java.net.URLDecoder.decode(pieces[1], "UTF-8")
+                URLDecoder.decode(pieces[1], "UTF-8")
             }
         }.getOrNull()
     }
