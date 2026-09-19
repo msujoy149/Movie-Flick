@@ -2444,8 +2444,9 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+        val safeDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        val mediaObject = extractInitialMediaObject(document)
+        val mediaObject = extractInitialMediaObject(safeDocument)
 
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
@@ -2517,8 +2518,9 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+        val safeDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        val mediaObject = extractInitialMediaObject(document)
+        val mediaObject = extractInitialMediaObject(safeDocument)
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
             "tv", "anime" -> "tv"
