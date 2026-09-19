@@ -79,7 +79,7 @@ class Zoryva : MainAPI() {
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
         const val HLS_SEGMENT_PROBE_TIMEOUT_MS = 3000L
-        const val MAX_EMITTED_FALLBACKS = 8
+        const val MAX_EMITTED_FALLBACKS = 24
 
         // Advanced search tuning. Normal searches should finish from the
         // website's native search page; the heavier global fallback is used
@@ -2101,13 +2101,103 @@ class Zoryva : MainAPI() {
          * HTTP request made by CloudStream will return a usable response.
          * Media3 reports that situation as ERROR_CODE_IO_BAD_HTTP_STATUS (2004).
          *
-         * Validate every extracted candidate concurrently with the same safe
-         * headers that will be attached to the player link. For known Zoryva
-         * proxy-backed hosts, also validate the same-origin Zoryva proxy route.
-         * This lets a blocked 1080p URL be skipped in favor of a working 720p
-         * or proxy source instead of handing the player a known-bad URL first.
+         * Probe the exact extracted candidates with the same safe headers
+         * that will be attached to the player link. Probe results are used to
+         * order sources and prefer confirmed direct/proxy candidates; they do
+         * not erase the website's own status=ok sources when the probe is
+         * inconclusive.
          */
         if (extractResolution.directSources.isNotEmpty()) {
+            /*
+             * Inspect the exact API-returned HLS manifests first so we can
+             * recognize adaptive masters and their audio groups. Inspection is
+             * enrichment, not a hard gate: a CDN can legitimately behave
+             * differently for a small probe than for the real player request.
+             */
+            val checks = coroutineScope {
+                extractResolution.directSources
+                    .distinctBy { normalizeMediaIdentity(it.url) }
+                    .map { source ->
+                        async {
+                            val hlsInfo = if (source.url.contains(".m3u8", true)) {
+                                withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                                    inspectHls(source)
+                                }
+                            } else {
+                                null
+                            }
+
+                            val preparedSource = if (hlsInfo != null) {
+                                source.copy(
+                                    quality = maxOf(source.quality, hlsInfo.maxQuality),
+                                    isHlsMaster = hlsInfo.isMaster,
+                                    audioLabel = hlsInfo.audioLabel
+                                )
+                            } else {
+                                source
+                            }
+
+                            val directPlayable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                                probeSource(preparedSource, hlsInfo)
+                            } ?: false
+
+                            /*
+                             * Only create/probe a proxy candidate when the
+                             * direct request is not confirmed. This keeps normal
+                             * Play fast and still gives blocked CDN sources a
+                             * same-origin fallback.
+                             */
+                            val proxyCandidate = if (
+                                !directPlayable &&
+                                requiresZoryvaProxy(preparedSource.url)
+                            ) {
+                                buildZoryvaProxyCandidate(
+                                    source = preparedSource,
+                                    pageUrl = pageUrl
+                                )
+                            } else {
+                                null
+                            }
+
+                            val proxyPlayable = if (proxyCandidate != null) {
+                                withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                                    probeSource(proxyCandidate, null)
+                                } ?: false
+                            } else {
+                                false
+                            }
+
+                            PrimarySourceCheck(
+                                source = preparedSource,
+                                directPlayable = directPlayable,
+                                proxy = proxyCandidate,
+                                proxyPlayable = proxyPlayable
+                            )
+                        }
+                    }
+                    .awaitAll()
+            }
+
+            /*
+             * The site's HLS master is the best representation for adaptive
+             * resolution and embedded multi-audio/subtitle groups. Keep it ahead
+             * of fixed-resolution children, while still exposing exact
+             * 2160/1440/1080/720/480/etc sources when Zoryva actually returned
+             * those URLs.
+             */
+            val orderedChecks = checks.sortedWith(
+                compareByDescending<PrimarySourceCheck> { it.directPlayable }
+                    .thenByDescending { it.proxyPlayable }
+                    .thenByDescending { it.source.isHlsMaster }
+                    .thenByDescending { it.source.audioLabel.isNotBlank() }
+                    .thenByDescending { it.source.quality }
+                    .thenBy { it.source.label.lowercase(Locale.ROOT) }
+                    .thenBy { it.source.url }
+            )
+
+            val emittedKeys = linkedSetOf<String>()
+            var emitted = 0
+
             val seenSubtitle = linkedSetOf<String>()
             extractResolution.subtitles.forEach { (language, url) ->
                 val key = "$language|$url"
@@ -2116,52 +2206,10 @@ class Zoryva : MainAPI() {
                 }
             }
 
-            val ordered = extractResolution.directSources
-                .distinctBy { normalizeMediaIdentity(it.url) }
-                .sortedWith(
-                    compareByDescending<MediaCandidate> { it.quality }
-                        .thenBy { it.label.lowercase(Locale.ROOT) }
-                        .thenBy { it.url }
-                )
-
-            val checks = coroutineScope {
-                ordered.map { source ->
-                    async {
-                        val directPlayable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                            probeSource(source, null)
-                        } ?: false
-
-                        val proxyCandidate = if (requiresZoryvaProxy(source.url)) {
-                            buildZoryvaProxyCandidate(
-                                source = source,
-                                pageUrl = pageUrl
-                            )
-                        } else {
-                            null
-                        }
-
-                        val proxyPlayable = if (proxyCandidate != null) {
-                            withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                                probeSource(proxyCandidate, null)
-                            } ?: false
-                        } else {
-                            false
-                        }
-
-                        PrimarySourceCheck(
-                            source = source,
-                            directPlayable = directPlayable,
-                            proxy = proxyCandidate,
-                            proxyPlayable = proxyPlayable
-                        )
-                    }
-                }.awaitAll()
-            }
-
-            val emittedKeys = linkedSetOf<String>()
-            var emitted = 0
-
-            for (check in checks) {
+            /*
+             * Pass 1: emit all sources confirmed by the bounded probe.
+             */
+            for (check in orderedChecks) {
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
                 if (check.directPlayable) {
@@ -2194,6 +2242,34 @@ class Zoryva : MainAPI() {
                             callback = callback,
                             labelSuffix = "Zoryva Proxy",
                             typeSourceUrl = check.source.url
+                        )
+                        emitted++
+                    }
+                }
+            }
+
+            /*
+             * Pass 2: the website's structured response has already marked these
+             * exact entries as successful. Never turn a transient/false-negative
+             * extension probe into "No Links Found".
+             *
+             * This is intentionally only a last resort after all confirmed
+             * direct/proxy candidates have been emitted.
+             */
+            if (emitted == 0) {
+                for (check in orderedChecks) {
+                    if (emitted >= MAX_EMITTED_FALLBACKS) break
+
+                    val source = check.source
+                    val sourceKey = "api|${normalizeMediaIdentity(source.url)}"
+
+                    if (emittedKeys.add(sourceKey)) {
+                        emitExtractorSource(
+                            source = source,
+                            output = buildDirectPlaybackOutput(source, pageUrl),
+                            callback = callback,
+                            labelSuffix = "API Source",
+                            typeSourceUrl = source.url
                         )
                         emitted++
                     }
@@ -2662,6 +2738,21 @@ class Zoryva : MainAPI() {
 
         val endpoints = buildList {
             add("$BASE_URL/api/extract?$exactQuery")
+
+            if (
+                mediaType == "tv" &&
+                context.season != null &&
+                context.episode != null
+            ) {
+                val minimalTvQuery = buildString {
+                    append("mediaType=tv")
+                    append("&externalId=").append(encode(context.tmdbId))
+                    append("&season=").append(context.season)
+                    append("&episode=").append(context.episode)
+                }
+                add("$BASE_URL/api/extract?$minimalTvQuery")
+            }
+
             if (allowSoftFallback) {
                 add("$BASE_URL/api/extract?$softQuery")
             }
@@ -3995,12 +4086,14 @@ class Zoryva : MainAPI() {
                         null
                     }
 
-                    val playable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                        probeSource(candidate, info)
-                    } ?: false
-
-                    if (!playable) return@async null
-
+                    /*
+                     * A direct page/server source is already a concrete media
+                     * URL exposed by Zoryva. In this secondary path, do not
+                     * impose another network probe gate: the primary structured
+                     * resolver already performed the authoritative source
+                     * selection, and CDN anti-bot/range behavior can make a
+                     * lightweight probe disagree with the actual player.
+                     */
                     val finalCandidate = if (info != null) {
                         candidate.copy(
                             quality = maxOf(candidate.quality, info.maxQuality),
@@ -4188,14 +4281,7 @@ class Zoryva : MainAPI() {
             runCatching {
                 app.get(
                     candidate.url,
-                    headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Accept" to ACCEPT,
-                        "Referer" to candidate.referer,
-                        "Origin" to candidate.origin,
-                        "Cache-Control" to "no-cache",
-                        "Pragma" to "no-cache"
-                    )
+                    headers = playbackHeadersFor(candidate)
                 )
             }.getOrNull()
         } ?: return null
@@ -4517,6 +4603,11 @@ class Zoryva : MainAPI() {
             if (bodyLength == 0L) return false
         }
 
+        /*
+         * HEAD is only a compatibility hint. Some CDNs disable HEAD even though
+         * GET is valid, so a missing HEAD response must not erase an API-approved
+         * HLS source.
+         */
         return true
     }
 
@@ -4764,7 +4855,9 @@ class Zoryva : MainAPI() {
     private fun buildSourceName(
         source: MediaCandidate
     ): String {
-        val quality = if (source.quality > 0) {
+        val quality = if (source.isHlsMaster) {
+            "Auto"
+        } else if (source.quality > 0) {
             "${source.quality}p"
         } else {
             "Auto"
