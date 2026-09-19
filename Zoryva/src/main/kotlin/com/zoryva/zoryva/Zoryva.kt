@@ -73,6 +73,8 @@ class Zoryva : MainAPI() {
         const val VIDROCK_SCRIPT_TIMEOUT_MS = 3500L
         const val VIDROCK_SCRIPT_LIMIT = 18
         const val VIDROCK_MAX_SERVERS = 12
+        const val ZORYVA_EXTRACT_TIMEOUT_MS = 9000L
+        const val ZORYVA_SCRAPED_TIMEOUT_MS = 6000L
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
         const val MAX_EMITTED_FALLBACKS = 8
@@ -255,6 +257,11 @@ class Zoryva : MainAPI() {
     )
 
     private data class VidrockResolution(
+        val directSources: List<MediaCandidate>,
+        val servers: List<VidrockServerTarget>
+    )
+
+    private data class ZoryvaExtractResolution(
         val directSources: List<MediaCandidate>,
         val servers: List<VidrockServerTarget>
     )
@@ -2022,6 +2029,28 @@ class Zoryva : MainAPI() {
         val directPage = directFetched.document
         val directText = directFetched.text
 
+        /*
+         * Zoryva has an official extraction endpoint used by the browser player.
+         * Resolve that endpoint from the same fresh detail-page metadata before
+         * falling back to generic server discovery. This is the primary source
+         * path because it is the website's own current playback contract.
+         */
+        val extractResolution = withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
+            resolveZoryvaExtract(
+                document = directPage,
+                pageUrl = pageUrl,
+                context = playbackContext
+            )
+        } ?: ZoryvaExtractResolution(emptyList(), emptyList())
+
+        val scrapedResolution = withTimeoutOrNull(ZORYVA_SCRAPED_TIMEOUT_MS) {
+            resolveZoryvaScraped(
+                document = directPage,
+                pageUrl = pageUrl,
+                context = playbackContext
+            )
+        } ?: ZoryvaExtractResolution(emptyList(), emptyList())
+
         val directResult = inspectPageForSources(
             page = directPage,
             rawText = directText,
@@ -2047,6 +2076,21 @@ class Zoryva : MainAPI() {
         } ?: VidrockResolution(emptyList(), emptyList())
 
         val targetMap = linkedMapOf<String, VidrockServerTarget>()
+
+        extractResolution.servers.forEach { target ->
+            val clean = cleanUrl(target.url)
+            if (clean.isNotBlank()) {
+                targetMap.putIfAbsent(clean, target)
+            }
+        }
+
+        scrapedResolution.servers.forEach { target ->
+            val clean = cleanUrl(target.url)
+            if (clean.isNotBlank()) {
+                targetMap.putIfAbsent(clean, target)
+            }
+        }
+
         discoveredServerPages.forEach { (url, label) ->
             val clean = cleanUrl(url)
             if (clean.isNotBlank()) {
@@ -2114,6 +2158,26 @@ class Zoryva : MainAPI() {
          * real playability validation. A 200 response containing an HTML error
          * page is NOT considered a playable source.
          */
+        if (extractResolution.directSources.isNotEmpty()) {
+            val extractServer = inspectCandidatesAsServer(
+                candidates = extractResolution.directSources,
+                serverName = "Zoryva Extract"
+            )
+            if (extractServer.sources.isNotEmpty()) {
+                results += extractServer
+            }
+        }
+
+        if (scrapedResolution.directSources.isNotEmpty()) {
+            val scrapedServer = inspectCandidatesAsServer(
+                candidates = scrapedResolution.directSources,
+                serverName = "Zoryva Scraped"
+            )
+            if (scrapedServer.sources.isNotEmpty()) {
+                results += scrapedServer
+            }
+        }
+
         if (vidrock.directSources.isNotEmpty()) {
             val directServer = inspectCandidatesAsServer(
                 candidates = vidrock.directSources,
@@ -2372,6 +2436,424 @@ class Zoryva : MainAPI() {
         }
 
         return listOf(base + query.toString())
+    }
+
+    private suspend fun resolveZoryvaExtract(
+        document: Document?,
+        pageUrl: String,
+        context: PlaybackContext?
+    ): ZoryvaExtractResolution {
+        context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+
+        val mediaObject = extractInitialMediaObject(document)
+
+        val mediaType = when (context.type.lowercase(Locale.ROOT)) {
+            "movie" -> "movie"
+            "tv", "anime" -> "tv"
+            else -> return ZoryvaExtractResolution(emptyList(), emptyList())
+        }
+
+        val title = firstNonBlank(
+            mediaObject?.optString("title"),
+            document?.selectFirst("h1")?.text(),
+            titleFromPath(URI(pageUrl).path.orEmpty())
+        ).orEmpty()
+
+        val originalTitle = firstNonBlank(
+            mediaObject?.optString("originalTitle"),
+            title
+        ).orEmpty()
+
+        val imdbId = firstNonBlank(
+            mediaObject?.optString("imdbId"),
+            extractImdbId(document?.html().orEmpty())
+        )
+
+        val runtime = mediaObject?.optInt("runtime", 0)?.takeIf { it > 0 }
+            ?: Regex("""(?i)\"runtime\"\s*:\s*(\d+)""")
+                .find(document?.html().orEmpty())
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+
+        val query = buildPlaybackQuery(
+            mediaType = mediaType,
+            externalId = context.tmdbId,
+            title = title,
+            originalTitle = originalTitle,
+            imdbId = imdbId,
+            runtime = runtime,
+            season = context.season,
+            episode = context.episode
+        )
+
+        val endpoint = "$BASE_URL/api/extract?$query"
+
+        val response = runCatching {
+            app.get(
+                endpoint,
+                headers = PAGE_HEADERS + mapOf(
+                    "Referer" to pageUrl,
+                    "Accept" to "application/json,text/plain,*/*;q=0.8",
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
+                )
+            )
+        }.getOrNull() ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+
+        if (response.code !in 200..399) {
+            return ZoryvaExtractResolution(emptyList(), emptyList())
+        }
+
+        return parseZoryvaExtractResponse(
+            raw = response.text,
+            referer = pageUrl
+        )
+    }
+
+    private suspend fun resolveZoryvaScraped(
+        document: Document?,
+        pageUrl: String,
+        context: PlaybackContext?
+    ): ZoryvaExtractResolution {
+        context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+
+        val mediaObject = extractInitialMediaObject(document)
+        val mediaType = when (context.type.lowercase(Locale.ROOT)) {
+            "movie" -> "movie"
+            "tv", "anime" -> "tv"
+            else -> return ZoryvaExtractResolution(emptyList(), emptyList())
+        }
+
+        val title = firstNonBlank(
+            mediaObject?.optString("title"),
+            document?.selectFirst("h1")?.text(),
+            titleFromPath(URI(pageUrl).path.orEmpty())
+        ).orEmpty()
+
+        val originalTitle = firstNonBlank(
+            mediaObject?.optString("originalTitle"),
+            title
+        ).orEmpty()
+
+        val imdbId = firstNonBlank(
+            mediaObject?.optString("imdbId"),
+            extractImdbId(document?.html().orEmpty())
+        )
+
+        val runtime = mediaObject?.optInt("runtime", 0)?.takeIf { it > 0 }
+
+        val query = buildPlaybackQuery(
+            mediaType = mediaType,
+            externalId = context.tmdbId,
+            title = title,
+            originalTitle = originalTitle,
+            imdbId = imdbId,
+            runtime = runtime,
+            season = context.season,
+            episode = context.episode
+        )
+
+        val endpoint = "$BASE_URL/api/scraped?$query"
+        val response = runCatching {
+            app.get(
+                endpoint,
+                headers = PAGE_HEADERS + mapOf(
+                    "Referer" to pageUrl,
+                    "Accept" to "application/json,text/plain,*/*;q=0.8",
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
+                )
+            )
+        }.getOrNull() ?: return ZoryvaExtractResolution(emptyList(), emptyList())
+
+        if (response.code !in 200..399) {
+            return ZoryvaExtractResolution(emptyList(), emptyList())
+        }
+
+        return parseZoryvaExtractResponse(
+            raw = response.text,
+            referer = pageUrl
+        )
+    }
+
+    private fun buildPlaybackQuery(
+        mediaType: String,
+        externalId: String,
+        title: String,
+        originalTitle: String,
+        imdbId: String?,
+        runtime: Int?,
+        season: Int?,
+        episode: Int?
+    ): String {
+        val parts = ArrayList<String>()
+        fun add(name: String, value: String?) {
+            if (!value.isNullOrBlank()) {
+                parts += "${name}=${encode(value)}"
+            }
+        }
+
+        add("mediaType", mediaType)
+        add("externalId", externalId)
+        add("title", title)
+        add("originalTitle", originalTitle)
+        add("imdbId", imdbId)
+        runtime?.takeIf { it > 0 }?.let { parts += "runtime=$it" }
+        season?.let { parts += "season=$it" }
+        episode?.let { parts += "episode=$it" }
+        parts += "soft=1"
+
+        return parts.joinToString("&")
+    }
+
+    private fun extractImdbId(
+        raw: String
+    ): String? {
+        if (raw.isBlank()) return null
+        return Regex("""(?i)\"imdbId\"\s*:\s*\"(tt\d{4,12})\""")
+            .find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: Regex("""(?i)(?:imdb\s*id|imdbId)[\s:=\"']+(tt\d{4,12})""")
+                .find(raw)
+                ?.groupValues
+                ?.getOrNull(1)
+    }
+
+    private fun parseZoryvaExtractResponse(
+        raw: String,
+        referer: String
+    ): ZoryvaExtractResolution {
+        val direct = linkedMapOf<String, MediaCandidate>()
+        val servers = linkedMapOf<String, VidrockServerTarget>()
+
+        fun addMedia(
+            rawUrl: String,
+            label: String = "Zoryva Extract",
+            sourceReferer: String = referer,
+            sourceOrigin: String = originOf(sourceReferer),
+            qualityHint: String = "",
+            height: Int? = null
+        ) {
+            val clean0 = cleanUrl(rawUrl)
+            if (clean0.isBlank()) return
+
+            val upstream = if (clean0.startsWith("$BASE_URL/api/proxy?", true)) {
+                extractProxyParameter(clean0, "url") ?: return
+            } else {
+                clean0
+            }
+
+            val clean = cleanUrl(upstream)
+            if (!isPlayableMedia(clean)) return
+            if (isObviouslyPromotional(clean) || isIgnoredHost(clean)) return
+
+            val finalReferer = if (clean.contains("peakstorm.top/", true)) {
+                firstNonBlank(
+                    extractProxyParameter(clean0, "referer"),
+                    sourceReferer
+                ).orEmpty().ifBlank { "https://speedracelight.com/" }
+            } else {
+                sourceReferer.ifBlank { referer }
+            }
+
+            val finalOrigin = if (clean.contains("peakstorm.top/", true)) {
+                firstNonBlank(
+                    extractProxyParameter(clean0, "origin"),
+                    sourceOrigin
+                ).orEmpty().ifBlank { originOf(finalReferer) }
+            } else {
+                sourceOrigin.ifBlank { originOf(finalReferer) }
+            }
+
+            val quality = when {
+                height != null && height > 0 -> qualityFromHeight(height)
+                else -> qualityFromUrl(clean, qualityHint.ifBlank { label })
+            }
+
+            direct.putIfAbsent(
+                normalizeMediaIdentity(clean),
+                MediaCandidate(
+                    url = clean,
+                    referer = finalReferer,
+                    origin = finalOrigin,
+                    quality = quality,
+                    label = qualityHint.ifBlank { label },
+                    server = label.ifBlank { "Zoryva Extract" },
+                    latencyMs = 0L,
+                    isHlsMaster = false,
+                    audioLabel = ""
+                )
+            )
+        }
+
+        fun addServer(
+            rawUrl: String,
+            label: String = "Zoryva Server",
+            sourceReferer: String = referer
+        ) {
+            val clean = normalizeExtractedUrl(rawUrl, sourceReferer) ?: return
+            if (clean.isBlank()) return
+            if (isPlayableMedia(clean)) {
+                addMedia(clean, label, sourceReferer)
+                return
+            }
+            if (isObviouslyPromotional(clean) || isIgnoredHost(clean)) return
+
+            servers.putIfAbsent(
+                "$label|$clean",
+                VidrockServerTarget(
+                    url = clean,
+                    name = label.ifBlank { "Zoryva Server" },
+                    referer = sourceReferer
+                )
+            )
+        }
+
+        fun walkJson(
+            value: Any?,
+            parentKey: String = "",
+            parentReferer: String = referer,
+            parentOrigin: String = originOf(referer),
+            parentLabel: String = "Zoryva Extract"
+        ) {
+            when (value) {
+                is JSONObject -> {
+                    val objectReferer = firstNonBlank(
+                        value.optString("referer"),
+                        value.optString("referrer"),
+                        value.optString("httpReferer")
+                    ).orEmpty().ifBlank { parentReferer }
+
+                    val objectOrigin = firstNonBlank(
+                        value.optString("origin"),
+                        value.optString("httpOrigin")
+                    ).orEmpty().ifBlank { parentOrigin }
+
+                    val objectLabel = firstNonBlank(
+                        value.optString("name"),
+                        value.optString("server"),
+                        value.optString("provider"),
+                        value.optString("sourceName"),
+                        value.optString("source"),
+                        value.optString("quality"),
+                        parentKey,
+                        parentLabel
+                    ).orEmpty()
+
+                    val broken = value.optBoolean("broken", false)
+                    val disabled = value.optBoolean("disabled", false)
+                    if (!broken && !disabled) {
+                        val qualityHint = firstNonBlank(
+                            value.optString("quality"),
+                            value.optString("resolution"),
+                            value.optString("label")
+                        ).orEmpty()
+                        val height = value.optInt("height", 0).takeIf { it > 0 }
+
+                        val directKeys = listOf(
+                            "url", "src", "file", "link", "streamUrl",
+                            "stream_url", "videoUrl", "video_url", "playUrl",
+                            "play_url", "mediaUrl", "media_url", "sourceUrl",
+                            "source_url", "manifest", "playlist", "m3u8", "mp4"
+                        )
+
+                        directKeys.forEach { key ->
+                            val candidate = value.optString(key).trim()
+                            if (candidate.isNotBlank()) {
+                                if (isPlayableMedia(candidate)) {
+                                    addMedia(
+                                        candidate,
+                                        objectLabel.ifBlank { key },
+                                        objectReferer,
+                                        objectOrigin,
+                                        qualityHint.ifBlank { key },
+                                        height
+                                    )
+                                } else if (
+                                    key.contains("server", true) ||
+                                    key.contains("source", true) ||
+                                    key.contains("player", true) ||
+                                    key.contains("embed", true)
+                                ) {
+                                    addServer(candidate, objectLabel.ifBlank { key }, objectReferer)
+                                }
+                            }
+                        }
+                    }
+
+                    val iterator = value.keys()
+                    while (iterator.hasNext()) {
+                        val key = iterator.next()
+                        walkJson(
+                            value.opt(key),
+                            parentKey = key,
+                            parentReferer = objectReferer,
+                            parentOrigin = objectOrigin,
+                            parentLabel = objectLabel
+                        )
+                    }
+                }
+
+                is JSONArray -> {
+                    for (i in 0 until value.length()) {
+                        walkJson(
+                            value.opt(i),
+                            parentKey = parentKey,
+                            parentReferer = parentReferer,
+                            parentOrigin = parentOrigin,
+                            parentLabel = parentLabel
+                        )
+                    }
+                }
+
+                is String -> {
+                    val text = value.trim()
+                    if (text.isBlank()) return
+
+                    extractUrlsFromRawText(text).forEach { found ->
+                        if (isPlayableMedia(found)) {
+                            addMedia(
+                                found,
+                                parentLabel,
+                                parentReferer,
+                                parentOrigin
+                            )
+                        } else if (
+                            parentKey.contains("server", true) ||
+                            parentKey.contains("source", true) ||
+                            parentKey.contains("player", true) ||
+                            parentKey.contains("embed", true)
+                        ) {
+                            addServer(found, parentLabel, parentReferer)
+                        }
+                    }
+                }
+            }
+        }
+
+        runCatching { walkJson(JSONObject(raw)) }
+        runCatching { walkJson(JSONArray(raw)) }
+
+        /* The endpoint is JSON in the normal case, but keep a raw-text fallback
+         * for escaped/serialized response variants. */
+        extractUrlsFromRawText(raw).forEach { found ->
+            if (isPlayableMedia(found)) {
+                addMedia(found)
+            } else if (
+                found.contains("server", true) ||
+                found.contains("embed", true) ||
+                found.contains("player", true)
+            ) {
+                addServer(found)
+            }
+        }
+
+        return ZoryvaExtractResolution(
+            directSources = direct.values.toList(),
+            servers = servers.values.toList()
+        )
     }
 
     private suspend fun resolveVidrock(
@@ -4548,34 +5030,33 @@ class Zoryva : MainAPI() {
         source: MediaCandidate,
         pageUrl: String
     ): PlaybackOutput {
-        if (!requiresZoryvaProxy(source.url)) {
+        /*
+         * CloudStream is not subject to browser CORS rules. The original
+         * short-lived upstream URL is therefore the preferred output. This is
+         * exactly the URL the website player ultimately feeds into its proxy.
+         * The required Referer/Origin are preserved as request headers.
+         */
+        if (requiresZoryvaProxy(source.url)) {
+            val upstreamReferer = mediaRefererFor(source.url, source.referer)
             return PlaybackOutput(
                 url = source.url,
-                referer = source.referer,
-                headers = playbackHeadersFor(source)
+                referer = upstreamReferer,
+                headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Accept" to ACCEPT,
+                    "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+                    "Referer" to upstreamReferer,
+                    "Origin" to originOf(upstreamReferer),
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache"
+                )
             )
         }
 
-        val upstreamReferer = mediaRefererFor(source.url, source.referer)
-        val proxyUrl = buildZoryvaProxyUrl(
-            sourceUrl = source.url,
-            referer = upstreamReferer,
-            origin = originOf(upstreamReferer)
-        )
-
-        /* The final CloudStream request is same-origin to Zoryva. The proxy
-         * URL carries the upstream referer/origin context required by the
-         * short-lived source. */
         return PlaybackOutput(
-            url = proxyUrl,
-            referer = pageUrl,
-            headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Accept" to ACCEPT,
-                "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
-                "Cache-Control" to "no-cache",
-                "Pragma" to "no-cache"
-            )
+            url = source.url,
+            referer = source.referer.ifBlank { pageUrl },
+            headers = playbackHeadersFor(source)
         )
     }
 
