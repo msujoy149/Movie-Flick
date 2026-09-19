@@ -204,7 +204,9 @@ class Zoryva : MainAPI() {
         val episode: Int,
         val overview: String?,
         val poster: String?,
-        val runtime: Int?
+        val runtime: Int?,
+        val airDate: String? = null,
+        val score: Double? = null
     )
 
     private data class DetailInfo(
@@ -1756,6 +1758,11 @@ class Zoryva : MainAPI() {
                         name = ep.name
                         season = ep.season
                         episode = ep.episode
+                        posterUrl = ep.poster
+                        description = ep.overview
+                        runTime = ep.runtime
+                        date = ep.airDate?.let(::parseEpisodeDateMillis)
+                        score = ep.score?.let { Score.from10(it) }
                     }
                 }
 
@@ -1825,9 +1832,28 @@ class Zoryva : MainAPI() {
         val episodes = if (type == TvType.Movie) {
             emptyList()
         } else {
+            val embedded = parseEpisodes(mediaObject)
+
+            val needsPageEpisodeRecovery =
+                embedded.isEmpty() ||
+                    embedded.any {
+                        it.name.matches(Regex("""(?i)Episode\s+\d+""")) ||
+                            it.id.isNullOrBlank() ||
+                            it.overview.isNullOrBlank() ||
+                            it.runtime == null ||
+                            it.airDate.isNullOrBlank()
+                    }
+
+            val pageEmbedded = if (needsPageEpisodeRecovery) {
+                parseEpisodeObjectsFromPage(document)
+            } else {
+                emptyList()
+            }
+
             mergeEpisodeMetadata(
-                embedded = parseEpisodes(mediaObject),
-                linked = parseEpisodeLinks(document, pageUrl)
+                embedded = embedded,
+                linked = parseEpisodeLinks(document, pageUrl),
+                pageEmbedded = pageEmbedded
             )
         }
 
@@ -1867,9 +1893,27 @@ class Zoryva : MainAPI() {
                     ) ?: "Episode $number",
                     season = seasonNumber,
                     episode = number,
-                    overview = episode.optString("overview").takeIf { it.isNotBlank() },
-                    poster = episode.optString("stillPath").takeIf { it.isNotBlank() },
-                    runtime = episode.optInt("runtime", 0).takeIf { it > 0 }
+                    overview = firstNonBlank(
+                        episode.optString("overview"),
+                        episode.optString("description")
+                    )?.takeIf { it.isNotBlank() },
+                    poster = firstNonBlank(
+                        episode.optString("stillPath"),
+                        episode.optString("posterPath")
+                    )?.takeIf { it.isNotBlank() },
+                    runtime = episode.optInt("runtime", 0).takeIf { it > 0 },
+                    airDate = normalizeEpisodeDate(
+                        firstNonBlank(
+                            episode.optString("airDate"),
+                            episode.optString("releaseDate"),
+                            episode.optString("air_date")
+                        )
+                    ),
+                    score = firstNonBlank(
+                        episode.optString("voteAverage"),
+                        episode.optString("rating"),
+                        episode.optString("score")
+                    )?.toDoubleOrNull()?.takeIf { it in 0.0..10.0 }
                 )
             }
         }
@@ -1880,70 +1924,390 @@ class Zoryva : MainAPI() {
         )
     }
 
+
+    /**
+     * Recover explicit episode objects from the decoded Next.js/Flight page.
+     * Only objects that explicitly contain seasonNumber + episodeNumber are
+     * accepted. No item is created from episodeCount alone.
+     */
+    private fun parseEpisodeObjectsFromPage(
+        document: Document
+    ): List<EpisodeInfo> {
+        val result = linkedMapOf<String, EpisodeInfo>()
+
+        val payloads = linkedSetOf<String>()
+        listOf(
+            extractNextFlightPayload(document),
+            decodeRscForCatalog(document.html()),
+            decodeRscOneLayer(document.html()),
+            normalizeEmbeddedText(document.html())
+        ).forEach { payload ->
+            if (payload.isNotBlank()) payloads += payload
+        }
+
+        fun addObject(rawObject: String) {
+            val obj = runCatching { JSONObject(rawObject) }.getOrNull()
+                ?: return
+
+            val season = firstNonBlank(
+                obj.optString("seasonNumber"),
+                obj.optString("season")
+            )?.toIntOrNull()?.takeIf { it >= 0 }
+                ?: return
+
+            val episode = firstNonBlank(
+                obj.optString("episodeNumber"),
+                obj.optString("episode")
+            )?.toIntOrNull()?.takeIf { it > 0 }
+                ?: return
+
+            val item = EpisodeInfo(
+                id = firstNonBlank(
+                    obj.optString("id"),
+                    obj.optString("episodeId")
+                )?.trim()?.takeIf { it.isNotBlank() },
+                name = firstNonBlank(
+                    obj.optString("name"),
+                    obj.optString("title")
+                )?.trim()?.takeIf { it.isNotBlank() }
+                    ?: "Episode $episode",
+                season = season,
+                episode = episode,
+                overview = firstNonBlank(
+                    obj.optString("overview"),
+                    obj.optString("description")
+                )?.trim()?.takeIf { it.isNotBlank() },
+                poster = firstNonBlank(
+                    obj.optString("stillPath"),
+                    obj.optString("posterPath"),
+                    obj.optString("image"),
+                    obj.optString("poster")
+                )?.trim()?.takeIf { it.startsWith("http", true) },
+                runtime = firstNonBlank(
+                    obj.optString("runtime"),
+                    obj.optString("duration")
+                )?.toIntOrNull()?.takeIf { it > 0 },
+                airDate = normalizeEpisodeDate(
+                    firstNonBlank(
+                        obj.optString("airDate"),
+                        obj.optString("releaseDate"),
+                        obj.optString("air_date")
+                    )
+                ),
+                score = firstNonBlank(
+                    obj.optString("voteAverage"),
+                    obj.optString("rating"),
+                    obj.optString("score")
+                )?.toDoubleOrNull()?.takeIf { it in 0.0..10.0 }
+            )
+
+            val key = "$season|$episode"
+            result[key] = result[key]?.let { mergeEpisodeInfo(it, item) } ?: item
+        }
+
+        val marker = Regex("""(?i)"episodeNumber"\s*:\s*\d+""")
+
+        payloads.forEach { payload ->
+            marker.findAll(payload)
+                .take(1200)
+                .forEach { match ->
+                    var cursor = match.range.first
+                    repeat(10) {
+                        val objectStart = payload.lastIndexOf('{', cursor)
+                        if (objectStart < 0) return@repeat
+
+                        val objectJson = extractBalancedJson(
+                            payload,
+                            objectStart,
+                            '{',
+                            '}'
+                        )
+
+                        if (
+                            objectJson != null &&
+                            objectJson.contains("\"episodeNumber\"", true)
+                        ) {
+                            addObject(objectJson)
+                            return@repeat
+                        }
+
+                        cursor = objectStart - 1
+                    }
+                }
+        }
+
+        return result.values
+            .sortedWith(
+                compareBy<EpisodeInfo> { it.season }
+                    .thenBy { it.episode }
+            )
+    }
+
     private fun parseEpisodeLinks(
         document: Document,
         pageUrl: String
     ): List<EpisodeInfo> {
-        val result = ArrayList<EpisodeInfo>()
+        val result = linkedMapOf<String, EpisodeInfo>()
 
-        document.select("a[href]").forEach { anchor ->
-            val href = normalizeExtractedUrl(anchor.attr("href"), pageUrl) ?: return@forEach
-            val path = runCatching { URI(href).path.orEmpty() }.getOrDefault("")
-            if (!isEpisodePath(path)) return@forEach
-
-            val parts = path.trim('/').split('/').filter { it.isNotBlank() }
-            if (parts.size < 4) return@forEach
-            val season = parts.getOrNull(parts.size - 2)?.toIntOrNull() ?: return@forEach
-            val episode = parts.lastOrNull()?.toIntOrNull() ?: return@forEach
-            if (season < 0 || episode <= 0) return@forEach
-
-            val title = firstNonBlank(
-                anchor.attr("aria-label"),
-                anchor.attr("title"),
-                anchor.text().trim()
-            )?.let(::cleanCardTitle)
-                ?.takeIf { it.isNotBlank() }
-                ?: "Episode $episode"
-
-            val poster = extractCardPoster(anchor, pageUrl)
-
-            result += EpisodeInfo(
-                id = null,
-                name = title,
-                season = season,
-                episode = episode,
-                overview = null,
-                poster = poster,
-                runtime = null
-            )
+        fun cleanEpisodeTitle(value: String): String {
+            return value
+                .replace(Regex("""^\s*\d+\s*[.)-]\s*"""), "")
+                .replace(
+                    Regex("""(?i)^\s*Episode\s*#?\d+\s*[:.)-]?\s*"""),
+                    ""
+                )
+                .replace(Regex("""\s+"""), " ")
+                .trim()
         }
 
-        return result
+        fun runtimeFromText(value: String): Int? {
+            val text = value.replace(Regex("""\s+"""), " ").trim()
+
+            Regex("""(?i)\b(\d{1,2})\s*h\s*(\d{1,2})\s*m\b""")
+                .find(text)
+                ?.let {
+                    val hours = it.groupValues[1].toIntOrNull() ?: 0
+                    val minutes = it.groupValues[2].toIntOrNull() ?: 0
+                    return hours * 60 + minutes
+                }
+
+            return Regex("""(?i)\b(\d{1,3})\s*(?:m|min|minutes)\b""")
+                .find(text)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+                ?.takeIf { it > 0 }
+        }
+
+        fun scoreFromText(value: String): Double? {
+            return Regex(
+                """(?<![\d.])(?:10(?:\.0)?|[0-9]\.[0-9])(?=\s|$)"""
+            )
+                .find(value.replace(Regex("""\s+"""), " "))
+                ?.value
+                ?.toDoubleOrNull()
+                ?.takeIf { it in 0.0..10.0 }
+        }
+
+        fun dateFromText(value: String): String? {
+            return Regex(
+                """(?i)\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b"""
+            )
+                .find(value)
+                ?.value
+                ?.let(::normalizeEpisodeDate)
+        }
+
+        document.select("a[href]").forEach { anchor ->
+            val href = normalizeExtractedUrl(
+                anchor.attr("href"),
+                pageUrl
+            ) ?: return@forEach
+
+            val path = runCatching { URI(href).path.orEmpty() }
+                .getOrDefault("")
+
+            if (!isEpisodePath(path)) return@forEach
+
+            val parts = path.trim('/')
+                .split('/')
+                .filter { it.isNotBlank() }
+
+            if (parts.size < 4) return@forEach
+
+            val season = parts[parts.size - 2].toIntOrNull()
+                ?: return@forEach
+            val episode = parts.lastOrNull()?.toIntOrNull()
+                ?: return@forEach
+
+            if (season < 0 || episode <= 0) return@forEach
+
+            var current: Element? = anchor
+            var name: String? = null
+            var overview: String? = null
+            var poster: String? = extractCardPoster(anchor, pageUrl)
+            var runtime: Int? = null
+            var airDate: String? = null
+            var score: Double? = null
+
+            repeat(6) {
+                val container = current ?: return@repeat
+
+                if (name == null) {
+                    name = firstNonBlank(
+                        container.attr("data-title"),
+                        container.attr("data-name"),
+                        container.select("h2,h3,h4,h5,h6,strong")
+                            .map { cleanEpisodeTitle(it.text()) }
+                            .firstOrNull {
+                                it.isNotBlank() &&
+                                    !it.equals("Episodes", true) &&
+                                    !it.matches(Regex("""(?i)Episode\s+\d+"""))
+                            },
+                        anchor.attr("aria-label"),
+                        anchor.attr("title"),
+                        anchor.text()
+                    )
+                        ?.let(::cleanEpisodeTitle)
+                        ?.takeIf { it.isNotBlank() }
+                }
+
+                if (overview == null) {
+                    overview = firstNonBlank(
+                        container.attr("data-overview"),
+                        container.attr("data-description"),
+                        container.select("[data-overview],[data-description]")
+                            .map { it.text() }
+                            .firstOrNull(),
+                        container.select("p, [class*=overview], [class*=description]")
+                            .map {
+                                it.text()
+                                    .replace(Regex("""\s+"""), " ")
+                                    .trim()
+                            }
+                            .filter { it.length >= 30 }
+                            .maxByOrNull { it.length }
+                    )
+                        ?.takeIf { it.length >= 20 }
+                }
+
+                if (poster == null) {
+                    poster = container.select("img")
+                        .mapNotNull {
+                            firstNonBlank(
+                                it.absUrl("src"),
+                                it.attr("src"),
+                                it.attr("data-src")
+                            )
+                        }
+                        .firstOrNull { it.startsWith("http", true) }
+                }
+
+                val text = container.text()
+                    .replace(Regex("""\s+"""), " ")
+                    .trim()
+
+                if (runtime == null) {
+                    runtime = firstNonBlank(
+                        container.attr("data-runtime"),
+                        container.attr("data-duration")
+                    )?.toIntOrNull()?.takeIf { it > 0 }
+                        ?: runtimeFromText(text)
+                }
+
+                if (airDate == null) {
+                    airDate = firstNonBlank(
+                        container.attr("data-air-date"),
+                        container.attr("data-date"),
+                        container.attr("datetime")
+                    )?.let(::normalizeEpisodeDate)
+                        ?: dateFromText(text)
+                }
+
+                if (score == null) {
+                    score = firstNonBlank(
+                        container.attr("data-rating"),
+                        container.attr("data-score")
+                    )?.toDoubleOrNull()?.takeIf { it in 0.0..10.0 }
+                        ?: scoreFromText(text)
+                }
+
+                if (
+                    name != null &&
+                    overview != null &&
+                    runtime != null &&
+                    airDate != null
+                ) {
+                    return@repeat
+                }
+
+                current = container.parent()
+            }
+
+            val item = EpisodeInfo(
+                id = null,
+                name = name?.takeIf { it.isNotBlank() }
+                    ?: "Episode $episode",
+                season = season,
+                episode = episode,
+                overview = overview,
+                poster = poster,
+                runtime = runtime,
+                airDate = airDate,
+                score = score
+            )
+
+            val key = "$season|$episode"
+            result[key] = result[key]?.let { mergeEpisodeInfo(it, item) } ?: item
+        }
+
+        return result.values
+            .sortedWith(
+                compareBy<EpisodeInfo> { it.season }
+                    .thenBy { it.episode }
+            )
+    }
+
+    private fun mergeEpisodeInfo(
+        first: EpisodeInfo,
+        second: EpisodeInfo
+    ): EpisodeInfo {
+        val firstGeneric = first.name.matches(
+            Regex("""(?i)Episode\s+\d+""")
+        )
+        val secondGeneric = second.name.matches(
+            Regex("""(?i)Episode\s+\d+""")
+        )
+
+        return first.copy(
+            id = first.id ?: second.id,
+            name = if (firstGeneric && !secondGeneric) {
+                second.name
+            } else {
+                first.name
+            },
+            overview = first.overview
+                ?.takeIf { it.isNotBlank() }
+                ?: second.overview,
+            poster = first.poster
+                ?.takeIf { it.isNotBlank() }
+                ?: second.poster,
+            runtime = first.runtime
+                ?.takeIf { it > 0 }
+                ?: second.runtime,
+            airDate = first.airDate
+                ?.takeIf { it.isNotBlank() }
+                ?: second.airDate,
+            score = first.score ?: second.score
+        )
     }
 
     private fun mergeEpisodeMetadata(
         embedded: List<EpisodeInfo>,
-        linked: List<EpisodeInfo>
+        linked: List<EpisodeInfo>,
+        pageEmbedded: List<EpisodeInfo>
     ): List<EpisodeInfo> {
         val result = linkedMapOf<String, EpisodeInfo>()
 
         fun add(item: EpisodeInfo) {
             val key = "${item.season}|${item.episode}"
             val existing = result[key]
-            result[key] = when {
-                existing == null -> item
-                existing.name.startsWith("Episode ") && !item.name.startsWith("Episode ") -> item
-                existing.poster.isNullOrBlank() && !item.poster.isNullOrBlank() -> existing.copy(poster = item.poster)
-                existing.overview.isNullOrBlank() && !item.overview.isNullOrBlank() -> existing.copy(overview = item.overview)
-                else -> existing
+            result[key] = if (existing == null) {
+                item
+            } else {
+                mergeEpisodeInfo(existing, item)
             }
         }
 
-        linked.forEach(::add)
         embedded.forEach(::add)
+        pageEmbedded.forEach(::add)
+        linked.forEach(::add)
 
         return result.values
-            .sortedWith(compareBy<EpisodeInfo> { it.season }.thenBy { it.episode })
+            .sortedWith(
+                compareBy<EpisodeInfo> { it.season }
+                    .thenBy { it.episode }
+            )
     }
 
     private fun buildEpisodeUrl(
@@ -2007,6 +2371,10 @@ class Zoryva : MainAPI() {
         val playbackContext = parsePlaybackContext(pageUrl)
             ?: return false
 
+        val episodeBasedPlayback =
+            playbackContext.season != null &&
+                playbackContext.episode != null
+
         /*
          * PRIMARY PLAYBACK PATH
          *
@@ -2030,7 +2398,13 @@ class Zoryva : MainAPI() {
          */
         val (initialExtract, directPage) = coroutineScope {
             val extractJob = async {
-                withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
+                val timeout = if (episodeBasedPlayback) {
+                    30000L
+                } else {
+                    ZORYVA_EXTRACT_TIMEOUT_MS
+                }
+
+                withTimeoutOrNull(timeout) {
                     resolveZoryvaExtract(
                         document = null,
                         pageUrl = pageUrl,
@@ -2043,11 +2417,8 @@ class Zoryva : MainAPI() {
             }
 
             val pageJob = async {
-                val timeout = if (
-                    playbackContext.season != null &&
-                    playbackContext.episode != null
-                ) {
-                    12000L
+                val timeout = if (episodeBasedPlayback) {
+                    20000L
                 } else {
                     7000L
                 }
@@ -2063,22 +2434,50 @@ class Zoryva : MainAPI() {
         var extractResolution =
             initialExtract ?: ZoryvaExtractResolution(emptyList(), emptyList())
 
+        val effectiveEpisodeId = episodeId
+            ?: if (episodeBasedPlayback && directPage != null) {
+                parseEpisodeObjectsFromPage(directPage)
+                    .firstOrNull {
+                        it.season == playbackContext.season &&
+                            it.episode == playbackContext.episode &&
+                            !it.id.isNullOrBlank()
+                    }
+                    ?.id
+            } else {
+                null
+            }
+
         /*
-         * If the slug-only request was not accepted or returned no usable
-         * source, use the exact title/IMDb/runtime metadata from the fresh
-         * Zoryva page and try /api/extract once more.
+         * For TV/Anime, always run the metadata-aware retry when the exact
+         * episode page is available. This lets the resolver use the page's
+         * real title/IMDb/runtime and the website's real episode id.
          */
-        if (extractResolution.directSources.isEmpty() && directPage != null) {
-            extractResolution = withTimeoutOrNull(15000L) {
+        if (
+            directPage != null &&
+            (episodeBasedPlayback || extractResolution.directSources.isEmpty())
+        ) {
+            val retryTimeout = if (episodeBasedPlayback) 30000L else 15000L
+
+            val retryResolution = withTimeoutOrNull(retryTimeout) {
                 resolveZoryvaExtract(
                     document = directPage,
                     pageUrl = pageUrl,
                     context = playbackContext,
                     preferredTitle = null,
                     allowSoftFallback = true,
-                    episodeId = episodeId
+                    episodeId = effectiveEpisodeId
                 )
-            } ?: extractResolution
+            }
+
+            if (
+                retryResolution != null &&
+                (
+                    retryResolution.directSources.isNotEmpty() ||
+                        retryResolution.servers.isNotEmpty()
+                    )
+            ) {
+                extractResolution = retryResolution
+            }
         }
 
         /*
@@ -2181,24 +2580,29 @@ class Zoryva : MainAPI() {
              * 2160/1440/1080/720/480/etc sources when Zoryva actually returned
              * those URLs.
              */
-            val hlsAudioTrackPool = checks
-                .flatMap { it.hls?.audioTracks.orEmpty() }
-
-            val audioTrackPool = mergeAudioTrackCandidates(
-                extractResolution.audioTracks,
-                hlsAudioTrackPool
-            )
-
             val enrichedChecks = checks.map { check ->
-                if (audioTrackPool.isEmpty()) {
+                val sourceTracks = mergeAudioTrackCandidates(
+                    check.source.audioTracks,
+                    check.hls?.audioTracks.orEmpty()
+                )
+
+                val globalTracks = if (checks.size == 1) {
+                    extractResolution.audioTracks
+                } else {
+                    emptyList()
+                }
+
+                val finalTracks = mergeAudioTrackCandidates(
+                    sourceTracks,
+                    globalTracks
+                )
+
+                if (finalTracks.isEmpty()) {
                     check
                 } else {
                     check.copy(
                         source = check.source.copy(
-                            audioTracks = mergeAudioTrackCandidates(
-                                check.source.audioTracks,
-                                audioTrackPool
-                            )
+                            audioTracks = finalTracks
                         )
                     )
                 }
@@ -2377,8 +2781,16 @@ class Zoryva : MainAPI() {
          * real page/player resolutions to be added without disturbing the
          * working direct path.
          */
-        val directText = directPage?.html().orEmpty()
-        val directDocument = directPage ?: return primaryEmitted > 0
+        val recoveredPage = directPage ?: if (episodeBasedPlayback) {
+            withTimeoutOrNull(12000L) {
+                getDocument(pageUrl)
+            }
+        } else {
+            null
+        }
+
+        val directText = recoveredPage?.html().orEmpty()
+        val directDocument = recoveredPage ?: return primaryEmitted > 0
 
         val scrapedResolution = withTimeoutOrNull(ZORYVA_SCRAPED_TIMEOUT_MS) {
             resolveZoryvaScraped(
@@ -2399,7 +2811,7 @@ class Zoryva : MainAPI() {
             document = directDocument,
             rawText = directText,
             pageUrl = pageUrl,
-            episodeId = episodeId
+            episodeId = effectiveEpisodeId
         )
 
         val vidrock = withTimeoutOrNull(VIDROCK_API_TIMEOUT_MS) {
@@ -2460,7 +2872,7 @@ class Zoryva : MainAPI() {
                             url = target.url,
                             name = target.name,
                             depth = 0,
-                            episodeId = episodeId,
+                            episodeId = effectiveEpisodeId,
                             referer = target.referer
                         )
                     }
@@ -2820,7 +3232,11 @@ class Zoryva : MainAPI() {
     ): List<String> {
         context ?: return emptyList()
 
-        val type = if (context.type.equals("movie", true)) "movie" else "tv"
+        val type = when (context.type.lowercase(Locale.ROOT)) {
+            "movie" -> "movie"
+            "anime" -> "anime"
+            else -> "tv"
+        }
         val base = "$BASE_URL/Api/Embedded"
         val query = StringBuilder()
             .append("?id=")
@@ -5819,6 +6235,56 @@ class Zoryva : MainAPI() {
                     if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString()
                 }
             }
+    }
+
+
+    private fun normalizeEpisodeDate(
+        value: String?
+    ): String? {
+        val cleaned = value
+            ?.replace(Regex("""\s+"""), " ")
+            ?.trim()
+            ?: return null
+
+        if (Regex("""^\d{4}-\d{2}-\d{2}$""").matches(cleaned)) {
+            return cleaned
+        }
+
+        listOf(
+            "MMM d, yyyy",
+            "MMMM d, yyyy"
+        ).forEach { pattern ->
+            val parsed = runCatching {
+                java.text.SimpleDateFormat(
+                    pattern,
+                    Locale.ENGLISH
+                ).apply {
+                    isLenient = false
+                }.parse(cleaned)
+            }.getOrNull()
+
+            if (parsed != null) {
+                return java.text.SimpleDateFormat(
+                    "yyyy-MM-dd",
+                    Locale.US
+                ).format(parsed)
+            }
+        }
+
+        return null
+    }
+
+    private fun parseEpisodeDateMillis(
+        value: String
+    ): Long? {
+        return runCatching {
+            java.text.SimpleDateFormat(
+                "yyyy-MM-dd",
+                Locale.US
+            ).apply {
+                isLenient = false
+            }.parse(value)?.time
+        }.getOrNull()
     }
 
     private fun cleanCardTitle(
