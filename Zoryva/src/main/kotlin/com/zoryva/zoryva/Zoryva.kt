@@ -2278,7 +2278,7 @@ class Zoryva : MainAPI() {
         return emitted.isNotEmpty()
     }
 
-    private fun emitExtractorSource(
+    private suspend fun emitExtractorSource(
         source: MediaCandidate,
         output: PlaybackOutput,
         callback: (ExtractorLink) -> Unit,
