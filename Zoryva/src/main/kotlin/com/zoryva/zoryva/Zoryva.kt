@@ -223,7 +223,8 @@ class Zoryva : MainAPI() {
         val server: String,
         val latencyMs: Long,
         val isHlsMaster: Boolean,
-        val audioLabel: String
+        val audioLabel: String,
+        val headers: Map<String, String> = emptyMap()
     )
 
     private data class PlaybackOutput(
@@ -273,6 +274,13 @@ class Zoryva : MainAPI() {
         val acceptRanges: String,
         val contentRange: String,
         val bodyPrefix: String
+    )
+
+    private data class PrimarySourceCheck(
+        val source: MediaCandidate,
+        val directPlayable: Boolean,
+        val proxy: MediaCandidate?,
+        val proxyPlayable: Boolean
     )
 
     private data class CachedCatalog(
@@ -2084,11 +2092,18 @@ class Zoryva : MainAPI() {
         }
 
         /*
-         * When the website explicitly says a source is OK, do not throw it
-         * away just because a mobile/CloudStream probe cannot reproduce the
-         * browser's byte-range handshake. The website is already the source of
-         * truth for this structured extraction. We still prefer explicit quality
-         * sources and keep proxy/direct alternatives below.
+         * PRIMARY EXTRACTED SOURCES
+         *
+         * /api/extract is the website's source of truth for the current media
+         * URLs, but an API-level `status=ok` does not guarantee that the exact
+         * HTTP request made by CloudStream will return a usable response.
+         * Media3 reports that situation as ERROR_CODE_IO_BAD_HTTP_STATUS (2004).
+         *
+         * Validate every extracted candidate concurrently with the same safe
+         * headers that will be attached to the player link. For known Zoryva
+         * proxy-backed hosts, also validate the same-origin Zoryva proxy route.
+         * This lets a blocked 1080p URL be skipped in favor of a working 720p
+         * or proxy source instead of handing the player a known-bad URL first.
          */
         if (extractResolution.directSources.isNotEmpty()) {
             val seenSubtitle = linkedSetOf<String>()
@@ -2107,56 +2122,76 @@ class Zoryva : MainAPI() {
                         .thenBy { it.url }
                 )
 
-            var emitted = 0
-            val emittedKeys = linkedSetOf<String>()
+            val checks = coroutineScope {
+                ordered.map { source ->
+                    async {
+                        val directPlayable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                            probeSource(source, null)
+                        } ?: false
 
-            for (source in ordered) {
+                        val proxyCandidate = if (requiresZoryvaProxy(source.url)) {
+                            buildZoryvaProxyCandidate(
+                                source = source,
+                                pageUrl = pageUrl
+                            )
+                        } else {
+                            null
+                        }
+
+                        val proxyPlayable = if (proxyCandidate != null) {
+                            withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                                probeSource(proxyCandidate, null)
+                            } ?: false
+                        } else {
+                            false
+                        }
+
+                        PrimarySourceCheck(
+                            source = source,
+                            directPlayable = directPlayable,
+                            proxy = proxyCandidate,
+                            proxyPlayable = proxyPlayable
+                        )
+                    }
+                }.awaitAll()
+            }
+
+            val emittedKeys = linkedSetOf<String>()
+            var emitted = 0
+
+            for (check in checks) {
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
-                val directOutput = buildDirectPlaybackOutput(source, pageUrl)
-                val sourceKey = "direct|${normalizeMediaIdentity(source.url)}"
-                if (emittedKeys.add(sourceKey)) {
-                    emitExtractorSource(
-                        source = source,
-                        output = directOutput,
-                        callback = callback,
-                        labelSuffix = "Direct",
-                        typeSourceUrl = source.url
-                    )
-                    emitted++
-                }
-
-                /*
-                 * Zoryva itself serves these upstreams through /api/proxy in
-                 * the browser. Keep that exact same-origin route as an immediate
-                 * fallback. It is still built from the fresh URL just returned by
-                 * /api/extract, so the signed token is never reused later.
-                 */
-                if (emitted < MAX_EMITTED_FALLBACKS && requiresZoryvaProxy(source.url)) {
-                    val proxyUrl = buildZoryvaProxyUrl(
-                        sourceUrl = source.url,
-                        referer = source.referer.ifBlank { mediaRefererFor(source.url, pageUrl) },
-                        origin = source.origin.ifBlank { originOf(mediaRefererFor(source.url, pageUrl)) }
-                    )
-
-                    val proxyKey = "proxy|${normalizeMediaIdentity(source.url)}"
-                    if (emittedKeys.add(proxyKey)) {
+                if (check.directPlayable) {
+                    val source = check.source
+                    val sourceKey = "direct|${normalizeMediaIdentity(source.url)}"
+                    if (emittedKeys.add(sourceKey)) {
                         emitExtractorSource(
                             source = source,
-                            output = PlaybackOutput(
-                                url = proxyUrl,
-                                referer = pageUrl,
-                                headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Accept" to ACCEPT,
-                                    "Accept-Language" to "en-US,en;q=0.9",
-                                    "Cache-Control" to "no-cache",
-                                    "Pragma" to "no-cache"
-                                )
+                            output = buildDirectPlaybackOutput(source, pageUrl),
+                            callback = callback,
+                            labelSuffix = "Direct",
+                            typeSourceUrl = source.url
+                        )
+                        emitted++
+                    }
+                }
+
+                if (emitted >= MAX_EMITTED_FALLBACKS) break
+
+                if (check.proxyPlayable && check.proxy != null) {
+                    val proxySource = check.proxy
+                    val proxyKey = "proxy|${normalizeMediaIdentity(check.source.url)}"
+                    if (emittedKeys.add(proxyKey)) {
+                        emitExtractorSource(
+                            source = check.source,
+                            output = buildDirectPlaybackOutput(
+                                proxySource,
+                                pageUrl
                             ),
                             callback = callback,
                             labelSuffix = "Zoryva Proxy",
-                            typeSourceUrl = source.url
+                            typeSourceUrl = check.source.url
                         )
                         emitted++
                     }
@@ -2404,24 +2439,54 @@ class Zoryva : MainAPI() {
         val result = linkedMapOf<String, String>()
 
         /*
-         * Keep the browser-like request deliberately small. In particular we
-         * do not manufacture Cookie or Authorization values.
+         * Keep the request deliberately small. Only public transport headers
+         * needed by player/CDN requests are accepted from the website.
+         * Cookies, Authorization and session/CSRF material are never propagated.
          */
         result["User-Agent"] = USER_AGENT
-        result["Accept"] = ACCEPT
+        result["Accept"] = if (source.url.contains(".m3u8", true)) {
+            "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
+        } else {
+            ACCEPT
+        }
         result["Accept-Language"] = "en-US,en;q=0.9"
-        val sourceReferer = source.referer.trim()
-        if (sourceReferer.startsWith("http", true)) {
-            result["Referer"] = sourceReferer
-        }
-        val sourceOrigin = source.origin.trim()
-        if (sourceOrigin.startsWith("http", true)) {
-            result["Origin"] = sourceOrigin
-        }
         result["Cache-Control"] = "no-cache"
         result["Pragma"] = "no-cache"
 
-        return result
+        val merged = mergePlaybackHeaders(
+            result,
+            source.headers
+        ).toMutableMap()
+
+        val referer = firstNonBlank(
+            headerValue(merged, "Referer"),
+            source.referer.takeIf { it.startsWith("http", true) },
+            if (source.url.contains("peakstorm.top/", true)) {
+                mediaRefererFor(source.url, source.referer)
+            } else {
+                null
+            }
+        )
+
+        if (!referer.isNullOrBlank()) {
+            putHeaderCaseInsensitive(merged, "Referer", referer)
+        }
+
+        val origin = firstNonBlank(
+            headerValue(merged, "Origin"),
+            source.origin.takeIf { it.startsWith("http", true) },
+            if (source.url.contains("peakstorm.top/", true)) {
+                originOf(referer.orEmpty())
+            } else {
+                null
+            }
+        )
+
+        if (!origin.isNullOrBlank()) {
+            putHeaderCaseInsensitive(merged, "Origin", origin)
+        }
+
+        return sanitizePlaybackHeaders(merged)
     }
 
     private data class PlaybackContext(
@@ -2782,9 +2847,10 @@ class Zoryva : MainAPI() {
             rawUrl: String,
             label: String = "Zoryva Extract",
             sourceReferer: String = referer,
-            sourceOrigin: String = originOf(sourceReferer),
+            sourceOrigin: String = "",
             qualityHint: String = "",
-            height: Int? = null
+            height: Int? = null,
+            sourceHeaders: Map<String, String> = emptyMap()
         ) {
             val clean0 = cleanUrl(rawUrl)
             if (clean0.isBlank()) return
@@ -2799,24 +2865,37 @@ class Zoryva : MainAPI() {
             if (!isPlayableMedia(clean)) return
             if (isObviouslyPromotional(clean) || isIgnoredHost(clean)) return
 
+            val safeSourceHeaders = sanitizePlaybackHeaders(sourceHeaders)
+
+            val headerReferer = headerValue(safeSourceHeaders, "Referer")
+            val headerOrigin = headerValue(safeSourceHeaders, "Origin")
+
             val finalReferer = if (clean.contains("peakstorm.top/", true)) {
                 firstNonBlank(
                     extractProxyParameter(clean0, "referer"),
+                    headerReferer,
                     sourceReferer.takeUnless { it.contains("zoryva.me", true) },
                     "https://speedracelight.com/"
                 ).orEmpty()
             } else {
-                sourceReferer.ifBlank { referer }
+                firstNonBlank(
+                    headerReferer,
+                    sourceReferer
+                ).orEmpty()
             }
 
             val finalOrigin = if (clean.contains("peakstorm.top/", true)) {
                 firstNonBlank(
                     extractProxyParameter(clean0, "origin"),
-                    sourceOrigin.takeUnless { it.contains("zoryva.me", true) },
+                    headerOrigin,
+                    sourceOrigin,
                     originOf(finalReferer)
                 ).orEmpty()
             } else {
-                sourceOrigin.ifBlank { originOf(finalReferer) }
+                firstNonBlank(
+                    headerOrigin,
+                    sourceOrigin
+                ).orEmpty()
             }
 
             val quality = when {
@@ -2842,7 +2921,8 @@ class Zoryva : MainAPI() {
                     server = label.ifBlank { "Zoryva Extract" },
                     latencyMs = 0L,
                     isHlsMaster = false,
-                    audioLabel = ""
+                    audioLabel = "",
+                    headers = safeSourceHeaders
                 )
             )
         }
@@ -2874,13 +2954,14 @@ class Zoryva : MainAPI() {
             value: Any?,
             parentKey: String = "",
             parentReferer: String = referer,
-            parentOrigin: String = originOf(referer),
+            parentOrigin: String = "",
+            parentHeaders: Map<String, String> = emptyMap(),
             parentLabel: String = "Zoryva Extract",
             parentApproved: Boolean = true
         ) {
             when (value) {
                 is JSONObject -> {
-                    fun nestedHeader(vararg wanted: String): String? {
+                    val nestedHeaders = buildMap<String, String> {
                         val keys = value.keys()
                         while (keys.hasNext()) {
                             val key = keys.next()
@@ -2889,27 +2970,50 @@ class Zoryva : MainAPI() {
                             val headerKeys = headerObject.keys()
                             while (headerKeys.hasNext()) {
                                 val headerKey = headerKeys.next()
-                                if (wanted.any { headerKey.equals(it, true) }) {
-                                    return headerObject.optString(headerKey).trim()
-                                        .takeIf { it.isNotBlank() }
+                                val headerValue = headerObject.optString(headerKey).trim()
+                                if (headerValue.isNotBlank()) {
+                                    put(headerKey, headerValue)
                                 }
                             }
                         }
-                        return null
                     }
+
+                    val explicitHeaders = buildMap<String, String> {
+                        listOf("referer", "referrer", "httpReferer", "origin", "httpOrigin").forEach { key ->
+                            val valueText = value.optString(key).trim()
+                            if (valueText.isNotBlank()) {
+                                put(
+                                    when {
+                                        key.equals("referer", true) ||
+                                            key.equals("referrer", true) ||
+                                            key.equals("httpReferer", true) -> "Referer"
+                                        else -> "Origin"
+                                    },
+                                    valueText
+                                )
+                            }
+                        }
+                    }
+
+                    val objectHeaders = mergePlaybackHeaders(
+                        parentHeaders,
+                        nestedHeaders + explicitHeaders
+                    )
 
                     val objectReferer = firstNonBlank(
                         value.optString("referer"),
                         value.optString("referrer"),
                         value.optString("httpReferer"),
-                        nestedHeader("Referer", "Referrer", "httpReferer")
-                    ).orEmpty().ifBlank { parentReferer }
+                        headerValue(objectHeaders, "Referer"),
+                        parentReferer
+                    ).orEmpty()
 
                     val objectOrigin = firstNonBlank(
                         value.optString("origin"),
                         value.optString("httpOrigin"),
-                        nestedHeader("Origin", "httpOrigin")
-                    ).orEmpty().ifBlank { parentOrigin }
+                        headerValue(objectHeaders, "Origin"),
+                        parentOrigin
+                    ).orEmpty()
 
                     val objectLabel = firstNonBlank(
                         value.optString("name"),
@@ -2970,7 +3074,8 @@ class Zoryva : MainAPI() {
                                     objectReferer,
                                     objectOrigin,
                                     qualityHint.ifBlank { key },
-                                    height
+                                    height,
+                                    objectHeaders
                                 )
                             } else if (
                                 key.contains("server", true) ||
@@ -2995,6 +3100,7 @@ class Zoryva : MainAPI() {
                             parentKey = key,
                             parentReferer = objectReferer,
                             parentOrigin = objectOrigin,
+                            parentHeaders = objectHeaders,
                             parentLabel = objectLabel,
                             parentApproved = approved
                         )
@@ -3008,6 +3114,7 @@ class Zoryva : MainAPI() {
                             parentKey = parentKey,
                             parentReferer = parentReferer,
                             parentOrigin = parentOrigin,
+                            parentHeaders = parentHeaders,
                             parentLabel = parentLabel,
                             parentApproved = parentApproved
                         )
@@ -3031,7 +3138,8 @@ class Zoryva : MainAPI() {
                                 found,
                                 parentLabel,
                                 parentReferer,
-                                parentOrigin
+                                parentOrigin,
+                                sourceHeaders = parentHeaders
                             )
                         } else if (
                             parentKey.contains("server", true) ||
@@ -4168,24 +4276,7 @@ class Zoryva : MainAPI() {
         val clean = cleanUrl(candidate.url)
         if (clean.isBlank()) return false
 
-        val headers = linkedMapOf<String, String>(
-            "User-Agent" to USER_AGENT,
-            "Accept" to if (clean.contains(".m3u8", true)) {
-                "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
-            } else {
-                ACCEPT
-            },
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache"
-        )
-
-        candidate.referer.takeIf { it.startsWith("http", true) }?.let {
-            headers["Referer"] = it
-        }
-        candidate.origin.takeIf { it.startsWith("http", true) }?.let {
-            headers["Origin"] = it
-        }
+        val headers = playbackHeadersFor(candidate).toMutableMap()
 
         return try {
             if (clean.contains(".m3u8", true)) {
@@ -4296,6 +4387,67 @@ class Zoryva : MainAPI() {
         }
     }
 
+    private fun isSafePlaybackHeader(
+        name: String
+    ): Boolean = when (name.lowercase(Locale.ROOT)) {
+        "user-agent",
+        "accept",
+        "accept-language",
+        "origin",
+        "referer",
+        "cache-control",
+        "pragma",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "x-requested-with" -> true
+        else -> false
+    }
+
+    private fun sanitizePlaybackHeaders(
+        headers: Map<String, String>
+    ): Map<String, String> {
+        val result = linkedMapOf<String, String>()
+        headers.forEach { (key, value) ->
+            val safeKey = key.trim()
+            val safeValue = value.replace("\r", "").replace("\n", "").trim()
+            if (safeKey.isBlank() || safeValue.isBlank()) return@forEach
+            if (!isSafePlaybackHeader(safeKey)) return@forEach
+            putHeaderCaseInsensitive(
+                result,
+                safeKey,
+                safeValue
+            )
+        }
+        return result
+    }
+
+    private fun putHeaderCaseInsensitive(
+        headers: MutableMap<String, String>,
+        name: String,
+        value: String
+    ) {
+        val existing = headers.keys.firstOrNull { it.equals(name, true) }
+        if (existing != null && existing != name) {
+            headers.remove(existing)
+        }
+        headers[name] = value
+    }
+
+    private fun mergePlaybackHeaders(
+        base: Map<String, String>,
+        extra: Map<String, String>
+    ): Map<String, String> {
+        val result = linkedMapOf<String, String>()
+        sanitizePlaybackHeaders(base).forEach { (key, value) ->
+            putHeaderCaseInsensitive(result, key, value)
+        }
+        sanitizePlaybackHeaders(extra).forEach { (key, value) ->
+            putHeaderCaseInsensitive(result, key, value)
+        }
+        return result
+    }
+
     private fun headerValue(
         headers: Map<String, String>,
         name: String
@@ -4394,10 +4546,36 @@ class Zoryva : MainAPI() {
         return output.toString()
     }
 
+    private fun buildZoryvaProxyCandidate(
+        source: MediaCandidate,
+        pageUrl: String
+    ): MediaCandidate? {
+        if (!requiresZoryvaProxy(source.url)) return null
+
+        val proxyUrl = buildZoryvaProxyUrl(
+            sourceUrl = source.url,
+            referer = source.referer.ifBlank { mediaRefererFor(source.url, pageUrl) },
+            origin = source.origin.ifBlank {
+                originOf(
+                    source.referer.ifBlank { mediaRefererFor(source.url, pageUrl) }
+                )
+            },
+            sourceHeaders = source.headers
+        )
+
+        return source.copy(
+            url = proxyUrl,
+            referer = pageUrl,
+            origin = originOf(pageUrl),
+            headers = emptyMap()
+        )
+    }
+
     private fun buildZoryvaProxyUrl(
         sourceUrl: String,
         referer: String,
-        origin: String
+        origin: String,
+        sourceHeaders: Map<String, String> = emptyMap()
     ): String {
         /* Never wrap an already-valid Zoryva proxy URL a second time. */
         if (sourceUrl.startsWith("$BASE_URL/api/proxy?", true)) {
@@ -4407,13 +4585,29 @@ class Zoryva : MainAPI() {
         val safeReferer = referer.ifBlank { BASE_URL + "/" }
         val safeOrigin = origin.ifBlank { originOf(safeReferer) }
 
+        val proxyHeaders = linkedMapOf<String, String>(
+            "Referer" to safeReferer,
+            "Origin" to safeOrigin,
+            "User-Agent" to USER_AGENT,
+            "Accept" to ACCEPT,
+            "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8"
+        )
+
+        sanitizePlaybackHeaders(sourceHeaders).forEach { (key, value) ->
+            putHeaderCaseInsensitive(proxyHeaders, key, value)
+        }
+
+        putHeaderCaseInsensitive(proxyHeaders, "Referer", safeReferer)
+        putHeaderCaseInsensitive(proxyHeaders, "Origin", safeOrigin)
+
         val headersJson = JSONObject()
-            .put("Referer", safeReferer)
-            .put("Origin", safeOrigin)
-            .put("User-Agent", USER_AGENT)
-            .put("Accept", ACCEPT)
-            .put("Accept-Language", "en-US,en;q=0.9,bn;q=0.8")
-            .toString()
+        proxyHeaders.forEach { (key, value) ->
+            headersJson.put(key, value)
+        }
+
+        val safeUserAgent = headerValue(proxyHeaders, "User-Agent")
+            .takeUnless { it.isNullOrBlank() }
+            ?: USER_AGENT
 
         val h = base64UrlNoPadding(
             headersJson.toByteArray(Charsets.UTF_8)
@@ -4428,7 +4622,7 @@ class Zoryva : MainAPI() {
             append("&origin=")
             append(encode(safeOrigin))
             append("&ua=")
-            append(encode(USER_AGENT))
+            append(encode(safeUserAgent))
             append("&h=")
             append(h)
         }
@@ -5291,30 +5485,51 @@ class Zoryva : MainAPI() {
         source: MediaCandidate,
         pageUrl: String
     ): PlaybackOutput {
-        val resolvedReferer = when {
-            source.referer.isNotBlank() -> source.referer
+        val baseHeaders = playbackHeadersFor(source).toMutableMap()
+
+        val fallbackReferer = when {
+            source.referer.startsWith("http", true) -> source.referer
             source.url.contains("peakstorm.top/", true) -> mediaRefererFor(source.url, pageUrl)
             else -> pageUrl
         }
 
-        val resolvedOrigin = source.origin.ifBlank { originOf(resolvedReferer) }
+        if (headerValue(baseHeaders, "Referer").isNullOrBlank()) {
+            putHeaderCaseInsensitive(
+                baseHeaders,
+                "Referer",
+                fallbackReferer
+            )
+        }
+
+        val sourceOrigin = firstNonBlank(
+            headerValue(source.headers, "Origin"),
+            source.origin.takeIf { it.startsWith("http", true) },
+            if (source.url.contains("peakstorm.top/", true)) {
+                originOf(
+                    headerValue(baseHeaders, "Referer").orEmpty()
+                )
+            } else {
+                null
+            }
+        )
+
+        if (!sourceOrigin.isNullOrBlank()) {
+            putHeaderCaseInsensitive(
+                baseHeaders,
+                "Origin",
+                sourceOrigin
+            )
+        }
+
+        val finalHeaders = sanitizePlaybackHeaders(baseHeaders)
+        val resolvedReferer = headerValue(finalHeaders, "Referer")
+            .orEmpty()
+            .ifBlank { pageUrl }
 
         return PlaybackOutput(
             url = source.url,
             referer = resolvedReferer,
-            headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Accept" to if (source.url.contains(".m3u8", true)) {
-                    "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
-                } else {
-                    ACCEPT
-                },
-                "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
-                "Referer" to resolvedReferer,
-                "Origin" to resolvedOrigin,
-                "Cache-Control" to "no-cache",
-                "Pragma" to "no-cache"
-            )
+            headers = finalHeaders
         )
     }
 
