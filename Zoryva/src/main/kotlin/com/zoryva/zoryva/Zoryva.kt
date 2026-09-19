@@ -263,7 +263,8 @@ class Zoryva : MainAPI() {
 
     private data class ZoryvaExtractResolution(
         val directSources: List<MediaCandidate>,
-        val servers: List<VidrockServerTarget>
+        val servers: List<VidrockServerTarget>,
+        val subtitles: List<Pair<String, String>> = emptyList()
     )
 
     private data class MediaProbe(
@@ -2017,24 +2018,22 @@ class Zoryva : MainAPI() {
         if (!pageUrl.startsWith("http", true)) return false
 
         val playbackContext = parsePlaybackContext(pageUrl)
+            ?: return false
 
         /*
-         * Every Play action starts from a fresh request. No tokenized media URL
-         * is retained between plays.
+         * PRIMARY PLAYBACK PATH
+         *
+         * Zoryva's own website exposes a JSON extraction contract at
+         * /api/extract. That response already contains the current, fresh,
+         * website-confirmed playable sources under videos[] / servers[].
+         *
+         * Every CloudStream Play action performs a new request here. No
+         * signed/tokenized media URL is cached between Play actions.
          */
-        val directFetched = withTimeoutOrNull(SERVER_PAGE_TIMEOUT_MS * 2) {
-            fetchPage(pageUrl, attempts = DETAIL_FETCH_ATTEMPTS)
-        } ?: return false
+        val directPage = withTimeoutOrNull(6500L) {
+            getDocument(pageUrl)
+        }
 
-        val directPage = directFetched.document
-        val directText = directFetched.text
-
-        /*
-         * Zoryva has an official extraction endpoint used by the browser player.
-         * Resolve that endpoint from the same fresh detail-page metadata before
-         * falling back to generic server discovery. This is the primary source
-         * path because it is the website's own current playback contract.
-         */
         val extractResolution = withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
             resolveZoryvaExtract(
                 document = directPage,
@@ -2043,34 +2042,122 @@ class Zoryva : MainAPI() {
             )
         } ?: ZoryvaExtractResolution(emptyList(), emptyList())
 
+        /*
+         * When the website explicitly says a source is OK, do not throw it
+         * away just because a mobile/CloudStream probe cannot reproduce the
+         * browser's byte-range handshake. The website is already the source of
+         * truth for this structured extraction. We still prefer explicit quality
+         * sources and keep proxy/direct alternatives below.
+         */
+        if (extractResolution.directSources.isNotEmpty()) {
+            val seenSubtitle = linkedSetOf<String>()
+            extractResolution.subtitles.forEach { (language, url) ->
+                val key = "$language|$url"
+                if (seenSubtitle.add(key)) {
+                    subtitleCallback(newSubtitleFile(language, url))
+                }
+            }
+
+            val ordered = extractResolution.directSources
+                .distinctBy { normalizeMediaIdentity(it.url) }
+                .sortedWith(
+                    compareByDescending<MediaCandidate> { it.quality }
+                        .thenBy { it.label.lowercase(Locale.ROOT) }
+                        .thenBy { it.url }
+                )
+
+            var emitted = 0
+            val emittedKeys = linkedSetOf<String>()
+
+            for (source in ordered) {
+                if (emitted >= MAX_EMITTED_FALLBACKS) break
+
+                val directOutput = buildDirectPlaybackOutput(source, pageUrl)
+                val sourceKey = "direct|${normalizeMediaIdentity(source.url)}"
+                if (emittedKeys.add(sourceKey)) {
+                    emitExtractorSource(
+                        source = source,
+                        output = directOutput,
+                        callback = callback,
+                        labelSuffix = "Direct",
+                        typeSourceUrl = source.url
+                    )
+                    emitted++
+                }
+
+                /*
+                 * Zoryva itself serves these upstreams through /api/proxy in
+                 * the browser. Keep that exact same-origin route as an immediate
+                 * fallback. It is still built from the fresh URL just returned by
+                 * /api/extract, so the signed token is never reused later.
+                 */
+                if (emitted < MAX_EMITTED_FALLBACKS && requiresZoryvaProxy(source.url)) {
+                    val proxyUrl = buildZoryvaProxyUrl(
+                        sourceUrl = source.url,
+                        referer = source.referer.ifBlank { mediaRefererFor(source.url, pageUrl) },
+                        origin = source.origin.ifBlank { originOf(mediaRefererFor(source.url, pageUrl)) }
+                    )
+
+                    val proxyKey = "proxy|${normalizeMediaIdentity(source.url)}"
+                    if (emittedKeys.add(proxyKey)) {
+                        emitExtractorSource(
+                            source = source,
+                            output = PlaybackOutput(
+                                url = proxyUrl,
+                                referer = pageUrl,
+                                headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Accept" to ACCEPT,
+                                    "Accept-Language" to "en-US,en;q=0.9",
+                                    "Cache-Control" to "no-cache",
+                                    "Pragma" to "no-cache"
+                                )
+                            ),
+                            callback = callback,
+                            labelSuffix = "Zoryva Proxy",
+                            typeSourceUrl = source.url
+                        )
+                        emitted++
+                    }
+                }
+            }
+
+            if (emitted > 0) return true
+        }
+
+        /*
+         * SECONDARY/FALLBACK PATHS
+         *
+         * Only run the heavier crawlers when the website's own structured
+         * extraction did not return a usable direct source. This keeps Play fast
+         * for the normal case and still preserves resilience when one upstream
+         * provider has a temporary issue.
+         */
+        val directText = directPage?.html().orEmpty()
+        val directDocument = directPage ?: return false
+
         val scrapedResolution = withTimeoutOrNull(ZORYVA_SCRAPED_TIMEOUT_MS) {
             resolveZoryvaScraped(
-                document = directPage,
+                document = directDocument,
                 pageUrl = pageUrl,
                 context = playbackContext
             )
         } ?: ZoryvaExtractResolution(emptyList(), emptyList())
 
         val directResult = inspectPageForSources(
-            page = directPage,
+            page = directDocument,
             rawText = directText,
             pageUrl = pageUrl,
             serverName = "Zoryva direct"
         )
 
         val discoveredServerPages = discoverServerPages(
-            document = directPage,
+            document = directDocument,
             rawText = directText,
             pageUrl = pageUrl,
             episodeId = episodeId
         )
 
-        /*
-         * The important change: Vidrock is resolved through its current API,
-         * not by guessing /movie/{id} or /tv/{id}/{season}/{episode} pages.
-         * The API response is expanded into every current server target and
-         * every direct media URL it exposes.
-         */
         val vidrock = withTimeoutOrNull(VIDROCK_API_TIMEOUT_MS) {
             resolveVidrock(playbackContext)
         } ?: VidrockResolution(emptyList(), emptyList())
@@ -2079,16 +2166,12 @@ class Zoryva : MainAPI() {
 
         extractResolution.servers.forEach { target ->
             val clean = cleanUrl(target.url)
-            if (clean.isNotBlank()) {
-                targetMap.putIfAbsent(clean, target)
-            }
+            if (clean.isNotBlank()) targetMap.putIfAbsent(clean, target)
         }
 
         scrapedResolution.servers.forEach { target ->
             val clean = cleanUrl(target.url)
-            if (clean.isNotBlank()) {
-                targetMap.putIfAbsent(clean, target)
-            }
+            if (clean.isNotBlank()) targetMap.putIfAbsent(clean, target)
         }
 
         discoveredServerPages.forEach { (url, label) ->
@@ -2105,11 +2188,6 @@ class Zoryva : MainAPI() {
             }
         }
 
-        /*
-         * Always include Zoryva's own embedded-player route as a fresh fallback.
-         * This mirrors the website's browser flow instead of relying only on
-         * server buttons that may be populated dynamically by JavaScript.
-         */
         buildZoryvaEmbedUrls(playbackContext).forEach { embedUrl ->
             targetMap.putIfAbsent(
                 embedUrl,
@@ -2126,14 +2204,8 @@ class Zoryva : MainAPI() {
         }
 
         val results = ArrayList<ServerResult>()
-        if (directResult.sources.isNotEmpty()) {
-            results += directResult
-        }
+        if (directResult.sources.isNotEmpty()) results += directResult
 
-        /*
-         * All discovered servers are resolved concurrently. We do not wait for
-         * server 1 before starting server 2/3/4/etc.
-         */
         coroutineScope {
             val jobs = targetMap.values
                 .filter { it.url.isNotBlank() }
@@ -2149,23 +2221,7 @@ class Zoryva : MainAPI() {
                         )
                     }
                 }
-
             results += jobs.awaitAll().flatten()
-        }
-
-        /*
-         * Direct URLs returned by the Vidrock API still need to pass the same
-         * real playability validation. A 200 response containing an HTML error
-         * page is NOT considered a playable source.
-         */
-        if (extractResolution.directSources.isNotEmpty()) {
-            val extractServer = inspectCandidatesAsServer(
-                candidates = extractResolution.directSources,
-                serverName = "Zoryva Extract"
-            )
-            if (extractServer.sources.isNotEmpty()) {
-                results += extractServer
-            }
         }
 
         if (scrapedResolution.directSources.isNotEmpty()) {
@@ -2173,9 +2229,7 @@ class Zoryva : MainAPI() {
                 candidates = scrapedResolution.directSources,
                 serverName = "Zoryva Scraped"
             )
-            if (scrapedServer.sources.isNotEmpty()) {
-                results += scrapedServer
-            }
+            if (scrapedServer.sources.isNotEmpty()) results += scrapedServer
         }
 
         if (vidrock.directSources.isNotEmpty()) {
@@ -2183,22 +2237,14 @@ class Zoryva : MainAPI() {
                 candidates = vidrock.directSources,
                 serverName = "Vidrock API"
             )
-            if (directServer.sources.isNotEmpty()) {
-                results += directServer
-            }
+            if (directServer.sources.isNotEmpty()) results += directServer
         }
 
         val usable = results
             .filter { it.sources.isNotEmpty() }
-            .flatMap { result ->
-                result.sources.map { source ->
-                    result to source
-                }
-            }
+            .flatMap { result -> result.sources.map { source -> result to source } }
             .sortedWith(
-                compareBy<Pair<ServerResult, MediaCandidate>> {
-                    it.first.latencyMs
-                }
+                compareBy<Pair<ServerResult, MediaCandidate>> { it.first.latencyMs }
                     .thenByDescending { it.second.quality }
                     .thenBy { it.second.server.lowercase(Locale.ROOT) }
             )
@@ -2208,62 +2254,55 @@ class Zoryva : MainAPI() {
         val emitted = linkedSetOf<String>()
         val subtitleSeen = linkedSetOf<String>()
 
-        /*
-         * Emit only sources that survived actual probing. The first source is
-         * the fastest confirmed playable source. Other confirmed playable
-         * sources remain available as fallbacks. Dead links are never emitted.
-         */
         for ((server, source) in usable) {
             for ((language, subtitleUrl) in server.subtitles) {
                 val key = "$language|$subtitleUrl"
                 if (subtitleSeen.add(key)) {
-                    subtitleCallback(
-                        newSubtitleFile(language, subtitleUrl)
-                    )
+                    subtitleCallback(newSubtitleFile(language, subtitleUrl))
                 }
             }
 
-            val sourceKey =
-                "${source.quality}|${normalizeMediaIdentity(source.url)}"
-
-            if (!emitted.add(sourceKey)) continue
+            if (!emitted.add(normalizeMediaIdentity(source.url))) continue
             if (emitted.size > MAX_EMITTED_FALLBACKS) break
 
-            val output = buildPlaybackOutput(
+            val output = buildDirectPlaybackOutput(source, pageUrl)
+            emitExtractorSource(
                 source = source,
-                pageUrl = pageUrl
-            )
-
-            val cleanUrl = output.url
-            val lowered = cleanUrl
-                .substringBefore('?')
-                .lowercase(Locale.ROOT)
-
-            val linkType = when {
-                lowered.endsWith(".m3u8") -> ExtractorLinkType.M3U8
-                lowered.endsWith(".mpd") -> ExtractorLinkType.DASH
-                else -> ExtractorLinkType.VIDEO
-            }
-
-            callback(
-                newExtractorLink(
-                    name,
-                    buildSourceName(source),
-                    cleanUrl,
-                    linkType
-                ) {
-                    quality = if (source.quality > 0) {
-                        source.quality
-                    } else {
-                        Qualities.Unknown.value
-                    }
-                    referer = output.referer
-                    headers = output.headers
-                }
+                output = output,
+                callback = callback,
+                labelSuffix = "Fallback",
+                typeSourceUrl = source.url
             )
         }
 
         return emitted.isNotEmpty()
+    }
+
+    private fun emitExtractorSource(
+        source: MediaCandidate,
+        output: PlaybackOutput,
+        callback: (ExtractorLink) -> Unit,
+        labelSuffix: String,
+        typeSourceUrl: String
+    ) {
+        val linkType = when {
+            typeSourceUrl.substringBefore('?').endsWith(".m3u8", true) -> ExtractorLinkType.M3U8
+            typeSourceUrl.substringBefore('?').endsWith(".mpd", true) -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
+
+        callback(
+            newExtractorLink(
+                name,
+                "${buildSourceName(source)} • $labelSuffix",
+                output.url,
+                linkType
+            ) {
+                quality = if (source.quality > 0) source.quality else Qualities.Unknown.value
+                referer = output.referer
+                headers = output.headers
+            }
+        )
     }
 
     private suspend fun inspectCandidatesAsServer(
@@ -2448,9 +2487,8 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
-        val pageDocument = document ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        val mediaObject = extractInitialMediaObject(pageDocument)
+        val mediaObject = document?.let { extractInitialMediaObject(it) }
 
         val mediaType = when (context.type.lowercase(Locale.ROOT)) {
             "movie" -> "movie"
@@ -2475,13 +2513,19 @@ class Zoryva : MainAPI() {
         )
 
         val runtime = mediaObject?.optInt("runtime", 0)?.takeIf { it > 0 }
-            ?: Regex("""(?i)\"runtime\"\s*:\s*(\d+)""")
+            ?: Regex("""(?i)\\"runtime\\"\\s*:\\s*(\\d+)""")
                 .find(document?.html().orEmpty())
                 ?.groupValues
                 ?.getOrNull(1)
                 ?.toIntOrNull()
 
-        val query = buildPlaybackQuery(
+        /*
+         * Use the exact browser-style request first: /api/extract with no
+         * synthetic soft flag. The captured website response proves this route
+         * returns structured videos[]/servers[] data. soft=1 remains a bounded
+         * compatibility retry for deployments that require it.
+         */
+        val exactQuery = buildPlaybackQuery(
             mediaType = mediaType,
             externalId = context.tmdbId,
             title = title,
@@ -2489,31 +2533,55 @@ class Zoryva : MainAPI() {
             imdbId = imdbId,
             runtime = runtime,
             season = context.season,
-            episode = context.episode
+            episode = context.episode,
+            includeSoft = false
         )
 
-        val endpoint = "$BASE_URL/api/extract?$query"
+        val softQuery = buildPlaybackQuery(
+            mediaType = mediaType,
+            externalId = context.tmdbId,
+            title = title,
+            originalTitle = originalTitle,
+            imdbId = imdbId,
+            runtime = runtime,
+            season = context.season,
+            episode = context.episode,
+            includeSoft = true
+        )
 
-        val response = runCatching {
-            app.get(
-                endpoint,
-                headers = PAGE_HEADERS + mapOf(
-                    "Referer" to pageUrl,
-                    "Accept" to "application/json,text/plain,*/*;q=0.8",
-                    "Cache-Control" to "no-cache",
-                    "Pragma" to "no-cache"
-                )
+        val endpoints = listOf(
+            "$BASE_URL/api/extract?$exactQuery",
+            "$BASE_URL/api/extract?$softQuery"
+        ).distinct()
+
+        for (endpoint in endpoints) {
+            val response = withTimeoutOrNull(ZORYVA_EXTRACT_TIMEOUT_MS) {
+                runCatching {
+                    app.get(
+                        endpoint,
+                        headers = PAGE_HEADERS + mapOf(
+                            "Referer" to pageUrl,
+                            "Accept" to "application/json,text/plain,*/*;q=0.8",
+                            "Cache-Control" to "no-cache",
+                            "Pragma" to "no-cache"
+                        )
+                    )
+                }.getOrNull()
+            } ?: continue
+
+            if (response.code !in 200..399) continue
+
+            val parsed = parseZoryvaExtractResponse(
+                raw = response.text,
+                referer = pageUrl
             )
-        }.getOrNull() ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
-        if (response.code !in 200..399) {
-            return ZoryvaExtractResolution(emptyList(), emptyList())
+            if (parsed.directSources.isNotEmpty() || parsed.servers.isNotEmpty()) {
+                return parsed
+            }
         }
 
-        return parseZoryvaExtractResponse(
-            raw = response.text,
-            referer = pageUrl
-        )
+        return ZoryvaExtractResolution(emptyList(), emptyList())
     }
 
     private suspend fun resolveZoryvaScraped(
@@ -2591,7 +2659,8 @@ class Zoryva : MainAPI() {
         imdbId: String?,
         runtime: Int?,
         season: Int?,
-        episode: Int?
+        episode: Int?,
+        includeSoft: Boolean = true
     ): String {
         val parts = ArrayList<String>()
         fun add(name: String, value: String?) {
@@ -2608,7 +2677,9 @@ class Zoryva : MainAPI() {
         runtime?.takeIf { it > 0 }?.let { parts += "runtime=$it" }
         season?.let { parts += "season=$it" }
         episode?.let { parts += "episode=$it" }
-        parts += "soft=1"
+        if (includeSoft) {
+            parts += "soft=1"
+        }
 
         return parts.joinToString("&")
     }
@@ -2633,6 +2704,33 @@ class Zoryva : MainAPI() {
     ): ZoryvaExtractResolution {
         val direct = linkedMapOf<String, MediaCandidate>()
         val servers = linkedMapOf<String, VidrockServerTarget>()
+        val subtitles = linkedMapOf<String, Pair<String, String>>()
+
+        fun isSuccessfulStatus(value: String): Boolean {
+            val status = value.trim().lowercase(Locale.ROOT)
+            return status.isBlank() || status in setOf(
+                "ok", "ready", "available", "success", "working", "active"
+            )
+        }
+
+        fun isSubtitleUrl(url: String): Boolean {
+            val lower = url.lowercase(Locale.ROOT).substringBefore('?')
+            return lower.endsWith(".vtt") ||
+                lower.endsWith(".srt") ||
+                lower.endsWith(".ass") ||
+                lower.endsWith(".ssa")
+        }
+
+        fun addSubtitle(
+            rawUrl: String,
+            language: String,
+            fallbackName: String = language
+        ) {
+            val clean = normalizeExtractedUrl(rawUrl, referer) ?: return
+            if (!isSubtitleUrl(clean)) return
+            val lang = language.ifBlank { fallbackName.ifBlank { "Subtitles" } }
+            subtitles.putIfAbsent("$lang|$clean", lang to clean)
+        }
 
         fun addMedia(
             rawUrl: String,
@@ -2678,26 +2776,27 @@ class Zoryva : MainAPI() {
                 else -> qualityFromUrl(clean, qualityHint.ifBlank { label })
             }
 
-            val variants = expandPeakstormHlsVariants(clean)
-            for (variant in variants) {
-                if (!isPlayableMedia(variant)) continue
-
-                val variantQuality = qualityFromUrl(variant, qualityHint.ifBlank { label })
-                direct.putIfAbsent(
-                    normalizeMediaIdentity(variant),
-                    MediaCandidate(
-                        url = variant,
-                        referer = finalReferer,
-                        origin = finalOrigin,
-                        quality = maxOf(quality, variantQuality),
-                        label = qualityHint.ifBlank { label },
-                        server = label.ifBlank { "Zoryva Extract" },
-                        latencyMs = 0L,
-                        isHlsMaster = false,
-                        audioLabel = ""
-                    )
+            /*
+             * Do not manufacture additional quality URLs here. The /api/extract
+             * response already gives us the exact current playable URL for each
+             * source (for example the real 1080p, 720p and 480p playlists).
+             * Synthetic variants can be stale or nonexistent, so only emit the
+             * exact URL that the website returned.
+             */
+            direct.putIfAbsent(
+                normalizeMediaIdentity(clean),
+                MediaCandidate(
+                    url = clean,
+                    referer = finalReferer,
+                    origin = finalOrigin,
+                    quality = quality,
+                    label = qualityHint.ifBlank { label },
+                    server = label.ifBlank { "Zoryva Extract" },
+                    latencyMs = 0L,
+                    isHlsMaster = false,
+                    audioLabel = ""
                 )
-            }
+            )
         }
 
         fun addServer(
@@ -2728,7 +2827,8 @@ class Zoryva : MainAPI() {
             parentKey: String = "",
             parentReferer: String = referer,
             parentOrigin: String = originOf(referer),
-            parentLabel: String = "Zoryva Extract"
+            parentLabel: String = "Zoryva Extract",
+            parentApproved: Boolean = true
         ) {
             when (value) {
                 is JSONObject -> {
@@ -2756,14 +2856,23 @@ class Zoryva : MainAPI() {
 
                     val broken = value.optBoolean("broken", false)
                     val disabled = value.optBoolean("disabled", false)
-                    if (!broken && !disabled) {
-                        val qualityHint = firstNonBlank(
-                            value.optString("quality"),
-                            value.optString("resolution"),
-                            value.optString("label")
-                        ).orEmpty()
-                        val height = value.optInt("height", 0).takeIf { it > 0 }
+                    val statusOk = isSuccessfulStatus(value.optString("status"))
+                    val approved = parentApproved && !broken && !disabled && statusOk
 
+                    val qualityHint = firstNonBlank(
+                        value.optString("quality"),
+                        value.optString("resolution"),
+                        value.optString("label")
+                    ).orEmpty()
+                    val height = value.optInt("height", 0).takeIf { it > 0 }
+
+                    val explicitLanguage = firstNonBlank(
+                        value.optString("language"),
+                        value.optString("lang"),
+                        value.optString("name")
+                    ).orEmpty()
+
+                    if (approved) {
                         val directKeys = listOf(
                             "url", "src", "file", "link", "streamUrl",
                             "stream_url", "videoUrl", "video_url", "playUrl",
@@ -2773,24 +2882,35 @@ class Zoryva : MainAPI() {
 
                         directKeys.forEach { key ->
                             val candidate = value.optString(key).trim()
-                            if (candidate.isNotBlank()) {
-                                if (isPlayableMedia(candidate)) {
-                                    addMedia(
-                                        candidate,
-                                        objectLabel.ifBlank { key },
-                                        objectReferer,
-                                        objectOrigin,
-                                        qualityHint.ifBlank { key },
-                                        height
-                                    )
-                                } else if (
-                                    key.contains("server", true) ||
-                                    key.contains("source", true) ||
-                                    key.contains("player", true) ||
-                                    key.contains("embed", true)
-                                ) {
-                                    addServer(candidate, objectLabel.ifBlank { key }, objectReferer)
-                                }
+                            if (candidate.isBlank()) return@forEach
+
+                            if (isSubtitleUrl(candidate) || parentKey.contains("subtitle", true) || key.contains("subtitle", true)) {
+                                addSubtitle(
+                                    candidate,
+                                    firstNonBlank(
+                                        value.optString("language"),
+                                        value.optString("lang"),
+                                        explicitLanguage,
+                                        key
+                                    ).orEmpty(),
+                                    objectLabel
+                                )
+                            } else if (isPlayableMedia(candidate)) {
+                                addMedia(
+                                    candidate,
+                                    objectLabel.ifBlank { key },
+                                    objectReferer,
+                                    objectOrigin,
+                                    qualityHint.ifBlank { key },
+                                    height
+                                )
+                            } else if (
+                                key.contains("server", true) ||
+                                key.contains("source", true) ||
+                                key.contains("player", true) ||
+                                key.contains("embed", true)
+                            ) {
+                                addServer(candidate, objectLabel.ifBlank { key }, objectReferer)
                             }
                         }
                     }
@@ -2798,12 +2918,17 @@ class Zoryva : MainAPI() {
                     val iterator = value.keys()
                     while (iterator.hasNext()) {
                         val key = iterator.next()
+                        val child = value.opt(key)
+                        if (approved && key.contains("subtitle", true) && child is String) {
+                            addSubtitle(child, explicitLanguage, objectLabel)
+                        }
                         walkJson(
-                            value.opt(key),
+                            child,
                             parentKey = key,
                             parentReferer = objectReferer,
                             parentOrigin = objectOrigin,
-                            parentLabel = objectLabel
+                            parentLabel = objectLabel,
+                            parentApproved = approved
                         )
                     }
                 }
@@ -2815,7 +2940,8 @@ class Zoryva : MainAPI() {
                             parentKey = parentKey,
                             parentReferer = parentReferer,
                             parentOrigin = parentOrigin,
-                            parentLabel = parentLabel
+                            parentLabel = parentLabel,
+                            parentApproved = parentApproved
                         )
                     }
                 }
@@ -2824,8 +2950,15 @@ class Zoryva : MainAPI() {
                     val text = value.trim()
                     if (text.isBlank()) return
 
+                    if (parentApproved && (parentKey.contains("subtitle", true) || isSubtitleUrl(text))) {
+                        addSubtitle(text, parentLabel, parentLabel)
+                    }
+
                     extractUrlsFromRawText(text).forEach { found ->
-                        if (isPlayableMedia(found)) {
+                        if (!parentApproved) return@forEach
+                        if (isSubtitleUrl(found)) {
+                            addSubtitle(found, parentLabel, parentLabel)
+                        } else if (isPlayableMedia(found)) {
                             addMedia(
                                 found,
                                 parentLabel,
@@ -2848,10 +2981,14 @@ class Zoryva : MainAPI() {
         runCatching { walkJson(JSONObject(raw)) }
         runCatching { walkJson(JSONArray(raw)) }
 
-        /* The endpoint is JSON in the normal case, but keep a raw-text fallback
-         * for escaped/serialized response variants. */
+        /*
+         * The normal response is JSON, but raw-text URL extraction is kept as a
+         * defensive fallback for escaped/serialized variants.
+         */
         extractUrlsFromRawText(raw).forEach { found ->
-            if (isPlayableMedia(found)) {
+            if (isSubtitleUrl(found)) {
+                subtitles.putIfAbsent("Subtitles|$found", "Subtitles" to found)
+            } else if (isPlayableMedia(found)) {
                 addMedia(found)
             } else if (
                 found.contains("server", true) ||
@@ -2864,7 +3001,8 @@ class Zoryva : MainAPI() {
 
         return ZoryvaExtractResolution(
             directSources = direct.values.toList(),
-            servers = servers.values.toList()
+            servers = servers.values.toList(),
+            subtitles = subtitles.values.toList()
         )
     }
 
@@ -5081,39 +5219,41 @@ class Zoryva : MainAPI() {
         }.distinct()
     }
 
-    private fun buildPlaybackOutput(
+    private fun buildDirectPlaybackOutput(
         source: MediaCandidate,
         pageUrl: String
     ): PlaybackOutput {
-        /*
-         * CloudStream is not subject to browser CORS rules. The original
-         * short-lived upstream URL is therefore the preferred output. This is
-         * exactly the URL the website player ultimately feeds into its proxy.
-         * The required Referer/Origin are preserved as request headers.
-         */
-        if (requiresZoryvaProxy(source.url)) {
-            val upstreamReferer = mediaRefererFor(source.url, source.referer)
-            return PlaybackOutput(
-                url = source.url,
-                referer = upstreamReferer,
-                headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Accept" to ACCEPT,
-                    "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
-                    "Referer" to upstreamReferer,
-                    "Origin" to originOf(upstreamReferer),
-                    "Cache-Control" to "no-cache",
-                    "Pragma" to "no-cache"
-                )
-            )
+        val resolvedReferer = when {
+            source.referer.isNotBlank() -> source.referer
+            source.url.contains("peakstorm.top/", true) -> mediaRefererFor(source.url, pageUrl)
+            else -> pageUrl
         }
+
+        val resolvedOrigin = source.origin.ifBlank { originOf(resolvedReferer) }
 
         return PlaybackOutput(
             url = source.url,
-            referer = source.referer.ifBlank { pageUrl },
-            headers = playbackHeadersFor(source)
+            referer = resolvedReferer,
+            headers = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Accept" to if (source.url.contains(".m3u8", true)) {
+                    "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
+                } else {
+                    ACCEPT
+                },
+                "Accept-Language" to "en-US,en;q=0.9,bn;q=0.8",
+                "Referer" to resolvedReferer,
+                "Origin" to resolvedOrigin,
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache"
+            )
         )
     }
+
+    private fun buildPlaybackOutput(
+        source: MediaCandidate,
+        pageUrl: String
+    ): PlaybackOutput = buildDirectPlaybackOutput(source, pageUrl)
 
     private fun isObviouslyPromotional(
         url: String
