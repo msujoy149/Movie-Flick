@@ -5,11 +5,13 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -52,6 +54,7 @@ class Zoryva : MainAPI() {
         const val MAX_SEARCH_ITEMS = 50
         const val MAX_SERVER_PAGES = 12
         const val MAX_CRAWL_DEPTH = 2
+        const val VIDROCK_ORIGIN = "https://vidrock.net"
         const val SOURCE_PROBE_TIMEOUT_MS = 7000L
         const val SERVER_PAGE_TIMEOUT_MS = 9000L
         const val HOME_PREFETCH_TIMEOUT_MS = 5000L
@@ -62,10 +65,14 @@ class Zoryva : MainAPI() {
         // only when native search cannot produce a useful match.
         const val SEARCH_RESULT_LIMIT = 50
         const val SEARCH_NATIVE_TIMEOUT_MS = 4500L
+        const val SEARCH_HOME_TIMEOUT_MS = 5000L
         const val SEARCH_FALLBACK_TIMEOUT_MS = 8500L
         const val SEARCH_SITEMAP_LIMIT = 5000
         const val SEARCH_SITEMAP_CHILD_LIMIT = 16
-        const val SEARCH_VERIFY_LIMIT = 8
+        const val SEARCH_VERIFY_LIMIT = 12
+        const val SEARCH_LOCAL_SCAN_LIMIT = 1600
+        const val DETAIL_FETCH_ATTEMPTS = 3
+        const val DETAIL_RETRY_DELAY_MS = 350L
         const val STRONG_SEARCH_SCORE = 0.78
         const val NORMAL_SEARCH_SCORE = 0.42
 
@@ -165,7 +172,8 @@ class Zoryva : MainAPI() {
         val title: String,
         val url: String,
         val poster: String?,
-        val type: TvType
+        val type: TvType,
+        val aliases: List<String> = emptyList()
     )
 
     private data class EpisodeInfo(
@@ -611,6 +619,23 @@ class Zoryva : MainAPI() {
             .takeIf { it.isNotBlank() }
             ?: return null
 
+        val aliases = buildList {
+            media.optString("originalTitle")
+                .trim()
+                .takeIf { it.isNotBlank() && !it.equals(title, true) }
+                ?.let(::add)
+            media.optString("name")
+                .trim()
+                .takeIf { it.isNotBlank() && !it.equals(title, true) }
+                ?.let(::add)
+            media.optString("slug")
+                .trim()
+                .takeIf { it.isNotBlank() }
+                ?.replace('-', ' ')
+                ?.replace('_', ' ')
+                ?.let(::add)
+        }
+
         val mediaType = media.optString("mediaType")
             .trim()
             .lowercase(Locale.ROOT)
@@ -646,7 +671,8 @@ class Zoryva : MainAPI() {
             title = cleanCardTitle(title),
             url = "$BASE_URL/$path/$externalId",
             poster = poster,
-            type = type
+            type = type,
+            aliases = aliases.map(::cleanCardTitle)
         )
     }
 
@@ -1014,27 +1040,80 @@ class Zoryva : MainAPI() {
         if (original.isBlank()) return emptyList()
 
         /*
-         * SEARCH STRATEGY
+         * Professional search pipeline:
          *
-         * 1) Ask Zoryva's own /search route first. This is the fastest path
-         *    because the website itself already knows its live catalog.
-         * 2) Rank those real site results locally with exact, token, partial,
-         *    typo-tolerant and order-independent matching.
-         * 3) If native search cannot produce a useful match, retry a very small
-         *    set of normalized query variants concurrently.
-         * 4) Only when those still fail, use a lightweight sitemap fallback.
-         *    Sitemap entries are real Zoryva media URLs, not invented results.
-         *    The best fuzzy candidates are then verified against their actual
-         *    Zoryva detail pages so the emitted title/poster come from the site.
+         * 1) Search Zoryva's own native search endpoint.
+         * 2) In parallel, refresh the four-section RSC catalog so an item that
+         *    is already visible on Home is searchable even when /search is a
+         *    client-rendered shell.
+         * 3) Merge both real-Zoryva result sets and rank them locally.
+         * 4) Use Jaro-Winkler + token similarity so queries such as
+         *    "research" can still match the real title "Reacher".
+         * 5) Only then use the sitemap/detail-page fallback.
          *
-         * No external catalog is used and no media URL is fabricated here.
+         * No outside catalog is introduced and no fake media URL is generated.
          */
-        val native = withTimeoutOrNull(SEARCH_NATIVE_TIMEOUT_MS) {
-            searchNative(original)
+        val (warm, native) = coroutineScope {
+            val warmJob = async {
+                withTimeoutOrNull(SEARCH_HOME_TIMEOUT_MS) {
+                    prefetchHomeCatalogs()
+                    homeRoutes
+                        .flatMap { route -> getCachedCatalog(route)?.items.orEmpty() }
+                        .distinctBy { cleanUrl(it.url) }
+                }.orEmpty()
+            }
+
+            val nativeJob = async {
+                withTimeoutOrNull(SEARCH_NATIVE_TIMEOUT_MS) {
+                    searchNative(original)
+                }.orEmpty()
+            }
+
+            warmJob.await() to nativeJob.await()
         }
 
-        if (!native.isNullOrEmpty()) {
-            return native
+        val localRanked = rankSearchItems(original, warm)
+
+        val nativeItems = native.mapNotNull { response ->
+            response.url?.takeIf { it.startsWith(BASE_URL, true) }?.let { url ->
+                val parsedType = when {
+                    isTvPath(runCatching { URI(url).path.orEmpty() }.getOrDefault("")) -> TvType.TvSeries
+                    isAnimePath(runCatching { URI(url).path.orEmpty() }.getOrDefault("")) -> TvType.Anime
+                    isMoviePath(runCatching { URI(url).path.orEmpty() }.getOrDefault("")) -> TvType.Movie
+                    else -> return@let null
+                }
+                val title = response.name
+                    .trim()
+                    .takeIf { it.isNotBlank() }
+                    ?: return@let null
+                SiteItem(title, cleanUrl(url), null, parsedType)
+            }
+        }
+
+        val merged = linkedMapOf<String, Pair<SiteItem, Double>>()
+        localRanked.forEach { (item, score) ->
+            merged[cleanUrl(item.url)] = item to score
+        }
+        nativeItems.forEach { item ->
+            val score = searchScore(original, item.title)
+            val key = cleanUrl(item.url)
+            val existing = merged[key]
+            if (existing == null || score > existing.second) {
+                merged[key] = item to score
+            }
+        }
+
+        val ranked = merged.values
+            .filter { it.second >= NORMAL_SEARCH_SCORE }
+            .sortedWith(
+                compareByDescending<Pair<SiteItem, Double>> { it.second }
+                    .thenBy { it.first.title.lowercase(Locale.ROOT) }
+            )
+
+        if (ranked.isNotEmpty()) {
+            return ranked
+                .take(SEARCH_RESULT_LIMIT)
+                .map { it.first.toSearchResponse() }
         }
 
         return withTimeoutOrNull(SEARCH_FALLBACK_TIMEOUT_MS) {
@@ -1174,7 +1253,13 @@ class Zoryva : MainAPI() {
     ): List<Pair<SiteItem, Double>> {
         return items
             .map { item ->
-                item to searchScore(original, item.title)
+                val aliasScore = item.aliases.maxOfOrNull { alias ->
+                    searchScore(original, alias)
+                } ?: 0.0
+                item to maxOf(
+                    searchScore(original, item.title),
+                    aliasScore
+                )
             }
             .filter { it.second >= NORMAL_SEARCH_SCORE }
             .sortedWith(
@@ -1339,6 +1424,18 @@ class Zoryva : MainAPI() {
             score = maxOf(score, 0.88 + minOf(0.10, ratio * 0.10))
         }
 
+        /* Human typos are often better captured by Jaro-Winkler than raw edit distance.
+         * Example: "research" vs "reacher" gets a strong similarity despite several
+         * insertions/deletions, while exact/substring matches above still dominate.
+         */
+        if (q.length >= 4 && t.length >= 4) {
+            score = maxOf(
+                score,
+                jaroWinkler(q, t),
+                jaroWinkler(qCompact, tCompact)
+            )
+        }
+
         val qTokens = q.split(' ').filter { it.length >= 2 }
         val tTokens = t.split(' ').filter { it.length >= 2 }
 
@@ -1434,6 +1531,69 @@ class Zoryva : MainAPI() {
         }
 
         return result.coerceIn(0.0, 1.0)
+    }
+
+    private fun jaroWinkler(
+        first: String,
+        second: String
+    ): Double {
+        if (first == second) return 1.0
+        if (first.isBlank() || second.isBlank()) return 0.0
+
+        val a = first
+        val b = second
+        val matchDistance = (maxOf(a.length, b.length) / 2) - 1
+        if (matchDistance < 0) return 0.0
+
+        val aMatches = BooleanArray(a.length)
+        val bMatches = BooleanArray(b.length)
+        var matches = 0
+
+        for (i in a.indices) {
+            val start = maxOf(0, i - matchDistance)
+            val end = minOf(i + matchDistance + 1, b.length)
+            for (j in start until end) {
+                if (bMatches[j] || a[i] != b[j]) continue
+                aMatches[i] = true
+                bMatches[j] = true
+                matches++
+                break
+            }
+        }
+
+        if (matches == 0) return 0.0
+
+        val aSequence = CharArray(matches)
+        val bSequence = CharArray(matches)
+        var ai = 0
+        var bi = 0
+
+        for (i in a.indices) {
+            if (aMatches[i]) aSequence[ai++] = a[i]
+        }
+        for (j in b.indices) {
+            if (bMatches[j]) bSequence[bi++] = b[j]
+        }
+
+        var transpositions = 0
+        for (i in 0 until matches) {
+            if (aSequence[i] != bSequence[i]) transpositions++
+        }
+
+        val m = matches.toDouble()
+        val jaro = (
+            m / a.length.toDouble() +
+                m / b.length.toDouble() +
+                (m - transpositions / 2.0) / m
+            ) / 3.0
+
+        var prefix = 0
+        val prefixLimit = minOf(4, minOf(a.length, b.length))
+        while (prefix < prefixLimit && a[prefix] == b[prefix]) {
+            prefix++
+        }
+
+        return (jaro + prefix * 0.1 * (1.0 - jaro)).coerceIn(0.0, 1.0)
     }
 
     private fun fullStringSimilarity(
@@ -1550,7 +1710,7 @@ class Zoryva : MainAPI() {
     ): DetailInfo? {
         val path = runCatching { URI(pageUrl).path.orEmpty() }.getOrDefault("")
 
-        val mediaObject = extractInitialMediaObject(document.html())
+        val mediaObject = extractInitialMediaObject(document)
 
         val mediaType = firstNonBlank(
             mediaObject?.optString("mediaType"),
@@ -1594,7 +1754,11 @@ class Zoryva : MainAPI() {
         val episodes = if (type == TvType.Movie) {
             emptyList()
         } else {
-            parseEpisodes(mediaObject)
+            mergeEpisodeMetadata(
+                embedded = parseEpisodes(mediaObject),
+                linked = parseEpisodeLinks(document, pageUrl),
+                generated = generateMissingEpisodes(mediaObject)
+            )
         }
 
         return DetailInfo(
@@ -1644,6 +1808,105 @@ class Zoryva : MainAPI() {
             compareBy<EpisodeInfo> { it.season }
                 .thenBy { it.episode }
         )
+    }
+
+    private fun parseEpisodeLinks(
+        document: Document,
+        pageUrl: String
+    ): List<EpisodeInfo> {
+        val result = ArrayList<EpisodeInfo>()
+
+        document.select("a[href]").forEach { anchor ->
+            val href = normalizeExtractedUrl(anchor.attr("href"), pageUrl) ?: return@forEach
+            val path = runCatching { URI(href).path.orEmpty() }.getOrDefault("")
+            if (!isEpisodePath(path)) return@forEach
+
+            val parts = path.trim('/').split('/').filter { it.isNotBlank() }
+            if (parts.size < 4) return@forEach
+            val season = parts.getOrNull(parts.size - 2)?.toIntOrNull() ?: return@forEach
+            val episode = parts.lastOrNull()?.toIntOrNull() ?: return@forEach
+            if (season < 0 || episode <= 0) return@forEach
+
+            val title = firstNonBlank(
+                anchor.attr("aria-label"),
+                anchor.attr("title"),
+                anchor.text().trim()
+            )?.let(::cleanCardTitle)
+                ?.takeIf { it.isNotBlank() }
+                ?: "Episode $episode"
+
+            val poster = extractCardPoster(anchor, pageUrl)
+
+            result += EpisodeInfo(
+                id = null,
+                name = title,
+                season = season,
+                episode = episode,
+                overview = null,
+                poster = poster,
+                runtime = null
+            )
+        }
+
+        return result
+    }
+
+    private fun generateMissingEpisodes(
+        mediaObject: JSONObject?
+    ): List<EpisodeInfo> {
+        val seasons = mediaObject?.optJSONArray("seasons") ?: return emptyList()
+        val result = ArrayList<EpisodeInfo>()
+
+        for (i in 0 until seasons.length()) {
+            val season = seasons.optJSONObject(i) ?: continue
+            val seasonNumber = season.optInt("seasonNumber", -1)
+            val episodeCount = season.optInt("episodeCount", 0)
+            if (seasonNumber < 0 || episodeCount <= 0) continue
+
+            val embeddedCount = season.optJSONArray("episodes")?.length() ?: 0
+            if (embeddedCount >= episodeCount) continue
+
+            for (number in 1..episodeCount.coerceAtMost(5000)) {
+                result += EpisodeInfo(
+                    id = null,
+                    name = "Episode $number",
+                    season = seasonNumber,
+                    episode = number,
+                    overview = null,
+                    poster = season.optString("posterPath").takeIf { it.isNotBlank() },
+                    runtime = null
+                )
+            }
+        }
+
+        return result
+    }
+
+    private fun mergeEpisodeMetadata(
+        embedded: List<EpisodeInfo>,
+        linked: List<EpisodeInfo>,
+        generated: List<EpisodeInfo>
+    ): List<EpisodeInfo> {
+        val result = linkedMapOf<String, EpisodeInfo>()
+
+        fun add(item: EpisodeInfo) {
+            val key = "${item.season}|${item.episode}"
+            val existing = result[key]
+            result[key] = when {
+                existing == null -> item
+                existing.name.startsWith("Episode ") && !item.name.startsWith("Episode ") -> item
+                existing.poster.isNullOrBlank() && !item.poster.isNullOrBlank() -> existing.copy(poster = item.poster)
+                existing.overview.isNullOrBlank() && !item.overview.isNullOrBlank() -> existing.copy(overview = item.overview)
+                else -> existing
+            }
+        }
+
+        linked.forEach(::add)
+        embedded.forEach(::add)
+        generated.forEach(::add)
+
+        return result.values
+            .sortedWith(compareBy<EpisodeInfo> { it.season }.thenBy { it.episode })
     }
 
     private fun buildEpisodeUrl(
@@ -1704,24 +1967,30 @@ class Zoryva : MainAPI() {
 
         if (!pageUrl.startsWith("http", true)) return false
 
+        val playbackContext = parsePlaybackContext(pageUrl)
+
         /*
          * IMPORTANT:
          * Every Play action starts from a fresh current page. No tokenized URL
          * from an earlier Play call is retained in class state or disk cache.
          */
-        val directPage = withTimeoutOrNull(
-            SERVER_PAGE_TIMEOUT_MS
-        ) {
-            getDocument(pageUrl)
+        val directFetched = withTimeoutOrNull(SERVER_PAGE_TIMEOUT_MS * 2) {
+            fetchPage(pageUrl, attempts = DETAIL_FETCH_ATTEMPTS)
         } ?: return false
+
+        val directPage = directFetched.document
+        val directText = directFetched.text
 
         val serverPages = discoverServerPages(
             document = directPage,
-            pageUrl = pageUrl
+            rawText = directText,
+            pageUrl = pageUrl,
+            episodeId = episodeId
         )
 
         val directResult = inspectPageForSources(
             page = directPage,
+            rawText = directText,
             pageUrl = pageUrl,
             serverName = "Zoryva direct"
         )
@@ -1730,6 +1999,16 @@ class Zoryva : MainAPI() {
 
         for ((url, name) in serverPages) {
             allTargets.putIfAbsent(cleanUrl(url), name)
+        }
+
+        /*
+         * Zoryva's browser player currently delegates VOD playback to Vidrock.
+         * Try the public movie/TV page forms as additional fresh server targets.
+         * The page itself decides whether a current playable URL is exposed;
+         * we never hard-code a signed CDN URL.
+         */
+        buildVidrockTargets(playbackContext).forEach { (url, label) ->
+            allTargets.putIfAbsent(cleanUrl(url), label)
         }
 
         /*
@@ -1747,7 +2026,8 @@ class Zoryva : MainAPI() {
                     inspectServerTarget(
                         url = entry.key,
                         name = entry.value,
-                        depth = 0
+                        depth = 0,
+                        episodeId = episodeId
                     )
                 }
             }
@@ -1813,10 +2093,63 @@ class Zoryva : MainAPI() {
         return emitted.isNotEmpty()
     }
 
+    private data class PlaybackContext(
+        val type: String,
+        val tmdbId: String,
+        val season: Int?,
+        val episode: Int?
+    )
+
+    private fun parsePlaybackContext(
+        pageUrl: String
+    ): PlaybackContext? {
+        val path = runCatching { URI(pageUrl).path.orEmpty() }.getOrDefault("")
+        val parts = path.trim('/').split('/').filter { it.isNotBlank() }
+        if (parts.size < 2) return null
+
+        val type = when {
+            parts[0].equals("movie", true) -> "movie"
+            parts[0].equals("tv", true) -> "tv"
+            parts[0].equals("anime", true) -> "anime"
+            else -> return null
+        }
+
+        val tmdbId = parts[1].takeIf { it.all(Char::isDigit) } ?: return null
+        val season = parts.drop(2).getOrNull(parts.size - 4)?.toIntOrNull()
+        val episode = parts.lastOrNull()?.toIntOrNull()
+
+        return if (type == "movie") {
+            PlaybackContext(type, tmdbId, null, null)
+        } else {
+            PlaybackContext(type, tmdbId, season, episode)
+        }
+    }
+
+    private fun buildVidrockTargets(
+        context: PlaybackContext?
+    ): List<Pair<String, String>> {
+        context ?: return emptyList()
+
+        val result = linkedSetOf<Pair<String, String>>()
+
+        if (context.type == "movie") {
+            result += "$VIDROCK_ORIGIN/movie/${context.tmdbId}" to "Vidrock Movie"
+            result += "$VIDROCK_ORIGIN/embed/movie/${context.tmdbId}" to "Vidrock Movie Embed"
+        } else {
+            val season = context.season ?: return emptyList()
+            val episode = context.episode ?: return emptyList()
+            result += "$VIDROCK_ORIGIN/tv/${context.tmdbId}/$season/$episode" to "Vidrock TV"
+            result += "$VIDROCK_ORIGIN/embed/tv/${context.tmdbId}/$season/$episode" to "Vidrock TV Embed"
+        }
+
+        return result.toList()
+    }
+
     private suspend fun inspectServerTarget(
         url: String,
         name: String,
-        depth: Int
+        depth: Int,
+        episodeId: String? = null
     ): List<ServerResult> {
         if (depth > MAX_CRAWL_DEPTH) return emptyList()
         if (url.isBlank()) return emptyList()
@@ -1825,12 +2158,14 @@ class Zoryva : MainAPI() {
 
         val started = System.currentTimeMillis()
 
-        val document = withTimeoutOrNull(SERVER_PAGE_TIMEOUT_MS) {
-            getDocument(url)
+        val fetched = withTimeoutOrNull(SERVER_PAGE_TIMEOUT_MS) {
+            fetchPage(url, attempts = 2)
         } ?: return emptyList()
 
+        val document = fetched.document
         val current = inspectPageForSources(
             page = document,
+            rawText = fetched.text,
             pageUrl = url,
             serverName = name
         ).copy(
@@ -1843,6 +2178,7 @@ class Zoryva : MainAPI() {
 
         val nested = discoverNestedPlayerPages(
             document = document,
+            rawText = fetched.text,
             pageUrl = url
         ).take(MAX_SERVER_PAGES)
 
@@ -1854,7 +2190,8 @@ class Zoryva : MainAPI() {
                     inspectServerTarget(
                         url = nestedUrl,
                         name = nestedName,
-                        depth = depth + 1
+                        depth = depth + 1,
+                        episodeId = episodeId
                     )
                 }
             }.awaitAll().flatten()
@@ -1862,53 +2199,57 @@ class Zoryva : MainAPI() {
     }
 
     private suspend fun inspectPageForSources(
-        page: Document,
+        page: Document?,
+        rawText: String,
         pageUrl: String,
         serverName: String
     ): ServerResult {
         val started = System.currentTimeMillis()
         val candidates = extractMediaCandidates(
             document = page,
+            rawText = rawText,
             pageUrl = pageUrl,
             serverName = serverName
-        )
+        ).distinctBy { normalizeMediaIdentity(it.url) }
+            .take(40)
 
-        val valid = ArrayList<MediaCandidate>()
-        val subtitles = linkedSetOf<Pair<String, String>>()
-
-        for (candidate in candidates.distinctBy { normalizeMediaIdentity(it.url) }) {
-            val info = if (candidate.url.contains(".m3u8", true)) {
-                inspectHls(candidate)
-            } else {
-                null
-            }
-
-            val playable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                probeSource(candidate, info)
-            } ?: false
-
-            if (!playable) continue
-
-            val finalCandidate = if (info != null) {
-                candidate.copy(
-                    quality = if (info.isMaster) {
-                        maxOf(candidate.quality, info.maxQuality)
+        val inspected = coroutineScope {
+            candidates.map { candidate ->
+                async {
+                    val info = if (candidate.url.contains(".m3u8", true)) {
+                        inspectHls(candidate)
                     } else {
-                        maxOf(candidate.quality, info.maxQuality)
-                    },
-                    isHlsMaster = info.isMaster,
-                    audioLabel = info.audioLabel
-                )
-            } else {
-                candidate
-            }
+                        null
+                    }
 
-            valid += finalCandidate
+                    val playable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                        probeSource(candidate, info)
+                    } ?: false
 
-            if (info != null) {
-                subtitles.addAll(info.subtitles)
-            }
+                    if (!playable) return@async null
 
+                    val finalCandidate = if (info != null) {
+                        candidate.copy(
+                            quality = maxOf(candidate.quality, info.maxQuality),
+                            isHlsMaster = info.isMaster,
+                            audioLabel = info.audioLabel
+                        )
+                    } else {
+                        candidate
+                    }
+
+                    finalCandidate to info
+                }
+            }.awaitAll()
+        }.filterNotNull()
+
+        val valid = inspected.map { it.first }
+        val subtitles = linkedSetOf<Pair<String, String>>()
+        inspected.forEach { pair ->
+            pair.second?.let { subtitles.addAll(it.subtitles) }
+        }
+
+        if (page != null) {
             subtitles.addAll(
                 extractExternalSubtitles(
                     page = page,
@@ -1927,7 +2268,8 @@ class Zoryva : MainAPI() {
     }
 
     private fun extractMediaCandidates(
-        document: Document,
+        document: Document?,
+        rawText: String,
         pageUrl: String,
         serverName: String
     ): List<MediaCandidate> {
@@ -1969,13 +2311,15 @@ class Zoryva : MainAPI() {
 
         /*
          * First read actual HTML media elements and data attributes.
+         * Some player/server endpoints return JSON instead of HTML, therefore
+         * the raw response text is also scanned below.
          */
-        document.select(
+        document?.select(
             "video[src], video source[src], source[src], " +
                 "[data-src], [data-video], [data-file], [data-url], " +
                 "[data-source], [data-stream], [data-manifest], " +
                 "a[href*='.m3u8'], a[href*='.mp4'], a[href*='.mpd']"
-        ).forEach { element ->
+        )?.forEach { element ->
             val label = firstNonBlank(
                 element.attr("label"),
                 element.attr("data-quality"),
@@ -2000,7 +2344,13 @@ class Zoryva : MainAPI() {
          * URL is already present in a rendered document, keep it as-is instead
          * of inventing a different source.
          */
-        val normalizedHtml = normalizeEmbeddedText(document.html())
+        val normalizedHtml = buildString {
+            if (document != null) append(normalizeEmbeddedText(document.html())).append('\n')
+            append(normalizeEmbeddedText(rawText)).append('\n')
+            if (document != null) {
+                append(extractNextFlightPayload(document)).append('\n')
+            }
+        }
 
         val proxyRegex = Regex(
             """https?://[^\"'<>\s]+/api/proxy\?[^\"'<>\s]+""",
@@ -2222,6 +2572,11 @@ class Zoryva : MainAPI() {
         referer: String,
         origin: String
     ): String {
+        /* Never wrap an already-valid Zoryva proxy URL a second time. */
+        if (sourceUrl.startsWith("$BASE_URL/api/proxy?", true)) {
+            return sourceUrl
+        }
+
         val safeReferer = referer.ifBlank { BASE_URL + "/" }
         val safeOrigin = origin.ifBlank { originOf(safeReferer) }
 
@@ -2279,8 +2634,10 @@ class Zoryva : MainAPI() {
     // ---------------------------------------------------------------------
 
     private fun discoverServerPages(
-        document: Document,
-        pageUrl: String
+        document: Document?,
+        rawText: String,
+        pageUrl: String,
+        episodeId: String? = null
     ): List<Pair<String, String>> {
         val result = linkedMapOf<String, String>()
 
@@ -2313,12 +2670,13 @@ class Zoryva : MainAPI() {
             )
         }
 
-        document.select(
+        document?.select(
             "iframe[src], embed[src], " +
                 "button[data-server], button[data-source], " +
                 "[data-server-url], [data-source-url], [data-player-url], " +
-                "[data-iframe], [data-embed-url]"
-        ).forEach { element ->
+                "[data-iframe], [data-embed-url], " +
+                "[data-server], [data-source]"
+        )?.forEach { element ->
             add(
                 firstNonBlank(
                     element.absUrl("src"),
@@ -2332,32 +2690,66 @@ class Zoryva : MainAPI() {
                     element.absUrl("data-iframe"),
                     element.attr("data-iframe"),
                     element.absUrl("data-embed-url"),
-                    element.attr("data-embed-url")
+                    element.attr("data-embed-url"),
+                    element.attr("data-server"),
+                    element.attr("data-source"),
+                    element.attr("data-file"),
+                    element.attr("data-stream"),
+                    element.attr("data-manifest")
                 ),
                 firstNonBlank(element.attr("title"), element.text())
             )
         }
 
-        document.select("a[href]").forEach { anchor ->
+        document?.select("a[href]")?.forEach { anchor ->
             add(
                 anchor.absUrl("href"),
                 anchor.text().trim()
             )
         }
 
-        val normalizedHtml = normalizeEmbeddedText(document.html())
+        val normalizedHtml = buildString {
+            if (document != null) append(normalizeEmbeddedText(document.html())).append('\n')
+            append(normalizeEmbeddedText(rawText)).append('\n')
+        }
         Regex(
             """https?://[^\"'<>\s]+""",
             RegexOption.IGNORE_CASE
         ).findAll(normalizedHtml).forEach { match ->
             val url = match.value
-            if (url.contains("vidrock", true) ||
-                url.contains("player", true) ||
-                url.contains("embed", true) ||
-                url.contains("stream", true)
-            ) {
+            val commonMediaHost =
+                url.contains("vidrock", true) ||
+                    url.contains("staticreverie", true) ||
+                    url.contains("file1", true) ||
+                    url.contains("file2", true) ||
+                    url.contains("player", true) ||
+                    url.contains("embed", true) ||
+                    url.contains("stream", true) ||
+                    url.contains("watch", true)
+
+            if (commonMediaHost) {
                 add(url, "Zoryva Source")
             }
+        }
+
+        /*
+         * Some server buttons expose only an episode/source identifier in the
+         * page JSON. Keep the identifier in discovery metadata and prefer URLs
+         * that visibly mention it. We do not manufacture a media URL from the
+         * identifier; it only improves selection among URLs the site exposed.
+         */
+        if (!episodeId.isNullOrBlank()) {
+            normalizedHtml
+                .split('\n')
+                .filter { it.contains(episodeId, true) }
+                .take(32)
+                .forEach { line ->
+                    Regex("""https?://[^\"'<>\s]+""", RegexOption.IGNORE_CASE)
+                        .findAll(line)
+                        .forEach { match ->
+                            add(match.value, "Zoryva Episode Source")
+                        }
+                }
         }
 
         return result.entries
@@ -2366,12 +2758,13 @@ class Zoryva : MainAPI() {
     }
 
     private fun discoverNestedPlayerPages(
-        document: Document,
+        document: Document?,
+        rawText: String,
         pageUrl: String
     ): List<Pair<String, String>> {
         val result = linkedMapOf<String, String>()
 
-        document.select("iframe[src], embed[src], a[href]").forEach { element ->
+        document?.select("iframe[src], embed[src], a[href]")?.forEach { element ->
             val url = when {
                 element.hasAttr("src") -> element.absUrl("src")
                 else -> element.absUrl("href")
@@ -2397,6 +2790,22 @@ class Zoryva : MainAPI() {
                 )
             }
         }
+
+        Regex("""https?://[^\"'<>\s]+""", RegexOption.IGNORE_CASE)
+            .findAll(normalizeEmbeddedText(rawText))
+            .forEach { match ->
+                val url = match.value
+                val lower = url.lowercase(Locale.ROOT)
+                if (
+                    (lower.contains("player") || lower.contains("embed") ||
+                        lower.contains("stream") || lower.contains("watch") ||
+                        lower.contains("vidrock") || lower.contains("staticreverie") ||
+                        lower.contains("file1") || lower.contains("file2")) &&
+                        !isPlayableMedia(url) && !isIgnoredHost(url)
+                ) {
+                    result.putIfAbsent(cleanUrl(url), "Nested Source")
+                }
+            }
 
         return result.entries
             .take(MAX_SERVER_PAGES)
@@ -2477,31 +2886,40 @@ class Zoryva : MainAPI() {
     // ---------------------------------------------------------------------
 
     private fun extractInitialMediaObject(
-        html: String
+        document: Document
     ): JSONObject? {
         /*
-         * Zoryva is Next.js. The media detail data is embedded in an RSC payload
-         * under initialMedia. The helper below decodes one JavaScript-string
-         * escaping layer and then extracts the balanced JSON object.
+         * The live Zoryva detail page transports initialMedia inside a quoted
+         * Next.js Flight payload. Reuse the same real Flight-string decoder used
+         * by Home instead of trying to unescape the whole HTML blindly.
          */
-        val decoded = decodeRscOneLayer(html)
-        val marker = "\"initialMedia\":"
-        val markerIndex = decoded.indexOf(marker)
-        if (markerIndex < 0) return null
+        val flight = extractNextFlightPayload(document)
+        val candidates = listOf(
+            flight,
+            decodeRscForCatalog(document.html()),
+            decodeRscOneLayer(document.html())
+        )
 
-        val start = decoded.indexOf('{', markerIndex + marker.length)
-        if (start < 0) return null
+        for (decoded in candidates) {
+            val marker = "\"initialMedia\":"
+            val markerIndex = decoded.indexOf(marker)
+            if (markerIndex < 0) continue
 
-        val json = extractBalancedJson(
-            decoded,
-            start,
-            '{',
-            '}'
-        ) ?: return null
+            val start = decoded.indexOf('{', markerIndex + marker.length)
+            if (start < 0) continue
 
-        return runCatching {
-            JSONObject(json)
-        }.getOrNull()
+            val json = extractBalancedJson(
+                decoded,
+                start,
+                '{',
+                '}'
+            ) ?: continue
+
+            val media = runCatching { JSONObject(json) }.getOrNull()
+            if (media != null) return media
+        }
+
+        return null
     }
 
     private fun extractBalancedJson(
@@ -2637,30 +3055,78 @@ class Zoryva : MainAPI() {
     // URL / TYPE / QUALITY HELPERS
     // ---------------------------------------------------------------------
 
-    private suspend fun getDocument(
-        url: String
-    ): Document? {
+    private data class FetchedPage(
+        val document: Document?,
+        val text: String,
+        val code: Int
+    )
+
+    private suspend fun fetchPage(
+        url: String,
+        attempts: Int = 2
+    ): FetchedPage? {
         val clean = cleanUrl(url)
         if (clean.isBlank()) return null
 
-        return runCatching {
-            val response = app.get(
-                clean,
-                headers = PAGE_HEADERS + mapOf(
-                    "Referer" to "$BASE_URL/"
-                )
-            )
+        val maxAttempts = attempts.coerceIn(1, DETAIL_FETCH_ATTEMPTS + 1)
+        var last: FetchedPage? = null
 
-            if (response.code !in 200..399) {
-                null
-            } else {
-                response.document.apply {
-                    if (baseUri().isBlank()) {
-                        setBaseUri(clean)
-                    }
+        repeat(maxAttempts) { attempt ->
+            val result = runCatching {
+                val pageHost = hostOf(clean).lowercase(Locale.ROOT)
+                val contextualOrigin = originOf(clean)
+                val pageReferer = when {
+                    pageHost == "vidrock.net" || pageHost.endsWith(".vidrock.net") ->
+                        "$VIDROCK_ORIGIN/"
+                    pageHost == hostOf(BASE_URL).lowercase(Locale.ROOT) ->
+                        "$BASE_URL/"
+                    else ->
+                        contextualOrigin.ifBlank { BASE_URL } + "/"
                 }
+
+                val response = app.get(
+                    clean,
+                    headers = PAGE_HEADERS + mapOf(
+                        "Referer" to pageReferer,
+                        "Origin" to contextualOrigin,
+                        "Sec-Fetch-Dest" to "document",
+                        "Sec-Fetch-Mode" to "navigate",
+                        "Sec-Fetch-Site" to if (pageHost == "vidrock.net") "same-origin" else "cross-site",
+                        "Upgrade-Insecure-Requests" to "1"
+                    )
+                )
+
+                val document = runCatching { response.document }.getOrNull()?.apply {
+                    if (baseUri().isBlank()) setBaseUri(clean)
+                }
+
+                FetchedPage(
+                    document = document,
+                    text = response.text,
+                    code = response.code
+                )
+            }.getOrNull()
+
+            last = result
+            if (result != null && result.code in 200..399) {
+                return result
             }
-        }.getOrNull()
+
+            if (attempt + 1 < maxAttempts) {
+                delay(DETAIL_RETRY_DELAY_MS * (attempt + 1L))
+            }
+        }
+
+        return last?.takeIf { it.code in 200..399 }
+    }
+
+    private suspend fun getDocument(
+        url: String
+    ): Document? {
+        return fetchPage(
+            url = url,
+            attempts = 2
+        )?.document
     }
 
     private fun normalizeExtractedUrl(
@@ -2822,7 +3288,7 @@ class Zoryva : MainAPI() {
     ): String {
         return value
             .lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
             .trim()
             .replace(Regex("\\s+"), " ")
     }
@@ -2914,7 +3380,19 @@ class Zoryva : MainAPI() {
             return isPlayableMedia(upstream)
         }
 
-        return MEDIA_EXTENSIONS.any { lower.contains(it) }
+        if (MEDIA_EXTENSIONS.any { lower.contains(it) }) return true
+
+        /*
+         * Zoryva's current browser player requests referer-bound MPEG-TS/stream
+         * pages from staticreverie under paths such as /file1/.../1080p/page-719.html
+         * and /file2/.../1080p/page-180.html. Although the suffix is .html, the
+         * upstream response is media (the proxy returns video/mp2t). Treat only
+         * this narrowly-recognized pattern as playable media; ordinary HTML pages
+         * remain excluded.
+         */
+        return lower.contains("staticreverie.site/") &&
+            Regex("/file(?:1|2)/[^?#\\s]*?/\\d{3,4}p/page-\\d+\\.html", RegexOption.IGNORE_CASE)
+                .containsMatchIn(lower)
     }
 
     private fun isObviouslyPromotional(
