@@ -3456,18 +3456,9 @@ class Zoryva : MainAPI() {
                 }
 
                 if (head != null && head.code in 200..399) {
-                    val contentType = headerValue(
-                        head.headers,
-                        "Content-Type"
-                    ).orEmpty()
-                    val acceptRanges = headerValue(
-                        head.headers,
-                        "Accept-Ranges"
-                    ).orEmpty()
-                    val contentRange = headerValue(
-                        head.headers,
-                        "Content-Range"
-                    ).orEmpty()
+                    val contentType = head.headers["Content-Type"].orEmpty()
+                    val acceptRanges = head.headers["Accept-Ranges"].orEmpty()
+                    val contentRange = head.headers["Content-Range"].orEmpty()
 
                     val looksVideoType =
                         contentType.startsWith("video/", true) ||
@@ -3507,15 +3498,9 @@ class Zoryva : MainAPI() {
 
                 if (response.code !in 200..399) return false
 
-                val contentType = headerValue(
-                    response.headers,
-                    "Content-Type"
-                ).orEmpty()
+                val contentType = response.headers["Content-Type"].orEmpty()
 
-                val contentRange = headerValue(
-                    response.headers,
-                    "Content-Range"
-                ).orEmpty()
+                val contentRange = response.headers["Content-Range"].orEmpty()
 
                 val looksVideoType =
                     contentType.startsWith("video/", true) ||
