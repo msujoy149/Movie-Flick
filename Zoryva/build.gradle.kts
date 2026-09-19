@@ -4,8 +4,8 @@ plugins {
     id("com.lagradost.cloudstream3.gradle")
 }
 
-// Version bumped so CloudStream does not keep the previous resolver build.
-version = 9
+// Bump the plugin version so CloudStream installs the fixed resolver build.
+version = 10
 
 cloudstream {
     description = "Zoryva CloudStream provider"
@@ -41,7 +41,6 @@ android {
 
 dependencies {
     implementation(kotlin("stdlib"))
-
     implementation("com.github.Blatzar:NiceHttp:0.4.11")
     implementation("org.jsoup:jsoup:1.18.3")
 }
