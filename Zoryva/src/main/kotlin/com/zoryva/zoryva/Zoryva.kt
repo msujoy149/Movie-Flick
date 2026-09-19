@@ -412,7 +412,21 @@ class Zoryva : MainAPI() {
     private fun parseHomepageRscCatalogs(
         document: Document
     ): Map<String, List<SiteItem>> {
-        val decoded = decodeRscForCatalog(document.html())
+        /*
+         * IMPORTANT: Zoryva's home catalog is transported through Next.js
+         * Flight/RSC scripts. Those scripts contain a JavaScript string inside
+         * self.__next_f.push([1, "..."]). A normal HTML/JSON unescape is not
+         * enough here because quotes are escaped inside the nested JS string.
+         * Decode the actual quoted Flight payload first, then parse initialRows.
+         */
+        val decodedPayload = extractNextFlightPayload(document)
+        val decoded = if (decodedPayload.contains("\"initialRows\":", true)) {
+            decodedPayload
+        } else {
+            /* Keep the legacy path as a defensive fallback for SSR changes. */
+            decodeRscForCatalog(document.html())
+        }
+
         if (!decoded.contains("\"initialRows\":", true)) {
             return emptyMap()
         }
@@ -434,10 +448,17 @@ class Zoryva : MainAPI() {
             val items = row.optJSONArray("items") ?: continue
             val target = when {
                 key == "trending" -> TRENDING
-                key == "popular-movies" || key == "new-releases" ||
-                    key == "top-rated" || key == "recently-added" -> MOVIES
-                key == "popular-tv" -> TV_SHOW
-                key == "popular-anime" || key == "trending-anime" -> ANIME
+                key == "popular-movies" ||
+                    key == "new-releases" ||
+                    key == "top-rated" ||
+                    key == "recently-added" ||
+                    key == "recommended" -> MOVIES
+                key == "popular-tv" ||
+                    key == "trending-tv" ||
+                    key == "latest-tv" -> TV_SHOW
+                key == "popular-anime" ||
+                    key == "trending-anime" ||
+                    key == "latest-anime" -> ANIME
                 else -> null
             } ?: continue
 
@@ -468,7 +489,106 @@ class Zoryva : MainAPI() {
             }
         }
 
-        return routeRows.mapValues { it.value.toList() }
+        return routeRows
+            .mapValues { (_, items) -> items.distinctBy { cleanUrl(it.url) } }
+    }
+
+    /**
+     * Decode the Next.js Flight payloads embedded in <script> tags.
+     * The website uses:
+     *
+     *   self.__next_f.push([1,"..."])
+     *
+     * The second argument is a JavaScript quoted string and may contain nested
+     * JSON/RSC escapes. We parse that quoted string explicitly instead of doing
+     * a blind replace operation which would leave \" sequences behind.
+     */
+    private fun extractNextFlightPayload(
+        document: Document
+    ): String {
+        val output = StringBuilder()
+        val marker = "push([1,\""
+
+        document.select("script").forEach { script ->
+            val data = script.data().ifBlank { script.html() }
+            if (!data.contains("__next_f", true)) return@forEach
+
+            var searchStart = 0
+            while (true) {
+                val markerIndex = data.indexOf(marker, searchStart)
+                if (markerIndex < 0) break
+
+                val quoteStart = markerIndex + "push([1,".length
+                val decoded = decodeQuotedJsString(data, quoteStart)
+                    ?: break
+
+                if (decoded.contains("initialRows") ||
+                    decoded.contains("initialHeroItems") ||
+                    decoded.contains("initialMedia")) {
+                    output.append(decoded).append('\n')
+                }
+
+                val nextIndex = quoteStart + 1
+                searchStart = nextIndex
+                if (searchStart >= data.length) break
+            }
+        }
+
+        return output.toString()
+    }
+
+    private fun decodeQuotedJsString(
+        text: String,
+        openingQuoteIndex: Int
+    ): String? {
+        if (openingQuoteIndex !in text.indices || text[openingQuoteIndex] != '"') {
+            return null
+        }
+
+        val out = StringBuilder()
+        var index = openingQuoteIndex + 1
+
+        while (index < text.length) {
+            val c = text[index]
+
+            if (c == '"') {
+                return out.toString()
+            }
+
+            if (c != '\\') {
+                out.append(c)
+                index++
+                continue
+            }
+
+            if (index + 1 >= text.length) return null
+            val escaped = text[index + 1]
+
+            when (escaped) {
+                '"' -> { out.append('"'); index += 2 }
+                '\\' -> { out.append('\\'); index += 2 }
+                '/' -> { out.append('/'); index += 2 }
+                'b' -> { out.append('\b'); index += 2 }
+                'f' -> { out.append('\u000C'); index += 2 }
+                'n' -> { out.append('\n'); index += 2 }
+                'r' -> { out.append('\r'); index += 2 }
+                't' -> { out.append('\t'); index += 2 }
+                'u' -> {
+                    if (index + 5 >= text.length) return null
+                    val hex = text.substring(index + 2, index + 6)
+                    val code = hex.toIntOrNull(16) ?: return null
+                    out.append(code.toChar())
+                    index += 6
+                }
+                else -> {
+                    /* JavaScript permits escaped non-special characters. */
+                    out.append(escaped)
+                    index += 2
+                }
+            }
+        }
+
+        return null
     }
 
     private fun resolveRscHeroReference(
@@ -496,9 +616,9 @@ class Zoryva : MainAPI() {
             .lowercase(Locale.ROOT)
 
         val type = when {
-            rowKey.contains("anime") -> TvType.Anime
             mediaType == "movie" -> TvType.Movie
             mediaType == "tv" || mediaType == "series" -> TvType.TvSeries
+            mediaType == "anime" || rowKey.contains("anime") -> TvType.Anime
             else -> return null
         }
 
