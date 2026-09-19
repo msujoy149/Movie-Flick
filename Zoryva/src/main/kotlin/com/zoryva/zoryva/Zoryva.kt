@@ -216,6 +216,12 @@ class Zoryva : MainAPI() {
         val episodes: List<EpisodeInfo>
     )
 
+    private data class AudioTrackCandidate(
+        val url: String,
+        val label: String = "",
+        val headers: Map<String, String> = emptyMap()
+    )
+
     private data class MediaCandidate(
         val url: String,
         val referer: String,
@@ -226,6 +232,8 @@ class Zoryva : MainAPI() {
         val latencyMs: Long,
         val isHlsMaster: Boolean,
         val audioLabel: String,
+        val isHls: Boolean = false,
+        val audioTracks: List<AudioTrackCandidate> = emptyList(),
         val headers: Map<String, String> = emptyMap()
     )
 
@@ -249,6 +257,7 @@ class Zoryva : MainAPI() {
         val hasSubtitleTracks: Boolean,
         val maxQuality: Int,
         val audioLabel: String,
+        val audioTracks: List<AudioTrackCandidate>,
         val subtitles: List<Pair<String, String>>,
         val variants: List<Pair<String, Int>>
     )
@@ -267,7 +276,8 @@ class Zoryva : MainAPI() {
     private data class ZoryvaExtractResolution(
         val directSources: List<MediaCandidate>,
         val servers: List<VidrockServerTarget>,
-        val subtitles: List<Pair<String, String>> = emptyList()
+        val subtitles: List<Pair<String, String>> = emptyList(),
+        val audioTracks: List<AudioTrackCandidate> = emptyList()
     )
 
     private data class MediaProbe(
@@ -282,7 +292,8 @@ class Zoryva : MainAPI() {
         val source: MediaCandidate,
         val directPlayable: Boolean,
         val proxy: MediaCandidate?,
-        val proxyPlayable: Boolean
+        val proxyPlayable: Boolean,
+        val hls: HlsInfo? = null
     )
 
     private data class CachedCatalog(
@@ -1817,7 +1828,7 @@ class Zoryva : MainAPI() {
             mergeEpisodeMetadata(
                 embedded = parseEpisodes(mediaObject),
                 linked = parseEpisodeLinks(document, pageUrl),
-                generated = generateMissingEpisodes(mediaObject)
+                generated = emptyList()
             )
         }
 
@@ -1906,37 +1917,6 @@ class Zoryva : MainAPI() {
                 poster = poster,
                 runtime = null
             )
-        }
-
-        return result
-    }
-
-    private fun generateMissingEpisodes(
-        mediaObject: JSONObject?
-    ): List<EpisodeInfo> {
-        val seasons = mediaObject?.optJSONArray("seasons") ?: return emptyList()
-        val result = ArrayList<EpisodeInfo>()
-
-        for (i in 0 until seasons.length()) {
-            val season = seasons.optJSONObject(i) ?: continue
-            val seasonNumber = season.optInt("seasonNumber", -1)
-            val episodeCount = season.optInt("episodeCount", 0)
-            if (seasonNumber < 0 || episodeCount <= 0) continue
-
-            val embeddedCount = season.optJSONArray("episodes")?.length() ?: 0
-            if (embeddedCount >= episodeCount) continue
-
-            for (number in 1..episodeCount.coerceAtMost(5000)) {
-                result += EpisodeInfo(
-                    id = null,
-                    name = "Episode $number",
-                    season = seasonNumber,
-                    episode = number,
-                    overview = null,
-                    poster = season.optString("posterPath").takeIf { it.isNotBlank() },
-                    runtime = null
-                )
-            }
         }
 
         return result
@@ -2107,6 +2087,8 @@ class Zoryva : MainAPI() {
          * not erase the website's own status=ok sources when the probe is
          * inconclusive.
          */
+        var primaryEmitted = 0
+
         if (extractResolution.directSources.isNotEmpty()) {
             /*
              * Inspect the exact API-returned HLS manifests first so we can
@@ -2119,7 +2101,7 @@ class Zoryva : MainAPI() {
                     .distinctBy { normalizeMediaIdentity(it.url) }
                     .map { source ->
                         async {
-                            val hlsInfo = if (source.url.contains(".m3u8", true)) {
+                            val hlsInfo = if (source.isHls || looksLikeHlsUrl(source.url)) {
                                 withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
                                     inspectHls(source)
                                 }
@@ -2131,7 +2113,12 @@ class Zoryva : MainAPI() {
                                 source.copy(
                                     quality = maxOf(source.quality, hlsInfo.maxQuality),
                                     isHlsMaster = hlsInfo.isMaster,
-                                    audioLabel = hlsInfo.audioLabel
+                                    audioLabel = hlsInfo.audioLabel,
+                                    isHls = true,
+                                    audioTracks = mergeAudioTrackCandidates(
+                                        source.audioTracks,
+                                        emptyList()
+                                    )
                                 )
                             } else {
                                 source
@@ -2171,7 +2158,8 @@ class Zoryva : MainAPI() {
                                 source = preparedSource,
                                 directPlayable = directPlayable,
                                 proxy = proxyCandidate,
-                                proxyPlayable = proxyPlayable
+                                proxyPlayable = proxyPlayable,
+                                hls = hlsInfo
                             )
                         }
                     }
@@ -2185,7 +2173,24 @@ class Zoryva : MainAPI() {
              * 2160/1440/1080/720/480/etc sources when Zoryva actually returned
              * those URLs.
              */
-            val orderedChecks = checks.sortedWith(
+            val audioTrackPool = extractResolution.audioTracks
+
+            val enrichedChecks = checks.map { check ->
+                if (audioTrackPool.isEmpty()) {
+                    check
+                } else {
+                    check.copy(
+                        source = check.source.copy(
+                            audioTracks = mergeAudioTrackCandidates(
+                                check.source.audioTracks,
+                                audioTrackPool
+                            )
+                        )
+                    )
+                }
+            }
+
+            val orderedChecks = enrichedChecks.sortedWith(
                 compareByDescending<PrimarySourceCheck> { it.directPlayable }
                     .thenByDescending { it.proxyPlayable }
                     .thenByDescending { it.source.isHlsMaster }
@@ -2207,88 +2212,159 @@ class Zoryva : MainAPI() {
             }
 
             /*
-             * Pass 1: emit all sources confirmed by the bounded probe.
+             * Pass 1: emit confirmed direct/proxy sources. For an HLS master,
+             * also emit every exact variant URL found in that manifest so the
+             * CloudStream Source selector exposes the real resolutions.
              */
+            suspend fun emitCheckedSource(
+                check: PrimarySourceCheck,
+                labelSuffix: String,
+                outputSource: MediaCandidate
+            ) {
+                if (emitted >= MAX_EMITTED_FALLBACKS) return
+
+                val source = outputSource
+                val sourceKey = "${labelSuffix.lowercase(Locale.ROOT)}|${normalizeMediaIdentity(source.url)}"
+                if (emittedKeys.add(sourceKey)) {
+                    emitExtractorSource(
+                        source = source,
+                        output = buildDirectPlaybackOutput(source, pageUrl),
+                        callback = callback,
+                        labelSuffix = labelSuffix,
+                        typeSourceUrl = source.url
+                    )
+                    emitted++
+                }
+            }
+
+            suspend fun emitMasterWithVariants(
+                check: PrimarySourceCheck,
+                source: MediaCandidate,
+                labelSuffix: String
+            ) {
+                if (emitted >= MAX_EMITTED_FALLBACKS) return
+
+                /* Keep the adaptive master first. It preserves the playlist's
+                 * own resolution/audio/subtitle group selection. */
+                emitCheckedSource(
+                    check = check,
+                    labelSuffix = labelSuffix,
+                    outputSource = source
+                )
+
+                val hls = check.hls ?: return
+                if (!hls.isMaster) return
+
+                for ((variantUrl, variantQuality) in hls.variants
+                    .distinctBy { normalizeMediaIdentity(it.first) }
+                    .sortedByDescending { it.second }
+                ) {
+                    if (emitted >= MAX_EMITTED_FALLBACKS) break
+
+                    val variantBase = source.copy(
+                        url = variantUrl,
+                        quality = maxOf(variantQuality, qualityFromUrl(variantUrl, "")),
+                        isHlsMaster = false,
+                        isHls = true,
+                        /* Standalone variant playlists may omit master-level
+                         * audio groups; attach the exact HLS audio playlist URLs
+                         * discovered above so alternate audio remains available. */
+                        audioTracks = mergeAudioTrackCandidates(
+                            source.audioTracks,
+                            hls.audioTracks
+                        )
+                    )
+
+                    val variant = if (
+                        labelSuffix.equals("Zoryva Proxy", true) &&
+                        check.source.url != source.url
+                    ) {
+                        buildZoryvaProxyCandidate(
+                            source = check.source.copy(
+                                url = variantUrl,
+                                quality = variantBase.quality,
+                                isHlsMaster = false,
+                                isHls = true,
+                                audioTracks = variantBase.audioTracks
+                            ),
+                            pageUrl = pageUrl
+                        ) ?: variantBase
+                    } else {
+                        variantBase
+                    }
+
+                    emitCheckedSource(
+                        check = check,
+                        labelSuffix = "${labelSuffix} • ${variantQuality}p Variant",
+                        outputSource = variant
+                    )
+                }
+            }
+
             for (check in orderedChecks) {
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
                 if (check.directPlayable) {
-                    val source = check.source
-                    val sourceKey = "direct|${normalizeMediaIdentity(source.url)}"
-                    if (emittedKeys.add(sourceKey)) {
-                        emitExtractorSource(
-                            source = source,
-                            output = buildDirectPlaybackOutput(source, pageUrl),
-                            callback = callback,
-                            labelSuffix = "Direct",
-                            typeSourceUrl = source.url
-                        )
-                        emitted++
-                    }
+                    emitMasterWithVariants(
+                        check = check,
+                        source = check.source,
+                        labelSuffix = "Direct"
+                    )
                 }
 
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
                 if (check.proxyPlayable && check.proxy != null) {
-                    val proxySource = check.proxy
-                    val proxyKey = "proxy|${normalizeMediaIdentity(check.source.url)}"
-                    if (emittedKeys.add(proxyKey)) {
-                        emitExtractorSource(
-                            source = check.source,
-                            output = buildDirectPlaybackOutput(
-                                proxySource,
-                                pageUrl
-                            ),
-                            callback = callback,
-                            labelSuffix = "Zoryva Proxy",
-                            typeSourceUrl = check.source.url
-                        )
-                        emitted++
-                    }
+                    emitMasterWithVariants(
+                        check = check,
+                        source = check.proxy,
+                        labelSuffix = "Zoryva Proxy"
+                    )
                 }
             }
 
-            /*
-             * Pass 2: the website's structured response has already marked these
-             * exact entries as successful. Never turn a transient/false-negative
-             * extension probe into "No Links Found".
-             *
-             * This is intentionally only a last resort after all confirmed
-             * direct/proxy candidates have been emitted.
-             */
+            /* Pass 2: website-approved sources if all probes were inconclusive. */
             if (emitted == 0) {
                 for (check in orderedChecks) {
                     if (emitted >= MAX_EMITTED_FALLBACKS) break
-
-                    val source = check.source
-                    val sourceKey = "api|${normalizeMediaIdentity(source.url)}"
-
-                    if (emittedKeys.add(sourceKey)) {
-                        emitExtractorSource(
-                            source = source,
-                            output = buildDirectPlaybackOutput(source, pageUrl),
-                            callback = callback,
-                            labelSuffix = "API Source",
-                            typeSourceUrl = source.url
-                        )
-                        emitted++
-                    }
+                    emitMasterWithVariants(
+                        check = check,
+                        source = check.source,
+                        labelSuffix = "API Source"
+                    )
                 }
             }
 
-            if (emitted > 0) return true
+            primaryEmitted = emitted
+
+            val episodeBasedPlayback =
+                playbackContext.season != null &&
+                    playbackContext.episode != null
+
+            /*
+             * TV/Anime always continue into the episode-page/server discovery
+             * pass because the exact player can be separate from /api/extract.
+             * Movies continue when fewer than two links were produced so the
+             * page can contribute additional real resolutions.
+             */
+            val needsSecondaryDiscovery =
+                episodeBasedPlayback ||
+                    primaryEmitted < 2
+
+            if (primaryEmitted > 0 && !needsSecondaryDiscovery) return true
         }
 
         /*
-         * SECONDARY/FALLBACK PATHS
+         * SECONDARY/AUGMENTATION PATHS
          *
-         * Only run the heavier crawlers when the website's own structured
-         * extraction did not return a usable direct source. This keeps Play fast
-         * for the normal case and still preserves resilience when one upstream
-         * provider has a temporary issue.
+         * TV/Anime always reach this augmentation pass so the exact episode
+         * player can contribute sources. Movies reach it when the structured
+         * extraction returned fewer than two source links, allowing additional
+         * real page/player resolutions to be added without disturbing the
+         * working direct path.
          */
         val directText = directPage?.html().orEmpty()
-        val directDocument = directPage ?: return false
+        val directDocument = directPage ?: return primaryEmitted > 0
 
         val scrapedResolution = withTimeoutOrNull(ZORYVA_SCRAPED_TIMEOUT_MS) {
             resolveZoryvaScraped(
@@ -2403,7 +2479,7 @@ class Zoryva : MainAPI() {
                     .thenBy { it.second.server.lowercase(Locale.ROOT) }
             )
 
-        if (usable.isEmpty()) return false
+        if (usable.isEmpty()) return primaryEmitted > 0
 
         val emitted = linkedSetOf<String>()
         val subtitleSeen = linkedSetOf<String>()
@@ -2440,9 +2516,24 @@ class Zoryva : MainAPI() {
         typeSourceUrl: String
     ) {
         val linkType = when {
-            typeSourceUrl.substringBefore('?').endsWith(".m3u8", true) -> ExtractorLinkType.M3U8
+            source.isHls || looksLikeHlsUrl(typeSourceUrl) || output.url.contains(".m3u8", true) -> ExtractorLinkType.M3U8
             typeSourceUrl.substringBefore('?').endsWith(".mpd", true) -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
+        }
+
+        val audioFiles = mutableListOf<AudioFile>()
+        for (track in source.audioTracks
+            .filter { it.url.isNotBlank() }
+            .distinctBy { cleanUrl(it.url) }
+        ) {
+            try {
+                val audioFile = newAudioFile(track.url)
+                if (audioFiles.none { it.url == audioFile.url }) {
+                    audioFiles.add(audioFile)
+                }
+            } catch (_: Exception) {
+                // Keep the video source even if one alternate audio URL fails.
+            }
         }
 
         callback(
@@ -2455,6 +2546,7 @@ class Zoryva : MainAPI() {
                 quality = if (source.quality > 0) source.quality else Qualities.Unknown.value
                 referer = output.referer
                 headers = output.headers
+                audioTracks = audioFiles
             }
         )
     }
@@ -2470,7 +2562,7 @@ class Zoryva : MainAPI() {
                 .distinctBy { normalizeMediaIdentity(it.url) }
                 .map { candidate ->
                     async {
-                        val hls = if (candidate.url.contains(".m3u8", true)) {
+                        val hls = if (candidate.isHls || looksLikeHlsUrl(candidate.url)) {
                             inspectHls(candidate)
                         } else {
                             null
@@ -2486,7 +2578,12 @@ class Zoryva : MainAPI() {
                             candidate.copy(
                                 quality = maxOf(candidate.quality, hls.maxQuality),
                                 isHlsMaster = hls.isMaster,
-                                audioLabel = hls.audioLabel
+                                audioLabel = hls.audioLabel,
+                                isHls = true,
+                                audioTracks = mergeAudioTrackCandidates(
+                                    candidate.audioTracks,
+                                    hls.audioTracks
+                                )
                             ) to hls
                         } else {
                             candidate to null
@@ -2522,7 +2619,7 @@ class Zoryva : MainAPI() {
          * Cookies, Authorization and session/CSRF material are never propagated.
          */
         result["User-Agent"] = USER_AGENT
-        result["Accept"] = if (source.url.contains(".m3u8", true)) {
+        result["Accept"] = if (source.isHls || looksLikeHlsUrl(source.url)) {
             "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*;q=0.8"
         } else {
             ACCEPT
@@ -2909,6 +3006,7 @@ class Zoryva : MainAPI() {
         val direct = linkedMapOf<String, MediaCandidate>()
         val servers = linkedMapOf<String, VidrockServerTarget>()
         val subtitles = linkedMapOf<String, Pair<String, String>>()
+        val audioTracks = linkedMapOf<String, AudioTrackCandidate>()
 
         fun isSuccessfulStatus(value: String): Boolean {
             val status = value.trim().lowercase(Locale.ROOT)
@@ -2936,6 +3034,31 @@ class Zoryva : MainAPI() {
             subtitles.putIfAbsent("$lang|$clean", lang to clean)
         }
 
+        fun addAudio(
+            rawUrl: String,
+            label: String = "",
+            sourceHeaders: Map<String, String> = emptyMap()
+        ) {
+            val clean = normalizeExtractedUrl(rawUrl, referer) ?: return
+            if (!clean.startsWith("http", true)) return
+            if (isObviouslyPromotional(clean) || isIgnoredHost(clean)) return
+            if (clean.lowercase(Locale.ROOT).substringBefore('?').endsWith(".vtt") ||
+                clean.lowercase(Locale.ROOT).substringBefore('?').endsWith(".srt") ||
+                clean.lowercase(Locale.ROOT).substringBefore('?').endsWith(".ass") ||
+                clean.lowercase(Locale.ROOT).substringBefore('?').endsWith(".ssa")
+            ) return
+
+            val identity = cleanUrl(clean)
+            audioTracks.putIfAbsent(
+                identity,
+                AudioTrackCandidate(
+                    url = clean,
+                    label = label.trim(),
+                    headers = sanitizePlaybackHeaders(sourceHeaders)
+                )
+            )
+        }
+
         fun addMedia(
             rawUrl: String,
             label: String = "Zoryva Extract",
@@ -2943,7 +3066,9 @@ class Zoryva : MainAPI() {
             sourceOrigin: String = "",
             qualityHint: String = "",
             height: Int? = null,
-            sourceHeaders: Map<String, String> = emptyMap()
+            sourceHeaders: Map<String, String> = emptyMap(),
+            mediaTypeHint: String = "",
+            audioTrackCandidates: List<AudioTrackCandidate> = emptyList()
         ) {
             val clean0 = cleanUrl(rawUrl)
             if (clean0.isBlank()) return
@@ -3015,6 +3140,8 @@ class Zoryva : MainAPI() {
                     latencyMs = 0L,
                     isHlsMaster = false,
                     audioLabel = "",
+                    isHls = looksLikeHlsUrl(clean, mediaTypeHint),
+                    audioTracks = audioTrackCandidates.distinctBy { cleanUrl(it.url) },
                     headers = safeSourceHeaders
                 )
             )
@@ -3137,6 +3264,11 @@ class Zoryva : MainAPI() {
                         value.optString("name")
                     ).orEmpty()
 
+                    val jsonMediaType = value.optString("type").trim()
+                    val objectIsAudio =
+                        jsonMediaType.equals("audio", true) ||
+                            parentKey.contains("audio", true)
+
                     if (approved) {
                         val directKeys = listOf(
                             "url", "src", "file", "link", "streamUrl",
@@ -3160,6 +3292,17 @@ class Zoryva : MainAPI() {
                                     ).orEmpty(),
                                     objectLabel
                                 )
+                            } else if (objectIsAudio || key.contains("audio", true)) {
+                                addAudio(
+                                    candidate,
+                                    firstNonBlank(
+                                        value.optString("language"),
+                                        value.optString("lang"),
+                                        explicitLanguage,
+                                        objectLabel
+                                    ).orEmpty(),
+                                    objectHeaders
+                                )
                             } else if (isPlayableMedia(candidate)) {
                                 addMedia(
                                     candidate,
@@ -3168,7 +3311,9 @@ class Zoryva : MainAPI() {
                                     objectOrigin,
                                     qualityHint.ifBlank { key },
                                     height,
-                                    objectHeaders
+                                    objectHeaders,
+                                    jsonMediaType,
+                                    emptyList()
                                 )
                             } else if (
                                 key.contains("server", true) ||
@@ -3226,13 +3371,16 @@ class Zoryva : MainAPI() {
                         if (!parentApproved) return@forEach
                         if (isSubtitleUrl(found)) {
                             addSubtitle(found, parentLabel, parentLabel)
+                        } else if (parentKey.contains("audio", true)) {
+                            addAudio(found, parentLabel, parentHeaders)
                         } else if (isPlayableMedia(found)) {
                             addMedia(
                                 found,
                                 parentLabel,
                                 parentReferer,
                                 parentOrigin,
-                                sourceHeaders = parentHeaders
+                                sourceHeaders = parentHeaders,
+                                mediaTypeHint = parentKey
                             )
                         } else if (
                             parentKey.contains("server", true) ||
@@ -3271,7 +3419,8 @@ class Zoryva : MainAPI() {
         return ZoryvaExtractResolution(
             directSources = direct.values.toList(),
             servers = servers.values.toList(),
-            subtitles = subtitles.values.toList()
+            subtitles = subtitles.values.toList(),
+            audioTracks = audioTracks.values.toList()
         )
     }
 
@@ -4080,7 +4229,7 @@ class Zoryva : MainAPI() {
         val inspected = coroutineScope {
             candidates.map { candidate ->
                 async {
-                    val info = if (candidate.url.contains(".m3u8", true)) {
+                    val info = if (candidate.isHls || looksLikeHlsUrl(candidate.url)) {
                         inspectHls(candidate)
                     } else {
                         null
@@ -4170,7 +4319,8 @@ class Zoryva : MainAPI() {
                     server = serverName,
                     latencyMs = 0L,
                     isHlsMaster = false,
-                    audioLabel = ""
+                    audioLabel = "",
+                    isHls = looksLikeHlsUrl(url, label.orEmpty())
                 )
             )
         }
@@ -4243,11 +4393,20 @@ class Zoryva : MainAPI() {
          * Absolute media URLs may be stored inside Next.js RSC/JSON payloads.
          */
         val absoluteMediaRegex = Regex(
-            """https?://[^\"'<>\s\\]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.m4v|\.mov)(?:\?[^\"'<>\s\\]*)?""",
+            """https?://[^\"'<>\s]+(?:\.m3u8|\.mp4|\.mkv|\.webm|\.m4v|\.mov)(?:\?[^\"'<>\s]*)?""",
             RegexOption.IGNORE_CASE
         )
 
-        absoluteMediaRegex.findAll(normalizedHtml).forEach { match ->
+        val extensionlessPeakstormHlsRegex = Regex(
+            """https?://[^\"'<>\s]+/r6(?:/s)?/[^\"'<>\s]+""",
+            RegexOption.IGNORE_CASE
+        )
+
+                absoluteMediaRegex.findAll(normalizedHtml).forEach { match ->
+            add(match.value)
+        }
+
+        extensionlessPeakstormHlsRegex.findAll(normalizedHtml).forEach { match ->
             add(match.value)
         }
 
@@ -4312,6 +4471,22 @@ class Zoryva : MainAPI() {
             else -> ""
         }
 
+        val hlsAudioTracks = Regex(
+            """(?i)#EXT-X-MEDIA:[^\r\n]*TYPE=AUDIO[^\r\n]*"""
+        ).findAll(body).mapNotNull { match ->
+            val line = match.value
+            val rawUri = regexAttribute(line, "URI") ?: return@mapNotNull null
+            val absolute = absoluteUrlLocal(rawUri, candidate.url) ?: return@mapNotNull null
+            AudioTrackCandidate(
+                url = absolute,
+                label = firstNonBlank(
+                    regexAttribute(line, "NAME"),
+                    regexAttribute(line, "LANGUAGE")
+                ).orEmpty(),
+                headers = candidate.headers
+            )
+        }.distinctBy { cleanUrl(it.url) }.toList()
+
         val subtitles = parseHlsSubtitleTracks(
             body = body,
             baseUrl = candidate.url
@@ -4352,6 +4527,7 @@ class Zoryva : MainAPI() {
             hasSubtitleTracks = hasSubs,
             maxQuality = variants.maxOfOrNull { it.second } ?: qualityFromUrl(candidate.url, candidate.label),
             audioLabel = audioLabel,
+            audioTracks = hlsAudioTracks,
             subtitles = subtitles,
             variants = variants
         )
@@ -4367,7 +4543,7 @@ class Zoryva : MainAPI() {
         val headers = playbackHeadersFor(candidate).toMutableMap()
 
         return try {
-            if (clean.contains(".m3u8", true)) {
+            if (candidate.isHls || looksLikeHlsUrl(clean)) {
                 val response = withTimeoutOrNull(PLAYABILITY_GET_TIMEOUT_MS) {
                     app.get(clean, headers = headers)
                 } ?: return false
@@ -5596,13 +5772,30 @@ class Zoryva : MainAPI() {
     ): Int {
         val value = "$url $label".lowercase(Locale.ROOT)
 
+        val explicitHeight = Regex(
+            """(?<!\d)(4320|2160|1440|1080|720|576|540|480|400|360|240|144)\s*p(?!\d)"""
+        ).find(value)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        if (explicitHeight != null) return qualityFromHeight(explicitHeight)
+
+        val resolutionPair = Regex(
+            """(?<!\d)\d{2,5}\s*[x×]\s*(\d{2,5})(?!\d)"""
+        ).find(value)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        if (resolutionPair != null) return qualityFromHeight(resolutionPair)
+
         return when {
             Regex("(?:2160|4k)").containsMatchIn(value) -> Qualities.P2160.value
             Regex("(?:1440|2k)").containsMatchIn(value) -> Qualities.P1440.value
             Regex("1080").containsMatchIn(value) -> Qualities.P1080.value
             Regex("720").containsMatchIn(value) -> Qualities.P720.value
+            Regex("576").containsMatchIn(value) -> 576
+            Regex("540").containsMatchIn(value) -> 540
             Regex("480").containsMatchIn(value) -> Qualities.P480.value
+            Regex("400").containsMatchIn(value) -> 400
             Regex("360").containsMatchIn(value) -> Qualities.P360.value
+            Regex("240").containsMatchIn(value) -> 240
+            Regex("144").containsMatchIn(value) -> 144
             else -> Qualities.Unknown.value
         }
     }
@@ -5611,12 +5804,18 @@ class Zoryva : MainAPI() {
         height: Int
     ): Int {
         return when {
+            height >= 4320 -> 4320
             height >= 2160 -> Qualities.P2160.value
             height >= 1440 -> Qualities.P1440.value
             height >= 1080 -> Qualities.P1080.value
             height >= 720 -> Qualities.P720.value
+            height >= 576 -> 576
+            height >= 540 -> 540
             height >= 480 -> Qualities.P480.value
+            height >= 400 -> 400
             height >= 360 -> Qualities.P360.value
+            height >= 240 -> 240
+            height >= 144 -> 144
             else -> Qualities.Unknown.value
         }
     }
@@ -5632,6 +5831,7 @@ class Zoryva : MainAPI() {
         }
 
         if (MEDIA_EXTENSIONS.any { lower.contains(it) }) return true
+        if (looksLikeHlsUrl(url)) return true
         if (lower.contains(".ts?", true) || lower.contains(".ts#", true) || lower.endsWith(".ts", true)) return true
         if (lower.contains(".m4s?", true) || lower.contains(".m4s#", true) || lower.endsWith(".m4s", true)) return true
 
@@ -5705,6 +5905,32 @@ class Zoryva : MainAPI() {
         ).map { height ->
             "$prefix$middle${height}$suffix$query"
         }.distinct()
+    }
+
+    private fun looksLikeHlsUrl(
+        url: String,
+        mediaTypeHint: String = ""
+    ): Boolean {
+        val value = ("$url $mediaTypeHint").lowercase(Locale.ROOT)
+        if (value.contains(".m3u8")) return true
+        if (value.contains("m3u8")) return true
+        if (value.contains("type=hls") || value.contains("type=\"hls\"")) return true
+        if (value.contains("format=hls") || value.contains("format=\"hls\"")) return true
+        if (value.contains("mime=m3u8") || value.contains("mime=\"m3u8\"")) return true
+
+        /* Current Zoryva/browser playback also returns extensionless signed
+         * HLS under peakstorm /r6 (and especially /r6/s/<token>). */
+        if (value.contains("peakstorm.top/") && value.contains("/r6/")) return true
+        return false
+    }
+
+    private fun mergeAudioTrackCandidates(
+        first: List<AudioTrackCandidate>,
+        second: List<AudioTrackCandidate>
+    ): List<AudioTrackCandidate> {
+        return (first + second)
+            .filter { it.url.isNotBlank() }
+            .distinctBy { cleanUrl(it.url) }
     }
 
     private fun buildDirectPlaybackOutput(
