@@ -57,14 +57,16 @@ class Zoryva : MainAPI() {
         /* Home is intentionally page-sized: the provider itself never caps the
          * catalogue at an artificial item count. CloudStream asks for page 1,
          * page 2, page 3, ... until the real catalogue is exhausted. */
-        const val INITIAL_HOME_ITEMS = 8
-        const val HOME_PAGE_SIZE = 8
+        const val INITIAL_HOME_ITEMS = 6
+        const val HOME_PAGE_SIZE = 6
         const val HOME_INITIAL_ROUTE_TIMEOUT_MS = 4500L
+        const val HOME_INITIAL_FALLBACK_TIMEOUT_MS = 3500L
         const val HOME_SITEMAP_CACHE_TTL_MS = 120_000L
         const val HOME_SITEMAP_CHILD_TIMEOUT_MS = 6000L
-        const val HOME_SITEMAP_CHILD_CONCURRENCY = 24
+        const val HOME_SITEMAP_CHILD_CONCURRENCY = 4
         const val HOME_BROWSE_CACHE_TTL_MS = 60_000L
-        const val HOME_BROWSE_PAGE_TIMEOUT_MS = 6500L
+        const val HOME_BROWSE_PAGE_TIMEOUT_MS = 5500L
+        const val HOME_PAGE_FETCH_CONCURRENCY = 1
         const val MAX_SEARCH_ITEMS = 50
         const val MAX_SERVER_PAGES = 12
         const val MAX_CRAWL_DEPTH = 2
@@ -326,6 +328,8 @@ class Zoryva : MainAPI() {
 
     private val catalogCache = ConcurrentHashMap<String, CachedCatalog>()
     private val browsePageCache = ConcurrentHashMap<String, CachedBrowsePage>()
+    private val initialHomeCache = ConcurrentHashMap<String, List<SiteItem>>()
+    private val initialHomeMutex = Mutex()
     private val catalogPrefetchMutex = Mutex()
     private val sitemapEntryCache = mutableListOf<SitemapEntry>()
     @Volatile private var sitemapCacheAt: Long = 0L
@@ -350,296 +354,273 @@ class Zoryva : MainAPI() {
         val currentPage = page.coerceAtLeast(1)
 
         /*
-         * Page 1 is deliberately lightweight. Fetch only the current route so
-         * Home can paint a small first batch quickly. The real continuation is
-         * loaded by CloudStream as the user scrolls into later pages.
+         * IMPORTANT: Home page 1 must remain extremely cheap.
+         *
+         * CloudStream may request multiple home rows at the same time. Older
+         * implementations fetched four large browse documents and decoded large
+         * Next.js payloads concurrently. That can overwhelm a low-memory phone
+         * and make CloudStream disappear/crash while Home is opening.
+         *
+         * The new first-frame rule is strict:
+         *   - fetch the shared homepage payload once
+         *   - keep only 6 items per requested row
+         *   - never run sitemap/detail verification here
+         *   - never start background catalogue crawling from page 1
          */
         if (currentPage == 1) {
-            var items = catalogCache[route]?.items.orEmpty()
-
-            if (items.isEmpty()) {
-                val routeDocument = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
-                    getDocument(route)
-                }
-
-                if (routeDocument != null) {
-                    items = buildBrowseItemsFromDocument(routeDocument, route)
-                        .distinctBy { cleanUrl(it.url) }
-                }
-
-                /* Fallback for a client-only browse shell: decode the homepage
-                 * RSC payload, but still avoid a broad sitemap verification pass
-                 * on the first frame. */
-                if (items.isEmpty()) {
-                    val homepage = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
-                        getDocument(BASE_URL)
-                    }
-                    items = homepage
-                        ?.let { parseHomepageRscCatalogs(it)[route].orEmpty() }
-                        .orEmpty()
-                        .distinctBy { cleanUrl(it.url) }
-                }
-
-                if (items.isNotEmpty()) {
-                    storeCatalog(route, items)
-                }
-            }
-
-            val ordered = orderHomeItems(items)
-            val visible = ordered.take(INITIAL_HOME_ITEMS)
-            val hasNext = visible.isNotEmpty()
+            val items = getInitialHomeItems(route)
+            val visible = items.take(INITIAL_HOME_ITEMS)
 
             return newHomePageResponse(
                 request,
                 visible.map { it.toSearchResponse() },
-                hasNext
+                hasNext = visible.size == INITIAL_HOME_ITEMS
             )
         }
 
-        val requiredCount = currentPage * HOME_PAGE_SIZE
-        val items = ensureHomeCatalogSize(
+        /*
+         * Lazy continuation is strictly user/page driven. One Home request gets
+         * one small page; it never fans out into several undocumented URL forms.
+         * This keeps memory/network pressure low and prevents the Home screen from
+         * being flooded with simultaneous parsing work.
+         */
+        val pageItems = loadHomeContinuationPage(
             route = route,
-            requiredCount = requiredCount
+            page = currentPage
         )
-
-        val startIndex = (currentPage - 1) * HOME_PAGE_SIZE
-        val ordered = orderHomeItems(items)
-        val pageItems = ordered
-            .drop(startIndex)
-            .take(HOME_PAGE_SIZE)
 
         return newHomePageResponse(
             request,
             pageItems.map { it.toSearchResponse() },
-            pageItems.isNotEmpty()
+            hasNext = pageItems.size == HOME_PAGE_SIZE
         )
     }
 
-    private fun orderHomeItems(items: List<SiteItem>): List<SiteItem> {
-        if (items.isEmpty()) return items
-        if (items.none { it.lastModified != null }) return items
-
-        return items.sortedWith(
-            compareByDescending<SiteItem> { it.lastModified ?: Long.MIN_VALUE }
-                .thenBy { it.title.lowercase(Locale.ROOT) }
-        )
-    }
-
-    private suspend fun ensureHomeCatalogSize(
-        route: String,
-        requiredCount: Int
+    private suspend fun getInitialHomeItems(
+        route: String
     ): List<SiteItem> {
-        var working = catalogCache[route]?.items.orEmpty()
-        if (working.size >= requiredCount) return working
+        initialHomeCache[route]?.let { return it }
 
-        /*
-         * First continuation source: the site's own browse route with a real
-         * page parameter. We keep the fetched page cache append-only so already
-         * loaded pages can never be displaced by a later refresh.
-         */
-        val nextPage = maxOf(
-            2,
-            (working.size / HOME_PAGE_SIZE) + 1
-        )
-        val targetPage = ((requiredCount - 1) / HOME_PAGE_SIZE).coerceAtLeast(1)
+        return initialHomeMutex.withLock {
+            initialHomeCache[route]?.let { return@withLock it }
 
-        if (nextPage <= targetPage + 1) {
-            val pages = (nextPage..(targetPage + 1)).toList()
-            val now = System.currentTimeMillis()
-            val missingPages = pages.filter { browsePage ->
-                val cached = browsePageCache["$route|$browsePage"]
-                cached == null ||
-                    now - cached.createdAt > HOME_BROWSE_CACHE_TTL_MS
+            /*
+             * Prefer one shared homepage request. Zoryva's four Home rows are
+             * transported together in the Next.js Flight/RSC payload, so this
+             * avoids four simultaneous full-page parses on first open.
+             */
+            val homepage = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
+                getDocument(BASE_URL)
             }
 
-            if (missingPages.isNotEmpty()) {
-                val fetched = coroutineScope {
-                    missingPages.map { browsePage ->
-                        async {
-                            val urls = listOf(
-                                buildBrowseUrl(route, browsePage),
-                                "$route?limit=${HOME_PAGE_SIZE * 3}&page=$browsePage",
-                                "$route?page=$browsePage&limit=${HOME_PAGE_SIZE * 3}",
-                                "$route?offset=${(browsePage - 1) * HOME_PAGE_SIZE}&limit=${HOME_PAGE_SIZE * 3}"
-                            ).distinct()
+            if (homepage != null) {
+                val catalogs = runCatching {
+                    parseHomepageRscCatalogs(homepage)
+                }.getOrDefault(emptyMap())
 
-                            val documents = coroutineScope {
-                                urls.map { candidateUrl ->
-                                    async {
-                                        withTimeoutOrNull(HOME_BROWSE_PAGE_TIMEOUT_MS) {
-                                            getDocument(candidateUrl)
-                                        }
-                                    }
-                                }.awaitAll()
-                            }
+                homeRoutes.forEach { homeRoute ->
+                    val seed = catalogs[homeRoute]
+                        .orEmpty()
+                        .distinctBy { cleanUrl(it.url) }
+                        .take(INITIAL_HOME_ITEMS)
 
-                            val parsed = documents
-                                .mapIndexed { index, document ->
-                                    document?.let {
-                                        buildBrowseItemsFromDocument(
-                                            it,
-                                            urls.getOrNull(index) ?: route
-                                        )
-                                    }.orEmpty()
-                                }
-                                .flatten()
-                                .distinctBy { cleanUrl(it.url) }
-
-                            browsePage to parsed
-                        }
-                    }.awaitAll()
-                }
-
-                fetched.forEach { (browsePage, items) ->
-                    if (items.isNotEmpty()) {
-                        browsePageCache["$route|$browsePage"] = CachedBrowsePage(
-                            createdAt = System.currentTimeMillis(),
-                            items = items
-                        )
+                    if (seed.isNotEmpty()) {
+                        initialHomeCache[homeRoute] = seed
+                        storeCatalog(homeRoute, seed)
                     }
                 }
             }
 
-            val seenBefore = working
-                .map { cleanUrl(it.url) }
-                .filter(String::isNotBlank)
-                .toMutableSet()
-
-            val browseContinuation = pages
-                .flatMap { browsePage ->
-                    browsePageCache["$route|$browsePage"]?.items.orEmpty()
+            /*
+             * Fallback only for the requested row. Parse the DOM links without
+             * decoding the whole browse-page RSC payload. This is intentionally
+             * bounded to six cards.
+             */
+            val fallback = if (initialHomeCache[route].isNullOrEmpty()) {
+                val document = withTimeoutOrNull(HOME_INITIAL_FALLBACK_TIMEOUT_MS) {
+                    getDocument(route)
                 }
-                .filter { item ->
-                    val key = cleanUrl(item.url)
-                    key.isNotBlank() && seenBefore.add(key)
-                }
+                document?.let {
+                    parseBrowseItemsLight(
+                        document = it,
+                        baseUrl = route,
+                        limit = INITIAL_HOME_ITEMS
+                    )
+                }.orEmpty()
+            } else {
+                emptyList()
+            }
 
-            if (browseContinuation.isNotEmpty()) {
-                storeCatalog(route, browseContinuation)
-                working = catalogCache[route]?.items.orEmpty()
-                if (working.size >= requiredCount) return working
+            if (fallback.isNotEmpty()) {
+                initialHomeCache[route] = fallback
+                storeCatalog(route, fallback)
+            }
+
+            initialHomeCache[route].orEmpty()
+        }
+    }
+
+    private suspend fun loadHomeContinuationPage(
+        route: String,
+        page: Int
+    ): List<SiteItem> {
+        val cacheKey = "$route|$page"
+        val now = System.currentTimeMillis()
+        browsePageCache[cacheKey]?.let { cached ->
+            if (now - cached.createdAt <= HOME_BROWSE_CACHE_TTL_MS) {
+                return cached.items.take(HOME_PAGE_SIZE)
             }
         }
 
         /*
-         * Canonical continuation fallback: the real Zoryva sitemap. Unlike a
-         * small fixed batch, this index is walked across every child sitemap,
-         * preserving each URL's <lastmod> so newly modified titles remain ahead
-         * of older catalogue items. Only the current CloudStream page is
-         * verified, so scrolling stays incremental.
+         * First try the website's real page-number continuation. This is a single
+         * network request, not a matrix of page/offset/limit variants.
          */
-        val sitemapEntries = getSitemapMediaEntries()
-        if (sitemapEntries.isEmpty()) return working
-
-        val seen = working
-            .map { cleanUrl(it.url) }
-            .filter(String::isNotBlank)
-            .toMutableSet()
-
-        val candidates = sitemapEntries.filter { entry ->
-            val path = entry.path
-            val matches = when (route) {
-                MOVIES -> isMoviePath(path)
-                TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
-                ANIME -> isAnimePath(path) && !isEpisodePath(path)
-                TRENDING -> isMoviePath(path) || isTvPath(path) || isAnimePath(path)
-                else -> false
-            }
-
-            matches && seen.add(
-                cleanUrl("$BASE_URL${normalizePathForSearch(path)}")
-            )
+        val pageUrl = buildBrowseUrl(route, page)
+        val document = withTimeoutOrNull(HOME_BROWSE_PAGE_TIMEOUT_MS) {
+            getDocument(pageUrl)
         }
 
-        if (candidates.isEmpty()) return working
+        var parsed = document?.let {
+            parseBrowseItemsLight(
+                document = it,
+                baseUrl = pageUrl,
+                limit = HOME_PAGE_SIZE
+            )
+        }.orEmpty()
 
-        val needed = (requiredCount - working.size).coerceAtLeast(HOME_PAGE_SIZE)
-        val verified = coroutineScope {
-            candidates
-                .take(needed + HOME_PAGE_SIZE)
-                .map { entry ->
-                    async {
+        /*
+         * Some Next.js pages expose their cards only inside Flight/RSC. Use the
+         * already-downloaded page once as a fallback. There is still only one
+         * page document in memory and only six items are retained.
+         */
+        if (parsed.isEmpty() && document != null) {
+            parsed = runCatching {
+                parseBrowseItems(document, pageUrl)
+                    .take(HOME_PAGE_SIZE)
+            }.getOrDefault(emptyList())
+        }
+
+        if (parsed.isEmpty()) {
+            /*
+             * Final continuation fallback: use the real sitemap ordering, but
+             * verify only the next six unseen entries. Sitemap discovery itself
+             * is cached and its concurrency is deliberately kept low.
+             */
+            val sitemapEntries = getSitemapMediaEntries()
+            if (sitemapEntries.isNotEmpty()) {
+                val existing = catalogCache[route]?.items.orEmpty()
+                    .map { cleanUrl(it.url) }
+                    .filter(String::isNotBlank)
+                    .toMutableSet()
+
+                val candidates = sitemapEntries.asSequence()
+                    .filter { entry ->
+                        val path = entry.path
+                        when (route) {
+                            MOVIES -> isMoviePath(path)
+                            TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
+                            ANIME -> isAnimePath(path) && !isEpisodePath(path)
+                            TRENDING -> isMoviePath(path) ||
+                                (isTvPath(path) && !isEpisodePath(path)) ||
+                                (isAnimePath(path) && !isEpisodePath(path))
+                            else -> false
+                        }
+                    }
+                    .filter { entry ->
+                        cleanUrl("$BASE_URL${normalizePathForSearch(entry.path)}")
+                            .let { url -> url.isNotBlank() && existing.add(url) }
+                    }
+                    .take(HOME_PAGE_SIZE)
+                    .toList()
+
+                if (candidates.isNotEmpty()) {
+                    parsed = candidates.mapNotNull { entry ->
                         verifySitemapCandidate(entry.path)?.copy(
                             lastModified = entry.lastModified
                         )
                     }
                 }
-                .awaitAll()
-                .filterNotNull()
+            }
         }
 
-        if (verified.isNotEmpty()) {
-            storeCatalog(route, verified)
-            working = catalogCache[route]?.items.orEmpty()
+        if (parsed.isNotEmpty()) {
+            /* Preserve source order. Do not re-sort the whole accumulated list:
+             * doing so can shift page 1 underneath page 2 and create duplicates. */
+            val cleanPage = parsed
+                .distinctBy { cleanUrl(it.url) }
+                .take(HOME_PAGE_SIZE)
+
+            browsePageCache[cacheKey] = CachedBrowsePage(
+                createdAt = System.currentTimeMillis(),
+                items = cleanPage
+            )
+
+            storeCatalog(route, cleanPage)
+            return cleanPage
         }
 
-        return working
+        browsePageCache[cacheKey] = CachedBrowsePage(
+            createdAt = System.currentTimeMillis(),
+            items = emptyList()
+        )
+        return emptyList()
     }
 
-    private suspend fun prefetchHomeCatalogs() {
-        val now = System.currentTimeMillis()
-        val hasFreshCatalog = homeRoutes.all { route ->
-            val cached = catalogCache[route]
-            cached != null && now - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS
+    private fun parseBrowseItemsLight(
+        document: Document,
+        baseUrl: String,
+        limit: Int
+    ): List<SiteItem> {
+        if (limit <= 0) return emptyList()
+
+        val result = linkedMapOf<String, SiteItem>()
+
+        for (anchor in document.select("a[href]")) {
+            if (result.size >= limit) break
+
+            val rawHref = anchor.attr("href").trim()
+            val absolute = normalizeExtractedUrl(rawHref, baseUrl) ?: continue
+            val path = runCatching { URI(absolute).path.orEmpty() }
+                .getOrDefault("")
+
+            val type = when {
+                isMoviePath(path) -> TvType.Movie
+                isAnimePath(path) && !isEpisodePath(path) -> TvType.Anime
+                isTvPath(path) && !isEpisodePath(path) -> TvType.TvSeries
+                else -> continue
+            }
+
+            val title = extractCardTitle(anchor)
+                .ifBlank { titleFromPath(path) }
+                .ifBlank { continue }
+
+            val clean = cleanUrl(absolute)
+            if (clean.isBlank()) continue
+
+            result.putIfAbsent(
+                clean,
+                SiteItem(
+                    title = title,
+                    url = clean,
+                    poster = extractCardPoster(anchor, baseUrl),
+                    type = type
+                )
+            )
         }
 
-        if (hasFreshCatalog) return
+        return result.values.toList()
+    }
 
-        catalogPrefetchMutex.withLock {
-            val lockedNow = System.currentTimeMillis()
-            val stillFresh = homeRoutes.all { route ->
-                val cached = catalogCache[route]
-                cached != null && lockedNow - cached.createdAt <= HOME_CATALOG_CACHE_TTL_MS
-            }
-            if (stillFresh) return
-
-            /*
-             * One Home request provides initialRows + initialHeroItems for all
-             * four sections. This is both faster and more reliable than trying
-             * to scrape the client-only /browse pages on the first frame.
-             */
-            val homepage = withTimeoutOrNull(7000L) {
-                getDocument(BASE_URL)
-            }
-
-            val rscCatalogs = homepage
-                ?.let { parseHomepageRscCatalogs(it) }
-                .orEmpty()
-
-            rscCatalogs.forEach { (route, items) ->
-                if (items.isNotEmpty()) {
-                    storeCatalog(route, items.distinctBy { cleanUrl(it.url) })
-                }
-            }
-
-            /*
-             * Keep the real browse routes as a secondary source. If the site
-             * changes back to SSR cards in the future, the parser can merge them
-             * immediately without changing the Home API.
-             */
-            val fallbackRoutes = homeRoutes.filter { route ->
-                getCachedCatalog(route)?.items.isNullOrEmpty()
-            }
-
-            if (fallbackRoutes.isNotEmpty()) {
-                val fetched = coroutineScope {
-                    fallbackRoutes.map { route ->
-                        async {
-                            route to withTimeoutOrNull(HOME_PREFETCH_TIMEOUT_MS) {
-                                getDocument(route)
-                            }
-                        }
-                    }.awaitAll()
-                }
-
-                fetched.forEach { (route, document) ->
-                    document ?: return@forEach
-                    val items = buildBrowseItemsFromDocument(document, route)
-                        .distinctBy { cleanUrl(it.url) }
-                    if (items.isNotEmpty()) {
-                        storeCatalog(route, items)
-                    }
-                }
+    /*
+     * Kept for search warm-up compatibility, but it is now deliberately small.
+     * Search has its own sitemap fallback and must not trigger a four-route Home
+     * crawl that can compete with the UI for memory.
+     */
+    private suspend fun prefetchHomeCatalogs() {
+        homeRoutes.forEach { route ->
+            if (initialHomeCache[route].isNullOrEmpty()) {
+                getInitialHomeItems(route)
             }
         }
     }
@@ -957,22 +938,6 @@ class Zoryva : MainAPI() {
         return parseBrowseItems(document, baseUrl)
             .distinctBy { cleanUrl(it.url) }
     }
-
-    private suspend fun loadHomeSitemapPage(
-        route: String,
-        page: Int
-    ): List<SiteItem> {
-        val items = ensureHomeCatalogSize(
-            route = route,
-            requiredCount = page.coerceAtLeast(1) * HOME_PAGE_SIZE
-        )
-        return items
-            .drop((page - 1).coerceAtLeast(0) * HOME_PAGE_SIZE)
-            .take(HOME_PAGE_SIZE)
-    }
-
-    private suspend fun getSitemapMediaPaths(): List<String> =
-        getSitemapMediaEntries().map { it.path }
 
     private suspend fun getSitemapMediaEntries(): List<SitemapEntry> {
         val now = System.currentTimeMillis()
