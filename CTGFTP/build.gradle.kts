@@ -12,7 +12,7 @@ android {
     }
 }
 
-version = 6
+version = 7
 
 cloudstream {
     description = "CTG FTP provider for Movie-Flick"
