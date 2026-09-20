@@ -50,11 +50,11 @@
     },
     {
         "iconUrl": "https://i.postimg.cc/QMxBDF9T/favicon-V2.png",
-        "jarFileSize": 201215,
-        "fileHash": "sha256-0917dae183bd8a229228d00fb012cb838449ae9395dd664c448812584c7b760e",
+        "jarFileSize": 239098,
+        "fileHash": "sha256-bdf75d9390fc054686e549989188aa536583d9381b378b57555ff566429945a0",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 60442,
+        "fileSize": 71643,
         "status": 1,
         "language": "bn",
         "authors": [
@@ -65,13 +65,13 @@
             "TvSeries",
             "Anime"
         ],
-        "version": 3,
+        "version": 5,
         "internalName": "CTGFTP",
         "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.jar",
         "description": "CTG FTP provider for Movie-Flick",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.cs3",
         "name": "CTGFTP",
-        "jarHash": "sha256-6781b6cb0a1a5ef49a2cd98b6a41efac0a1171b46217249754fb6df6d1120846"
+        "jarHash": "sha256-5fa8addff884803f8d3dc551223fc85dc42689cc42427b3c6f8c88b13b565c5d"
     },
     {
         "fileHash": "sha256-fd676cc4a3b827beb5426ce4eabf1756d58dd225aa75ea16d290fbcf66d84be2",
