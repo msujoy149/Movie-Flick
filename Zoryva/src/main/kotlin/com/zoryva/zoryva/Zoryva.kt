@@ -410,7 +410,7 @@ class Zoryva : MainAPI() {
             }.filterNotNull()
 
             if (verified.isNotEmpty()) {
-                appendCatalog(route, verified)
+                storeCatalog(route, verified)
                 working = catalogCache[route]?.items.orEmpty()
             }
 
