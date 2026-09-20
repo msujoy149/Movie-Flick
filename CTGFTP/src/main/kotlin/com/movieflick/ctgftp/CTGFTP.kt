@@ -13,7 +13,7 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * CTG FTP v7 — embedded episode sources + exact playback
+ * CTG FTP v10 — exact per-episode source cache + direct playback
  *
  * Movie playback:
  * detail -> watch -> serialized links[] -> actual media URL -> ExtractorLink
@@ -82,6 +82,10 @@ class CTGFTP : MainAPI() {
         ".flv",
         ".ts"
     )
+
+    /* CTG per-episode source cache populated from the series response. */
+    private val episodePlaybackCache =
+        java.util.concurrent.ConcurrentHashMap<String, List<CtgPlaybackSource>>()
 
     override suspend fun getMainPage(
         page: Int,
@@ -753,9 +757,25 @@ class CTGFTP : MainAPI() {
                 ?.lowercase(Locale.ROOT)
 
             if (type == "episode") {
+                val episodeId = watchId(input)
+                val seriesSlug = queryParam(input, "series")
+                val cachedSources =
+                    episodePlaybackCache[episodeCacheKey(seriesSlug, episodeId)]
+                        ?: episodePlaybackCache[episodeId]
+
+                if (!cachedSources.isNullOrEmpty()) {
+                    if (emitEpisodeSources(
+                            sources = cachedSources,
+                            referer = input,
+                            subtitleCallback = subtitleCallback,
+                            callback = callback
+                        )
+                    ) return true
+                }
+
                 return loadExactWatchSources(
                     input = input,
-                    episodeId = watchId(input),
+                    episodeId = episodeId,
                     subtitleCallback = subtitleCallback,
                     callback = callback
                 )
@@ -929,6 +949,57 @@ class CTGFTP : MainAPI() {
         val watchUrl: String,
         val sources: List<CtgPlaybackSource>
     )
+
+    private fun episodeCacheKey(
+        seriesSlug: String?,
+        episodeId: String
+    ): String {
+        return if (seriesSlug.isNullOrBlank()) {
+            episodeId
+        } else {
+            "${seriesSlug.lowercase(Locale.ROOT)}::$episodeId"
+        }
+    }
+
+    private suspend fun emitEpisodeSources(
+        sources: List<CtgPlaybackSource>,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var emitted = false
+        val subtitleSeen = linkedSetOf<String>()
+
+        sources.distinctBy { mediaDedupKey(it.url) }.forEach { source ->
+            if (!isMediaUrl(source.url)) return@forEach
+
+            source.subtitleTracks.forEach { track ->
+                if (subtitleSeen.add(track.url)) {
+                    subtitleCallback(
+                        newSubtitleFile(
+                            lang = track.label.ifBlank {
+                                track.language.ifBlank { "Subtitle" }
+                            },
+                            url = track.url
+                        )
+                    )
+                }
+            }
+
+            emitMediaLink(
+                mediaUrl = source.url,
+                referer = referer,
+                qualityHint = source.quality,
+                sourceName = source.sourceName,
+                language = source.language,
+                includeLanguage = true,
+                callback = callback
+            )
+            emitted = true
+        }
+
+        return emitted
+    }
 
     private suspend fun loadExactWatchSources(
         input: String,
@@ -2394,36 +2465,17 @@ class CTGFTP : MainAPI() {
          *
          * Episode number + season are the stable identity here. When the
          * serialized record arrives, it replaces the shell record so its
-         * exact source payload is what CloudStream receives.
+         * exact source payload is cached and reused by loadLinks().
          */
         val existingKey = result.keys.firstOrNull { key ->
             key.startsWith("$season:$episode:")
         }
 
         /*
-         * IMPORTANT — TV/Anime PLAYBACK DATA
-         *
-         * The CTG series page already gives us the exact links[] for each
-         * episode. When those sources are available, make the Episode's data
-         * string carry that exact source list, just like a direct movie source.
-         *
-         * This avoids relying on a second watch-page scrape at Play time and
-         * prevents "No Links Found" when CTG's watch page is a streamed shell.
-         * If no links are available in the series payload, keep the exact watch
-         * URL as the fallback so playback can still try a fresh resolution.
+         * Keep the Episode data as the exact CTG watch URL. The selected
+         * episode sources are cached separately from the same series response.
          */
-        val playableData = if (playbackSources.isNotEmpty()) {
-            buildEpisodeDataPayload(
-                episodeId = playbackSources.firstOrNull()?.episodeId
-                    ?: watchIdOrEmpty(cleanData),
-                watchUrl = cleanData,
-                sources = playbackSources
-            )
-        } else {
-            cleanData
-        }
-
-        val episodeData = newEpisode(playableData) {
+        val episodeData = newEpisode(cleanData) {
             this.name = name.ifBlank {
                 "Episode $episode"
             }
@@ -2552,14 +2604,20 @@ class CTGFTP : MainAPI() {
                         objectText = objectText,
                         baseUrl = baseUrl,
                         episodeId = id
-                    )
+                    ).ifEmpty {
+                        extractEpisodePlaybackSourcesFast(
+                            html = normalized,
+                            baseUrl = baseUrl,
+                            episodeId = id
+                        )
+                    }
 
-                /*
-                 * Build the Episode data exactly like the working direct-movie
-                 * path when CTG has already supplied this episode's links[].
-                 * The payload contains only this episode's sources, not the
-                 * whole series.
-                 */
+                if (playbackSources.isNotEmpty()) {
+                    episodePlaybackCache[episodeCacheKey(seriesSlug, id)] =
+                        playbackSources
+                    episodePlaybackCache[id] = playbackSources
+                }
+
                 val dataUrl = watchUrl
 
                 val parsed = ParsedEpisode(
@@ -2594,6 +2652,93 @@ class CTGFTP : MainAPI() {
      * object by its stable CTG episode id and only then reads that object's
      * links[]. This guarantees Episode N can only emit Episode N sources.
      */
+    /** Exact fallback for the link object belonging to one episode id. */
+    private fun extractEpisodePlaybackSourcesFast(
+        html: String,
+        baseUrl: String,
+        episodeId: String
+    ): List<CtgPlaybackSource> {
+        if (html.isBlank() || episodeId.isBlank()) return emptyList()
+
+        val marker = "\"episode_id\":\"$episodeId\""
+        val result = mutableListOf<CtgPlaybackSource>()
+        var from = 0
+
+        while (true) {
+            val markerIndex = html.indexOf(marker, from)
+            if (markerIndex < 0) break
+
+            val objectStart = html.lastIndexOf('{', markerIndex)
+            val objectText = if (objectStart >= 0) {
+                extractJsonObjectAt(html, objectStart)
+            } else null
+
+            if (objectText != null &&
+                extractJsonString(objectText, "episode_id") == episodeId
+            ) {
+                val quality = extractJsonString(objectText, "quality")
+                val sourceName = extractJsonString(objectText, "source")
+                val language = extractJsonString(objectText, "language")
+                val subtitles = extractSubtitleTracks(objectText, baseUrl)
+
+                listOfNotNull(
+                    extractJsonString(objectText, "url"),
+                    extractJsonString(objectText, "hls_url")
+                ).forEach { rawUrl ->
+                    val media = absoluteUrl(cleanUrl(rawUrl), baseUrl)
+                    if (isMediaUrl(media)) {
+                        result += CtgPlaybackSource(
+                            url = media,
+                            quality = quality,
+                            sourceName = sourceName,
+                            language = language,
+                            episodeId = episodeId,
+                            movieId = null,
+                            subtitleTracks = subtitles
+                        )
+                    }
+                }
+            }
+
+            from = markerIndex + marker.length
+        }
+
+        return result.distinctBy { mediaDedupKey(it.url) }
+    }
+
+    private fun extractJsonObjectAt(
+        text: String,
+        objectStart: Int
+    ): String? {
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        for (index in objectStart until text.length) {
+            val ch = text[index]
+
+            if (inString) {
+                if (escaped) escaped = false
+                else if (ch == '\\') escaped = true
+                else if (ch == '"') inString = false
+                continue
+            }
+
+            when (ch) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(objectStart, index + 1)
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
     private fun extractEpisodeSourcesFromAllEpisodes(
         html: String,
         baseUrl: String,
