@@ -1448,6 +1448,60 @@ class CTGFTP : MainAPI() {
             .distinctBy { mediaDedupKey(it.url) }
     }
 
+    private fun extractSubtitleTracks(
+        objectText: String,
+        baseUrl: String
+    ): List<CtgSubtitleTrack> {
+        val normalized = normalizeCtgPayload(objectText)
+        val arrays = extractJsonArraysAfterKey(
+            normalized,
+            "\"subtitle_tracks\""
+        )
+
+        if (arrays.isEmpty()) return emptyList()
+
+        val result = mutableListOf<CtgSubtitleTrack>()
+
+        arrays.forEach { arrayText ->
+            extractTopLevelJsonObjects(arrayText).forEach { trackObject ->
+                val rawUrl = extractJsonString(
+                    trackObject,
+                    "url"
+                ) ?: return@forEach
+
+                val url = absoluteUrl(
+                    cleanUrl(rawUrl),
+                    baseUrl
+                )
+
+                if (
+                    url.isNotBlank() &&
+                    (
+                        url.startsWith("http://", true) ||
+                            url.startsWith("https://", true)
+                    )
+                ) {
+                    result.add(
+                        CtgSubtitleTrack(
+                            url = url,
+                            language = extractJsonString(
+                                trackObject,
+                                "language"
+                            ).orEmpty(),
+                            label = extractJsonString(
+                                trackObject,
+                                "label"
+                            ).orEmpty()
+                        )
+                    )
+                }
+            }
+        }
+
+        val seen = linkedSetOf<String>()
+        return result.filter { seen.add(it.url) }
+    }
+
     private fun normalizeCtgPayload(
         html: String
     ): String {
