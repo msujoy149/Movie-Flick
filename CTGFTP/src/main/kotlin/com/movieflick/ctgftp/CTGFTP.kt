@@ -23,7 +23,8 @@ import java.util.TimeZone
 class CTGFTP : MainAPI() {
 
     private companion object {
-        const val EPISODE_DATA_PREFIX = "ctg-episode-v2|"
+        const val EPISODE_DATA_PREFIX = "ctg-episode-v3|"
+        const val LEGACY_EPISODE_DATA_PREFIX = "ctg-episode-v2|"
         const val SOURCE_SEPARATOR = "||"
         const val SOURCE_FIELD_SEPARATOR = "~"
         const val SUBTITLE_SEPARATOR = ";;"
@@ -677,7 +678,7 @@ class CTGFTP : MainAPI() {
          * media path as a working movie source: URL -> ExtractorLink.
          * No sibling episode scan and no resolution probing is performed.
          */
-        if (input.startsWith(EPISODE_DATA_PREFIX)) {
+        if (input.startsWith(EPISODE_DATA_PREFIX) || input.startsWith(LEGACY_EPISODE_DATA_PREFIX)) {
             val embedded = parseEpisodeDataPayload(input)
 
             var emitted = false
@@ -2399,7 +2400,30 @@ class CTGFTP : MainAPI() {
             key.startsWith("$season:$episode:")
         }
 
-        val episodeData = newEpisode(cleanData) {
+        /*
+         * IMPORTANT — TV/Anime PLAYBACK DATA
+         *
+         * The CTG series page already gives us the exact links[] for each
+         * episode. When those sources are available, make the Episode's data
+         * string carry that exact source list, just like a direct movie source.
+         *
+         * This avoids relying on a second watch-page scrape at Play time and
+         * prevents "No Links Found" when CTG's watch page is a streamed shell.
+         * If no links are available in the series payload, keep the exact watch
+         * URL as the fallback so playback can still try a fresh resolution.
+         */
+        val playableData = if (playbackSources.isNotEmpty()) {
+            buildEpisodeDataPayload(
+                episodeId = playbackSources.firstOrNull()?.episodeId
+                    ?: watchIdOrEmpty(cleanData),
+                watchUrl = cleanData,
+                sources = playbackSources
+            )
+        } else {
+            cleanData
+        }
+
+        val episodeData = newEpisode(playableData) {
             this.name = name.ifBlank {
                 "Episode $episode"
             }
@@ -2531,14 +2555,10 @@ class CTGFTP : MainAPI() {
                     )
 
                 /*
-                 * Keep episode data compact and movie-like. The watch URL is
-                 * the source-of-truth for this exact episode; loadLinks()
-                 * fetches it only when Play is pressed and resolves that
-                 * episode's own allEpisodes[].links[] directly.
-                 *
-                 * Do NOT embed every media URL into the Episode data. Apart
-                 * from making the data unnecessarily large, doing so can make
-                 * CloudStream carry stale/oversized episode payloads.
+                 * Build the Episode data exactly like the working direct-movie
+                 * path when CTG has already supplied this episode's links[].
+                 * The payload contains only this episode's sources, not the
+                 * whole series.
                  */
                 val dataUrl = watchUrl
 
@@ -2742,6 +2762,12 @@ class CTGFTP : MainAPI() {
             .trimEnd('/')
             .substringAfterLast('/')
             .takeIf { it.isNotBlank() }
+    }
+
+    private fun watchIdOrEmpty(
+        url: String
+    ): String {
+        return if (isWatchUrl(url)) watchId(url) else ""
     }
 
     private fun episodeIdentity(
