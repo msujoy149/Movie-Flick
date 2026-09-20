@@ -326,11 +326,11 @@
     },
     {
         "iconUrl": "https://zoryva.me/icon-512.png",
-        "jarFileSize": 1101859,
-        "fileHash": "sha256-f358720164c77accc5fd995b37df09e2f7db91aa6ac82ac441c360289f7afa01",
+        "jarFileSize": 1035688,
+        "fileHash": "sha256-b274ae720817a4baaafaaf80741bb4b68c235c74a9cff70801802bac5f316b7f",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 215601,
+        "fileSize": 209385,
         "status": 1,
         "language": "hi",
         "authors": [
@@ -347,6 +347,6 @@
         "description": "Zoryva CloudStream provider",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.cs3",
         "name": "Zoryva",
-        "jarHash": "sha256-20dd4b7a2b5c18b89331271dd59bb244737407d4c0273fdda761d010a9a5f6fb"
+        "jarHash": "sha256-3f082d7cb11c76aedd69d649ed59e218bf6d3100be0f5c8fc58e9d82b1f82bc8"
     }
 ]
