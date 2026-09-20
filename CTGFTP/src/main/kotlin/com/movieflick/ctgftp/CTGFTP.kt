@@ -430,13 +430,28 @@ class CTGFTP : MainAPI() {
             )
         }
 
-        val document = getDocument(clean)
+        /*
+         * Keep the raw HTTP response for TV/Anime pages. CTG's Next.js
+         * `allEpisodes[]` + per-episode `links[]` live inside streamed script
+         * payloads. Jsoup's reconstructed document can hide/reshape that
+         * payload, so episode parsing must use the original response text.
+         */
+        val pageResponse = runCatching {
+            app.get(
+                clean,
+                headers = pageHeaders + ("Referer" to "$mainUrl/")
+            )
+        }.getOrNull()
+
+        val document = pageResponse?.document
             ?: return newMovieLoadResponse(
                 titleFromUrl(clean),
                 clean,
                 typeFromUrl(clean),
                 clean
             )
+
+        val rawPageHtml = pageResponse.text
 
         val title = extractPageTitle(document)
             .ifBlank { titleFromUrl(clean) }
@@ -447,7 +462,11 @@ class CTGFTP : MainAPI() {
 
         when (typeFromUrl(clean)) {
             TvType.TvSeries -> {
-                val episodes = parseEpisodes(document, clean)
+                val episodes = parseEpisodes(
+                    document = document,
+                    rawHtml = rawPageHtml,
+                    baseUrl = clean
+                )
 
                 if (episodes.isNotEmpty()) {
                     return newTvSeriesLoadResponse(
@@ -464,7 +483,11 @@ class CTGFTP : MainAPI() {
             }
 
             TvType.Anime -> {
-                val episodes = parseEpisodes(document, clean)
+                val episodes = parseEpisodes(
+                    document = document,
+                    rawHtml = rawPageHtml,
+                    baseUrl = clean
+                )
 
                 if (episodes.isNotEmpty()) {
                     return newAnimeLoadResponse(
@@ -648,11 +671,11 @@ class CTGFTP : MainAPI() {
          * EMBEDDED EPISODE SOURCES
          * ============================================================
          *
-         * For TV/Anime, parseSerializedEpisodes() already reads the exact
-         * links[] belonging to each episode. Keep those URLs in the Episode
-         * data so Play does not need to download and scan a large Next.js page
-         * again. This makes playback fast and prevents another episode's
-         * sources from being accidentally picked up.
+         * For TV/Anime, parseSerializedEpisodes() reads the exact links[]
+         * belonging to each episode and stores those real media URLs in the
+         * Episode data. This makes every episode use the same final direct
+         * media path as a working movie source: URL -> ExtractorLink.
+         * No sibling episode scan and no resolution probing is performed.
          */
         if (input.startsWith(EPISODE_DATA_PREFIX)) {
             val embedded = parseEpisodeDataPayload(input)
@@ -2091,6 +2114,7 @@ class CTGFTP : MainAPI() {
 
     private fun parseEpisodes(
         document: Document,
+        rawHtml: String,
         baseUrl: String
     ): List<Episode> {
         val result = linkedMapOf<String, Episode>()
@@ -2258,7 +2282,13 @@ class CTGFTP : MainAPI() {
          */
         val seriesSlug = seriesSlugFromUrl(baseUrl)
         val serialized = parseSerializedEpisodes(
-            html = document.html(),
+            /*
+             * IMPORTANT: use the original response body, not document.html().
+             * CTG's streamed Next.js payload contains the authoritative
+             * allEpisodes + links objects, and the original response preserves
+             * the escape structure needed by the parser.
+             */
+            html = rawHtml.ifBlank { document.html() },
             baseUrl = baseUrl,
             seriesSlug = seriesSlug
         )
@@ -2372,9 +2402,9 @@ class CTGFTP : MainAPI() {
         }
 
         /*
-         * Prefer the serialized episode only when it actually carries
-         * playback sources. If it does not, retain the existing watch-page
-         * shell so a fresh exact-page resolution remains available.
+         * Serialized `allEpisodes[]` is the authoritative episode record.
+         * When it contains one or more real links[], replace the lightweight
+         * DOM shell with the link-bearing episode data.
          */
         if (existingKey != null) {
             if (playbackSources.isNotEmpty()) {
