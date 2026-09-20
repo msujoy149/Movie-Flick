@@ -59,8 +59,10 @@ class Zoryva : MainAPI() {
          * page 2, page 3, ... until the real catalogue is exhausted. */
         const val INITIAL_HOME_ITEMS = 6
         const val HOME_PAGE_SIZE = 6
-        const val HOME_INITIAL_ROUTE_TIMEOUT_MS = 4500L
-        const val HOME_INITIAL_FALLBACK_TIMEOUT_MS = 3500L
+        const val HOME_INITIAL_ROUTE_TIMEOUT_MS = 3500L
+        const val HOME_INITIAL_FALLBACK_TIMEOUT_MS = 2500L
+        const val HOME_MAX_HTML_CHARS = 2_000_000
+        const val HOME_RSC_CHUNK_MAX_CHARS = 700_000
         const val HOME_SITEMAP_CACHE_TTL_MS = 120_000L
         const val HOME_SITEMAP_CHILD_TIMEOUT_MS = 6000L
         const val HOME_SITEMAP_CHILD_CONCURRENCY = 4
@@ -328,8 +330,6 @@ class Zoryva : MainAPI() {
 
     private val catalogCache = ConcurrentHashMap<String, CachedCatalog>()
     private val browsePageCache = ConcurrentHashMap<String, CachedBrowsePage>()
-    private val initialHomeCache = ConcurrentHashMap<String, List<SiteItem>>()
-    private val initialHomeMutex = Mutex()
     private val catalogPrefetchMutex = Mutex()
     private val sitemapEntryCache = mutableListOf<SitemapEntry>()
     @Volatile private var sitemapCacheAt: Long = 0L
@@ -354,217 +354,261 @@ class Zoryva : MainAPI() {
         val currentPage = page.coerceAtLeast(1)
 
         /*
-         * IMPORTANT: Home page 1 must remain extremely cheap.
+         * Home must be cheap enough to run on low-memory devices.
          *
-         * CloudStream may request multiple home rows at the same time. Older
-         * implementations fetched four large browse documents and decoded large
-         * Next.js payloads concurrently. That can overwhelm a low-memory phone
-         * and make CloudStream disappear/crash while Home is opening.
+         * IMPORTANT:
+         * - Never scrape all four categories for a single row request.
+         * - Never crawl the sitemap while opening Home.
+         * - Never verify detail pages just to render posters.
+         * - Keep every request page-sized (6 items).
          *
-         * The new first-frame rule is strict:
-         *   - fetch the shared homepage payload once
-         *   - keep only 6 items per requested row
-         *   - never run sitemap/detail verification here
-         *   - never start background catalogue crawling from page 1
+         * CloudStream can ask several rows at once, so each row is isolated and
+         * cached. A row only fetches its own browse page and returns immediately.
          */
-        if (currentPage == 1) {
-            val items = getInitialHomeItems(route)
-            val visible = items.take(INITIAL_HOME_ITEMS)
-
-            return newHomePageResponse(
-                request,
-                visible.map { it.toSearchResponse() },
-                hasNext = visible.size == INITIAL_HOME_ITEMS
-            )
-        }
-
-        /*
-         * Lazy continuation is strictly user/page driven. One Home request gets
-         * one small page; it never fans out into several undocumented URL forms.
-         * This keeps memory/network pressure low and prevents the Home screen from
-         * being flooded with simultaneous parsing work.
-         */
-        val pageItems = loadHomeContinuationPage(
-            route = route,
-            page = currentPage
-        )
+        val items = loadHomePageLight(route, currentPage)
 
         return newHomePageResponse(
             request,
-            pageItems.map { it.toSearchResponse() },
-            hasNext = pageItems.size == HOME_PAGE_SIZE
+            items.map { it.toSearchResponse() },
+            hasNext = items.size == HOME_PAGE_SIZE
         )
     }
 
-    private suspend fun getInitialHomeItems(
-        route: String
-    ): List<SiteItem> {
-        initialHomeCache[route]?.let { return it }
-
-        return initialHomeMutex.withLock {
-            initialHomeCache[route]?.let { return@withLock it }
-
-            /*
-             * Prefer one shared homepage request. Zoryva's four Home rows are
-             * transported together in the Next.js Flight/RSC payload, so this
-             * avoids four simultaneous full-page parses on first open.
-             */
-            val homepage = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
-                getDocument(BASE_URL)
-            }
-
-            if (homepage != null) {
-                val catalogs = runCatching {
-                    parseHomepageRscCatalogs(homepage)
-                }.getOrDefault(emptyMap())
-
-                homeRoutes.forEach { homeRoute ->
-                    val seed = catalogs[homeRoute]
-                        .orEmpty()
-                        .distinctBy { cleanUrl(it.url) }
-                        .take(INITIAL_HOME_ITEMS)
-
-                    if (seed.isNotEmpty()) {
-                        initialHomeCache[homeRoute] = seed
-                        storeCatalog(homeRoute, seed)
-                    }
-                }
-            }
-
-            /*
-             * Fallback only for the requested row. Parse the DOM links without
-             * decoding the whole browse-page RSC payload. This is intentionally
-             * bounded to six cards.
-             */
-            val fallback = if (initialHomeCache[route].isNullOrEmpty()) {
-                val document = withTimeoutOrNull(HOME_INITIAL_FALLBACK_TIMEOUT_MS) {
-                    getDocument(route)
-                }
-                document?.let {
-                    parseBrowseItemsLight(
-                        document = it,
-                        baseUrl = route,
-                        limit = INITIAL_HOME_ITEMS
-                    )
-                }.orEmpty()
-            } else {
-                emptyList()
-            }
-
-            if (fallback.isNotEmpty()) {
-                initialHomeCache[route] = fallback
-                storeCatalog(route, fallback)
-            }
-
-            initialHomeCache[route].orEmpty()
-        }
-    }
-
-    private suspend fun loadHomeContinuationPage(
+    private suspend fun loadHomePageLight(
         route: String,
         page: Int
     ): List<SiteItem> {
+        if (route !in homeRoutes) return emptyList()
+
         val cacheKey = "$route|$page"
         val now = System.currentTimeMillis()
         browsePageCache[cacheKey]?.let { cached ->
             if (now - cached.createdAt <= HOME_BROWSE_CACHE_TTL_MS) {
-                return cached.items.take(HOME_PAGE_SIZE)
+                return cached.items
             }
         }
 
-        /*
-         * First try the website's real page-number continuation. This is a single
-         * network request, not a matrix of page/offset/limit variants.
-         */
         val pageUrl = buildBrowseUrl(route, page)
-        val document = withTimeoutOrNull(HOME_BROWSE_PAGE_TIMEOUT_MS) {
-            getDocument(pageUrl)
+
+        /*
+         * Do NOT use fetchPage() for Home. fetchPage() constructs a full Jsoup
+         * Document from the complete response. On a Next.js page that can be a
+         * very large HTML/RSC payload, and several Home rows may be requested at
+         * the same time by CloudStream. That is unnecessary memory pressure.
+         *
+         * Home therefore reads only the response text and parses a bounded prefix.
+         */
+        val document = withTimeoutOrNull(
+            if (page == 1) HOME_INITIAL_ROUTE_TIMEOUT_MS
+            else HOME_BROWSE_PAGE_TIMEOUT_MS
+        ) {
+            runCatching {
+                val response = app.get(
+                    pageUrl,
+                    headers = PAGE_HEADERS
+                )
+                if (response.code !in 200..399) {
+                    null
+                } else {
+                    val text = response.text
+                    val bounded = if (text.length > HOME_MAX_HTML_CHARS) {
+                        text.substring(0, HOME_MAX_HTML_CHARS)
+                    } else {
+                        text
+                    }
+                    Jsoup.parse(bounded, pageUrl)
+                }
+            }.getOrNull()
         }
 
-        var parsed = document?.let {
-            parseBrowseItemsLight(
-                document = it,
-                baseUrl = pageUrl,
+        if (document == null) {
+            browsePageCache[cacheKey] = CachedBrowsePage(
+                createdAt = System.currentTimeMillis(),
+                items = emptyList()
+            )
+            return emptyList()
+        }
+
+        /*
+         * First choice: ordinary DOM cards. This is by far the cheapest path.
+         */
+        var items = parseBrowseItemsLight(
+            document = document,
+            baseUrl = pageUrl,
+            limit = HOME_PAGE_SIZE
+        )
+
+        /*
+         * Next.js can render cards only inside Flight/RSC. We use a bounded RSC
+         * reader that decodes one small Flight chunk at a time and stops as soon
+         * as six matching media objects are found. It never concatenates the
+         * complete homepage payload.
+         */
+        if (items.size < HOME_PAGE_SIZE) {
+            items = mergeHomeRscItems(
+                base = items,
+                document = document,
+                route = route,
                 limit = HOME_PAGE_SIZE
             )
-        }.orEmpty()
-
-        /*
-         * Some Next.js pages expose their cards only inside Flight/RSC. Use the
-         * already-downloaded page once as a fallback. There is still only one
-         * page document in memory and only six items are retained.
-         */
-        if (parsed.isEmpty() && document != null) {
-            parsed = runCatching {
-                parseBrowseItems(document, pageUrl)
-                    .take(HOME_PAGE_SIZE)
-            }.getOrDefault(emptyList())
         }
 
-        if (parsed.isEmpty()) {
-            /*
-             * Final continuation fallback: use the real sitemap ordering, but
-             * verify only the next six unseen entries. Sitemap discovery itself
-             * is cached and its concurrency is deliberately kept low.
-             */
-            val sitemapEntries = getSitemapMediaEntries()
-            if (sitemapEntries.isNotEmpty()) {
-                val existing = catalogCache[route]?.items.orEmpty()
-                    .map { cleanUrl(it.url) }
-                    .filter(String::isNotBlank)
-                    .toMutableSet()
+        val clean = items
+            .distinctBy { cleanUrl(it.url) }
+            .take(HOME_PAGE_SIZE)
 
-                val candidates = sitemapEntries.asSequence()
-                    .filter { entry ->
-                        val path = entry.path
-                        when (route) {
-                            MOVIES -> isMoviePath(path)
-                            TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
-                            ANIME -> isAnimePath(path) && !isEpisodePath(path)
-                            TRENDING -> isMoviePath(path) ||
-                                (isTvPath(path) && !isEpisodePath(path)) ||
-                                (isAnimePath(path) && !isEpisodePath(path))
-                            else -> false
+        browsePageCache[cacheKey] = CachedBrowsePage(
+            createdAt = System.currentTimeMillis(),
+            items = clean
+        )
+
+        if (clean.isNotEmpty()) {
+            storeCatalog(route, clean)
+        }
+
+        return clean
+    }
+
+    private fun mergeHomeRscItems(
+        base: List<SiteItem>,
+        document: Document,
+        route: String,
+        limit: Int
+    ): List<SiteItem> {
+        if (base.size >= limit) return base.take(limit)
+
+        val wantedType = when (route) {
+            MOVIES -> TvType.Movie
+            TV_SHOW -> TvType.TvSeries
+            ANIME -> TvType.Anime
+            TRENDING -> null
+            else -> return base
+        }
+
+        val result = linkedMapOf<String, SiteItem>()
+        base.forEach { result[cleanUrl(it.url)] = it }
+
+        for (script in document.select("script")) {
+            if (result.size >= limit) break
+
+            val data = script.data().ifBlank { script.html() }
+            if (!data.contains("__next_f", true)) continue
+
+            val pushMarker = "push([1,\""
+            var searchStart = 0
+
+            while (result.size < limit) {
+                val markerIndex = data.indexOf(pushMarker, searchStart)
+                if (markerIndex < 0) break
+
+                val quoteStart = markerIndex + "push([1,".length
+                val decoded = decodeQuotedJsStringBounded(
+                    text = data,
+                    openingQuoteIndex = quoteStart,
+                    maxChars = HOME_RSC_CHUNK_MAX_CHARS
+                ) ?: break
+
+                var mediaSearch = 0
+                val mediaMarker = "\"mediaType\":\""
+
+                while (result.size < limit) {
+                    val typeIndex = decoded.indexOf(mediaMarker, mediaSearch)
+                    if (typeIndex < 0) break
+
+                    val objectStart = decoded.lastIndexOf('{', typeIndex)
+                    if (objectStart < 0) break
+
+                    val objectJson = extractBalancedJson(
+                        decoded,
+                        objectStart,
+                        '{',
+                        '}'
+                    )
+
+                    if (objectJson != null) {
+                        val media = runCatching {
+                            JSONObject(objectJson)
+                        }.getOrNull()
+
+                        if (media != null) {
+                            val hint = when {
+                                media.optString("mediaType").equals("movie", true) -> "movie"
+                                media.optString("mediaType").equals("tv", true) -> "tv"
+                                media.optString("mediaType").equals("series", true) -> "tv"
+                                media.optString("mediaType").equals("anime", true) -> "anime"
+                                else -> ""
+                            }
+
+                            val item = rscMediaToSiteItem(media, hint)
+                            if (item != null &&
+                                (wantedType == null || item.type == wantedType)
+                            ) {
+                                val key = cleanUrl(item.url)
+                                if (key.isNotBlank()) result.putIfAbsent(key, item)
+                            }
                         }
                     }
-                    .filter { entry ->
-                        cleanUrl("$BASE_URL${normalizePathForSearch(entry.path)}")
-                            .let { url -> url.isNotBlank() && existing.add(url) }
-                    }
-                    .take(HOME_PAGE_SIZE)
-                    .toList()
 
-                if (candidates.isNotEmpty()) {
-                    parsed = candidates.mapNotNull { entry ->
-                        verifySitemapCandidate(entry.path)?.copy(
-                            lastModified = entry.lastModified
-                        )
-                    }
+                    mediaSearch = typeIndex + mediaMarker.length
+                }
+
+                searchStart = quoteStart + 1
+            }
+        }
+
+        return result.values.take(limit)
+    }
+
+    private fun decodeQuotedJsStringBounded(
+        text: String,
+        openingQuoteIndex: Int,
+        maxChars: Int
+    ): String? {
+        if (openingQuoteIndex !in text.indices || text[openingQuoteIndex] != '"') {
+            return null
+        }
+
+        val out = StringBuilder(minOf(maxChars, 32_768))
+        var index = openingQuoteIndex + 1
+
+        while (index < text.length && out.length <= maxChars) {
+            val c = text[index]
+
+            if (c == '"') return out.toString()
+
+            if (c != '\\') {
+                out.append(c)
+                index++
+                continue
+            }
+
+            if (index + 1 >= text.length) return null
+            val escaped = text[index + 1]
+
+            when (escaped) {
+                '"' -> { out.append('"'); index += 2 }
+                '\\' -> { out.append('\\'); index += 2 }
+                '/' -> { out.append('/'); index += 2 }
+                'b' -> { out.append('\b'); index += 2 }
+                'f' -> { out.append('\u000C'); index += 2 }
+                'n' -> { out.append('\n'); index += 2 }
+                'r' -> { out.append('\r'); index += 2 }
+                't' -> { out.append('\t'); index += 2 }
+                'u' -> {
+                    if (index + 5 >= text.length) return null
+                    val hex = text.substring(index + 2, index + 6)
+                    val code = hex.toIntOrNull(16) ?: return null
+                    out.append(code.toChar())
+                    index += 6
+                }
+                else -> {
+                    out.append(escaped)
+                    index += 2
                 }
             }
         }
 
-        if (parsed.isNotEmpty()) {
-            /* Preserve source order. Do not re-sort the whole accumulated list:
-             * doing so can shift page 1 underneath page 2 and create duplicates. */
-            val cleanPage = parsed
-                .distinctBy { cleanUrl(it.url) }
-                .take(HOME_PAGE_SIZE)
-
-            browsePageCache[cacheKey] = CachedBrowsePage(
-                createdAt = System.currentTimeMillis(),
-                items = cleanPage
-            )
-
-            storeCatalog(route, cleanPage)
-            return cleanPage
-        }
-
-        browsePageCache[cacheKey] = CachedBrowsePage(
-            createdAt = System.currentTimeMillis(),
-            items = emptyList()
-        )
-        return emptyList()
+        return null
     }
 
     private fun parseBrowseItemsLight(
@@ -618,9 +662,13 @@ class Zoryva : MainAPI() {
      * crawl that can compete with the UI for memory.
      */
     private suspend fun prefetchHomeCatalogs() {
-        homeRoutes.forEach { route ->
-            if (initialHomeCache[route].isNullOrEmpty()) {
-                getInitialHomeItems(route)
+        /*
+         * Search warm-up is intentionally small. Home itself never calls this
+         * function; search may use it to populate the four row caches gradually.
+         */
+        for (route in homeRoutes) {
+            if (catalogCache[route]?.items.isNullOrEmpty()) {
+                loadHomePageLight(route, 1)
             }
         }
     }
