@@ -79,7 +79,7 @@ class Zoryva : MainAPI() {
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
         const val HLS_SEGMENT_PROBE_TIMEOUT_MS = 3000L
-        const val MAX_EMITTED_FALLBACKS = 128
+        const val MAX_EMITTED_FALLBACKS = 24
 
         // Advanced search tuning. Normal searches should finish from the
         // website's native search page; the heavier global fallback is used
@@ -2594,7 +2594,7 @@ class Zoryva : MainAPI() {
          * URL slug immediately, and if that is not sufficient we retry with the
          * exact metadata from the detail page that finished in parallel.
          */
-        val (initialExtract, directPage) = coroutineScope {
+        val (initialExtract, directPage, seriesPage) = coroutineScope {
             val extractJob = async {
                 val timeout = if (episodeBasedPlayback) {
                     30000L
@@ -2609,7 +2609,8 @@ class Zoryva : MainAPI() {
                         context = playbackContext,
                         preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
                         allowSoftFallback = false,
-                        episodeId = episodeId
+                        episodeId = episodeId,
+                        seriesDocument = null
                     )
                 }
             }
@@ -2626,7 +2627,22 @@ class Zoryva : MainAPI() {
                 }
             }
 
-            extractJob.await() to pageJob.await()
+            val seriesJob = async {
+                if (!episodeBasedPlayback) {
+                    null
+                } else {
+                    val mediaPath = if (playbackContext.type.equals("anime", true)) "anime" else "tv"
+                    withTimeoutOrNull(12000L) {
+                        getDocument("$BASE_URL/$mediaPath/${playbackContext.tmdbId}")
+                    }
+                }
+            }
+
+            Triple(
+                extractJob.await(),
+                pageJob.await(),
+                seriesJob.await()
+            )
         }
 
         var extractResolution =
@@ -2663,7 +2679,8 @@ class Zoryva : MainAPI() {
                     context = playbackContext,
                     preferredTitle = null,
                     allowSoftFallback = true,
-                    episodeId = effectiveEpisodeId
+                    episodeId = effectiveEpisodeId,
+                    seriesDocument = seriesPage
                 )
             }
 
@@ -3526,11 +3543,13 @@ class Zoryva : MainAPI() {
         context: PlaybackContext?,
         preferredTitle: String? = null,
         allowSoftFallback: Boolean = true,
-        episodeId: String? = null
+        episodeId: String? = null,
+        seriesDocument: Document? = null
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
         val mediaObject = document?.let { extractInitialMediaObject(it) }
+        val seriesMediaObject = seriesDocument?.let { extractInitialMediaObject(it) }
 
         val exactEpisode = if (
             context.season != null &&
@@ -3559,6 +3578,7 @@ class Zoryva : MainAPI() {
         }
 
         val title = firstNonBlank(
+            seriesMediaObject?.optString("title"),
             mediaObject?.optString("title"),
             document?.selectFirst("h1")?.text(),
             preferredTitle,
@@ -3566,12 +3586,15 @@ class Zoryva : MainAPI() {
         ).orEmpty()
 
         val originalTitle = firstNonBlank(
+            seriesMediaObject?.optString("originalTitle"),
             mediaObject?.optString("originalTitle"),
             title
         ).orEmpty()
 
         val imdbId = firstNonBlank(
+            seriesMediaObject?.optString("imdbId"),
             mediaObject?.optString("imdbId"),
+            extractImdbId(seriesDocument?.html().orEmpty()),
             extractImdbId(document?.html().orEmpty())
         )
 
@@ -3609,7 +3632,7 @@ class Zoryva : MainAPI() {
             season = context.season,
             episode = context.episode,
             includeSoft = false,
-            refresh = true
+            refresh = context.season != null && context.episode != null
         )
 
         val softQuery = buildPlaybackQuery(
@@ -3623,7 +3646,7 @@ class Zoryva : MainAPI() {
             season = context.season,
             episode = context.episode,
             includeSoft = true,
-            refresh = true
+            refresh = context.season != null && context.episode != null
         )
 
         val endpoints = buildList {
@@ -4268,6 +4291,119 @@ class Zoryva : MainAPI() {
                             addServer(found, parentLabel, parentReferer)
                         }
                     }
+                }
+            }
+        }
+
+        /*
+         * Deterministic parse of the exact /api/extract contract observed on
+         * Zoryva. This is intentionally before the generic recursive walker.
+         * The live TV response may expose an extensionless workers.dev URL with
+         * `type: mp4`; relying on the URL suffix alone loses that source.
+         */
+        runCatching {
+            val root = JSONObject(raw)
+            val resultObject = root.optJSONObject("result") ?: root
+
+            val responseHeaders = buildMap<String, String> {
+                val headerObject = resultObject.optJSONObject("headers") ?: return@buildMap
+                val keys = headerObject.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val value = headerObject.optString(key).trim()
+                    if (value.isNotBlank()) put(key, value)
+                }
+            }
+
+            fun mergeObjectHeaders(value: JSONObject?): Map<String, String> {
+                if (value == null) return responseHeaders
+                return buildMap {
+                    responseHeaders.forEach { (key, item) -> put(key, item) }
+                    val keys = value.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val item = value.optString(key).trim()
+                        if (item.isNotBlank()) put(key, item)
+                    }
+                }
+            }
+
+            fun addStructuredVideo(video: JSONObject, server: JSONObject? = null) {
+                val url = video.optString("url").trim()
+                if (url.isBlank()) return
+
+                val typeHint = video.optString("type").trim()
+                val qualityHint = firstNonBlank(
+                    video.optString("quality"),
+                    server?.optString("quality"),
+                    video.optString("resolution"),
+                    server?.optString("resolution")
+                ).orEmpty()
+
+                val headers = mergeObjectHeaders(video.optJSONObject("headers"))
+                val sourceReferer = firstNonBlank(
+                    headerValue(headers, "Referer"),
+                    video.optString("referer"),
+                    server?.optString("referer"),
+                    referer
+                ).orEmpty()
+                val sourceOrigin = firstNonBlank(
+                    headerValue(headers, "Origin"),
+                    video.optString("origin"),
+                    server?.optString("origin")
+                ).orEmpty()
+
+                addMedia(
+                    rawUrl = url,
+                    label = firstNonBlank(
+                        server?.optString("name"),
+                        video.optString("name"),
+                        server?.optString("provider"),
+                        video.optString("provider"),
+                        qualityHint,
+                        "Zoryva API"
+                    ).orEmpty(),
+                    sourceReferer = sourceReferer,
+                    sourceOrigin = sourceOrigin,
+                    qualityHint = qualityHint,
+                    height = video.optInt("height", 0).takeIf { it > 0 },
+                    sourceHeaders = headers,
+                    mediaTypeHint = typeHint
+                )
+            }
+
+            resultObject.optJSONArray("videos")?.let { videos ->
+                for (i in 0 until videos.length()) {
+                    videos.optJSONObject(i)?.let { addStructuredVideo(it) }
+                }
+            }
+
+            resultObject.optJSONArray("servers")?.let { serversArray ->
+                for (i in 0 until serversArray.length()) {
+                    val server = serversArray.optJSONObject(i) ?: continue
+                    val status = server.optString("status").trim().lowercase(Locale.ROOT)
+                    if (
+                        server.optBoolean("broken", false) ||
+                        server.optBoolean("disabled", false) ||
+                        status in setOf("error", "failed", "failure", "broken", "disabled", "offline", "unavailable", "invalid", "rejected")
+                    ) continue
+
+                    server.optJSONObject("video")?.let { addStructuredVideo(it, server) }
+                        ?: firstNonBlank(
+                            server.optString("url"),
+                            server.optString("src"),
+                            server.optString("link")
+                        )?.let { serverUrl ->
+                            addServer(
+                                serverUrl,
+                                firstNonBlank(
+                                    server.optString("name"),
+                                    server.optString("provider"),
+                                    "Zoryva Server"
+                                ).orEmpty(),
+                                referer
+                            )
+                        }
                 }
             }
         }
