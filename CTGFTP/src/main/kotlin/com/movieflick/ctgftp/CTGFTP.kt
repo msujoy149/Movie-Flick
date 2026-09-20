@@ -1520,7 +1520,7 @@ class CTGFTP : MainAPI() {
          */
         val rsMappings = linkedMapOf<String, MutableList<String>>()
         val rsRegex = Regex(
-            """\$RS\(\"([^\"]+)\",\"([^\"]+)\"\)"""
+            """${'$'}RS\("([^"]+)","([^"]+)"\)"""
         )
 
         document.select("script").forEach { script ->
