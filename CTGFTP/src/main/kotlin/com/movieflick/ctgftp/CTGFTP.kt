@@ -945,11 +945,23 @@ class CTGFTP : MainAPI() {
         val targetId = episodeId?.takeIf { it.isNotBlank() }
             ?: watchId(input)
 
-        val ctgSources = extractCtgPlaybackLinks(
+        // PRIMARY EPISODE RESOLUTION:
+        // Read the authoritative allEpisodes[] object and select the exact
+        // episode by id. This mirrors the movie flow but guarantees that the
+        // selected episode can never receive a sibling episode source.
+        val ctgSources = extractEpisodeSourcesFromAllEpisodes(
             html = response.text,
             baseUrl = input,
-            preferredEpisodeId = targetId
-        )
+            episodeId = targetId
+        ).ifEmpty {
+            // FALLBACK: keep the existing targeted links[] resolver for older
+            // or structurally different CTG watch responses.
+            extractCtgPlaybackLinks(
+                html = response.text,
+                baseUrl = input,
+                preferredEpisodeId = targetId
+            )
+        }
 
         if (ctgSources.isEmpty()) {
             /*
@@ -2407,11 +2419,11 @@ class CTGFTP : MainAPI() {
          * DOM shell with the link-bearing episode data.
          */
         if (existingKey != null) {
-            if (playbackSources.isNotEmpty()) {
-                result.remove(existingKey)
-                result[episodeIdentity(cleanData, season, episode)] = episodeData
-            }
-            return
+            // The serialized CTG episode record is authoritative for metadata.
+            // Always replace the lightweight DOM shell, even when links[] is
+            // temporarily absent in a partial response. Playback can still
+            // resolve the exact watch URL later.
+            result.remove(existingKey)
         }
 
         result[episodeIdentity(cleanData, season, episode)] = episodeData
@@ -2518,15 +2530,17 @@ class CTGFTP : MainAPI() {
                         episodeId = id
                     )
 
-                val dataUrl = if (playbackSources.isNotEmpty()) {
-                    buildEpisodeDataPayload(
-                        episodeId = id,
-                        watchUrl = watchUrl,
-                        sources = playbackSources
-                    )
-                } else {
-                    watchUrl
-                }
+                /*
+                 * Keep episode data compact and movie-like. The watch URL is
+                 * the source-of-truth for this exact episode; loadLinks()
+                 * fetches it only when Play is pressed and resolves that
+                 * episode's own allEpisodes[].links[] directly.
+                 *
+                 * Do NOT embed every media URL into the Episode data. Apart
+                 * from making the data unnecessarily large, doing so can make
+                 * CloudStream carry stale/oversized episode payloads.
+                 */
+                val dataUrl = watchUrl
 
                 val parsed = ParsedEpisode(
                     dataUrl = dataUrl,
@@ -2551,6 +2565,48 @@ class CTGFTP : MainAPI() {
         }
 
         return result.values.toList()
+    }
+
+    /**
+     * Resolve one exact episode from CTG's authoritative allEpisodes[] payload.
+     *
+     * Unlike a generic whole-page media scan, this first selects the episode
+     * object by its stable CTG episode id and only then reads that object's
+     * links[]. This guarantees Episode N can only emit Episode N sources.
+     */
+    private fun extractEpisodeSourcesFromAllEpisodes(
+        html: String,
+        baseUrl: String,
+        episodeId: String
+    ): List<CtgPlaybackSource> {
+        if (html.isBlank() || episodeId.isBlank()) return emptyList()
+
+        val normalized = normalizeCtgPayload(html)
+        val arrays = extractJsonArraysAfterKey(
+            normalized,
+            "\"allEpisodes\""
+        )
+
+        for (arrayText in arrays) {
+            for (objectText in extractTopLevelJsonObjects(arrayText)) {
+                val id = extractJsonString(objectText, "id")
+                    ?: continue
+
+                if (id != episodeId) continue
+
+                val sources = extractEpisodePlaybackSources(
+                    objectText = objectText,
+                    baseUrl = baseUrl,
+                    episodeId = episodeId
+                )
+
+                if (sources.isNotEmpty()) {
+                    return sources
+                }
+            }
+        }
+
+        return emptyList()
     }
 
     private fun extractEpisodePlaybackSources(
