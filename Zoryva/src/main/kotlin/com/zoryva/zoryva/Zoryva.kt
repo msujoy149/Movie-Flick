@@ -54,11 +54,17 @@ class Zoryva : MainAPI() {
         const val TV_SHOW = "$BASE_URL/browse/tv"
         const val ANIME = "$BASE_URL/browse/anime"
 
-        const val MAX_HOME_ITEMS = 24
+        /* Home is intentionally page-sized: the provider itself never caps the
+         * catalogue at an artificial item count. CloudStream asks for page 1,
+         * page 2, page 3, ... until the real catalogue is exhausted. */
         const val INITIAL_HOME_ITEMS = 8
         const val HOME_PAGE_SIZE = 8
+        const val HOME_INITIAL_ROUTE_TIMEOUT_MS = 4500L
         const val HOME_SITEMAP_CACHE_TTL_MS = 120_000L
-        const val HOME_SITEMAP_CHILD_LIMIT = 512
+        const val HOME_SITEMAP_CHILD_TIMEOUT_MS = 6000L
+        const val HOME_SITEMAP_CHILD_CONCURRENCY = 24
+        const val HOME_BROWSE_CACHE_TTL_MS = 60_000L
+        const val HOME_BROWSE_PAGE_TIMEOUT_MS = 6500L
         const val MAX_SEARCH_ITEMS = 50
         const val MAX_SERVER_PAGES = 12
         const val MAX_CRAWL_DEPTH = 2
@@ -195,7 +201,14 @@ class Zoryva : MainAPI() {
         val url: String,
         val poster: String?,
         val type: TvType,
-        val aliases: List<String> = emptyList()
+        val aliases: List<String> = emptyList(),
+        val lastModified: Long? = null
+    )
+
+    private data class SitemapEntry(
+        val path: String,
+        val lastModified: Long? = null,
+        val sourceOrder: Long = 0L
     )
 
     private data class EpisodeInfo(
@@ -306,9 +319,15 @@ class Zoryva : MainAPI() {
         val items: List<SiteItem>
     )
 
+    private data class CachedBrowsePage(
+        val createdAt: Long,
+        val items: List<SiteItem>
+    )
+
     private val catalogCache = ConcurrentHashMap<String, CachedCatalog>()
+    private val browsePageCache = ConcurrentHashMap<String, CachedBrowsePage>()
     private val catalogPrefetchMutex = Mutex()
-    private val sitemapPathCache = mutableListOf<String>()
+    private val sitemapEntryCache = mutableListOf<SitemapEntry>()
     @Volatile private var sitemapCacheAt: Long = 0L
     private val sitemapMutex = Mutex()
 
@@ -330,9 +349,51 @@ class Zoryva : MainAPI() {
         val route = request.data
         val currentPage = page.coerceAtLeast(1)
 
+        /*
+         * Page 1 is deliberately lightweight. Fetch only the current route so
+         * Home can paint a small first batch quickly. The real continuation is
+         * loaded by CloudStream as the user scrolls into later pages.
+         */
         if (currentPage == 1) {
-            /* Keep the first frame small and fast, then grow the catalog on demand. */
-            prefetchHomeCatalogs()
+            var items = catalogCache[route]?.items.orEmpty()
+
+            if (items.isEmpty()) {
+                val routeDocument = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
+                    getDocument(route)
+                }
+
+                if (routeDocument != null) {
+                    items = buildBrowseItemsFromDocument(routeDocument, route)
+                        .distinctBy { cleanUrl(it.url) }
+                }
+
+                /* Fallback for a client-only browse shell: decode the homepage
+                 * RSC payload, but still avoid a broad sitemap verification pass
+                 * on the first frame. */
+                if (items.isEmpty()) {
+                    val homepage = withTimeoutOrNull(HOME_INITIAL_ROUTE_TIMEOUT_MS) {
+                        getDocument(BASE_URL)
+                    }
+                    items = homepage
+                        ?.let { parseHomepageRscCatalogs(it)[route].orEmpty() }
+                        .orEmpty()
+                        .distinctBy { cleanUrl(it.url) }
+                }
+
+                if (items.isNotEmpty()) {
+                    storeCatalog(route, items)
+                }
+            }
+
+            val ordered = orderHomeItems(items)
+            val visible = ordered.take(INITIAL_HOME_ITEMS)
+            val hasNext = visible.isNotEmpty()
+
+            return newHomePageResponse(
+                request,
+                visible.map { it.toSearchResponse() },
+                hasNext
+            )
         }
 
         val requiredCount = currentPage * HOME_PAGE_SIZE
@@ -342,21 +403,25 @@ class Zoryva : MainAPI() {
         )
 
         val startIndex = (currentPage - 1) * HOME_PAGE_SIZE
-        val pageItems = items
+        val ordered = orderHomeItems(items)
+        val pageItems = ordered
             .drop(startIndex)
             .take(HOME_PAGE_SIZE)
-
-        /*
-         * Every full page can be followed by another page. When the real
-         * sitemap runs out, the next request returns an empty/short page and
-         * CloudStream stops naturally. There is no 24-item hard stop here.
-         */
-        val hasNext = pageItems.size == HOME_PAGE_SIZE
 
         return newHomePageResponse(
             request,
             pageItems.map { it.toSearchResponse() },
-            hasNext
+            pageItems.isNotEmpty()
+        )
+    }
+
+    private fun orderHomeItems(items: List<SiteItem>): List<SiteItem> {
+        if (items.isEmpty()) return items
+        if (items.none { it.lastModified != null }) return items
+
+        return items.sortedWith(
+            compareByDescending<SiteItem> { it.lastModified ?: Long.MIN_VALUE }
+                .thenBy { it.title.lowercase(Locale.ROOT) }
         )
     }
 
@@ -367,54 +432,145 @@ class Zoryva : MainAPI() {
         var working = catalogCache[route]?.items.orEmpty()
         if (working.size >= requiredCount) return working
 
-        val paths = getSitemapMediaPaths()
-        if (paths.isEmpty()) return working
+        /*
+         * First continuation source: the site's own browse route with a real
+         * page parameter. We keep the fetched page cache append-only so already
+         * loaded pages can never be displaced by a later refresh.
+         */
+        val nextPage = maxOf(
+            2,
+            (working.size / HOME_PAGE_SIZE) + 1
+        )
+        val targetPage = ((requiredCount - 1) / HOME_PAGE_SIZE).coerceAtLeast(1)
 
-        val filtered = paths.filter { path ->
-            when (route) {
-                MOVIES -> isMoviePath(path)
-                TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
-                ANIME -> isAnimePath(path) && !isEpisodePath(path)
-                TRENDING -> true
-                else -> false
+        if (nextPage <= targetPage + 1) {
+            val pages = (nextPage..(targetPage + 1)).toList()
+            val now = System.currentTimeMillis()
+            val missingPages = pages.filter { browsePage ->
+                val cached = browsePageCache["$route|$browsePage"]
+                cached == null ||
+                    now - cached.createdAt > HOME_BROWSE_CACHE_TTL_MS
+            }
+
+            if (missingPages.isNotEmpty()) {
+                val fetched = coroutineScope {
+                    missingPages.map { browsePage ->
+                        async {
+                            val urls = listOf(
+                                buildBrowseUrl(route, browsePage),
+                                "$route?limit=${HOME_PAGE_SIZE * 3}&page=$browsePage",
+                                "$route?page=$browsePage&limit=${HOME_PAGE_SIZE * 3}",
+                                "$route?offset=${(browsePage - 1) * HOME_PAGE_SIZE}&limit=${HOME_PAGE_SIZE * 3}"
+                            ).distinct()
+
+                            val documents = coroutineScope {
+                                urls.map { candidateUrl ->
+                                    async {
+                                        withTimeoutOrNull(HOME_BROWSE_PAGE_TIMEOUT_MS) {
+                                            getDocument(candidateUrl)
+                                        }
+                                    }
+                                }.awaitAll()
+                            }
+
+                            val parsed = documents
+                                .mapIndexed { index, document ->
+                                    document?.let {
+                                        buildBrowseItemsFromDocument(
+                                            it,
+                                            urls.getOrNull(index) ?: route
+                                        )
+                                    }.orEmpty()
+                                }
+                                .flatten()
+                                .distinctBy { cleanUrl(it.url) }
+
+                            browsePage to parsed
+                        }
+                    }.awaitAll()
+                }
+
+                fetched.forEach { (browsePage, items) ->
+                    if (items.isNotEmpty()) {
+                        browsePageCache["$route|$browsePage"] = CachedBrowsePage(
+                            createdAt = System.currentTimeMillis(),
+                            items = items
+                        )
+                    }
+                }
+            }
+
+            val seenBefore = working
+                .map { cleanUrl(it.url) }
+                .filter(String::isNotBlank)
+                .toMutableSet()
+
+            val browseContinuation = pages
+                .flatMap { browsePage ->
+                    browsePageCache["$route|$browsePage"]?.items.orEmpty()
+                }
+                .filter { item ->
+                    val key = cleanUrl(item.url)
+                    key.isNotBlank() && seenBefore.add(key)
+                }
+
+            if (browseContinuation.isNotEmpty()) {
+                storeCatalog(route, browseContinuation)
+                working = catalogCache[route]?.items.orEmpty()
+                if (working.size >= requiredCount) return working
             }
         }
 
+        /*
+         * Canonical continuation fallback: the real Zoryva sitemap. Unlike a
+         * small fixed batch, this index is walked across every child sitemap,
+         * preserving each URL's <lastmod> so newly modified titles remain ahead
+         * of older catalogue items. Only the current CloudStream page is
+         * verified, so scrolling stays incremental.
+         */
+        val sitemapEntries = getSitemapMediaEntries()
+        if (sitemapEntries.isEmpty()) return working
+
         val seen = working
-            .asSequence()
             .map { cleanUrl(it.url) }
-            .filter { it.isNotBlank() }
+            .filter(String::isNotBlank)
             .toMutableSet()
 
-        val candidates = filtered.filter { path ->
-            val url = cleanUrl(
-                "$BASE_URL${normalizePathForSearch(path)}"
+        val candidates = sitemapEntries.filter { entry ->
+            val path = entry.path
+            val matches = when (route) {
+                MOVIES -> isMoviePath(path)
+                TV_SHOW -> isTvPath(path) && !isEpisodePath(path)
+                ANIME -> isAnimePath(path) && !isEpisodePath(path)
+                TRENDING -> isMoviePath(path) || isTvPath(path) || isAnimePath(path)
+                else -> false
+            }
+
+            matches && seen.add(
+                cleanUrl("$BASE_URL${normalizePathForSearch(path)}")
             )
-            url.isNotBlank() && seen.add(url)
         }
 
         if (candidates.isEmpty()) return working
 
-        var offset = 0
-        while (working.size < requiredCount && offset < candidates.size) {
-            val batch = candidates
-                .drop(offset)
-                .take(HOME_PAGE_SIZE * 3)
+        val needed = (requiredCount - working.size).coerceAtLeast(HOME_PAGE_SIZE)
+        val verified = coroutineScope {
+            candidates
+                .take(needed + HOME_PAGE_SIZE)
+                .map { entry ->
+                    async {
+                        verifySitemapCandidate(entry.path)?.copy(
+                            lastModified = entry.lastModified
+                        )
+                    }
+                }
+                .awaitAll()
+                .filterNotNull()
+        }
 
-            if (batch.isEmpty()) break
-
-            val verified = coroutineScope {
-                batch.map { path ->
-                    async { verifySitemapCandidate(path) }
-                }.awaitAll()
-            }.filterNotNull()
-
-            if (verified.isNotEmpty()) {
-                storeCatalog(route, verified)
-                working = catalogCache[route]?.items.orEmpty()
-            }
-
-            offset += batch.size
+        if (verified.isNotEmpty()) {
+            storeCatalog(route, verified)
+            working = catalogCache[route]?.items.orEmpty()
         }
 
         return working
@@ -743,7 +899,20 @@ class Zoryva : MainAPI() {
             url = "$BASE_URL/$path/$externalId",
             poster = poster,
             type = type,
-            aliases = aliases.map(::cleanCardTitle)
+            aliases = aliases.map(::cleanCardTitle),
+            lastModified = parseSitemapTimestamp(
+                firstNonBlank(
+                    media.optString("updatedAt"),
+                    media.optString("modifiedAt"),
+                    media.optString("lastModified"),
+                    media.optString("publishedAt"),
+                    media.optString("createdAt"),
+                    media.optString("addedAt"),
+                    media.optString("dateAdded"),
+                    media.optString("uploadDate"),
+                    media.optString("uploadedAt")
+                )
+            )
         )
     }
 
@@ -802,16 +971,23 @@ class Zoryva : MainAPI() {
             .take(HOME_PAGE_SIZE)
     }
 
-    private suspend fun getSitemapMediaPaths(): List<String> {
+    private suspend fun getSitemapMediaPaths(): List<String> =
+        getSitemapMediaEntries().map { it.path }
+
+    private suspend fun getSitemapMediaEntries(): List<SitemapEntry> {
         val now = System.currentTimeMillis()
         if (now - sitemapCacheAt <= HOME_SITEMAP_CACHE_TTL_MS) {
-            return synchronized(sitemapPathCache) { sitemapPathCache.toList() }
+            return synchronized(sitemapEntryCache) {
+                sitemapEntryCache.toList()
+            }
         }
 
         return sitemapMutex.withLock {
             val lockedNow = System.currentTimeMillis()
             if (lockedNow - sitemapCacheAt <= HOME_SITEMAP_CACHE_TTL_MS) {
-                return@withLock synchronized(sitemapPathCache) { sitemapPathCache.toList() }
+                return@withLock synchronized(sitemapEntryCache) {
+                    sitemapEntryCache.toList()
+                }
             }
 
             val roots = listOf(
@@ -820,7 +996,7 @@ class Zoryva : MainAPI() {
                 "$BASE_URL/sitemap-index.xml"
             )
 
-            var rootDocument: org.jsoup.nodes.Document? = null
+            var rootDocument: Document? = null
             for (root in roots) {
                 val candidate = runCatching { getDocument(root) }.getOrNull()
                 if (candidate != null && candidate.select("loc").isNotEmpty()) {
@@ -829,44 +1005,115 @@ class Zoryva : MainAPI() {
                 }
             }
 
-            val document = rootDocument ?: return@withLock emptyList()
+            val root = rootDocument ?: return@withLock emptyList()
+            var orderCounter = 0L
 
-            val direct = linkedSetOf<String>()
-            val childUrls = linkedSetOf<String>()
+            fun parseUrlEntries(document: Document): List<SitemapEntry> {
+                val result = ArrayList<SitemapEntry>()
+                val urlNodes = document.select("url")
 
-            document.select("loc").forEach { element ->
-                val url = element.text().trim()
-                if (url.isBlank()) return@forEach
-                val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
-                if (isSearchContentPath(path)) {
-                    direct += normalizePathForSearch(path)
-                } else if (url.endsWith(".xml", true) || url.contains("sitemap", true)) {
-                    childUrls += cleanUrl(url)
-                }
-            }
+                if (urlNodes.isNotEmpty()) {
+                    urlNodes.forEach { node ->
+                        val loc = node.selectFirst("loc")?.text()?.trim().orEmpty()
+                        if (loc.isBlank()) return@forEach
 
-            val children = coroutineScope {
-                childUrls.take(HOME_SITEMAP_CHILD_LIMIT).map { url ->
-                    async { getDocument(url) }
-                }.awaitAll()
-            }
+                        val path = runCatching { URI(loc).path.orEmpty() }
+                            .getOrDefault("")
+                        if (!isSearchContentPath(path)) return@forEach
 
-            children.forEach { document ->
-                document ?: return@forEach
-                document.select("loc").forEach { element ->
-                    val url = element.text().trim()
-                    if (url.isBlank()) return@forEach
-                    val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
-                    if (isSearchContentPath(path)) {
-                        direct += normalizePathForSearch(path)
+                        result += SitemapEntry(
+                            path = normalizePathForSearch(path),
+                            lastModified = parseSitemapTimestamp(
+                                node.selectFirst("lastmod")?.text()
+                            ),
+                            sourceOrder = orderCounter++
+                        )
+                    }
+                } else {
+                    /* Defensive support for feeds that omit <url> wrappers. */
+                    document.select("loc").forEach { element ->
+                        val loc = element.text().trim()
+                        if (loc.isBlank()) return@forEach
+                        val path = runCatching { URI(loc).path.orEmpty() }
+                            .getOrDefault("")
+                        if (!isSearchContentPath(path)) return@forEach
+
+                        result += SitemapEntry(
+                            path = normalizePathForSearch(path),
+                            lastModified = null,
+                            sourceOrder = orderCounter++
+                        )
                     }
                 }
+
+                return result
             }
 
-            val result = direct.toList()
-            synchronized(sitemapPathCache) {
-                sitemapPathCache.clear()
-                sitemapPathCache.addAll(result)
+            val directEntries = parseUrlEntries(root).toMutableList()
+            val childUrls = linkedSetOf<String>()
+
+            root.select("sitemap > loc, sitemap loc").forEach { element ->
+                val loc = element.text().trim()
+                if (loc.isBlank()) return@forEach
+                val path = runCatching { URI(loc).path.orEmpty() }
+                    .getOrDefault("")
+                if (
+                    path.endsWith(".xml", true) ||
+                    path.contains("sitemap", true)
+                ) {
+                    childUrls += cleanUrl(loc)
+                }
+            }
+
+            /* Fetch every child sitemap, but cap concurrency rather than the
+             * number of children. This removes the old 512-child artificial
+             * ceiling without opening hundreds of simultaneous connections. */
+            childUrls.chunked(HOME_SITEMAP_CHILD_CONCURRENCY).forEach { batch ->
+                val children = coroutineScope {
+                    batch.map { url ->
+                        async {
+                            withTimeoutOrNull(HOME_SITEMAP_CHILD_TIMEOUT_MS) {
+                                getDocument(url)
+                            }
+                        }
+                    }.awaitAll()
+                }
+
+                children.forEach { document ->
+                    document ?: return@forEach
+                    directEntries += parseUrlEntries(document)
+                }
+            }
+
+            val merged = linkedMapOf<String, SitemapEntry>()
+            directEntries.forEach { entry ->
+                val existing = merged[entry.path]
+                if (existing == null) {
+                    merged[entry.path] = entry
+                } else if (
+                    existing.lastModified == null && entry.lastModified != null
+                ) {
+                    merged[entry.path] = existing.copy(
+                        lastModified = entry.lastModified
+                    )
+                } else if (
+                    existing.lastModified != null &&
+                        entry.lastModified != null &&
+                        entry.lastModified > existing.lastModified
+                ) {
+                    merged[entry.path] = entry
+                }
+            }
+
+            val result = merged.values.sortedWith(
+                compareByDescending<SitemapEntry> {
+                    it.lastModified ?: Long.MIN_VALUE
+                }.thenBy { it.sourceOrder }
+            )
+
+            synchronized(sitemapEntryCache) {
+                sitemapEntryCache.clear()
+                sitemapEntryCache.addAll(result)
             }
             sitemapCacheAt = lockedNow
             result
@@ -885,13 +1132,29 @@ class Zoryva : MainAPI() {
         items: List<SiteItem>
     ) {
         if (items.isEmpty()) return
-        val merged = (
-            catalogCache[route]?.items.orEmpty() + items
-        ).distinctBy { cleanUrl(it.url) }
+
+        val merged = linkedMapOf<String, SiteItem>()
+        (catalogCache[route]?.items.orEmpty() + items).forEach { item ->
+            val key = cleanUrl(item.url)
+            if (key.isBlank()) return@forEach
+
+            val existing = merged[key]
+            if (existing == null) {
+                merged[key] = item
+            } else {
+                merged[key] = existing.copy(
+                    poster = existing.poster ?: item.poster,
+                    aliases = (existing.aliases + item.aliases)
+                        .filter { it.isNotBlank() }
+                        .distinct(),
+                    lastModified = item.lastModified ?: existing.lastModified
+                )
+            }
+        }
 
         catalogCache[route] = CachedCatalog(
             createdAt = System.currentTimeMillis(),
-            items = merged
+            items = merged.values.toList()
         )
     }
 
@@ -2560,63 +2823,115 @@ class Zoryva : MainAPI() {
          * URL slug immediately, and if that is not sufficient we retry with the
          * exact metadata from the detail page that finished in parallel.
          */
-        val (initialExtract, directPage, seriesPage) = coroutineScope {
-            val extractJob = async {
-                val timeout = if (episodeBasedPlayback) {
-                    30000L
-                } else {
-                    ZORYVA_EXTRACT_TIMEOUT_MS
-                }
-
-                withTimeoutOrNull(timeout) {
-                    resolveZoryvaExtract(
-                        document = null,
-                        pageUrl = pageUrl,
-                        context = playbackContext,
-                        preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
-                        allowSoftFallback = false,
-                        episodeId = episodeId,
-                        seriesDocument = null
-                    )
-                }
-            }
-
-            val pageJob = async {
-                val timeout = if (episodeBasedPlayback) {
-                    20000L
-                } else {
-                    7000L
-                }
-
-                withTimeoutOrNull(timeout) {
-                    getDocument(pageUrl)
-                }
-            }
-
-            val seriesJob = async {
-                if (!episodeBasedPlayback) {
-                    null
-                } else {
-                    val mediaPath = if (playbackContext.type.equals("anime", true)) "anime" else "tv"
-                    withTimeoutOrNull(12000L) {
-                        getDocument("$BASE_URL/$mediaPath/${playbackContext.tmdbId}")
-                    }
-                }
-            }
-
-            Triple(
-                extractJob.await(),
-                pageJob.await(),
-                seriesJob.await()
+        /*
+         * Start with the same fresh /api/extract call the website uses. Do not
+         * block this first playback attempt on the detail/series HTML: a valid
+         * structured source is already enough to start playback.
+         */
+        val initialExtract = withTimeoutOrNull(
+            if (episodeBasedPlayback) 30000L else ZORYVA_EXTRACT_TIMEOUT_MS
+        ) {
+            resolveZoryvaExtract(
+                document = null,
+                pageUrl = pageUrl,
+                context = playbackContext,
+                preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
+                allowSoftFallback = false,
+                episodeId = episodeId,
+                seriesDocument = null
             )
         }
+
+        var directPage: Document? = null
+        var seriesPage: Document? = null
 
         var extractResolution =
             initialExtract ?: ZoryvaExtractResolution(emptyList(), emptyList())
 
+        /*
+         * Only hydrate the episode/detail pages when the first structured API
+         * pass did not produce a real source. This keeps normal playback fast
+         * while still giving TV/Anime the exact airDate/IMDb/runtime/episodeId
+         * needed for the browser-equivalent retry.
+         */
+        if (
+            extractResolution.directSources.isEmpty() &&
+                extractResolution.servers.isEmpty()
+        ) {
+            val hydratedPages = coroutineScope {
+                val pageJob = async {
+                    withTimeoutOrNull(if (episodeBasedPlayback) 20000L else 7000L) {
+                        getDocument(pageUrl)
+                    }
+                }
+
+                val seriesJob = async {
+                    if (!episodeBasedPlayback) {
+                        null
+                    } else {
+                        val mediaPath = if (
+                            playbackContext.type.equals("anime", true)
+                        ) {
+                            "anime"
+                        } else {
+                            "tv"
+                        }
+
+                        withTimeoutOrNull(12000L) {
+                            getDocument(
+                                "$BASE_URL/$mediaPath/${playbackContext.tmdbId}"
+                            )
+                        }
+                    }
+                }
+
+                pageJob.await() to seriesJob.await()
+            }
+
+            directPage = hydratedPages.first
+            seriesPage = hydratedPages.second
+
+            val effectiveEpisodeId = episodeId
+                ?: if (episodeBasedPlayback && directPage != null) {
+                    parseEpisodeObjectsFromPage(directPage!!)
+                        .firstOrNull {
+                            it.season == playbackContext.season &&
+                                it.episode == playbackContext.episode &&
+                                !it.id.isNullOrBlank()
+                        }
+                        ?.id
+                } else {
+                    null
+                }
+
+            val retryTimeout = if (episodeBasedPlayback) 30000L else 15000L
+            val retryResolution = if (directPage != null) {
+                withTimeoutOrNull(retryTimeout) {
+                    resolveZoryvaExtract(
+                        document = directPage,
+                        pageUrl = pageUrl,
+                        context = playbackContext,
+                        preferredTitle = null,
+                        allowSoftFallback = true,
+                        episodeId = effectiveEpisodeId,
+                        seriesDocument = seriesPage
+                    )
+                }
+            } else {
+                null
+            }
+
+            if (retryResolution != null) {
+                extractResolution = mergeZoryvaExtractResolutions(
+                    extractResolution,
+                    retryResolution
+                )
+            }
+        }
+
         val effectiveEpisodeId = episodeId
             ?: if (episodeBasedPlayback && directPage != null) {
-                parseEpisodeObjectsFromPage(directPage)
+                parseEpisodeObjectsFromPage(directPage!!)
                     .firstOrNull {
                         it.season == playbackContext.season &&
                             it.episode == playbackContext.episode &&
@@ -2626,40 +2941,6 @@ class Zoryva : MainAPI() {
             } else {
                 null
             }
-
-        /*
-         * For TV/Anime, always run the metadata-aware retry when the exact
-         * episode page is available. This lets the resolver use the page's
-         * real title/IMDb/runtime and the website's real episode id.
-         */
-        if (
-            directPage != null &&
-            (episodeBasedPlayback || extractResolution.directSources.isEmpty())
-        ) {
-            val retryTimeout = if (episodeBasedPlayback) 30000L else 15000L
-
-            val retryResolution = withTimeoutOrNull(retryTimeout) {
-                resolveZoryvaExtract(
-                    document = directPage,
-                    pageUrl = pageUrl,
-                    context = playbackContext,
-                    preferredTitle = null,
-                    allowSoftFallback = true,
-                    episodeId = effectiveEpisodeId,
-                    seriesDocument = seriesPage
-                )
-            }
-
-            if (
-                retryResolution != null &&
-                (
-                    retryResolution.directSources.isNotEmpty() ||
-                        retryResolution.servers.isNotEmpty()
-                    )
-            ) {
-                extractResolution = retryResolution
-            }
-        }
 
         /*
          * PRIMARY EXTRACTED SOURCES
@@ -2676,6 +2957,48 @@ class Zoryva : MainAPI() {
          * inconclusive.
          */
         var primaryEmitted = 0
+        val emittedKeys = linkedSetOf<String>()
+
+        /*
+         * FAST PLAYBACK PATH:
+         * /api/extract has already returned a real source. Give CloudStream that
+         * exact URL immediately instead of waiting for HLS inspection or probes.
+         * This is especially important for signed/extensionless worker URLs.
+         */
+        suspend fun emitImmediateSource(
+            source: MediaCandidate,
+            labelSuffix: String
+        ) {
+            if (primaryEmitted >= MAX_EMITTED_FALLBACKS) return
+
+            val normalizedIdentity = normalizeMediaIdentity(source.url)
+            val key = "${labelSuffix.lowercase(Locale.ROOT)}|$normalizedIdentity"
+            if (!emittedKeys.add(key)) return
+
+            emitExtractorSource(
+                source = source,
+                output = buildDirectPlaybackOutput(source, pageUrl),
+                callback = callback,
+                labelSuffix = labelSuffix,
+                typeSourceUrl = source.url
+            )
+            primaryEmitted++
+        }
+
+        extractResolution.directSources
+            .distinctBy { normalizeMediaIdentity(it.url) }
+            .forEach { source ->
+                if (
+                    primaryEmitted < MAX_EMITTED_FALLBACKS &&
+                        requiresZoryvaProxy(source.url)
+                ) {
+                    buildZoryvaProxyCandidate(source, pageUrl)?.let { proxy ->
+                        emitImmediateSource(proxy, "Zoryva Proxy")
+                    }
+                }
+
+                emitImmediateSource(source, "Direct")
+            }
 
         if (extractResolution.directSources.isNotEmpty()) {
             /*
@@ -2825,8 +3148,7 @@ class Zoryva : MainAPI() {
                     .thenBy { it.source.url }
             )
 
-            val emittedKeys = linkedSetOf<String>()
-            var emitted = 0
+            var emitted = primaryEmitted
 
             val seenSubtitle = linkedSetOf<String>()
             extractResolution.subtitles.forEach { (language, url) ->
@@ -2870,6 +3192,7 @@ class Zoryva : MainAPI() {
                         typeSourceUrl = source.url
                     )
                     emitted++
+                    primaryEmitted = maxOf(primaryEmitted, emitted)
                 }
             }
 
@@ -2952,7 +3275,7 @@ class Zoryva : MainAPI() {
                 val workerProxyPreferred =
                     check.proxy != null &&
                         check.source.url.contains(
-                            "flamingo-e55.workers.dev/",
+                            "workers.dev/",
                             true
                         )
 
@@ -3010,21 +3333,17 @@ class Zoryva : MainAPI() {
 
             primaryEmitted = emitted
 
-            val episodeBasedPlayback =
-                playbackContext.season != null &&
-                    playbackContext.episode != null
-
             /*
-             * TV/Anime always continue into the episode-page/server discovery
+             * TV/Anime continue into the episode-page/server discovery
              * pass because the exact player can be separate from /api/extract.
              * Movies continue when fewer than two links were produced so the
              * page can contribute additional real resolutions.
              */
-            val needsSecondaryDiscovery =
-                episodeBasedPlayback ||
-                    primaryEmitted < 2
-
-            if (primaryEmitted > 0 && !needsSecondaryDiscovery) return true
+            /* Once the structured API has produced at least one real source,
+             * that source set is authoritative enough to hand playback to the
+             * player. TV/Anime especially must not be converted into No Links
+             * Found merely because a secondary crawl is slow or fails. */
+            if (primaryEmitted > 0) return true
         }
 
         /*
@@ -3280,7 +3599,7 @@ class Zoryva : MainAPI() {
         callback(
             newExtractorLink(
                 name,
-                "${buildSourceName(source)} • $labelSuffix",
+                cleanSourceDisplayName(source, labelSuffix),
                 output.url,
                 linkType
             ) {
@@ -3442,6 +3761,54 @@ class Zoryva : MainAPI() {
                 tmdbId = tmdbId,
                 season = null,
                 episode = null
+            )
+        }
+
+        /* Some website/player links carry season/episode in the query instead of
+         * the path. Accept both forms so a copied canonical player URL remains
+         * episode-aware. */
+        val queryParameters = runCatching {
+            URI(pageUrl).rawQuery.orEmpty()
+                .split('&')
+                .mapNotNull { pair ->
+                    val equals = pair.indexOf('=')
+                    if (equals <= 0) return@mapNotNull null
+                    val key = runCatching {
+                        URLDecoder.decode(
+                            pair.substring(0, equals),
+                            StandardCharsets.UTF_8.name()
+                        )
+                    }.getOrNull()?.lowercase(Locale.ROOT) ?: return@mapNotNull null
+                    val value = runCatching {
+                        URLDecoder.decode(
+                            pair.substring(equals + 1),
+                            StandardCharsets.UTF_8.name()
+                        )
+                    }.getOrNull() ?: return@mapNotNull null
+                    key to value
+                }
+                .toMap()
+        }.getOrDefault(emptyMap())
+
+        val querySeason = firstNonBlank(
+            queryParameters["season"],
+            queryParameters["seasonnumber"],
+            queryParameters["season_number"]
+        )?.toIntOrNull()
+
+        val queryEpisode = firstNonBlank(
+            queryParameters["episode"],
+            queryParameters["episodenumber"],
+            queryParameters["episode_number"],
+            queryParameters["ep"]
+        )?.toIntOrNull()
+
+        if (querySeason != null && queryEpisode != null) {
+            return PlaybackContext(
+                type = type,
+                tmdbId = tmdbId,
+                season = querySeason,
+                episode = queryEpisode
             )
         }
 
@@ -3733,34 +4100,127 @@ class Zoryva : MainAPI() {
             ZORYVA_EXTRACT_TIMEOUT_MS
         }
 
-        for (endpoint in endpoints) {
-            val response = withTimeoutOrNull(endpointTimeout) {
-                runCatching {
-                    app.get(
-                        endpoint,
-                        headers = PAGE_HEADERS + mapOf(
-                            "Referer" to pageUrl,
-                            "Accept" to "application/json,text/plain,*/*;q=0.8",
-                            "Cache-Control" to "no-cache",
-                            "Pragma" to "no-cache"
+        /*
+         * Query all bounded endpoint variants concurrently. The browser/backend
+         * may return a usable source from one variant while another returns a
+         * valid-but-empty response. Returning the first non-empty response was
+         * the reason later movie/TV entries could appear as "No Links Found".
+         */
+        val parsedResults = coroutineScope {
+            endpoints.map { endpoint ->
+                async {
+                    withTimeoutOrNull(endpointTimeout) {
+                        runCatching {
+                            app.get(
+                                endpoint,
+                                headers = PAGE_HEADERS + mapOf(
+                                    "Referer" to pageUrl,
+                                    "Accept" to "application/json,text/plain,*/*;q=0.8",
+                                    "Cache-Control" to "no-cache",
+                                    "Pragma" to "no-cache"
+                                )
+                            )
+                        }.getOrNull()
+                    }?.takeIf { it.code in 200..399 }
+                        ?.let {
+                            parseZoryvaExtractResponse(
+                                raw = it.text,
+                                referer = pageUrl
+                            )
+                        }
+                }
+            }.awaitAll().filterNotNull()
+        }
+
+        if (parsedResults.isEmpty()) {
+            return ZoryvaExtractResolution(emptyList(), emptyList())
+        }
+
+        val mergedDirect = linkedMapOf<String, MediaCandidate>()
+        val mergedServers = linkedMapOf<String, VidrockServerTarget>()
+        val mergedSubtitles = linkedMapOf<String, Pair<String, String>>()
+        val mergedAudio = linkedMapOf<String, AudioTrackCandidate>()
+
+        parsedResults.forEach { result ->
+            result.directSources.forEach { source ->
+                val key = normalizeMediaIdentity(source.url)
+                val existing = mergedDirect[key]
+                if (existing == null) {
+                    mergedDirect[key] = source
+                } else {
+                    mergedDirect[key] = existing.copy(
+                        referer = firstNonBlank(
+                            source.referer,
+                            existing.referer
+                        ).orEmpty(),
+                        origin = firstNonBlank(
+                            source.origin,
+                            existing.origin
+                        ).orEmpty(),
+                        quality = maxOf(existing.quality, source.quality),
+                        label = firstNonBlank(
+                            existing.label,
+                            source.label
+                        ).orEmpty(),
+                        server = firstNonBlank(
+                            existing.server,
+                            source.server
+                        ).orEmpty(),
+                        isHlsMaster = existing.isHlsMaster || source.isHlsMaster,
+                        audioLabel = firstNonBlank(
+                            existing.audioLabel,
+                            source.audioLabel
+                        ).orEmpty(),
+                        isHls = existing.isHls || source.isHls,
+                        audioTracks = mergeAudioTrackCandidates(
+                            existing.audioTracks,
+                            source.audioTracks
+                        ),
+                        headers = mergePlaybackHeaders(
+                            existing.headers,
+                            source.headers
                         )
                     )
-                }.getOrNull()
-            } ?: continue
+                }
+            }
 
-            if (response.code !in 200..399) continue
+            result.servers.forEach { target ->
+                mergedServers.putIfAbsent(
+                    cleanUrl(target.url),
+                    target
+                )
+            }
 
-            val parsed = parseZoryvaExtractResponse(
-                raw = response.text,
-                referer = pageUrl
-            )
+            result.subtitles.forEach { subtitle ->
+                mergedSubtitles.putIfAbsent(
+                    "${subtitle.first}|${subtitle.second}",
+                    subtitle
+                )
+            }
 
-            if (parsed.directSources.isNotEmpty() || parsed.servers.isNotEmpty()) {
-                return parsed
+            result.audioTracks.forEach { track ->
+                mergedAudio[cleanUrl(track.url)] =
+                    mergedAudio[cleanUrl(track.url)]?.let { existing ->
+                        existing.copy(
+                            label = firstNonBlank(
+                                existing.label,
+                                track.label
+                            ).orEmpty(),
+                            headers = mergePlaybackHeaders(
+                                existing.headers,
+                                track.headers
+                            )
+                        )
+                    } ?: track
             }
         }
 
-        return ZoryvaExtractResolution(emptyList(), emptyList())
+        return ZoryvaExtractResolution(
+            directSources = mergedDirect.values.toList(),
+            servers = mergedServers.values.toList(),
+            subtitles = mergedSubtitles.values.toList(),
+            audioTracks = mergedAudio.values.toList()
+        )
     }
 
     private suspend fun resolveZoryvaScraped(
@@ -3973,7 +4433,9 @@ class Zoryva : MainAPI() {
             height: Int? = null,
             sourceHeaders: Map<String, String> = emptyMap(),
             mediaTypeHint: String = "",
-            audioTrackCandidates: List<AudioTrackCandidate> = emptyList()
+            audioTrackCandidates: List<AudioTrackCandidate> = emptyList(),
+            audioLabelHint: String = "",
+            hlsMasterHint: Boolean = false
         ) {
             val clean0 = cleanUrl(rawUrl)
             if (clean0.isBlank()) return
@@ -4043,8 +4505,10 @@ class Zoryva : MainAPI() {
                     label = qualityHint.ifBlank { label },
                     server = label.ifBlank { "Zoryva Extract" },
                     latencyMs = 0L,
-                    isHlsMaster = false,
-                    audioLabel = "",
+                    isHlsMaster = hlsMasterHint ||
+                        qualityHint.trim().equals("auto", true) ||
+                        label.trim().equals("auto", true),
+                    audioLabel = audioLabelHint.trim(),
                     isHls = looksLikeHlsUrl(clean, mediaTypeHint),
                     audioTracks = audioTrackCandidates.distinctBy { cleanUrl(it.url) },
                     headers = safeSourceHeaders
@@ -4368,22 +4832,38 @@ class Zoryva : MainAPI() {
                     server?.optString("origin")
                 ).orEmpty()
 
+                val providerLabel = firstNonBlank(
+                    server?.optString("provider"),
+                    video.optString("provider"),
+                    server?.optString("name"),
+                    video.optString("name"),
+                    qualityHint,
+                    "Zoryva API"
+                ).orEmpty()
+
+                val audioLabelHint = firstNonBlank(
+                    server?.optString("audioLabel"),
+                    video.optString("audioLabel"),
+                    server?.optString("audioLanguage"),
+                    video.optString("audioLanguage")
+                ).orEmpty()
+
+                val hlsMasterHint =
+                    video.optBoolean("auto", false) ||
+                        server?.optBoolean("auto", false) == true ||
+                        qualityHint.equals("auto", true)
+
                 addMedia(
                     rawUrl = url,
-                    label = firstNonBlank(
-                        server?.optString("name"),
-                        video.optString("name"),
-                        server?.optString("provider"),
-                        video.optString("provider"),
-                        qualityHint,
-                        "Zoryva API"
-                    ).orEmpty(),
+                    label = providerLabel,
                     sourceReferer = sourceReferer,
                     sourceOrigin = sourceOrigin,
                     qualityHint = qualityHint,
                     height = video.optInt("height", 0).takeIf { it > 0 },
                     sourceHeaders = headers,
-                    mediaTypeHint = typeHint
+                    mediaTypeHint = typeHint,
+                    audioLabelHint = audioLabelHint,
+                    hlsMasterHint = hlsMasterHint
                 )
             }
 
@@ -6000,6 +6480,10 @@ class Zoryva : MainAPI() {
             url = proxyUrl,
             referer = pageUrl,
             origin = originOf(pageUrl),
+            isHls = source.isHls ||
+                source.url.contains("workers.dev/", true) ||
+                source.url.contains("peakstorm.top/", true) ||
+                source.url.contains("staticreverie.site/", true),
             headers = emptyMap()
         )
     }
@@ -6081,8 +6565,15 @@ class Zoryva : MainAPI() {
             else -> ""
         }
 
-        val server = source.server
+        val cleanedServer = source.server
             .trim()
+            .replace(Regex("(?i)^source\s*\d+\s*[•·:|-]?\s*"), "")
+            .replace(Regex("(?i)\b(?:auto|adaptive|direct|proxy|4320p|2160p|1440p|1080p|720p|576p|540p|480p|400p|360p|240p|144p|hd)\b"), " ")
+            .replace(Regex("\s*[•·|:/-]\s*"), " ")
+            .replace(Regex("\s+"), " ")
+            .trim()
+
+        val server = cleanedServer
             .takeUnless {
                 it.isBlank() ||
                     it.equals("zoryva", true) ||
@@ -6104,13 +6595,12 @@ class Zoryva : MainAPI() {
                 append(" • ")
                 append(format)
             }
-            if (server != null && !server.equals(audio, true)) {
-                append(" • ")
-                append(server)
-            }
-            if (audio != null && !audio.equals(server, true)) {
+            if (audio != null) {
                 append(" • ")
                 append(audio)
+            } else if (server != null) {
+                append(" • ")
+                append(server)
             }
         }
     }
@@ -6120,13 +6610,12 @@ class Zoryva : MainAPI() {
         labelSuffix: String
     ): String {
         val base = buildSourceName(source)
-        return if (
+        return when {
             labelSuffix.contains("proxy", true) &&
-            !base.contains("Proxy", true)
-        ) {
-            "$base • Proxy"
-        } else {
-            base
+                !base.contains("Proxy", true) -> "$base • Proxy"
+            labelSuffix.contains("fallback", true) &&
+                !base.contains("Fallback", true) -> "$base • Fallback"
+            else -> base
         }
     }
 
@@ -6760,6 +7249,36 @@ class Zoryva : MainAPI() {
     }
 
 
+    private fun parseSitemapTimestamp(
+        value: String?
+    ): Long? {
+        val cleaned = value?.trim()?.takeIf { it.isNotBlank() } ?: return null
+
+        cleaned.toLongOrNull()?.let { raw ->
+            return if (raw < 10_000_000_000L) raw * 1000L else raw
+        }
+
+        val patterns = listOf(
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+            "yyyy-MM-dd'T'HH:mm:ssX",
+            "yyyy-MM-dd"
+        )
+
+        for (pattern in patterns) {
+            val parsed = runCatching {
+                java.text.SimpleDateFormat(pattern, Locale.US).apply {
+                    isLenient = false
+                }.parse(cleaned)?.time
+            }.getOrNull()
+
+            if (parsed != null) return parsed
+        }
+
+        return null
+    }
+
     private fun normalizeEpisodeDate(
         value: String?
     ): String? {
@@ -7004,7 +7523,7 @@ class Zoryva : MainAPI() {
         val lower = url.lowercase(Locale.ROOT)
         return lower.contains("staticreverie.site/") ||
             lower.contains("peakstorm.top/") ||
-            lower.contains("flamingo-e55.workers.dev/")
+            lower.contains("workers.dev/")
     }
 
     private fun mediaRefererFor(
