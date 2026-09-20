@@ -2336,22 +2336,55 @@ class CTGFTP : MainAPI() {
         val cleanData = cleanUrl(dataUrl)
         if (cleanData.isBlank()) return
 
-        result.putIfAbsent(
-            episodeIdentity(cleanData, season, episode),
-            newEpisode(cleanData) {
-                this.name = name.ifBlank {
-                    "Episode $episode"
-                }
-                this.season = season
-                this.episode = episode
-                this.posterUrl = posterUrl
-                this.description = description
-                this.date = parseEpisodeDate(
-                    airDate
-                )
-                this.runTime = runTime
+        /*
+         * A CTG episode can be discovered twice:
+         *
+         *   1) from the rendered <li> card (watch URL only), and
+         *   2) from Next.js `allEpisodes[]` (authoritative episode object + links[]).
+         *
+         * The previous implementation keyed the map by the complete data URL.
+         * That meant the DOM version was already present, so the richer
+         * serialized version was discarded by putIfAbsent(). The CloudStream
+         * Episode therefore kept only the watch URL and loadLinks() later had
+         * to rediscover the media source, causing "No Links Found" on episodes
+         * whose playable links only exist inside serialized `links[]`.
+         *
+         * Episode number + season are the stable identity here. When the
+         * serialized record arrives, it replaces the shell record so its
+         * exact source payload is what CloudStream receives.
+         */
+        val existingKey = result.keys.firstOrNull { key ->
+            key.startsWith("$season:$episode:")
+        }
+
+        val episodeData = newEpisode(cleanData) {
+            this.name = name.ifBlank {
+                "Episode $episode"
             }
-        )
+            this.season = season
+            this.episode = episode
+            this.posterUrl = posterUrl
+            this.description = description
+            this.date = parseEpisodeDate(
+                airDate
+            )
+            this.runTime = runTime
+        }
+
+        /*
+         * Prefer the serialized episode only when it actually carries
+         * playback sources. If it does not, retain the existing watch-page
+         * shell so a fresh exact-page resolution remains available.
+         */
+        if (existingKey != null) {
+            if (playbackSources.isNotEmpty()) {
+                result.remove(existingKey)
+                result[episodeIdentity(cleanData, season, episode)] = episodeData
+            }
+            return
+        }
+
+        result[episodeIdentity(cleanData, season, episode)] = episodeData
     }
 
     private fun parseSerializedEpisodes(
