@@ -4223,6 +4223,106 @@ class Zoryva : MainAPI() {
         )
     }
 
+    private fun mergeZoryvaExtractResolutions(
+        first: ZoryvaExtractResolution,
+        second: ZoryvaExtractResolution
+    ): ZoryvaExtractResolution {
+        val mergedDirect = linkedMapOf<String, MediaCandidate>()
+        val mergedServers = linkedMapOf<String, VidrockServerTarget>()
+        val mergedSubtitles = linkedMapOf<String, Pair<String, String>>()
+        val mergedAudio = linkedMapOf<String, AudioTrackCandidate>()
+
+        (first.directSources + second.directSources).forEach { source ->
+            if (source.url.isBlank()) return@forEach
+
+            val key = normalizeMediaIdentity(source.url)
+            val existing = mergedDirect[key]
+
+            if (existing == null) {
+                mergedDirect[key] = source
+            } else {
+                mergedDirect[key] = existing.copy(
+                    referer = firstNonBlank(
+                        existing.referer,
+                        source.referer
+                    ).orEmpty(),
+                    origin = firstNonBlank(
+                        existing.origin,
+                        source.origin
+                    ).orEmpty(),
+                    quality = maxOf(
+                        existing.quality,
+                        source.quality
+                    ),
+                    label = firstNonBlank(
+                        existing.label,
+                        source.label
+                    ).orEmpty(),
+                    server = firstNonBlank(
+                        existing.server,
+                        source.server
+                    ).orEmpty(),
+                    latencyMs = minOf(
+                        existing.latencyMs,
+                        source.latencyMs
+                    ),
+                    isHlsMaster = existing.isHlsMaster || source.isHlsMaster,
+                    audioLabel = firstNonBlank(
+                        existing.audioLabel,
+                        source.audioLabel
+                    ).orEmpty(),
+                    isHls = existing.isHls || source.isHls,
+                    audioTracks = mergeAudioTrackCandidates(
+                        existing.audioTracks,
+                        source.audioTracks
+                    ),
+                    headers = mergePlaybackHeaders(
+                        existing.headers,
+                        source.headers
+                    )
+                )
+            }
+        }
+
+        (first.servers + second.servers).forEach { target ->
+            if (target.url.isBlank()) return@forEach
+            mergedServers.putIfAbsent(cleanUrl(target.url), target)
+        }
+
+        (first.subtitles + second.subtitles).forEach { subtitle ->
+            if (subtitle.second.isBlank()) return@forEach
+            mergedSubtitles.putIfAbsent(
+                "${subtitle.first}|${subtitle.second}",
+                subtitle
+            )
+        }
+
+        (first.audioTracks + second.audioTracks).forEach { track ->
+            if (track.url.isBlank()) return@forEach
+
+            val key = cleanUrl(track.url)
+            mergedAudio[key] = mergedAudio[key]?.let { existing ->
+                existing.copy(
+                    label = firstNonBlank(
+                        existing.label,
+                        track.label
+                    ).orEmpty(),
+                    headers = mergePlaybackHeaders(
+                        existing.headers,
+                        track.headers
+                    )
+                )
+            } ?: track
+        }
+
+        return ZoryvaExtractResolution(
+            directSources = mergedDirect.values.toList(),
+            servers = mergedServers.values.toList(),
+            subtitles = mergedSubtitles.values.toList(),
+            audioTracks = mergedAudio.values.toList()
+        )
+    }
+
     private suspend fun resolveZoryvaScraped(
         document: Document?,
         pageUrl: String,
@@ -6567,10 +6667,10 @@ class Zoryva : MainAPI() {
 
         val cleanedServer = source.server
             .trim()
-            .replace(Regex("(?i)^source\s*\d+\s*[•·:|-]?\s*"), "")
-            .replace(Regex("(?i)\b(?:auto|adaptive|direct|proxy|4320p|2160p|1440p|1080p|720p|576p|540p|480p|400p|360p|240p|144p|hd)\b"), " ")
-            .replace(Regex("\s*[•·|:/-]\s*"), " ")
-            .replace(Regex("\s+"), " ")
+            .replace(Regex("""(?i)^source\s*\d+\s*[•·:|-]?\s*"""), "")
+            .replace(Regex("""(?i)\b(?:auto|adaptive|direct|proxy|4320p|2160p|1440p|1080p|720p|576p|540p|480p|400p|360p|240p|144p|hd)\b"""), " ")
+            .replace(Regex("""\s*[•·|:/-]\s*"""), " ")
+            .replace(Regex("""\s+"""), " ")
             .trim()
 
         val server = cleanedServer
