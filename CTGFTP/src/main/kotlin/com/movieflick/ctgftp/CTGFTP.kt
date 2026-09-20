@@ -13,7 +13,7 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * CTG FTP v10 — exact per-episode source cache + direct playback
+ * CTG FTP v11 — embedded exact per-episode source payload + direct playback
  *
  * Movie playback:
  * detail -> watch -> serialized links[] -> actual media URL -> ExtractorLink
@@ -2472,10 +2472,32 @@ class CTGFTP : MainAPI() {
         }
 
         /*
-         * Keep the Episode data as the exact CTG watch URL. The selected
-         * episode sources are cached separately from the same series response.
+         * Put the exact episode source payload into Episode.data.
+         *
+         * This follows the same final playback concept as the working movie
+         * path: the selected Episode carries its concrete media URL(s).
+         * Therefore loadLinks() does not depend on an in-memory cache surviving
+         * between the series detail screen and the player.
+         *
+         * If CTG has one or more links[] entries, serialize those exact
+         * episode sources here. Otherwise retain the exact watch URL as a
+         * runtime fallback.
          */
-        val episodeData = newEpisode(cleanData) {
+        val episodeDataPayload =
+            if (playbackSources.isNotEmpty()) {
+                buildEpisodeDataPayload(
+                    episodeId = playbackSources
+                        .firstOrNull()
+                        ?.episodeId
+                        ?: watchIdOrEmpty(cleanData),
+                    watchUrl = cleanData,
+                    sources = playbackSources
+                )
+            } else {
+                cleanData
+            }
+
+        val episodeData = newEpisode(episodeDataPayload) {
             this.name = name.ifBlank {
                 "Episode $episode"
             }
