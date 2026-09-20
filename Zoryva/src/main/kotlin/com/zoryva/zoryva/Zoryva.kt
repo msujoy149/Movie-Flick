@@ -1999,21 +1999,48 @@ class Zoryva : MainAPI() {
                     seriesUrl = clean
                 )
 
+                val seriesImdbId = extractImdbId(document.html())
+
                 val episodes = hydratedInfo.episodes.map { ep ->
-                    val episodeUrl =
+                    val candidateEpisodeUrl =
                         ep.url?.takeIf { it.startsWith("http", true) }
-                            ?: buildEpisodeUrl(
-                                baseUrl = clean,
-                                title = hydratedInfo.title,
-                                season = ep.season,
-                                episode = ep.episode
-                            )
+
+                    val episodeUrl = candidateEpisodeUrl
+                        ?.takeIf { candidate ->
+                            val candidateContext = parsePlaybackContext(candidate)
+                            candidateContext?.season == ep.season &&
+                                candidateContext.episode == ep.episode
+                        }
+                        ?: buildEpisodeContextUrl(
+                            seriesUrl = clean,
+                            season = ep.season,
+                            episode = ep.episode
+                        )
+
+                    val playbackJson = JSONObject().apply {
+                        ep.id?.let { put("episodeId", it) }
+                        put("episodeTitle", ep.name)
+                        put("seriesTitle", hydratedInfo.title)
+                        firstNonBlank(
+                            extractInitialMediaObject(document)?.optString("originalTitle"),
+                            extractMeta(document, "property=og:title"),
+                            hydratedInfo.title
+                        )?.let { put("originalTitle", it) }
+                        seriesImdbId?.let { put("imdbId", it) }
+                        ep.runtime?.let { put("runtime", it) }
+                        ep.airDate?.let { put("airDate", it) }
+                        put("season", ep.season)
+                        put("episode", ep.episode)
+                        put("episodeUrl", episodeUrl)
+                    }.toString()
 
                     newEpisode(
-                        if (ep.id.isNullOrBlank()) {
-                            episodeUrl
-                        } else {
-                            "$episodeUrl||${ep.id}"
+                        buildString {
+                            append(episodeUrl)
+                            append("||")
+                            append(ep.id.orEmpty())
+                            append("||")
+                            append(encode(playbackJson))
                         }
                     ) {
                         name = ep.name
@@ -2737,6 +2764,15 @@ class Zoryva : MainAPI() {
         )
     }
 
+    private fun buildEpisodeContextUrl(
+        seriesUrl: String,
+        season: Int,
+        episode: Int
+    ): String {
+        val separator = if (seriesUrl.contains("?")) "&" else "?"
+        return "${seriesUrl}${separator}season=$season&episode=$episode"
+    }
+
     private fun buildEpisodeUrl(
         baseUrl: String,
         title: String,
@@ -2779,23 +2815,62 @@ class Zoryva : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val separator = data.indexOf("||")
-
-        val pageUrl = if (separator >= 0) {
-            data.substring(0, separator).trim()
-        } else {
-            data.trim()
+        val parts = data.split("||", limit = 3)
+        val pageUrl = parts.firstOrNull()?.trim().orEmpty()
+        val rawEpisodeId = parts.getOrNull(1)?.trim().orEmpty()
+            .takeIf { it.isNotBlank() }
+        val episodeMetadata = parts.getOrNull(2)?.let { rawMetadata ->
+            runCatching {
+                val decoded = URLDecoder.decode(rawMetadata, "UTF-8")
+                val json = JSONObject(decoded)
+                EpisodePlaybackMetadata(
+                    episodeId = firstNonBlank(
+                        json.optString("episodeId"),
+                        rawEpisodeId
+                    ),
+                    episodeTitle = json.optString("episodeTitle")
+                        .takeIf { it.isNotBlank() },
+                    seriesTitle = json.optString("seriesTitle")
+                        .takeIf { it.isNotBlank() },
+                    originalTitle = json.optString("originalTitle")
+                        .takeIf { it.isNotBlank() },
+                    imdbId = json.optString("imdbId")
+                        .takeIf { it.isNotBlank() },
+                    runtime = json.optInt("runtime", 0).takeIf { it > 0 },
+                    airDate = normalizeEpisodeDate(
+                        json.optString("airDate")
+                    ),
+                    season = json.optInt("season", -1).takeIf { it >= 0 },
+                    episode = json.optInt("episode", -1).takeIf { it > 0 },
+                    episodeUrl = json.optString("episodeUrl")
+                        .takeIf { it.startsWith("http", true) }
+                )
+            }.getOrNull()
         }
-
-        val episodeId = if (separator >= 0) {
-            data.substring(separator + 2).trim().takeIf { it.isNotBlank() }
-        } else {
-            null
-        }
+        val episodeId = episodeMetadata?.episodeId ?: rawEpisodeId
 
         if (!pageUrl.startsWith("http", true)) return false
 
         val playbackContext = parsePlaybackContext(pageUrl)
+            ?: episodeMetadata?.let { meta ->
+                val type = when {
+                    pageUrl.contains("/anime/", true) -> "anime"
+                    pageUrl.contains("/tv/", true) -> "tv"
+                    else -> null
+                }
+                val tmdbId = Regex("/(?:tv|anime)/(\\d+)")
+                    .find(pageUrl)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                if (type != null && tmdbId != null) {
+                    PlaybackContext(
+                        type = type,
+                        tmdbId = tmdbId,
+                        season = meta.season,
+                        episode = meta.episode
+                    )
+                } else null
+            }
             ?: return false
 
         val episodeBasedPlayback =
@@ -2803,79 +2878,48 @@ class Zoryva : MainAPI() {
                 playbackContext.episode != null
 
         /*
-         * PRIMARY PLAYBACK PATH
-         *
-         * Zoryva's own website exposes a JSON extraction contract at
-         * /api/extract. That response already contains the current, fresh,
-         * website-confirmed playable sources under videos[] / servers[].
-         *
-         * Every CloudStream Play action performs a new request here. No
-         * signed/tokenized media URL is cached between Play actions.
+         * TV/Anime playback needs the same metadata-aware sequence as the real
+         * Zoryva browser: begin the fresh /api/extract call immediately, while
+         * also fetching the exact page context in parallel. We then ALWAYS run
+         * the metadata-aware episode retry for TV/Anime, even when the first
+         * request happened to return a partial/incorrect source set. This avoids
+         * the historical failure where the first generic response short-circuited
+         * before the exact episode parameters were available.
          */
-        /*
-         * Do not wait for the HTML detail page before starting playback
-         * extraction. The browser's /api/extract call can take several seconds
-         * (the captured Spider-Man request took about 9.4s), so serializing a
-         * page fetch first and then putting the API call under another short
-         * timeout can cancel the real extraction before it returns.
-         *
-         * Start both operations in parallel. The extract resolver can use the
-         * URL slug immediately, and if that is not sufficient we retry with the
-         * exact metadata from the detail page that finished in parallel.
-         */
-        /*
-         * Start with the same fresh /api/extract call the website uses. Do not
-         * block this first playback attempt on the detail/series HTML: a valid
-         * structured source is already enough to start playback.
-         */
-        val initialExtract = withTimeoutOrNull(
-            if (episodeBasedPlayback) 30000L else ZORYVA_EXTRACT_TIMEOUT_MS
-        ) {
-            resolveZoryvaExtract(
-                document = null,
-                pageUrl = pageUrl,
-                context = playbackContext,
-                preferredTitle = titleFromPath(URI(pageUrl).path.orEmpty()),
-                allowSoftFallback = false,
-                episodeId = episodeId,
-                seriesDocument = null
-            )
-        }
+        val (initialExtract, loadedPages) = coroutineScope {
+            val extractJob = async {
+                withTimeoutOrNull(
+                    if (episodeBasedPlayback) 30000L else ZORYVA_EXTRACT_TIMEOUT_MS
+                ) {
+                    resolveZoryvaExtract(
+                        document = null,
+                        pageUrl = pageUrl,
+                        context = playbackContext,
+                        preferredTitle = episodeMetadata?.seriesTitle
+                            ?: titleFromPath(URI(pageUrl).path.orEmpty()),
+                        allowSoftFallback = false,
+                        episodeId = episodeId,
+                        episodeMetadata = episodeMetadata
+                    )
+                }
+            }
 
-        var directPage: Document? = null
-        var seriesPage: Document? = null
-
-        var extractResolution =
-            initialExtract ?: ZoryvaExtractResolution(emptyList(), emptyList())
-
-        /*
-         * Only hydrate the episode/detail pages when the first structured API
-         * pass did not produce a real source. This keeps normal playback fast
-         * while still giving TV/Anime the exact airDate/IMDb/runtime/episodeId
-         * needed for the browser-equivalent retry.
-         */
-        if (
-            extractResolution.directSources.isEmpty() &&
-                extractResolution.servers.isEmpty()
-        ) {
-            val hydratedPages = coroutineScope {
-                val pageJob = async {
-                    withTimeoutOrNull(if (episodeBasedPlayback) 20000L else 7000L) {
+            val pagesJob = async {
+                val directPageJob = async {
+                    withTimeoutOrNull(
+                        if (episodeBasedPlayback) 20000L else 7000L
+                    ) {
                         getDocument(pageUrl)
                     }
                 }
 
-                val seriesJob = async {
+                val seriesPageJob = async {
                     if (!episodeBasedPlayback) {
                         null
                     } else {
                         val mediaPath = if (
                             playbackContext.type.equals("anime", true)
-                        ) {
-                            "anime"
-                        } else {
-                            "tv"
-                        }
+                        ) "anime" else "tv"
 
                         withTimeoutOrNull(12000L) {
                             getDocument(
@@ -2885,40 +2929,70 @@ class Zoryva : MainAPI() {
                     }
                 }
 
-                pageJob.await() to seriesJob.await()
+                directPageJob.await() to seriesPageJob.await()
             }
 
-            directPage = hydratedPages.first
-            seriesPage = hydratedPages.second
+            extractJob.await() to pagesJob.await()
+        }
 
-            val effectiveEpisodeId = episodeId
-                ?: if (episodeBasedPlayback && directPage != null) {
-                    parseEpisodeObjectsFromPage(directPage!!)
-                        .firstOrNull {
-                            it.season == playbackContext.season &&
-                                it.episode == playbackContext.episode &&
-                                !it.id.isNullOrBlank()
-                        }
-                        ?.id
-                } else {
-                    null
+        var extractResolution =
+            initialExtract ?: ZoryvaExtractResolution(emptyList(), emptyList())
+
+        val directPage = loadedPages.first
+        val seriesPage = loadedPages.second
+
+        val pageEpisode = if (episodeBasedPlayback) {
+            directPage
+                ?.let { parseEpisodeObjectsFromPage(it) }
+                ?.firstOrNull {
+                    it.season == playbackContext.season &&
+                        it.episode == playbackContext.episode
                 }
+                ?: seriesPage
+                    ?.let { parseEpisodeObjectsFromPage(it) }
+                    ?.firstOrNull {
+                        it.season == playbackContext.season &&
+                            it.episode == playbackContext.episode
+                    }
+        } else null
 
-            val retryTimeout = if (episodeBasedPlayback) 30000L else 15000L
-            val retryResolution = if (directPage != null) {
-                withTimeoutOrNull(retryTimeout) {
+        val effectiveEpisodeId =
+            episodeId ?: pageEpisode?.id
+
+        if (episodeBasedPlayback) {
+            val retryDocument = directPage ?: seriesPage
+            val retryResolution = withTimeoutOrNull(30000L) {
+                resolveZoryvaExtract(
+                    document = retryDocument,
+                    pageUrl = pageUrl,
+                    context = playbackContext,
+                    preferredTitle = episodeMetadata?.seriesTitle,
+                    allowSoftFallback = true,
+                    episodeId = effectiveEpisodeId,
+                    seriesDocument = seriesPage,
+                    episodeMetadata = episodeMetadata
+                )
+            }
+
+            if (retryResolution != null) {
+                extractResolution = mergeZoryvaExtractResolutions(
+                    extractResolution,
+                    retryResolution
+                )
+            }
+        } else if (extractResolution.directSources.isEmpty()) {
+            val retryResolution = directPage?.let { page ->
+                withTimeoutOrNull(15000L) {
                     resolveZoryvaExtract(
-                        document = directPage,
+                        document = page,
                         pageUrl = pageUrl,
                         context = playbackContext,
                         preferredTitle = null,
                         allowSoftFallback = true,
                         episodeId = effectiveEpisodeId,
-                        seriesDocument = seriesPage
+                        episodeMetadata = episodeMetadata
                     )
                 }
-            } else {
-                null
             }
 
             if (retryResolution != null) {
@@ -2928,19 +3002,6 @@ class Zoryva : MainAPI() {
                 )
             }
         }
-
-        val effectiveEpisodeId = episodeId
-            ?: if (episodeBasedPlayback && directPage != null) {
-                parseEpisodeObjectsFromPage(directPage!!)
-                    .firstOrNull {
-                        it.season == playbackContext.season &&
-                            it.episode == playbackContext.episode &&
-                            !it.id.isNullOrBlank()
-                    }
-                    ?.id
-            } else {
-                null
-            }
 
         /*
          * PRIMARY EXTRACTED SOURCES
@@ -3731,6 +3792,19 @@ class Zoryva : MainAPI() {
         val episode: Int?
     )
 
+    private data class EpisodePlaybackMetadata(
+        val episodeId: String? = null,
+        val episodeTitle: String? = null,
+        val seriesTitle: String? = null,
+        val originalTitle: String? = null,
+        val imdbId: String? = null,
+        val runtime: Int? = null,
+        val airDate: String? = null,
+        val season: Int? = null,
+        val episode: Int? = null,
+        val episodeUrl: String? = null
+    )
+
     private fun parsePlaybackContext(
         pageUrl: String
     ): PlaybackContext? {
@@ -3753,6 +3827,10 @@ class Zoryva : MainAPI() {
 
         val tmdbId = parts[1]
             .takeIf { it.all(Char::isDigit) }
+            ?: Regex("^(\\d+)")
+                .find(parts[1])
+                ?.groupValues
+                ?.getOrNull(1)
             ?: return null
 
         if (type == "movie") {
@@ -3881,7 +3959,8 @@ class Zoryva : MainAPI() {
         preferredTitle: String? = null,
         allowSoftFallback: Boolean = true,
         episodeId: String? = null,
-        seriesDocument: Document? = null
+        seriesDocument: Document? = null,
+        episodeMetadata: EpisodePlaybackMetadata? = null
     ): ZoryvaExtractResolution {
         context ?: return ZoryvaExtractResolution(emptyList(), emptyList())
 
@@ -3915,27 +3994,31 @@ class Zoryva : MainAPI() {
         }
 
         val title = firstNonBlank(
+            episodeMetadata?.seriesTitle,
             seriesMediaObject?.optString("title"),
             mediaObject?.optString("title"),
-            document?.selectFirst("h1")?.text(),
             preferredTitle,
+            document?.selectFirst("h1")?.text(),
             titleFromPath(URI(pageUrl).path.orEmpty())
         ).orEmpty()
 
         val originalTitle = firstNonBlank(
+            episodeMetadata?.originalTitle,
             seriesMediaObject?.optString("originalTitle"),
             mediaObject?.optString("originalTitle"),
             title
         ).orEmpty()
 
         val imdbId = firstNonBlank(
+            episodeMetadata?.imdbId,
             seriesMediaObject?.optString("imdbId"),
             mediaObject?.optString("imdbId"),
             extractImdbId(seriesDocument?.html().orEmpty()),
             extractImdbId(document?.html().orEmpty())
         )
 
-        val runtime = exactEpisode?.runtime
+        val runtime = episodeMetadata?.runtime
+            ?: exactEpisode?.runtime
             ?: mediaObject?.optInt("runtime", 0)?.takeIf { it > 0 }
             ?: Regex("""(?i)\\"runtime\\"\\s*:\\s*(\\d+)""")
                 .find(document?.html().orEmpty())
@@ -3943,7 +4026,8 @@ class Zoryva : MainAPI() {
                 ?.getOrNull(1)
                 ?.toIntOrNull()
 
-        val airDate = exactEpisode?.airDate
+        val airDate = episodeMetadata?.airDate
+            ?: exactEpisode?.airDate
             ?: normalizeEpisodeDate(
                 firstNonBlank(
                     mediaObject?.optString("airDate"),
