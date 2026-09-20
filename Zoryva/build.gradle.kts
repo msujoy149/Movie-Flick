@@ -4,7 +4,7 @@ plugins {
     id("com.lagradost.cloudstream3.gradle")
 }
 
-version = 17
+version = 18
 
 cloudstream {
     description = "Zoryva CloudStream provider"
