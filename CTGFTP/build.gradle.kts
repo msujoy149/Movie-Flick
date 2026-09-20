@@ -24,7 +24,7 @@ cloudstream {
         "Anime"
     )
     language = "bn"
-    iconUrl = "https://flagcdn.com/w320/bd.png"
+    iconUrl = "https://i.postimg.cc/QMxBDF9T/favicon-V2.png"
     isCrossPlatform = true
 }
 
