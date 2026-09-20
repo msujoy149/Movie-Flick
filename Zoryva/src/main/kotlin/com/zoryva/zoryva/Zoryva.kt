@@ -46,7 +46,7 @@ import javax.crypto.spec.SecretKeySpec
  */
 class Zoryva : MainAPI() {
 
-    // v21 — dynamic Home pagination + TV/Anime episode-resolution hardening
+    // v22 — dynamic category continuation + authoritative TV/Anime source parsing
 
 
     private companion object {
@@ -60,7 +60,7 @@ class Zoryva : MainAPI() {
         const val MAX_HOME_ITEMS = 24
         const val INITIAL_HOME_ITEMS = MAX_HOME_ITEMS
         const val HOME_SITEMAP_CACHE_TTL_MS = 120_000L
-        const val HOME_SITEMAP_CHILD_LIMIT = 128
+        const val HOME_SITEMAP_CHILD_LIMIT = 512
         const val MAX_SEARCH_ITEMS = 50
         const val MAX_SERVER_PAGES = 12
         const val MAX_CRAWL_DEPTH = 2
@@ -82,7 +82,7 @@ class Zoryva : MainAPI() {
         const val PLAYABILITY_GET_TIMEOUT_MS = 5000L
         const val PLAYABILITY_HEAD_TIMEOUT_MS = 3500L
         const val HLS_SEGMENT_PROBE_TIMEOUT_MS = 3000L
-        const val MAX_EMITTED_FALLBACKS = 64
+        const val MAX_EMITTED_FALLBACKS = 128
 
         // Advanced search tuning. Normal searches should finish from the
         // website's native search page; the heavier global fallback is used
@@ -335,18 +335,29 @@ class Zoryva : MainAPI() {
             /* Fill the first Home page with a real 24-item bootstrap set. */
             prefetchHomeCatalogs()
 
-            val cached = getCachedCatalog(route)
-            val items = if (!cached?.items.isNullOrEmpty()) {
-                cached?.items.orEmpty()
-            } else {
-                loadHomeSitemapPage(route, 1).also { fallback ->
-                    if (fallback.isNotEmpty()) storeCatalog(route, fallback)
+            val cachedItems = catalogCache[route]?.items.orEmpty()
+
+            /*
+             * The homepage RSC payload commonly contains only a small seed
+             * (often 8 cards per row). Never treat that seed as the complete
+             * category. Fill the first CloudStream page from the real sitemap
+             * before deciding whether there is another page.
+             */
+            var items = cachedItems
+            if (items.size < INITIAL_HOME_ITEMS) {
+                val fill = loadHomeSitemapPage(route, 1)
+                if (fill.isNotEmpty()) {
+                    items = (items + fill)
+                        .distinctBy { cleanUrl(it.url) }
                 }
             }
 
+            if (items.isNotEmpty()) {
+                storeCatalog(route, items)
+            }
+
             val visible = items.take(INITIAL_HOME_ITEMS)
-            val hasNext = visible.size >= INITIAL_HOME_ITEMS ||
-                items.size > visible.size
+            val hasNext = visible.size >= INITIAL_HOME_ITEMS
 
             return newHomePageResponse(
                 request,
@@ -2542,11 +2553,9 @@ class Zoryva : MainAPI() {
          * HTTP request made by CloudStream will return a usable response.
          * Media3 reports that situation as ERROR_CODE_IO_BAD_HTTP_STATUS (2004).
          *
-         * Probe the exact extracted candidates with the same safe headers
-         * that will be attached to the player link. Probe results are used to
-         * order sources and prefer confirmed direct/proxy candidates; they do
-         * not erase the website's own status=ok sources when the probe is
-         * inconclusive.
+         * Inspect HLS manifests for real variants/audio groups, but do not gate
+         * emission on a diagnostic HTTP probe. The exact website-returned URL is
+         * authoritative for the primary link path.
          */
         var primaryEmitted = 0
 
@@ -2563,7 +2572,7 @@ class Zoryva : MainAPI() {
                     .map { source ->
                         async {
                             val hlsInfo = if (source.isHls || looksLikeHlsUrl(source.url)) {
-                                withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                                withTimeoutOrNull(5000L) {
                                     inspectHls(source)
                                 }
                             } else {
@@ -2585,14 +2594,24 @@ class Zoryva : MainAPI() {
                                 source
                             }
 
-                            val directPlayable = withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                                probeSource(preparedSource, hlsInfo)
-                            } ?: false
+                            /*
+                             * Do not perform a second HTTP reachability probe
+                             * before emitting an API source. The website has
+                             * already declared this exact URL usable, and signed
+                             * CDNs commonly reject HEAD/range probes that the
+                             * real player request accepts. Probing here was also
+                             * adding several seconds to every TV/Anime click.
+                             *
+                             * We therefore use the probe only as optional
+                             * diagnostic information elsewhere. The primary path
+                             * emits the exact website URL immediately.
+                             */
+                            val directPlayable = true
 
                             /*
                              * The browser uses Zoryva's same-origin proxy for
-                             * workers.dev media, so prepare that path regardless
-                             * of the direct probe result.
+                             * workers.dev / signed CDN media. Prepare that path
+                             * unconditionally for known proxy-backed hosts.
                              */
                             val proxyCandidate = if (
                                 requiresZoryvaProxy(preparedSource.url)
@@ -2605,8 +2624,14 @@ class Zoryva : MainAPI() {
                                 null
                             }
 
-                            val proxyHls = if (proxyCandidate != null) {
-                                withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
+                            /* HLS inspection is only enrichment for variants /
+                             * audio tracks. A failure here must never suppress
+                             * the master source itself. */
+                            val proxyHls = if (proxyCandidate != null &&
+                                (proxyCandidate.isHls ||
+                                    looksLikeHlsUrl(proxyCandidate.url))
+                            ) {
+                                withTimeoutOrNull(5000L) {
                                     inspectHls(proxyCandidate)
                                 }
                             } else {
@@ -2634,22 +2659,11 @@ class Zoryva : MainAPI() {
                                 proxyCandidate
                             }
 
-                            val proxyPlayable = if (preparedProxy != null) {
-                                withTimeoutOrNull(SOURCE_PROBE_TIMEOUT_MS) {
-                                    probeSource(
-                                        preparedProxy,
-                                        proxyHls
-                                    )
-                                } ?: false
-                            } else {
-                                false
-                            }
-
                             PrimarySourceCheck(
                                 source = preparedSource,
                                 directPlayable = directPlayable,
                                 proxy = preparedProxy,
-                                proxyPlayable = proxyPlayable,
+                                proxyPlayable = preparedProxy != null,
                                 hls = hlsInfo,
                                 proxyHls = proxyHls
                             )
@@ -2819,9 +2833,15 @@ class Zoryva : MainAPI() {
                     true
                 )
 
+                /*
+                 * Do not gate a website-approved source on our diagnostic probe.
+                 * Some signed/extensionless CDNs reject a HEAD/range probe while
+                 * accepting the actual player request. The browser capture also
+                 * proves that workers.dev sources are intentionally delivered
+                 * through Zoryva /api/proxy.
+                 */
                 if (
                     proxyFirst &&
-                    check.proxyPlayable &&
                     check.proxy != null
                 ) {
                     emitMasterWithVariants(
@@ -2833,19 +2853,16 @@ class Zoryva : MainAPI() {
 
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
-                if (check.directPlayable) {
-                    emitMasterWithVariants(
-                        check = check,
-                        source = check.source,
-                        labelSuffix = "Direct"
-                    )
-                }
+                emitMasterWithVariants(
+                    check = check,
+                    source = check.source,
+                    labelSuffix = "Direct"
+                )
 
                 if (emitted >= MAX_EMITTED_FALLBACKS) break
 
                 if (
                     !proxyFirst &&
-                    check.proxyPlayable &&
                     check.proxy != null
                 ) {
                     emitMasterWithVariants(
@@ -4132,6 +4149,241 @@ class Zoryva : MainAPI() {
                             addServer(found, parentLabel, parentReferer)
                         }
                     }
+                }
+            }
+        }
+
+        /*
+         * Deterministic parser for Zoryva's real /api/extract contract.
+         *
+         * The live TV response captured from The Scandal contains:
+         *   result.videos[].url/type/quality/headers
+         *   result.servers[].video.url/type/quality/headers
+         *   result.servers[].audioLabel/audioLanguage
+         *   result.subtitles[].url/language/headers
+         *   result.audios[] metadata
+         *
+         * Do this before the generic walker. In particular, the provider can
+         * return an extensionless workers.dev URL whose JSON `type` is `mp4`;
+         * URL-suffix-only parsing would throw that valid source away.
+         */
+        runCatching {
+            val root = JSONObject(raw)
+            val resultObject = root.optJSONObject("result") ?: root
+
+            fun objectHeaders(obj: JSONObject?): Map<String, String> {
+                if (obj == null) return emptyMap()
+                return buildMap {
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val value = obj.optString(key).trim()
+                        if (value.isNotBlank()) put(key, value)
+                    }
+                }
+            }
+
+            val responseHeaders = objectHeaders(
+                resultObject.optJSONObject("headers")
+            )
+
+            fun mergedHeaders(
+                obj: JSONObject?
+            ): Map<String, String> {
+                return buildMap {
+                    responseHeaders.forEach { (key, value) -> put(key, value) }
+                    objectHeaders(obj).forEach { (key, value) -> put(key, value) }
+                }
+            }
+
+            fun structuredLabel(
+                video: JSONObject,
+                server: JSONObject?
+            ): String {
+                return firstNonBlank(
+                    server?.optString("name"),
+                    video.optString("name"),
+                    server?.optString("audioLabel"),
+                    video.optString("audioLabel"),
+                    server?.optString("provider"),
+                    video.optString("provider"),
+                    video.optString("quality"),
+                    "Zoryva API"
+                ).orEmpty()
+            }
+
+            fun addStructuredVideo(
+                video: JSONObject,
+                server: JSONObject? = null
+            ) {
+                val url = video.optString("url").trim()
+                if (url.isBlank()) return
+
+                val typeHint = firstNonBlank(
+                    video.optString("type"),
+                    video.optString("mimeType"),
+                    server?.optString("type"),
+                    server?.optString("mimeType")
+                ).orEmpty()
+
+                val qualityHint = firstNonBlank(
+                    video.optString("quality"),
+                    server?.optString("quality"),
+                    video.optString("resolution"),
+                    server?.optString("resolution")
+                ).orEmpty()
+
+                val headers = mergedHeaders(video.optJSONObject("headers"))
+                val sourceReferer = firstNonBlank(
+                    headerValue(headers, "Referer"),
+                    video.optString("referer"),
+                    server?.optString("referer"),
+                    referer
+                ).orEmpty()
+
+                val sourceOrigin = firstNonBlank(
+                    headerValue(headers, "Origin"),
+                    video.optString("origin"),
+                    server?.optString("origin")
+                ).orEmpty()
+
+                val media = MediaCandidate(
+                    url = url,
+                    referer = sourceReferer,
+                    origin = sourceOrigin,
+                    quality = qualityFromUrl(url, qualityHint),
+                    label = structuredLabel(video, server),
+                    server = firstNonBlank(
+                        server?.optString("provider"),
+                        server?.optString("name"),
+                        video.optString("provider"),
+                        "Zoryva"
+                    ).orEmpty(),
+                    latencyMs = 0L,
+                    isHlsMaster = typeHint.equals("hls", true) ||
+                        typeHint.contains("mpegurl", true),
+                    audioLabel = firstNonBlank(
+                        server?.optString("audioLabel"),
+                        video.optString("audioLabel"),
+                        server?.optString("audioLanguage"),
+                        video.optString("audioLanguage")
+                    ).orEmpty(),
+                    isHls = typeHint.equals("hls", true) ||
+                        typeHint.contains("mpegurl", true) ||
+                        looksLikeHlsUrl(url, typeHint),
+                    audioTracks = emptyList(),
+                    headers = sanitizePlaybackHeaders(headers)
+                )
+
+                if (!isPlayableMedia(url, typeHint)) return
+                if (isObviouslyPromotional(url) || isIgnoredHost(url)) return
+
+                /* Reuse the normal source constructor so quality/referer/origin
+                 * normalization remains identical to the generic path. */
+                addMedia(
+                    rawUrl = url,
+                    label = media.label,
+                    sourceReferer = media.referer,
+                    sourceOrigin = media.origin,
+                    qualityHint = qualityHint,
+                    height = video.optInt("height", 0).takeIf { it > 0 },
+                    sourceHeaders = media.headers,
+                    mediaTypeHint = typeHint,
+                    audioTrackCandidates = emptyList()
+                )
+            }
+
+            resultObject.optJSONArray("videos")?.let { videos ->
+                for (i in 0 until videos.length()) {
+                    val video = videos.optJSONObject(i) ?: continue
+                    addStructuredVideo(video)
+                }
+            }
+
+            resultObject.optJSONArray("servers")?.let { serversArray ->
+                for (i in 0 until serversArray.length()) {
+                    val server = serversArray.optJSONObject(i) ?: continue
+                    val status = server.optString("status")
+                        .trim()
+                        .lowercase(Locale.ROOT)
+
+                    if (
+                        server.optBoolean("broken", false) ||
+                        server.optBoolean("disabled", false) ||
+                        status in setOf(
+                            "error", "failed", "failure", "broken", "disabled",
+                            "offline", "unavailable", "invalid", "rejected"
+                        )
+                    ) continue
+
+                    server.optJSONObject("video")?.let { video ->
+                        addStructuredVideo(video, server)
+                    } ?: firstNonBlank(
+                        server.optString("url"),
+                        server.optString("src"),
+                        server.optString("link")
+                    )?.let { serverUrl ->
+                        addServer(
+                            rawUrl = serverUrl,
+                            label = firstNonBlank(
+                                server.optString("name"),
+                                server.optString("provider"),
+                                "Zoryva Server"
+                            ).orEmpty(),
+                            sourceReferer = firstNonBlank(
+                                server.optString("referer"),
+                                referer
+                            ).orEmpty()
+                        )
+                    }
+                }
+            }
+
+            resultObject.optJSONArray("subtitles")?.let { subtitlesArray ->
+                for (i in 0 until subtitlesArray.length()) {
+                    val subtitle = subtitlesArray.optJSONObject(i) ?: continue
+                    val url = subtitle.optString("url").trim()
+                    if (url.isBlank()) continue
+
+                    val language = firstNonBlank(
+                        subtitle.optString("language"),
+                        subtitle.optString("lang"),
+                        subtitle.optString("name"),
+                        "Subtitles"
+                    ).orEmpty()
+
+                    addSubtitle(
+                        rawUrl = url,
+                        language = language,
+                        fallbackName = subtitle.optString("name")
+                    )
+                }
+            }
+
+            /* Some extractor versions expose audio files directly. Only attach
+             * actual URLs; metadata such as {language,name,type} must not be
+             * turned into a made-up link. */
+            resultObject.optJSONArray("audios")?.let { audiosArray ->
+                for (i in 0 until audiosArray.length()) {
+                    val audio = audiosArray.optJSONObject(i) ?: continue
+                    val url = firstNonBlank(
+                        audio.optString("url"),
+                        audio.optString("src"),
+                        audio.optString("file"),
+                        audio.optString("link")
+                    ) ?: continue
+
+                    addAudio(
+                        rawUrl = url,
+                        label = firstNonBlank(
+                            audio.optString("name"),
+                            audio.optString("language"),
+                            audio.optString("lang"),
+                            audio.optString("type"),
+                            "Audio"
+                        ).orEmpty(),
+                        sourceHeaders = mergedHeaders(audio.optJSONObject("headers"))
+                    )
                 }
             }
         }
@@ -5801,6 +6053,10 @@ class Zoryva : MainAPI() {
                     it.equals("zoryva direct", true)
             }
 
+        val audio = source.audioLabel
+            .trim()
+            .takeIf { it.isNotBlank() }
+
         return buildString {
             append("Zoryva • ")
             append(quality)
@@ -5811,6 +6067,14 @@ class Zoryva : MainAPI() {
             if (server != null) {
                 append(" • ")
                 append(server)
+            }
+            if (audio != null) {
+                val alreadyNamed =
+                    server?.contains(audio, true) == true
+                if (!alreadyNamed) {
+                    append(" • ")
+                    append(audio)
+                }
             }
         }
     }
