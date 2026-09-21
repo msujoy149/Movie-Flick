@@ -4,20 +4,21 @@ plugins {
     id("com.lagradost.cloudstream3.gradle")
 }
 
-version = 2
+version = 1
 
 cloudstream {
-    description = "MovieBox provider for Movie-Flick"
+    description = "MovieBox provider with proven Global + IN backend failover"
     authors = listOf("Movie-Flick")
     status = 1
 
     tvTypes = listOf(
         "Movie",
-        "TvSeries",
-        "Anime"
+        "TvSeries"
     )
 
-    language = "hi"
+    // Preserve the India/Tamil marker used by the original working provider.
+    language = "ta"
+    iconUrl = "https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png"
     isCrossPlatform = false
 
     setRepo(
@@ -39,8 +40,4 @@ android {
     }
 }
 
-dependencies {
-    implementation(kotlin("stdlib"))
-    implementation("com.github.Blatzar:NiceHttp:0.4.11")
-    implementation("org.jsoup:jsoup:1.18.3")
-}
+// CloudStream + coroutines are supplied by the repository root build.gradle.kts.
