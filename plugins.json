@@ -193,21 +193,22 @@
         "jarHash": "sha256-811760aa816306acea1878bd51c9584c2856ffab0e73c7e5f9667c7693ded828"
     },
     {
-        "iconUrl": "https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png",
-        "fileHash": "sha256-bca1556db88e038ac5e18da1b726be13a0b9e0c756f8107ca7717e40dbd9d780",
+        "iconUrl": "https://h5-static.aoneroom.com/ssrStatic/club/public/_nuxt/logo.DMnCL3zY.svg",
+        "fileHash": "sha256-0be818c587cad14b3732987992110ff36dbab827fd06af805a814c59d27c276b",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
         "fileSize": 25761,
         "status": 1,
         "language": "hi",
         "authors": [
+            "NivinCNC",
             "Movie-Flick"
         ],
         "tvTypes": [
             "Movie",
             "TvSeries"
         ],
-        "version": 4,
+        "version": 51,
         "internalName": "MovieBox",
         "description": "Multi Language Movies and Series Provider",
         "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
