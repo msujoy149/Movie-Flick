@@ -86,14 +86,35 @@ jobs:
             ! -path "$GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3" \
             -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
 
-          PREBUILT="$GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3"
           PUBLISHED="$GITHUB_WORKSPACE/build-output/MovieBox.cs3"
 
-          if [ ! -f "$PREBUILT" ]; then
-            echo "ERROR: Missing $PREBUILT"
+          # Accept either location so an existing repository layout does not
+          # break the build. The recommended location is:
+          #   MovieBox/MovieBoxPrebuilt.cs3
+          # The older layout:
+          #   MovieBox/prebuilt/MovieBoxPrebuilt.cs3
+          # is also accepted.
+          PREBUILT=""
+          for candidate in             "$GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3"             "$GITHUB_WORKSPACE/src/MovieBox/prebuilt/MovieBoxPrebuilt.cs3"             "$GITHUB_WORKSPACE/src/MovieBox/prebuilt/MovieBoxPrebuilt.cs3.bin"; do
+            if [ -f "$candidate" ]; then
+              PREBUILT="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$PREBUILT" ]; then
+            echo "ERROR: MovieBoxPrebuilt.cs3 was not found."
+            echo "Checked:"
+            echo "  $GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3"
+            echo "  $GITHUB_WORKSPACE/src/MovieBox/prebuilt/MovieBoxPrebuilt.cs3"
+            echo "  $GITHUB_WORKSPACE/src/MovieBox/prebuilt/MovieBoxPrebuilt.cs3.bin"
+            echo
+            echo "Expected the proven MovieBoxProvider artifact to be committed"
+            echo "inside the private repository."
             exit 1
           fi
 
+          echo "Using MovieBox runtime: $PREBUILT"
           cp -f "$PREBUILT" "$PUBLISHED"
           cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
              "$GITHUB_WORKSPACE/build-output/plugins.json"
