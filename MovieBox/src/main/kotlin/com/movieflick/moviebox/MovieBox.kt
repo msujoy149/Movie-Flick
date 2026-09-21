@@ -83,16 +83,6 @@ class MovieBox : MainAPI() {
         val declaredDurationSeconds: Long = -1L
     )
 
-    private data class NuxtSeasonInfo(
-        val season: Int,
-        val episodeCount: Int
-    )
-
-    private data class NuxtTvInfo(
-        val subjectId: String?,
-        val seasons: List<NuxtSeasonInfo>
-    )
-
     private fun browserHeaders(
         referer: String = "$mainUrl/"
     ) = mapOf(
@@ -619,41 +609,12 @@ class MovieBox : MainAPI() {
         val type = typeFromPath(path)
 
         if (type == TvType.TvSeries) {
-            /*
-             * The current MovieBox website already ships the real series
-             * subject + season metadata inside its Nuxt SSR payload.
-             *
-             * Example from the live page source: the resource object contains
-             * `seasons`, each season has `se` and `maxEp`, and the resolution
-             * entries also expose `epNum`. This is the authoritative place to
-             * build a dynamic CloudStream episode list.
-             *
-             * The old implementation depended on a second external search/API
-             * call to discover the subject first. When that call returned no
-             * useful result, CloudStream received an empty list and displayed
-             * "No Episodes found" even though the website showed all episodes.
-             */
-            val nuxtInfo = document?.let(::parseNuxtTvInfo)
-            val subjectId =
-                nuxtInfo?.subjectId?.takeIf { it.isNotBlank() }
-                    ?: findApiSubjectId(title)
-
-            val episodes = when {
-                !subjectId.isNullOrBlank() &&
-                    !nuxtInfo?.seasons.isNullOrEmpty() ->
-                    buildDynamicEpisodes(
-                        subjectId = subjectId,
-                        seasons = nuxtInfo?.seasons.orEmpty()
-                    )
-
-                !subjectId.isNullOrBlank() ->
-                    fetchApiEpisodes(
-                        subjectId = subjectId,
-                        seriesTitle = title
-                    )
-
-                else ->
-                    emptyList()
+            val subjectId = findApiSubjectId(title)
+            val detailPath = contentSlug(path).orEmpty()
+            val episodes = if (!subjectId.isNullOrBlank()) {
+                fetchApiEpisodes(subjectId, title, detailPath)
+            } else {
+                emptyList()
             }
 
             return newTvSeriesLoadResponse(
@@ -700,11 +661,53 @@ class MovieBox : MainAPI() {
 
         if (rawData.startsWith("mbxepisode||")) {
             val parts = rawData.split("||")
+
+            // New verified format:
+            // mbxepisode||subjectId||detailPath||season||episode
+            if (parts.size >= 5) {
+                val subjectId = parts[1]
+                val detailPath = parts[2]
+                val season = parts[3].toIntOrNull() ?: 1
+                val episode = parts[4].toIntOrNull() ?: 1
+
+                return resolveWebsitePlayback(
+                    subjectId = subjectId,
+                    detailPath = detailPath,
+                    season = season,
+                    episode = episode,
+                    subtitleCallback = subtitleCallback,
+                    callback = callback
+                )
+            }
+
+            // Backward compatibility for previously generated episode entries.
             if (parts.size >= 4) {
                 val subjectId = parts[1]
                 val season = parts[2].toIntOrNull() ?: 1
                 val episode = parts[3].toIntOrNull() ?: 1
-                return resolveApiPlayback(subjectId, season, episode, subtitleCallback, callback)
+                val derivedDetailPath = rawData
+                    .substringAfter("mbxepisode||", "")
+                    .substringAfter("||", "")
+                    .let { contentSlug(it).orEmpty() }
+
+                if (derivedDetailPath.isNotBlank()) {
+                    return resolveWebsitePlayback(
+                        subjectId = subjectId,
+                        detailPath = derivedDetailPath,
+                        season = season,
+                        episode = episode,
+                        subtitleCallback = subtitleCallback,
+                        callback = callback
+                    )
+                }
+
+                return resolveApiPlayback(
+                    subjectId,
+                    season,
+                    episode,
+                    subtitleCallback,
+                    callback
+                )
             }
         }
 
@@ -1125,7 +1128,8 @@ class MovieBox : MainAPI() {
 
     private suspend fun fetchApiEpisodes(
         subjectId: String,
-        seriesTitle: String
+        seriesTitle: String,
+        detailPath: String
     ): List<Episode> {
         val requests = listOf(
             ApiConfig.JSON_SEASON_INFO to mapOf("subjectId" to subjectId),
@@ -1145,7 +1149,7 @@ class MovieBox : MainAPI() {
             .sortedWith(compareBy<EpisodeInfoHolder> { it.season }.thenBy { it.episode })
             .map { info ->
                 newEpisode(
-                    data = "mbxepisode||$subjectId||${info.season}||${info.episode}"
+                    data = "mbxepisode||$subjectId||$detailPath||${info.season}||${info.episode}"
                 ) {
                     name = info.title.ifBlank { "Episode ${info.episode}" }
                     season = info.season
@@ -1159,289 +1163,6 @@ class MovieBox : MainAPI() {
         val episode: Int,
         val title: String = ""
     )
-
-    /*
-     * ------------------------------------------------------------
-     * NUXT SSR TV EPISODE DISCOVERY
-     * ------------------------------------------------------------
-     *
-     * MovieBox's current web app serializes its page state in the
-     * `__NUXT_DATA__` script using devalue-style reference indexes.
-     * The series resource looks like:
-     *
-     *   {"seasons": <ref>, ...}
-     *   -> [{"se": <ref>, "maxEp": <ref>,
-     *       "allEp": <ref>, "resolutions": <ref>}]
-     *
-     * `maxEp` and the resolution `epNum` values are the dynamic episode
-     * counts for each season. We use those counts directly so a series with
-     * 5, 6, 8, 12, 20, 40, 50, etc. episodes is represented correctly.
-     *
-     * No hard-coded episode count is used. When the page contains no SSR
-     * metadata, the existing API fallback remains available.
-     */
-    private fun parseNuxtTvInfo(
-        document: Document
-    ): NuxtTvInfo? {
-        val script =
-            document.selectFirst(
-                "script[data-nuxt-data=nuxt-app]"
-            )
-                ?: document.selectFirst(
-                    "script#__NUXT_DATA__"
-                )
-                ?: document.selectFirst(
-                    "script[id=__NUXT_DATA__]"
-                )
-                ?: return null
-
-        val raw =
-            script.data()
-                .trim()
-                .ifBlank { script.html().trim() }
-
-        if (raw.isBlank()) return null
-
-        val root = parseNuxtJsonArray(raw) ?: return null
-
-        /*
-         * The useful page payload is the object containing both `subject`
-         * and `resource`. Searching the root table avoids relying on a
-         * version-specific numeric index such as 10.
-         */
-        val container =
-            (0 until root.size())
-                .asSequence()
-                .map { root.get(it) }
-                .firstOrNull { node ->
-                    node.isObject &&
-                        node.has("subject") &&
-                        node.has("resource")
-                }
-                ?: return null
-
-        val subject =
-            devalueRefNode(
-                root,
-                container.get("subject")
-            ) ?: return null
-
-        val resource =
-            devalueRefNode(
-                root,
-                container.get("resource")
-            ) ?: return null
-
-        if (!subject.isObject || !resource.isObject) {
-            return null
-        }
-
-        val subjectId =
-            devalueRefText(
-                root,
-                subject.get("subjectId")
-            )
-
-        val seasonsNode =
-            devalueRefNode(
-                root,
-                resource.get("seasons")
-            )
-
-        if (seasonsNode == null || !seasonsNode.isArray) {
-            return NuxtTvInfo(
-                subjectId = subjectId,
-                seasons = emptyList()
-            )
-        }
-
-        val seasons =
-            seasonsNode
-                .mapIndexedNotNull { index, seasonRef ->
-                    val seasonNode =
-                        devalueRefNode(
-                            root,
-                            seasonRef
-                        ) ?: return@mapIndexedNotNull null
-
-                    if (!seasonNode.isObject) {
-                        return@mapIndexedNotNull null
-                    }
-
-                    val seasonNumber =
-                        devalueRefInt(
-                            root,
-                            seasonNode.get("se")
-                        )
-                            ?.takeIf { it > 0 }
-                            ?: (index + 1)
-
-                    val maxEpisode =
-                        devalueRefInt(
-                            root,
-                            seasonNode.get("maxEp")
-                        )
-                            ?: 0
-
-                    val allEpisode =
-                        devalueRefInt(
-                            root,
-                            seasonNode.get("allEp")
-                        )
-                            ?: 0
-
-                    val resolutionEpisodeCount =
-                        devalueRefNode(
-                            root,
-                            seasonNode.get("resolutions")
-                        )
-                            ?.takeIf { it.isArray }
-                            ?.mapNotNull { resolutionRef ->
-                                val resolutionNode =
-                                    devalueRefNode(
-                                        root,
-                                        resolutionRef
-                                    ) ?: return@mapNotNull null
-
-                                devalueRefInt(
-                                    root,
-                                    resolutionNode.get("epNum")
-                                )
-                            }
-                            ?.maxOrNull()
-                            ?: 0
-
-                    val count =
-                        maxOf(
-                            maxEpisode,
-                            allEpisode,
-                            resolutionEpisodeCount
-                        )
-
-                    if (count <= 0) {
-                        null
-                    } else {
-                        NuxtSeasonInfo(
-                            season = seasonNumber,
-                            episodeCount = count
-                        )
-                    }
-                }
-                .distinctBy { it.season }
-                .sortedBy { it.season }
-
-        return NuxtTvInfo(
-            subjectId = subjectId,
-            seasons = seasons
-        )
-    }
-
-    private fun parseNuxtJsonArray(
-        raw: String
-    ): JsonNode? {
-        runCatching {
-            jsonMapper.readTree(raw)
-        }.getOrNull()?.let { parsed ->
-            if (parsed.isArray) return parsed
-        }
-
-        /*
-         * Some saved/source-copied HTML snapshots contain an extra backslash
-         * before punctuation such as `:` or `_`. The real network response
-         * does not require this cleanup, but keeping the fallback makes the
-         * parser tolerant of those snapshots too.
-         */
-        val cleaned =
-            raw.replace(
-                Regex(
-                    """\\(?!["\\/bfnrtu])"""
-                ),
-                ""
-            )
-
-        return runCatching {
-            jsonMapper.readTree(cleaned)
-        }.getOrNull()?.takeIf { it.isArray }
-    }
-
-    private fun devalueRefNode(
-        root: JsonNode,
-        reference: JsonNode?
-    ): JsonNode? {
-        if (!root.isArray || reference == null) return null
-        if (!reference.isIntegralNumber) return null
-
-        val index = reference.asInt()
-        if (index < 0 || index >= root.size()) return null
-
-        return root.get(index)
-    }
-
-    private fun devalueRefText(
-        root: JsonNode,
-        reference: JsonNode?
-    ): String? {
-        val value =
-            devalueRefNode(
-                root,
-                reference
-            ) ?: return null
-
-        return when {
-            value.isTextual -> value.asText().trim().takeIf { it.isNotBlank() }
-            value.isNumber || value.isBoolean -> value.asText()
-            else -> null
-        }
-    }
-
-    private fun devalueRefInt(
-        root: JsonNode,
-        reference: JsonNode?
-    ): Int? {
-        val value =
-            devalueRefNode(
-                root,
-                reference
-            ) ?: return null
-
-        return when {
-            value.isIntegralNumber -> value.asInt()
-            value.isNumber -> value.asDouble().toInt()
-            value.isTextual -> value.asText().trim().toIntOrNull()
-            else -> null
-        }
-    }
-
-    private fun buildDynamicEpisodes(
-        subjectId: String,
-        seasons: List<NuxtSeasonInfo>
-    ): List<Episode> {
-        return seasons
-            .flatMap { seasonInfo ->
-                (1..seasonInfo.episodeCount).map { episodeNumber ->
-                    newEpisode(
-                        data =
-                            "mbxepisode||$subjectId||${seasonInfo.season}||$episodeNumber"
-                    ) {
-                        name =
-                            "Episode " +
-                                episodeNumber
-                                    .toString()
-                                    .padStart(2, '0')
-
-                        season = seasonInfo.season
-                        episode = episodeNumber
-                    }
-                }
-            }
-            .sortedWith(
-                compareBy<Episode> {
-                    it.season ?: Int.MAX_VALUE
-                }.thenBy {
-                    it.episode ?: Int.MAX_VALUE
-                }
-            )
-    }
 
     private fun collectEpisodeObjects(
         node: JsonNode?,
@@ -1485,6 +1206,101 @@ class MovieBox : MainAPI() {
             }
         } else if (node.isArray) {
             node.forEach { child -> collectEpisodeObjects(child, out, inheritedSeason) }
+        }
+    }
+
+    /**
+     * Verified MovieBox website playback resolver.
+     *
+     * Browser evidence shows that the website calls:
+     *   /wefeed-h5api-bff/subject/play
+     * with subjectId + se + ep + detailPath, and the JSON response directly
+     * contains the signed MP4 streams for that exact episode.
+     *
+     * We intentionally request the endpoint once without a synthetic quality
+     * parameter. The server returns the available streams for the episode; we
+     * then emit each valid resolution from that response.
+     */
+    private suspend fun resolveWebsitePlayback(
+        subjectId: String,
+        detailPath: String,
+        season: Int,
+        episode: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val normalizedDetailPath = detailPath
+            .trim()
+            .trimStart('/')
+            .substringBefore('?')
+            .substringBefore('#')
+
+        if (subjectId.isBlank() || normalizedDetailPath.isBlank()) {
+            return false
+        }
+
+        val params = linkedMapOf(
+            "subjectId" to subjectId,
+            "se" to season.toString(),
+            "ep" to episode.toString(),
+            "detailPath" to normalizedDetailPath
+        )
+
+        val json = websitePlayGet(params) ?: return false
+        val found = linkedMapOf<String, MediaSource>()
+
+        collectStreamSources(json, found)
+        collectApiSubtitles(json, subtitleCallback)
+
+        val playable = found.values
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+            .sortedWith(
+                compareByDescending<MediaSource> { it.quality }
+                    .thenByDescending { it.declaredDurationSeconds }
+                    .thenByDescending { it.declaredSize }
+                    .thenBy { it.url }
+            )
+
+        if (playable.isEmpty()) return false
+
+        playable.forEach { source ->
+            emitSource(source.copy(referer = "$mainUrl/"), callback)
+        }
+
+        return true
+    }
+
+    private suspend fun websitePlayGet(
+        params: Map<String, String>
+    ): JsonNode? {
+        val query = params.entries.joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+
+        val url = if (query.isBlank()) {
+            "$mainUrl/wefeed-h5api-bff/subject/play"
+        } else {
+            "$mainUrl/wefeed-h5api-bff/subject/play?$query"
+        }
+
+        val response = runCatching {
+            app.get(
+                url,
+                headers = apiHeaders().toMutableMap().apply {
+                    this["Accept"] = "application/json"
+                    this["Referer"] = "$mainUrl/"
+                    this["Origin"] = mainUrl
+                }
+            )
+        }.getOrNull() ?: return null
+
+        if (response.code !in 200..399) return null
+
+        return runCatching {
+            jsonMapper.readTree(response.text)
+        }.getOrNull()?.takeIf {
+            nodeText(it, "code") == null || nodeText(it, "code") == "0" || it.path("code").asInt(-1) == 0
         }
     }
 
@@ -1598,34 +1414,110 @@ class MovieBox : MainAPI() {
         if (node == null) return
 
         if (node.isObject) {
+            // MovieBox website playback responses expose streams as:
+            // data.streams[].{url,resolutions,size,duration,codecName,...}
+            val directUrl = nodeText(node, "url", "videoAddress", "src")
+            if (!directUrl.isNullOrBlank() && looksLikePlayableMedia(directUrl)) {
+                val url = normalizeMediaUrl(directUrl, mainUrl)
+                if (url != null) {
+                    val resolutionText = nodeText(
+                        node,
+                        "resolutions",
+                        "resolution",
+                        "quality",
+                        "definition"
+                    ).orEmpty()
+                    val localQuality = qualityFromText(resolutionText)
+                    val localSize = nodeLong(node, "size", "fileSize", "contentLength")
+                    val localDuration = nodeLong(
+                        node,
+                        "duration",
+                        "durationSeconds"
+                    )
+
+                    val existing = out[url]
+                    out[url] = MediaSource(
+                        url = url,
+                        quality = maxOf(
+                            existing?.quality ?: Qualities.Unknown.value,
+                            localQuality
+                        ),
+                        label = if (localQuality > 0) {
+                            "${localQuality}p"
+                        } else {
+                            "MovieBox Stream"
+                        },
+                        referer = "$mainUrl/",
+                        declaredSize = maxOf(
+                            existing?.declaredSize ?: -1L,
+                            localSize
+                        ),
+                        declaredDurationSeconds = maxOf(
+                            existing?.declaredDurationSeconds ?: -1L,
+                            localDuration
+                        )
+                    )
+                }
+            }
+
             val localQuality = nodeText(
                 node,
-                "quality", "definition", "resolution", "name", "label"
+                "quality",
+                "definition",
+                "resolution",
+                "resolutions",
+                "name",
+                "label"
             ).orEmpty()
             val localSize = nodeLong(node, "size", "fileSize", "contentLength")
             val localDuration = nodeLong(node, "duration", "durationSeconds")
 
             node.fields().forEachRemaining { (key, child) ->
+                // Avoid recursively re-processing the direct URL field after
+                // it has already been handled above.
+                if (key.equals("url", true) ||
+                    key.equals("videoAddress", true) ||
+                    key.equals("src", true)
+                ) {
+                    return@forEachRemaining
+                }
+
                 if (child.isTextual && looksLikePlayableMedia(child.asText())) {
-                    val url = normalizeMediaUrl(child.asText(), mainUrl) ?: return@forEachRemaining
-                    val quality = qualityFromText("$localQuality $context $url")
+                    val url = normalizeMediaUrl(child.asText(), mainUrl)
+                        ?: return@forEachRemaining
+                    val quality = qualityFromText(
+                        "$localQuality $context $key $url"
+                    )
+                    val existing = out[url]
                     out[url] = MediaSource(
                         url = url,
-                        quality = quality,
+                        quality = maxOf(
+                            existing?.quality ?: Qualities.Unknown.value,
+                            quality
+                        ),
                         label = if (quality > 0) "${quality}p" else "MovieBox Stream",
-                        referer = mainUrl,
-                        declaredSize = maxOf(out[url]?.declaredSize ?: -1L, localSize),
+                        referer = "$mainUrl/",
+                        declaredSize = maxOf(
+                            existing?.declaredSize ?: -1L,
+                            localSize
+                        ),
                         declaredDurationSeconds = maxOf(
-                            out[url]?.declaredDurationSeconds ?: -1L,
+                            existing?.declaredDurationSeconds ?: -1L,
                             localDuration
                         )
                     )
                 } else {
-                    collectStreamSources(child, out, "$context $key $localQuality")
+                    collectStreamSources(
+                        child,
+                        out,
+                        "$context $key $localQuality"
+                    )
                 }
             }
         } else if (node.isArray) {
-            node.forEach { child -> collectStreamSources(child, out, context) }
+            node.forEach { child ->
+                collectStreamSources(child, out, context)
+            }
         }
     }
 
@@ -3741,7 +3633,7 @@ class MovieBox : MainAPI() {
 
         val match =
             Regex(
-                """(?i)(2160|1440|1080|720|576|480|360)p"""
+                """(?i)\b(2160|1440|1080|720|576|480|360)(?:p|\s*px)?\b"""
             ).find(text)
 
         return match
