@@ -328,10 +328,10 @@
   },
   {
     "iconUrl": "https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png",
-    "fileHash": "sha256-CvRTagyvcxx2mfICmwD9JPdr0b48j1R3FLvIKlciTrk=",
+    "fileHash": "sha256-d0d417019b2efb613458ff750fa817073ec22bbaf631887c83486a52f21dbbcc",
     "apiVersion": 1,
     "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-    "fileSize": 97158,
+    "fileSize": 97156,
     "status": 1,
     "language": "hi",
     "authors": [
