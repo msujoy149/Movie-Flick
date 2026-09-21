@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import okhttp3.Headers
 import java.net.URI
 import java.net.URLEncoder
 import java.util.Locale
@@ -659,8 +660,8 @@ class MovieBox : MainAPI() {
         val imdbText = imdbRating?.let { "IMDb ${formatRating(it)}" }
 
         if (contentType == TvType.TvSeries) {
-            val subjectId = subjectData?.subjectId
-                ?: urlSubjectId
+            val subjectId = urlSubjectId
+                ?: subjectData?.subjectId
                 ?: findWebsiteSubjectId(title, contentType)
                 ?: findApiSubjectId(title)
             val detailPath = subjectData?.detailPath ?: contentSlug(path).orEmpty()
@@ -901,6 +902,14 @@ class MovieBox : MainAPI() {
 
     private val jsonMapper by lazy { ObjectMapper() }
 
+    /*
+     * MovieBox H5 uses a short-lived browser session token for the BFF.
+     * The website establishes it while loading normal pages; keep only the
+     * runtime cookies observed from those responses and reuse them for the
+     * same-origin H5 API calls. Nothing is hard-coded.
+     */
+    private val websiteCookies: MutableMap<String, String> = linkedMapOf()
+
     private fun apiHeaders() = mapOf(
         "Accept" to "application/json,text/plain,*/*;q=0.8",
         "User-Agent" to (browserHeaders()["User-Agent"] ?: "Mozilla/5.0"),
@@ -909,6 +918,93 @@ class MovieBox : MainAPI() {
         "Pragma" to "no-cache",
         "Referer" to "$mainUrl/"
     )
+
+    private fun websiteCookieHeader(): String =
+        websiteCookies.entries
+            .filter { it.key.isNotBlank() && it.value.isNotBlank() }
+            .joinToString("; ") { "${it.key}=${it.value}" }
+
+    private fun captureWebsiteCookies(headers: Headers) {
+        headers.values("Set-Cookie").forEach { raw ->
+            val pair = raw.substringBefore(';').trim()
+            val separator = pair.indexOf('=')
+            if (separator <= 0) return@forEach
+
+            val name = pair.substring(0, separator).trim()
+            val value = pair.substring(separator + 1).trim()
+            if (name.isNotBlank() && value.isNotBlank()) {
+                websiteCookies[name] = value
+            }
+        }
+    }
+
+    private fun captureRuntimeTokens(html: String) {
+        if (html.isBlank()) return
+
+        val tokenRegex = Regex(
+            """(?is)[\"'](token|apiToken)[\"']\s*[:=]\s*[\"'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)[\"']"""
+        )
+
+        tokenRegex.findAll(
+            html
+                .replace("\\u0022", "\"")
+                .replace("\\u003A", ":")
+        ).forEach { match ->
+            websiteCookies[match.groupValues[1]] = match.groupValues[2]
+        }
+    }
+
+    private suspend fun ensureWebsiteSession() {
+        if (websiteCookies.containsKey("token") || websiteCookies.containsKey("apiToken")) return
+
+        val response = runCatching {
+            app.get(
+                "$mainUrl/",
+                headers = browserHeaders("$mainUrl/") + mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "same-origin",
+                    "Upgrade-Insecure-Requests" to "1"
+                )
+            )
+        }.getOrNull() ?: return
+
+        if (response.code in 200..399) {
+            captureWebsiteCookies(response.headers)
+            captureRuntimeTokens(response.text)
+        }
+    }
+
+    private fun websiteH5Headers(referer: String = "$mainUrl/"): MutableMap<String, String> {
+        val headers = linkedMapOf(
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "User-Agent" to (browserHeaders()["User-Agent"] ?: "Mozilla/5.0"),
+            "Accept-Language" to "en-US,en;q=0.9,hi;q=0.8,bn;q=0.7",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "X-Request-Lang" to "en",
+            "X-Client-Info" to "{\"timezone\":\"UTC\"}",
+            "Origin" to mainUrl,
+            "Referer" to referer,
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin"
+        )
+
+        websiteCookieHeader().takeIf { it.isNotBlank() }?.let {
+            headers["Cookie"] = it
+        }
+
+        val bearer = websiteCookies["token"]
+            ?.takeIf { it.startsWith("eyJ") }
+            ?: websiteCookies["apiToken"]
+                ?.takeIf { it.startsWith("eyJ") }
+
+        bearer?.let { headers["Authorization"] = "Bearer $it" }
+        return headers
+    }
 
     private suspend fun apiGetJson(
         path: String,
@@ -1144,6 +1240,7 @@ class MovieBox : MainAPI() {
         query: String,
         pageSize: Int = SEARCH_RESULT_LIMIT
     ): List<SiteItem> {
+        ensureWebsiteSession()
         val endpoint = "$mainUrl/wefeed-h5api-bff/subject/everyone-search"
         val variants = listOf(
             mapOf("keyword" to query, "page" to "0", "perPage" to pageSize.toString()),
@@ -1160,13 +1257,8 @@ class MovieBox : MainAPI() {
             val response = runCatching {
                 app.get(
                     addCacheBuster("$endpoint?$queryString"),
-                    headers = apiHeaders().toMutableMap().apply {
+                    headers = websiteH5Headers("$mainUrl/").apply {
                         this["Accept"] = "application/json"
-                        this["Content-Type"] = "application/json"
-                        this["X-Request-Lang"] = "en"
-                        this["X-Client-Info"] = "{\"timezone\":\"UTC\"}"
-                        this["Origin"] = mainUrl
-                        this["Referer"] = "$mainUrl/"
                     }
                 )
             }.getOrNull() ?: continue
@@ -1379,6 +1471,7 @@ class MovieBox : MainAPI() {
         fallbackDocument: Document?
     ): List<Episode> {
         val counts = LinkedHashMap<Int, Int>()
+
         metadata?.seasons?.forEach { (season, count) ->
             if (count > 0) counts[season] = count
         }
@@ -1389,14 +1482,44 @@ class MovieBox : MainAPI() {
             }
         }
 
-        if (counts.isEmpty()) {
-            for (season in 1..20) {
-                val count = discoverEpisodeCount(subjectId, detailPath, season, 100)
-                if (count > 0) {
-                    counts[season] = count
-                } else if (season > 1 && counts.isNotEmpty()) {
-                    break
+        /*
+         * Do not trust a parsed season count blindly. Validate/extend it against
+         * the website's real per-episode play endpoint. This keeps the list
+         * dynamic while still preserving metadata counts when a later episode is
+         * temporarily unavailable to the probe.
+         */
+        if (counts.isNotEmpty()) {
+            val known = counts.toMap()
+            known.forEach { (season, seedCount) ->
+                val discovered = runCatching {
+                    discoverEpisodeCount(
+                        subjectId = subjectId,
+                        detailPath = detailPath,
+                        season = season,
+                        maxProbe = maxOf(32, seedCount + 16)
+                    )
+                }.getOrDefault(0)
+
+                if (discovered > 0) {
+                    counts[season] = maxOf(seedCount, discovered)
                 }
+            }
+        }
+
+        /*
+         * Discover additional seasons that were not represented in SSR metadata.
+         * A missing first episode ends the contiguous season scan.
+         */
+        val firstMissingSeason = (1..20).firstOrNull { season -> !counts.containsKey(season) } ?: 21
+        for (season in firstMissingSeason..20) {
+            val count = runCatching {
+                discoverEpisodeCount(subjectId, detailPath, season, 100)
+            }.getOrDefault(0)
+
+            if (count > 0) {
+                counts[season] = count
+            } else if (counts.isNotEmpty()) {
+                break
             }
         }
 
@@ -1511,6 +1634,8 @@ class MovieBox : MainAPI() {
     }
 
     private suspend fun websitePlayGet(params: Map<String, String>): JsonNode? {
+        ensureWebsiteSession()
+
         val query = params.entries.joinToString("&") { (key, value) ->
             "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
         }
@@ -1519,18 +1644,12 @@ class MovieBox : MainAPI() {
         val response = runCatching {
             app.get(
                 url,
-                headers = apiHeaders().toMutableMap().apply {
-                    this["Accept"] = "application/json"
-                    this["X-Request-Lang"] = "en"
-                    this["X-Client-Info"] = "{\"timezone\":\"UTC\"}"
-                    this["Origin"] = mainUrl
-                    this["Referer"] = "$mainUrl/"
-                    this["Sec-Fetch-Dest"] = "empty"
-                    this["Sec-Fetch-Mode"] = "cors"
-                    this["Sec-Fetch-Site"] = "same-origin"
-                }
+                headers = websiteH5Headers("$mainUrl/")
             )
         }.getOrNull() ?: return null
+
+        captureWebsiteCookies(response.headers)
+        captureRuntimeTokens(response.text)
 
         if (response.code !in 200..399) return null
         val json = runCatching { jsonMapper.readTree(response.text) }.getOrNull() ?: return null
@@ -2802,7 +2921,7 @@ class MovieBox : MainAPI() {
      * SEARCH RANKING
      * ------------------------------------------------------------
      *
-     * Hindi > English > Bangla > Other.
+     * Hindi > Bangla > Other labelled languages > Main/unlabelled.
      *
      * No duplicate filtering is applied.
      */
@@ -2848,9 +2967,9 @@ class MovieBox : MainAPI() {
     private fun languageRank(text: String): Int {
         val normalized = normalizeSearch(text)
         if (Regex("""\b(hindi|hindi dubbed|hindi audio|dubbed in hindi)\b""").containsMatchIn(normalized) || text.contains("हिन्दी") || text.contains("हिंदी")) return 1
-        if (Regex("""\b(bangla|bengali|bangla dubbed|bangla audio)\b""").containsMatchIn(normalized) || text.contains("বাংলা") || text.contains("বাঙ্গালী")) return 3
-        if (Regex("""(?i)(?:\[|\(|-|\s)(english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\b""").containsMatchIn(normalized)) return 4
-        return 2
+        if (Regex("""\b(bangla|bengali|bangla dubbed|bangla audio)\b""").containsMatchIn(normalized) || text.contains("বাংলা") || text.contains("বাঙ্গালী")) return 2
+        if (Regex("""(?i)(?:\[|\(|-|\s)(english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\b""").containsMatchIn(normalized)) return 3
+        return 4
     }
 
     private fun searchScore(
@@ -3186,6 +3305,9 @@ class MovieBox : MainAPI() {
             ) {
                 continue
             }
+
+            captureWebsiteCookies(response.headers)
+            captureRuntimeTokens(response.text)
 
             return MirrorPage(
                 domain = domain,
