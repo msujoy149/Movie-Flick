@@ -98,6 +98,20 @@ jobs:
           cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
              "$GITHUB_WORKSPACE/build-output/plugins.json"
 
+          # repo.json belongs in the published builds directory.
+          # The previous workflow forgot to create/copy it, which caused:
+          # "repo.json missing" in the Copy build files step.
+          cat > "$GITHUB_WORKSPACE/build-output/repo.json" <<EOF
+          {
+            "name": "movieflick",
+            "description": "movieflick CloudStream Extensions | 149",
+            "manifestVersion": 1,
+            "pluginLists": [
+              "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/plugins.json"
+            ]
+          }
+          EOF
+
           # Rebuild only the MovieBox entry in plugins.json so the
           # published metadata points at our direct MovieBox.cs3.
           python3 - "$GITHUB_WORKSPACE/build-output/plugins.json" "$PUBLISHED" "$GITHUB_REPOSITORY" <<'PY'
@@ -167,6 +181,13 @@ jobs:
 
           echo "=== build-output ==="
           ls -lah "$GITHUB_WORKSPACE/build-output"
+
+          test -f "$GITHUB_WORKSPACE/build-output/repo.json"
+          test -f "$GITHUB_WORKSPACE/build-output/plugins.json"
+          test -f "$GITHUB_WORKSPACE/build-output/MovieBox.cs3"
+
+          echo "=== repo.json ==="
+          cat "$GITHUB_WORKSPACE/build-output/repo.json"
 
       - name: Prepare builds branch
         run: |
