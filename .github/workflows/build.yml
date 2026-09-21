@@ -115,6 +115,7 @@ jobs:
           # Rebuild only the MovieBox entry in plugins.json so the
           # published metadata points at our direct MovieBox.cs3.
           python3 - "$GITHUB_WORKSPACE/build-output/plugins.json" "$PUBLISHED" "$GITHUB_REPOSITORY" <<'PY'
+          import base64
           import hashlib
           import json
           import pathlib
@@ -136,10 +137,10 @@ jobs:
           ]
 
           raw = cs3_path.read_bytes()
-
-          # CloudStream expects: sha256-<lowercase hexadecimal digest>
-          # (NOT a base64-encoded digest).
-          file_hash = "sha256-" + hashlib.sha256(raw).hexdigest()
+          file_hash = (
+              "sha256-"
+              + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii")
+          )
 
           plugins.append({
               "iconUrl": "https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png",
@@ -151,7 +152,7 @@ jobs:
               "language": "hi",
               "authors": ["NivinCNC", "Movie-Flick"],
               "tvTypes": ["Movie", "TvSeries"],
-              "version": 50,
+              "version": 52,
               "internalName": "MovieBox",
               "description": "Multi Language Movies and Series Provider",
               "url": f"https://raw.githubusercontent.com/{repository}/builds/MovieBox.cs3",
