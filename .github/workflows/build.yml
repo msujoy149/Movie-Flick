@@ -1,15 +1,13 @@
 name: Build
 
 concurrency:
-  group: "build"
+  group: build
   cancel-in-progress: true
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - "*.md"
 
 permissions:
   contents: write
@@ -40,10 +38,8 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -78,98 +74,58 @@ jobs:
 
           test -f "$SRC/build/plugins.json"
 
-          # Copy normal Gradle-built plugins.
-          # Do NOT use find -exec here: YAML/shell escaping was causing
-          # "find: missing argument to `-exec'".
-          while IFS= read -r -d '' artifact; do
-            case "$artifact" in
-              "$SRC/MovieBox/MovieBox_NoSupportAd_v52.cs3"|
-              "$SRC/MovieBox/MovieBoxPrebuilt.cs3"|
-              "$SRC/MovieBox/prebuilt/MovieBox_NoSupportAd_v52.cs3"|
-              "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3"|
-              "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3.bin")
-                continue
-                ;;
-            esac
-            cp -f "$artifact" "$OUT/"
-          done < <(find "$SRC" -type f -name "*.cs3" -print0)
+          # Copy compiled plugins produced by Gradle.
+          find "$SRC" -type f -name "*.cs3" -not -path "$SRC/MovieBox/MovieBox_NoSupportAd_v52.cs3" -exec cp -f -t "$OUT" {} +
 
-          # Locate the MovieBox runtime artifact. The current repository
-          # screenshot shows MovieBox_NoSupportAd_v52.cs3, but both names
-          # are accepted so the build is not tied to one filename.
-          PREBUILT=""
-          CANDIDATES=(
-            "$SRC/MovieBox/MovieBox_NoSupportAd_v52.cs3"
-            "$SRC/MovieBox/MovieBoxPrebuilt.cs3"
-            "$SRC/MovieBox/prebuilt/MovieBox_NoSupportAd_v52.cs3"
-            "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3"
-            "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3.bin"
-          )
-
-          for candidate in "${CANDIDATES[@]}"; do
-            if [ -f "$candidate" ]; then
-              PREBUILT="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$PREBUILT" ]; then
-            echo "ERROR: MovieBox runtime artifact not found."
-            echo "Checked:"
-            printf '  %s\n' "${CANDIDATES[@]}"
+          # Current repository filename, as shown in GitHub.
+          if [ -f "$SRC/MovieBox/MovieBox_NoSupportAd_v52.cs3" ]; then
+            cp -f "$SRC/MovieBox/MovieBox_NoSupportAd_v52.cs3" "$OUT/MovieBox.cs3"
+          elif [ -f "$SRC/MovieBox/MovieBoxPrebuilt.cs3" ]; then
+            cp -f "$SRC/MovieBox/MovieBoxPrebuilt.cs3" "$OUT/MovieBox.cs3"
+          elif [ -f "$SRC/MovieBox/prebuilt/MovieBox_NoSupportAd_v52.cs3" ]; then
+            cp -f "$SRC/MovieBox/prebuilt/MovieBox_NoSupportAd_v52.cs3" "$OUT/MovieBox.cs3"
+          elif [ -f "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3" ]; then
+            cp -f "$SRC/MovieBox/prebuilt/MovieBoxPrebuilt.cs3" "$OUT/MovieBox.cs3"
+          else
+            echo "ERROR: MovieBox runtime file is missing from the repository."
             exit 1
           fi
 
-          echo "Using MovieBox runtime: $PREBUILT"
-
-          PUBLISHED="$OUT/MovieBox.cs3"
-          cp -f "$PREBUILT" "$PUBLISHED"
-
-          # Start from the generated plugin list and replace any previous
-          # MovieBox entry with our single direct MovieBox artifact.
           cp -f "$SRC/build/plugins.json" "$OUT/plugins.json"
 
-          cat > "$OUT/repo.json" <<EOF
-          {
-            "name": "movieflick",
-            "description": "movieflick CloudStream Extensions | 149",
-            "manifestVersion": 1,
-            "pluginLists": [
-              "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/plugins.json"
-            ]
-          }
-          EOF
+          printf '%s\n' \
+            '{' \
+            '  "name": "movieflick",' \
+            '  "description": "movieflick CloudStream Extensions | 149",' \
+            '  "manifestVersion": 1,' \
+            '  "pluginLists": [' \
+            "    \"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/plugins.json\"" \
+            '  ]' \
+            '}' > "$OUT/repo.json"
 
-          python3 - "$OUT/plugins.json" "$PUBLISHED" "$GITHUB_REPOSITORY" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import sys
+          # Replace every old MovieBox entry with one published entry.
+          MOVIEBOX_HASH="sha256-$(sha256sum "$OUT/MovieBox.cs3" | cut -d" " -f1)"
+          MOVIEBOX_SIZE="$(wc -c < "$OUT/MovieBox.cs3" | tr -d " ")"
+          MOVIEBOX_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/MovieBox.cs3"
+          MOVIEBOX_ICON="https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png"
 
-          plugins_path = pathlib.Path(sys.argv[1])
-          cs3_path = pathlib.Path(sys.argv[2])
-          repository = sys.argv[3]
-
-          plugins = json.loads(plugins_path.read_text(encoding="utf-8"))
-
-          plugins = [
-              plugin for plugin in plugins
-              if plugin.get("internalName") not in {
-                  "MovieBox",
-                  "MovieBoxProvider",
-                  "MovieBoxProviderIN",
-              }
-          ]
-
-          raw = cs3_path.read_bytes()
-          file_hash = "sha256-" + hashlib.sha256(raw).hexdigest()
-
-          plugins.append({
-              "iconUrl": "https://github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/raw/refs/heads/master/Logos/MovieBoxProvider/icon.png",
-              "fileHash": file_hash,
+          jq \
+            --arg hash "$MOVIEBOX_HASH" \
+            --arg url "$MOVIEBOX_URL" \
+            --arg icon "$MOVIEBOX_ICON" \
+            --argjson size "$MOVIEBOX_SIZE" \
+            '
+            map(select(
+              (.internalName // "") != "MovieBox" and
+              (.internalName // "") != "MovieBoxProvider" and
+              (.internalName // "") != "MovieBoxProviderIN"
+            ))
+            + [{
+              "iconUrl": $icon,
+              "fileHash": $hash,
               "apiVersion": 1,
-              "repositoryUrl": f"https://github.com/{repository}",
-              "fileSize": len(raw),
+              "repositoryUrl": ("https://github.com/" + env.GITHUB_REPOSITORY),
+              "fileSize": $size,
               "status": 1,
               "language": "hi",
               "authors": ["NivinCNC", "Movie-Flick"],
@@ -177,43 +133,22 @@ jobs:
               "version": 52,
               "internalName": "MovieBox",
               "description": "Multi Language Movies and Series Provider",
-              "url": f"https://raw.githubusercontent.com/{repository}/builds/MovieBox.cs3",
+              "url": $url,
               "name": "MovieBox"
-          })
+            }]
+            ' "$OUT/plugins.json" > "$OUT/plugins.json.tmp"
 
-          plugins_path.write_text(
-              json.dumps(plugins, ensure_ascii=False, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          PY
+          mv "$OUT/plugins.json.tmp" "$OUT/plugins.json"
 
-          echo "=== Build output ==="
-          ls -lah "$OUT"
-
+          jq -e 'any(.[]; .internalName == "MovieBox")' "$OUT/plugins.json" >/dev/null
           test -f "$OUT/repo.json"
           test -f "$OUT/plugins.json"
           test -f "$OUT/MovieBox.cs3"
 
-          echo "=== MovieBox metadata ==="
-          python3 - "$OUT/plugins.json" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              plugins = json.load(handle)
-
-          matches = [
-              plugin for plugin in plugins
-              if plugin.get("internalName") == "MovieBox"
-          ]
-
-          if len(matches) != 1:
-              raise SystemExit(
-                  f"Expected exactly one MovieBox entry, found {len(matches)}"
-              )
-
-          print(json.dumps(matches[0], ensure_ascii=False, indent=2))
-          PY
+          echo "MovieBox hash: $MOVIEBOX_HASH"
+          echo "MovieBox size: $MOVIEBOX_SIZE"
+          echo "Build output:"
+          ls -lah "$OUT"
 
       - name: Prepare builds branch
         run: |
@@ -222,15 +157,13 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf builds
 
-          git clone \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
-            builds
-
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" builds
           cd builds
 
-          if git ls-remote --exit-code --heads origin builds >/dev/null 2>&1; then
-            git fetch origin builds
-            git checkout builds
+          git fetch origin builds || true
+
+          if git show-ref --verify --quiet refs/remotes/origin/builds; then
+            git checkout -B builds origin/builds
             git rm -rf . || true
             git clean -fdx
           else
@@ -243,18 +176,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          cp -f "$GITHUB_WORKSPACE/build-output/"* \
-            "$GITHUB_WORKSPACE/builds/"
+          cp -f "$GITHUB_WORKSPACE/build-output/"* "$GITHUB_WORKSPACE/builds/"
 
           cd "$GITHUB_WORKSPACE/builds"
 
           test -f repo.json
           test -f plugins.json
           test -f MovieBox.cs3
-
-          echo "✓ repo.json"
-          echo "✓ plugins.json"
-          echo "✓ MovieBox.cs3"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
