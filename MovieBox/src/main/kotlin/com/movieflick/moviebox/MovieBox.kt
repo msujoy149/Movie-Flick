@@ -103,12 +103,6 @@ class MovieBox : MainAPI() {
         "Referer" to referer
     )
 
-    /** Exact browser-style TV player referer used by MovieBox H5. */
-    private fun websitePlayReferer(subjectId: String, detailPath: String): String {
-        val cleanPath = detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
-        return "$mainUrl/play/$cleanPath?id=${URLEncoder.encode(subjectId, "UTF-8")}&scene=&page_from=type_filter_tv&type=/movie/detail&tab=tv"
-    }
-
     /*
      * ------------------------------------------------------------
      * HOME
@@ -592,13 +586,13 @@ class MovieBox : MainAPI() {
         // MovieBox uses /play/<slug> for both Movie and TV. The TV player URL
         // itself carries tab=tv/page_from=type_filter_tv, which is the reliable
         // type signal for a /play route.
-        val contentType = typeFromUrl(url, path)
+        val urlContentType = typeFromUrl(url, path)
         val slug = contentSlug(path)
         val urlSubjectId = Regex("(?i)[?&]id=(\\d{8,25})\\b")
             .find(url)?.groupValues?.getOrNull(1)
 
         val candidatePaths = linkedSetOf<String>().apply {
-            when (contentType) {
+            when (urlContentType) {
                 TvType.TvSeries -> {
                     slug?.takeIf { it.isNotBlank() }?.let { add("/play/$it") }
                     add(path)
@@ -658,6 +652,16 @@ class MovieBox : MainAPI() {
         if (title.isBlank()) return null
 
         val subjectData = document?.let { extractWebsiteSubjectData(it, path, title) }
+
+        // /play/<slug> is shared by Movie and TV on MovieBox. When the URL
+        // itself has no TV marker (for example a search-result /play URL),
+        // trust the exact subjectType from Nuxt SSR metadata.
+        val contentType = if (path.startsWith("/play/", true) && subjectData?.subjectType == 2) {
+            TvType.TvSeries
+        } else {
+            urlContentType
+        }
+
         val poster = firstUsefulUrl(
             document?.selectFirst("meta[property=og:image]")?.attr("content"),
             document?.selectFirst("meta[name=twitter:image]")?.attr("content"),
@@ -1335,14 +1339,158 @@ class MovieBox : MainAPI() {
         val detailPath: String,
         val seasons: Map<Int, Int> = emptyMap(),
         val imdbRating: Double? = null,
-        val poster: String? = null
+        val poster: String? = null,
+        val subjectType: Int? = null
     )
+
+    /*
+     * MovieBox detail pages use Nuxt/devalue SSR data. Numeric values inside
+     * the SSR objects are references into the top-level __NUXT_DATA__ array;
+     * they are NOT the final values themselves. For example:
+     *
+     *   "subjectType": 13  -> root[13] == 2
+     *   "maxEp": 146       -> root[146] == 11
+     *
+     * Resolve those references before extracting TV metadata.
+     */
+    private fun extractNuxtWebsiteSubjectData(
+        document: Document,
+        contentPath: String,
+        title: String
+    ): WebsiteSubjectData? {
+        val script = document.selectFirst("script#__NUXT_DATA__") ?: return null
+        val raw = firstNonBlank(script.data(), script.html()).orEmpty()
+        if (raw.isBlank()) return null
+
+        val root = runCatching { jsonMapper.readTree(raw) }.getOrNull() ?: return null
+        if (!root.isArray) return null
+
+        fun resolve(node: JsonNode?): JsonNode? {
+            if (node == null) return null
+            if (node.isIntegralNumber) {
+                val index = node.intValue()
+                if (index >= 0 && index < root.size()) return root.get(index)
+            }
+            return node
+        }
+
+        fun text(node: JsonNode?): String? =
+            resolve(node)?.takeIf { it.isValueNode }?.asText()?.takeIf { it.isNotBlank() }
+
+        fun int(node: JsonNode?): Int? =
+            resolve(node)?.takeIf { it.isIntegralNumber }?.intValue()
+
+        val requestedId = Regex("""(?i)[?&]id=(\d{8,25})\b""")
+            .find(
+                firstNonBlank(
+                    document.selectFirst("meta[property=og:url]")?.attr("content"),
+                    document.selectFirst("link[rel=canonical]")?.attr("href")
+                ).orEmpty()
+            )
+            ?.groupValues
+            ?.getOrNull(1)
+
+        val normalizedTitle = normalizeSearch(title)
+        var bestScore = Int.MIN_VALUE
+        var bestSubject: JsonNode? = null
+        var bestResource: JsonNode? = null
+
+        for (i in 0 until root.size()) {
+            val record = root.get(i)
+            if (!record.isObject) continue
+
+            val subject = resolve(record.get("subject")) ?: continue
+            if (!subject.isObject) continue
+
+            val subjectId = text(subject.get("subjectId")) ?: continue
+            val detail = text(subject.get("detailPath")).orEmpty()
+            val subjectTitle = text(subject.get("title")).orEmpty()
+            val recordResource = resolve(record.get("resource"))
+
+            if (requestedId != null && subjectId != requestedId) continue
+
+            var score = 0
+            if (requestedId != null && subjectId == requestedId) score += 100
+            if (normalizedTitle.isNotBlank() && normalizeSearch(subjectTitle) == normalizedTitle) score += 40
+            if (contentPath.isNotBlank() && detail.equals(contentPath.substringAfterLast('/'), true)) score += 30
+            if (recordResource?.isObject == true && recordResource.has("seasons")) score += 50
+
+            if (score > bestScore) {
+                bestScore = score
+                bestSubject = subject
+                bestResource = recordResource
+            }
+        }
+
+        val subject = bestSubject ?: return null
+        val subjectId = text(subject.get("subjectId")) ?: return null
+        val detailPath = text(subject.get("detailPath"))
+            ?: contentSlug(contentPath)
+            ?: return null
+
+        val seasonCounts = linkedMapOf<Int, Int>()
+        val resource = bestResource
+
+        val seasons = resolve(resource?.get("seasons"))
+        if (seasons?.isArray == true) {
+            seasons.forEach { seasonRef ->
+                val seasonNode = resolve(seasonRef) ?: return@forEach
+                if (!seasonNode.isObject) return@forEach
+
+                val seasonNumber = int(seasonNode.get("se"))
+                    ?: int(seasonNode.get("season"))
+                    ?: 1
+
+                var count = int(seasonNode.get("maxEp"))
+                    ?: int(seasonNode.get("episodeCount"))
+                    ?: int(seasonNode.get("allEp"))
+                    ?: 0
+
+                val resolutions = resolve(seasonNode.get("resolutions"))
+                if (resolutions?.isArray == true) {
+                    resolutions.forEach { resolutionRef ->
+                        val resolution = resolve(resolutionRef)
+                        val epNum = int(resolution?.get("epNum"))
+                            ?: int(resolution?.get("episodeCount"))
+                            ?: 0
+                        if (epNum > count) count = epNum
+                    }
+                }
+
+                if (seasonNumber > 0 && count > 0) {
+                    seasonCounts[seasonNumber] = maxOf(
+                        seasonCounts[seasonNumber] ?: 0,
+                        count
+                    )
+                }
+            }
+        }
+
+        val cover = resolve(subject.get("cover"))
+        val poster = text(cover?.get("url"))
+            ?: text(cover?.get("src"))
+
+        val rating = text(subject.get("imdbRatingValue"))
+            ?.toDoubleOrNull()
+            ?.takeIf { it in 0.0..10.0 }
+
+        return WebsiteSubjectData(
+            subjectId = subjectId,
+            detailPath = detailPath,
+            seasons = seasonCounts,
+            imdbRating = rating,
+            poster = poster,
+            subjectType = int(subject.get("subjectType"))
+        )
+    }
 
     private fun extractWebsiteSubjectData(
         document: Document,
         contentPath: String,
         title: String
     ): WebsiteSubjectData? {
+        extractNuxtWebsiteSubjectData(document, contentPath, title)?.let { return it }
+
         val decoded = document.html()
             .replace("\\/", "/")
             .replace("\\u002F", "/")
@@ -1490,11 +1638,14 @@ class MovieBox : MainAPI() {
                 if (count > 0) counts[season] = maxOf(counts[season] ?: 0, count)
             }
 
-            // The exact subject object is not always the closest object to the
-            // subjectId in Nuxt/devalue SSR data. Scan the complete document as
-            // a metadata-only fallback before using any playback probe.
-            parseSeasonCounts(fallbackDocument.html()).forEach { (season, count) ->
-                if (count > 0) counts[season] = maxOf(counts[season] ?: 0, count)
+            // Do not apply the legacy regex parser to Nuxt/devalue pages:
+            // values such as "maxEp": 146 are references to root[146], not
+            // the literal episode count. The exact Nuxt parser above already
+            // resolves those references.
+            if (fallbackDocument.selectFirst("script#__NUXT_DATA__") == null) {
+                parseSeasonCounts(fallbackDocument.html()).forEach { (season, count) ->
+                    if (count > 0) counts[season] = maxOf(counts[season] ?: 0, count)
+                }
             }
         }
 
