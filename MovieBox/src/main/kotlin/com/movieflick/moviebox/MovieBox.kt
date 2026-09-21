@@ -583,7 +583,10 @@ class MovieBox : MainAPI() {
         val path = pathFromUrl(url)
         if (path.isBlank()) return null
 
-        val contentType = typeFromPath(path)
+        // MovieBox uses /play/<slug> for both Movie and TV. The TV player URL
+        // itself carries tab=tv/page_from=type_filter_tv, which is the reliable
+        // type signal for a /play route.
+        val contentType = typeFromUrl(url, path)
         val slug = contentSlug(path)
         val urlSubjectId = Regex("(?i)[?&]id=(\\d{8,25})\\b")
             .find(url)?.groupValues?.getOrNull(1)
@@ -664,9 +667,9 @@ class MovieBox : MainAPI() {
                 ?: subjectData?.subjectId
                 ?: findWebsiteSubjectId(title, contentType)
                 ?: findApiSubjectId(title)
-            val detailPath = contentSlug(path).orEmpty()
+            val detailPath = subjectData?.detailPath ?: contentSlug(path).orEmpty()
             val episodes = if (!subjectId.isNullOrBlank() && detailPath.isNotBlank()) {
-                fetchWebsiteEpisodes(subjectId, detailPath, title, subjectData, document)
+                fetchWebsiteEpisodes(subjectId, detailPath, subjectData, document)
             } else emptyList()
 
             return newTvSeriesLoadResponse(
@@ -682,7 +685,7 @@ class MovieBox : MainAPI() {
         }
 
         val subjectId = subjectData?.subjectId ?: urlSubjectId
-        val detailPath = contentSlug(path).orEmpty()
+        val detailPath = subjectData?.detailPath ?: contentSlug(path).orEmpty()
         val playbackData = if (!subjectId.isNullOrBlank() && detailPath.isNotBlank()) {
             "mbxcontent||$subjectId||$detailPath"
         } else canonicalUrl(path)
@@ -729,29 +732,11 @@ class MovieBox : MainAPI() {
         if (rawData.startsWith("mbxepisode||")) {
             val parts = rawData.split("||")
             if (parts.size >= 5) {
-                val subjectId = parts[1]
-                val detailPath = parts[2]
-                val season = parts[3].toIntOrNull() ?: 1
-                val episode = parts[4].toIntOrNull() ?: 1
-
-                if (resolveWebsitePlayback(
-                        subjectId = subjectId,
-                        detailPath = detailPath,
-                        season = season,
-                        episode = episode,
-                        subtitleCallback = subtitleCallback,
-                        callback = callback
-                    )
-                ) {
-                    return true
-                }
-
-                // Keep the previously-working resolver as a fallback. The
-                // H5 endpoint must not become a single point of failure.
-                return resolveApiPlayback(
-                    subjectId = subjectId,
-                    season = season,
-                    episode = episode,
+                return resolveWebsitePlayback(
+                    subjectId = parts[1],
+                    detailPath = parts[2],
+                    season = parts[3].toIntOrNull() ?: 1,
+                    episode = parts[4].toIntOrNull() ?: 1,
                     subtitleCallback = subtitleCallback,
                     callback = callback
                 )
@@ -972,13 +957,13 @@ class MovieBox : MainAPI() {
         }
     }
 
-    private suspend fun ensureWebsiteSession(referer: String = "$mainUrl/") {
+    private suspend fun ensureWebsiteSession() {
         if (websiteCookies.containsKey("token") || websiteCookies.containsKey("apiToken")) return
 
         val response = runCatching {
             app.get(
-                referer,
-                headers = browserHeaders(referer) + mapOf(
+                "$mainUrl/",
+                headers = browserHeaders("$mainUrl/") + mapOf(
                     "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Sec-Fetch-Dest" to "document",
                     "Sec-Fetch-Mode" to "navigate",
@@ -1434,13 +1419,13 @@ class MovieBox : MainAPI() {
     private fun parseSeasonCounts(context: String): Map<Int, Int> {
         val counts = LinkedHashMap<Int, Int>()
         val countRegex = Regex(
-            """(?i)["']?(?:maxEp|maxEpisode|episodeCount|episodesAvailable|totalEpisode|allEp)["']?\s*(?:[:=,]|\b)\s*["']?(\d{1,4})"""
+            """(?i)["']?(?:maxEp|maxEpisode|episodeCount|episodesAvailable|totalEpisode|allEp)["']?\s*[:=]\s*["']?(\d{1,4})"""
         )
         val epRegex = Regex(
-            """(?i)["']?epNum["']?\s*(?:[:=,]|\b)\s*["']?(\d{1,4})"""
+            """(?i)["']?epNum["']?\s*[:=]\s*["']?(\d{1,4})"""
         )
         val seasonRegex = Regex(
-            """(?i)["']?(?:seasonNumber|season|se)["']?\s*(?:[:=,]|\b)\s*["']?(\d{1,3})"""
+            """(?i)["']?(?:seasonNumber|season|se)["']?\s*[:=]\s*["']?(\d{1,3})"""
         )
 
         fun seasonNear(position: Int): Int {
@@ -1485,7 +1470,6 @@ class MovieBox : MainAPI() {
     private suspend fun fetchWebsiteEpisodes(
         subjectId: String,
         detailPath: String,
-        seriesTitle: String,
         metadata: WebsiteSubjectData?,
         fallbackDocument: Document?
     ): List<Episode> {
@@ -1495,77 +1479,49 @@ class MovieBox : MainAPI() {
             if (count > 0) counts[season] = count
         }
 
-        if (counts.isEmpty() && fallbackDocument != null) {
-            extractWebsiteSubjectData(fallbackDocument, detailPath, seriesTitle)
-                ?.seasons
-                ?.forEach { (season, count) ->
-                    if (count > 0) counts[season] = count
-                }
-
-            // Keep the list independent from subject-data matching. Some Nuxt
-            // pages expose maxEp/epNum in the SSR payload even when the nearest
-            // subject object cannot be reconstructed perfectly.
-            parseSeasonCounts(fallbackDocument.html()).forEach { (season, count) ->
+        if (fallbackDocument != null) {
+            extractWebsiteSubjectData(fallbackDocument, detailPath, "")?.seasons?.forEach { (season, count) ->
                 if (count > 0) counts[season] = maxOf(counts[season] ?: 0, count)
             }
 
-            val visibleCount = Regex("(?i)\\b(\\d{1,4})\\s+Episodes?\\b")
-                .find(fallbackDocument.text())
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
-                ?.takeIf { it > 0 }
-
-            if (visibleCount != null) {
-                counts[1] = maxOf(counts[1] ?: 0, visibleCount)
+            // The exact subject object is not always the closest object to the
+            // subjectId in Nuxt/devalue SSR data. Scan the complete document as
+            // a metadata-only fallback before using any playback probe.
+            parseSeasonCounts(fallbackDocument.html()).forEach { (season, count) ->
+                if (count > 0) counts[season] = maxOf(counts[season] ?: 0, count)
             }
         }
 
-        // Metadata is the episode-list source of truth. Do NOT gate the list
-        // on a playback probe: a temporary H5 auth/network failure must never
-        // turn a real series into "No Episodes Found".
-        if (counts.isEmpty()) {
-            val apiEpisodes = runCatching {
-                fetchApiEpisodes(subjectId, seriesTitle)
-            }.getOrDefault(emptyList())
+        /*
+         * Discover additional seasons that were not represented in SSR metadata.
+         * A missing first episode ends the contiguous season scan.
+         */
+        val firstMissingSeason = (1..20).firstOrNull { season -> !counts.containsKey(season) } ?: 21
+        for (season in firstMissingSeason..20) {
+            val count = runCatching {
+                discoverEpisodeCount(subjectId, detailPath, season, 100)
+            }.getOrDefault(0)
 
-            apiEpisodes.forEach { episode ->
-                val season = episode.season ?: 1
-                val number = episode.episode ?: return@forEach
-                counts[season] = maxOf(counts[season] ?: 0, number)
+            if (count > 0) {
+                counts[season] = count
+            } else if (counts.isNotEmpty()) {
+                break
             }
         }
 
-        // Only when neither SSR nor the legacy episode metadata gives us a
-        // count do we use the verified H5 play endpoint as a discovery fallback.
-        if (counts.isEmpty()) {
-            for (season in 1..20) {
-                val count = runCatching {
-                    discoverEpisodeCount(subjectId, detailPath, season, 100)
-                }.getOrDefault(0)
+        if (counts.isEmpty()) return emptyList()
 
-                if (count > 0) {
-                    counts[season] = count
-                } else if (season > 1) {
-                    break
+        return counts.toSortedMap().flatMap { (season, count) ->
+            (1..count).map { episode ->
+                newEpisode(
+                    data = "mbxepisode||$subjectId||$detailPath||$season||$episode"
+                ) {
+                    name = "Episode $episode"
+                    this.season = season
+                    this.episode = episode
                 }
             }
         }
-
-        return counts
-            .filterValues { it > 0 }
-            .toSortedMap()
-            .flatMap { (season, count) ->
-                (1..count).map { episode ->
-                    newEpisode(
-                        data = "mbxepisode||$subjectId||$detailPath||$season||$episode"
-                    ) {
-                        name = "Episode $episode"
-                        this.season = season
-                        this.episode = episode
-                    }
-                }
-            }
     }
 
     private suspend fun discoverEpisodeCount(
@@ -1614,7 +1570,7 @@ class MovieBox : MainAPI() {
                 "subjectId" to subjectId,
                 "se" to season.toString(),
                 "ep" to episode.toString(),
-                "detailPath" to detailPath
+                "detailPath" to detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
             ),
             websitePlayReferer(subjectId, detailPath)
         ) ?: return false
@@ -1666,16 +1622,12 @@ class MovieBox : MainAPI() {
         return true
     }
 
-    private fun websitePlayReferer(subjectId: String, detailPath: String): String {
-        val path = detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
-        val id = URLEncoder.encode(subjectId, "UTF-8")
-        return "$mainUrl/play/$path?id=$id&scene=&page_from=type_filter_tv&type=/movie/detail&tab=tv"
-    }
-
     private suspend fun websitePlayGet(
         params: Map<String, String>,
         referer: String = "$mainUrl/"
     ): JsonNode? {
+        ensureWebsiteSession(referer)
+
         val query = params.entries.joinToString("&") { (key, value) ->
             "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
         }
@@ -1683,25 +1635,20 @@ class MovieBox : MainAPI() {
 
         suspend fun request(): JsonNode? {
             val response = runCatching {
-                app.get(
-                    url,
-                    headers = websiteH5Headers(referer)
-                )
+                app.get(url, headers = websiteH5Headers(referer))
             }.getOrNull() ?: return null
 
             captureWebsiteCookies(response.headers)
             captureRuntimeTokens(response.text)
-
             if (response.code !in 200..399) return null
+
             val json = runCatching { jsonMapper.readTree(response.text) }.getOrNull() ?: return null
-            return if (json.path("code").asInt(-1) == 0) json else null
+            return json.takeIf { it.path("code").asInt(-1) == 0 }
         }
 
-        ensureWebsiteSession(referer)
         request()?.let { return it }
 
-        // One clean retry handles an expired/stale web token without adding a
-        // permanent cache or making playback depend on a single session.
+        // Refresh once if the short-lived website token/session has expired.
         websiteCookies.clear()
         ensureWebsiteSession(referer)
         return request()
@@ -1714,13 +1661,11 @@ class MovieBox : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (subjectId.isBlank() || detailPath.isBlank()) return false
-        val cleanDetailPath = detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
         val json = websitePlayGet(
             mapOf(
                 "subjectId" to subjectId,
-                "detailPath" to cleanDetailPath
-            ),
-            websitePlayReferer(subjectId, cleanDetailPath)
+                "detailPath" to detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
+            )
         ) ?: return false
 
         val found = linkedMapOf<String, MediaSource>()
@@ -3558,6 +3503,30 @@ class MovieBox : MainAPI() {
         }
     }
 
+    private fun typeFromUrl(
+        url: String,
+        path: String
+    ): TvType {
+        val lowerUrl = url.lowercase(Locale.ROOT)
+        if (path.startsWith("/tv-series/", true)) return TvType.TvSeries
+        if (path.startsWith("/animated-series/", true)) return TvType.Anime
+        if (path.startsWith("/film/", true) || path.startsWith("/movies/", true)) return TvType.Movie
+
+        if (lowerUrl.contains("page_from=type_filter_tv") ||
+            lowerUrl.contains("type_filter_tv") ||
+            Regex("(?i)[?&]tab=tv(?:[&#]|$)").containsMatchIn(lowerUrl)) {
+            return TvType.TvSeries
+        }
+
+        if (lowerUrl.contains("page_from=type_filter_animated") ||
+            lowerUrl.contains("type_filter_animation") ||
+            Regex("(?i)[?&]tab=animated(?:[&#]|$)").containsMatchIn(lowerUrl)) {
+            return TvType.Anime
+        }
+
+        return typeFromPath(path)
+    }
+
     private fun typeFromPath(
         path: String
     ): TvType {
@@ -4023,7 +3992,7 @@ class MovieBox : MainAPI() {
 
         val match =
             Regex(
-                """(?i)(2160|1440|1080|720|576|480|360)\s*p?\b"""
+                """(?i)(2160|1440|1080|720|576|480|360)p"""
             ).find(text)
 
         return match
