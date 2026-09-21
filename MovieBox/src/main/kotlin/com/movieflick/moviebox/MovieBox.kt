@@ -1779,6 +1779,11 @@ class MovieBox : MainAPI() {
         return true
     }
 
+    private fun websitePlayReferer(subjectId: String, detailPath: String): String {
+        val cleanPath = detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
+        return "$mainUrl/play/${cleanPath}?id=${URLEncoder.encode(subjectId, "UTF-8")}&scene=&page_from=type_filter_tv&type=/movie/detail&tab=tv"
+    }
+
     private suspend fun websitePlayGet(
         params: Map<String, String>,
         referer: String = "$mainUrl/"
