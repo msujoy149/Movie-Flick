@@ -1,353 +1,351 @@
 [
-    {
-        "jarFileSize": 251610,
-        "fileHash": "sha256-8f1d74390fddb66c2e87e41949a166ede9f7b3b3fe52e07abb9a5cfe9b3109d3",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 55786,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 13,
-        "internalName": "BasPlayFTP",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.jar",
-        "description": "Bas Play FTP provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.cs3",
-        "name": "BasPlayFTP",
-        "jarHash": "sha256-a2cf7ce329a32378fb7d3173fb3d87540303d2790dc7029408a81365ec50911e"
-    },
-    {
-        "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
-        "jarFileSize": 234664,
-        "fileHash": "sha256-0cfd98b7f0860736cf85627bc78fb340fb43d48eb9b25379d8521de2325b241d",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 66371,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 1,
-        "internalName": "CinePlexFTP",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.jar",
-        "description": "Cine Plex FTP provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.cs3",
-        "name": "CinePlexFTP",
-        "jarHash": "sha256-e69c2a8c845ed0eb8892fbc39c30ec7f2659c7a1e5d8c537dd5af78e6e84a710"
-    },
-    {
-        "iconUrl": "https://i.postimg.cc/QMxBDF9T/favicon-V2.png",
-        "jarFileSize": 257599,
-        "fileHash": "sha256-c3dd547d2e5976970d4fe2a75fd64e37bb2a89a8a598bdf954b2c176efb40cb3",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 77942,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 12,
-        "internalName": "CTGFTP",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.jar",
-        "description": "CTG FTP provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.cs3",
-        "name": "CTGFTP",
-        "jarHash": "sha256-aecd090d48f3b455785bd6d26b17b0cdc3d3ab4bf25ca85a23fcbf62c8b3379f"
-    },
-    {
-        "fileHash": "sha256-fd676cc4a3b827beb5426ce4eabf1756d58dd225aa75ea16d290fbcf66d84be2",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 171071,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 2,
-        "internalName": "DhakaFTP",
-        "description": "Dhaka FTP",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DhakaFTP.cs3",
-        "name": "DhakaFTP"
-    },
-    {
-        "jarFileSize": 327444,
-        "fileHash": "sha256-78edb8e58a5fa7c4f1091cafe8c46b9f87fad035a7e03530c5d25e6097f2a807",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 73613,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 1,
-        "internalName": "DiscoveryFTP",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DiscoveryFTP.jar",
-        "description": "Discovery FTP provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DiscoveryFTP.cs3",
-        "name": "DiscoveryFTP",
-        "jarHash": "sha256-cdae5b0325478834c3396018ed3c0ff1958c81c62cc7c8d66310b796d250bb8f"
-    },
-    {
-        "iconUrl": "https://hianime.at/theme/images/icons-192.png",
-        "jarFileSize": 194866,
-        "fileHash": "sha256-a4119d56d65ca0ec59d87a8781f98ac23992ce20d994382f18c2218408fb1b34",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 57014,
-        "status": 1,
-        "language": "en",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 1,
-        "internalName": "HiAnime",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.jar",
-        "description": "Hi Anime provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.cs3",
-        "name": "HiAnime",
-        "jarHash": "sha256-9b7f154195477a1c30dbebf64007aa8a78e2d1989d45ae56c2c3e7446534191f"
-    },
-    {
-        "jarFileSize": 110432,
-        "fileHash": "sha256-aed9a374f0e18880b91a63b0e2e7f52dca21798944ac6d17982f9f40a549cea0",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 32634,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 16,
-        "internalName": "KhulnaPlex",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.jar",
-        "description": "Khulna Plex provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.cs3",
-        "name": "KhulnaPlex",
-        "jarHash": "sha256-75e8f5a738d7a2c55daf3112033a1a71db8715cc0cd5da840d2cf6b6f499c091"
-    },
-    {
-        "iconUrl": "https://www.mojaloss.stream/favicon.png",
-        "jarFileSize": 211467,
-        "fileHash": "sha256-b99916097ad331d0d3c300cbf55123f2084cfca81981747acd9906fd145aed15",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 52986,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 1,
-        "internalName": "MojaLoss",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.jar",
-        "description": "Moja Loss provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.cs3",
-        "name": "MojaLoss",
-        "jarHash": "sha256-811760aa816306acea1878bd51c9584c2856ffab0e73c7e5f9667c7693ded828"
-    },
-    {
-        "iconUrl": "https://h5-static.aoneroom.com/ssrStatic/club/public/_nuxt/logo.DMnCL3zY.svg",
-        "fileHash": "sha256-4bbc93b4b18c0616347526ba654d487d6d3abfa3b960fb34a08befdafe0ed0d4",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 1929,
-        "status": 1,
-        "language": "hi",
-        "authors": [
-            "NivinCNC",
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries"
-        ],
-        "version": 51,
-        "internalName": "MovieBox",
-        "description": "Multi Language Movies and Series Provider",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
-        "name": "MovieBox"
-    },
-    {
-        "jarFileSize": 152303,
-        "fileHash": "sha256-2397f44e4f40b68c1953e0f87f69c6a36bae26e9d4a6811767289b642ffb2368",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 36557,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries"
-        ],
-        "version": 1,
-        "internalName": "MovieHaat",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieHaat.jar",
-        "description": "Movie Haat provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieHaat.cs3",
-        "name": "MovieHaat",
-        "jarHash": "sha256-0a1d5da679251f3fec6a881fd5bb135928f77f3c9e228e8164523bdb07dc4921"
-    },
-    {
-        "iconUrl": "https://movielinkbd.tv/favicon.png",
-        "jarFileSize": 258515,
-        "fileHash": "sha256-31140e13fe71ed04506e5eda9acba250c77e5bd38ee184a5f8b7fbe2eec362c9",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 59402,
-        "status": 1,
-        "language": "bn",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 1,
-        "internalName": "MovieLinkBD",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.jar",
-        "description": "Movie Link BD provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.cs3",
-        "name": "MovieLinkBD",
-        "jarHash": "sha256-ce84b1c9511281d1c38451e86d484a8e26d35a1655bc597f13c62c7d38db42f4"
-    },
-    {
-        "iconUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/main/OnlineMovies/icon.png",
-        "fileHash": "sha256-ffca730811bb5b3a71303d1118d2b3c4fda9f0c3149741af7412857566064258",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 43598,
-        "status": 3,
-        "authors": [
-            
-        ],
-        "version": -1,
-        "internalName": "OnlineMovies",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/OnlineMovies.cs3",
-        "name": "OnlineMovies"
-    },
-    {
-        "jarFileSize": 502502,
-        "fileHash": "sha256-36009fb290dae24da8d7e611b4fec9198bea4abf380d2309724286ae02aae7a4",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 77046,
-        "status": 1,
-        "language": "hi",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Other",
-            "Live",
-            "TvSeries"
-        ],
-        "version": 1,
-        "internalName": "YouTube",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.jar",
-        "description": "YouTube provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
-        "name": "YouTube",
-        "jarHash": "sha256-6e23e7ce5e048372fa2e9b813184b780feced98bd430890cb599cb2ace75ba49"
-    },
-    {
-        "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
-        "jarFileSize": 285569,
-        "fileHash": "sha256-94cb0d143b971c0c81d7c2ad152ce200e453ce3e5e82599ef6040134434b7f06",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 62809,
-        "status": 1,
-        "language": "bn-IN",
-        "authors": [
-            "Movie-Flick"
-        ],
-        "tvTypes": [
-            "Other",
-            "TvSeries"
-        ],
-        "version": 11,
-        "internalName": "YouTubeKids",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.jar",
-        "description": "Bengali India YouTube Kids provider for Movie-Flick",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.cs3",
-        "name": "YouTubeKids",
-        "jarHash": "sha256-7f6e3aa78f8f4560c2383300ddb853487a4a084ecebffb866edfc12635839750"
-    },
-    {
-        "iconUrl": "https://zoryva.me/icon-512.png",
-        "jarFileSize": 1019465,
-        "fileHash": "sha256-7762f9b7625b78f7df584db32ce8453cfc135bbf7fc854f56ee95bc8d5499e86",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
-        "fileSize": 206087,
-        "status": 1,
-        "language": "hi",
-        "authors": [
-            "Zoryva"
-        ],
-        "tvTypes": [
-            "Movie",
-            "TvSeries",
-            "Anime"
-        ],
-        "version": 23,
-        "internalName": "Zoryva",
-        "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.jar",
-        "description": "Zoryva CloudStream provider",
-        "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.cs3",
-        "name": "Zoryva",
-        "jarHash": "sha256-d81ec1df9b6059320163ff5f6a66831011dac0332d06feba7da110d7aaa83afd"
-    }
+  {
+    "jarFileSize": 251610,
+    "fileHash": "sha256-8f1d74390fddb66c2e87e41949a166ede9f7b3b3fe52e07abb9a5cfe9b3109d3",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 55786,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 13,
+    "internalName": "BasPlayFTP",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.jar",
+    "description": "Bas Play FTP provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/BasPlayFTP.cs3",
+    "name": "BasPlayFTP",
+    "jarHash": "sha256-a2cf7ce329a32378fb7d3173fb3d87540303d2790dc7029408a81365ec50911e"
+  },
+  {
+    "iconUrl": "https://cineplexbd.net/favicon.png?v=2",
+    "jarFileSize": 234664,
+    "fileHash": "sha256-0cfd98b7f0860736cf85627bc78fb340fb43d48eb9b25379d8521de2325b241d",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 66371,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 1,
+    "internalName": "CinePlexFTP",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.jar",
+    "description": "Cine Plex FTP provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CinePlexFTP.cs3",
+    "name": "CinePlexFTP",
+    "jarHash": "sha256-e69c2a8c845ed0eb8892fbc39c30ec7f2659c7a1e5d8c537dd5af78e6e84a710"
+  },
+  {
+    "iconUrl": "https://i.postimg.cc/QMxBDF9T/favicon-V2.png",
+    "jarFileSize": 257599,
+    "fileHash": "sha256-c3dd547d2e5976970d4fe2a75fd64e37bb2a89a8a598bdf954b2c176efb40cb3",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 77942,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 12,
+    "internalName": "CTGFTP",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.jar",
+    "description": "CTG FTP provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/CTGFTP.cs3",
+    "name": "CTGFTP",
+    "jarHash": "sha256-aecd090d48f3b455785bd6d26b17b0cdc3d3ab4bf25ca85a23fcbf62c8b3379f"
+  },
+  {
+    "fileHash": "sha256-fd676cc4a3b827beb5426ce4eabf1756d58dd225aa75ea16d290fbcf66d84be2",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 171071,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 2,
+    "internalName": "DhakaFTP",
+    "description": "Dhaka FTP",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DhakaFTP.cs3",
+    "name": "DhakaFTP"
+  },
+  {
+    "jarFileSize": 327444,
+    "fileHash": "sha256-78edb8e58a5fa7c4f1091cafe8c46b9f87fad035a7e03530c5d25e6097f2a807",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 73613,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 1,
+    "internalName": "DiscoveryFTP",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DiscoveryFTP.jar",
+    "description": "Discovery FTP provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/DiscoveryFTP.cs3",
+    "name": "DiscoveryFTP",
+    "jarHash": "sha256-cdae5b0325478834c3396018ed3c0ff1958c81c62cc7c8d66310b796d250bb8f"
+  },
+  {
+    "iconUrl": "https://hianime.at/theme/images/icons-192.png",
+    "jarFileSize": 194866,
+    "fileHash": "sha256-a4119d56d65ca0ec59d87a8781f98ac23992ce20d994382f18c2218408fb1b34",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 57014,
+    "status": 1,
+    "language": "en",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 1,
+    "internalName": "HiAnime",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.jar",
+    "description": "Hi Anime provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/HiAnime.cs3",
+    "name": "HiAnime",
+    "jarHash": "sha256-9b7f154195477a1c30dbebf64007aa8a78e2d1989d45ae56c2c3e7446534191f"
+  },
+  {
+    "jarFileSize": 110432,
+    "fileHash": "sha256-aed9a374f0e18880b91a63b0e2e7f52dca21798944ac6d17982f9f40a549cea0",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 32634,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 16,
+    "internalName": "KhulnaPlex",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.jar",
+    "description": "Khulna Plex provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/KhulnaPlex.cs3",
+    "name": "KhulnaPlex",
+    "jarHash": "sha256-75e8f5a738d7a2c55daf3112033a1a71db8715cc0cd5da840d2cf6b6f499c091"
+  },
+  {
+    "iconUrl": "https://www.mojaloss.stream/favicon.png",
+    "jarFileSize": 211467,
+    "fileHash": "sha256-b99916097ad331d0d3c300cbf55123f2084cfca81981747acd9906fd145aed15",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 52986,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 1,
+    "internalName": "MojaLoss",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.jar",
+    "description": "Moja Loss provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MojaLoss.cs3",
+    "name": "MojaLoss",
+    "jarHash": "sha256-811760aa816306acea1878bd51c9584c2856ffab0e73c7e5f9667c7693ded828"
+  },
+  {
+    "jarFileSize": 152303,
+    "fileHash": "sha256-2397f44e4f40b68c1953e0f87f69c6a36bae26e9d4a6811767289b642ffb2368",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 36557,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 1,
+    "internalName": "MovieHaat",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieHaat.jar",
+    "description": "Movie Haat provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieHaat.cs3",
+    "name": "MovieHaat",
+    "jarHash": "sha256-0a1d5da679251f3fec6a881fd5bb135928f77f3c9e228e8164523bdb07dc4921"
+  },
+  {
+    "iconUrl": "https://movielinkbd.tv/favicon.png",
+    "jarFileSize": 258515,
+    "fileHash": "sha256-31140e13fe71ed04506e5eda9acba250c77e5bd38ee184a5f8b7fbe2eec362c9",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 59402,
+    "status": 1,
+    "language": "bn",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 1,
+    "internalName": "MovieLinkBD",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.jar",
+    "description": "Movie Link BD provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieLinkBD.cs3",
+    "name": "MovieLinkBD",
+    "jarHash": "sha256-ce84b1c9511281d1c38451e86d484a8e26d35a1655bc597f13c62c7d38db42f4"
+  },
+  {
+    "iconUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/main/OnlineMovies/icon.png",
+    "fileHash": "sha256-ffca730811bb5b3a71303d1118d2b3c4fda9f0c3149741af7412857566064258",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 43598,
+    "status": 3,
+    "authors": [],
+    "version": -1,
+    "internalName": "OnlineMovies",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/OnlineMovies.cs3",
+    "name": "OnlineMovies"
+  },
+  {
+    "jarFileSize": 502502,
+    "fileHash": "sha256-36009fb290dae24da8d7e611b4fec9198bea4abf380d2309724286ae02aae7a4",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 77046,
+    "status": 1,
+    "language": "hi",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Other",
+      "Live",
+      "TvSeries"
+    ],
+    "version": 1,
+    "internalName": "YouTube",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.jar",
+    "description": "YouTube provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTube.cs3",
+    "name": "YouTube",
+    "jarHash": "sha256-6e23e7ce5e048372fa2e9b813184b780feced98bd430890cb599cb2ace75ba49"
+  },
+  {
+    "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/fb/YouTube_Kids_LogoVector.svg/512px-YouTube_Kids_LogoVector.svg.png",
+    "jarFileSize": 285569,
+    "fileHash": "sha256-94cb0d143b971c0c81d7c2ad152ce200e453ce3e5e82599ef6040134434b7f06",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 62809,
+    "status": 1,
+    "language": "bn-IN",
+    "authors": [
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Other",
+      "TvSeries"
+    ],
+    "version": 11,
+    "internalName": "YouTubeKids",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.jar",
+    "description": "Bengali India YouTube Kids provider for Movie-Flick",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/YouTubeKids.cs3",
+    "name": "YouTubeKids",
+    "jarHash": "sha256-7f6e3aa78f8f4560c2383300ddb853487a4a084ecebffb866edfc12635839750"
+  },
+  {
+    "iconUrl": "https://zoryva.me/icon-512.png",
+    "jarFileSize": 1019465,
+    "fileHash": "sha256-7762f9b7625b78f7df584db32ce8453cfc135bbf7fc854f56ee95bc8d5499e86",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 206087,
+    "status": 1,
+    "language": "hi",
+    "authors": [
+      "Zoryva"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries",
+      "Anime"
+    ],
+    "version": 23,
+    "internalName": "Zoryva",
+    "jarUrl": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.jar",
+    "description": "Zoryva CloudStream provider",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/Zoryva.cs3",
+    "name": "Zoryva",
+    "jarHash": "sha256-d81ec1df9b6059320163ff5f6a66831011dac0332d06feba7da110d7aaa83afd"
+  },
+  {
+    "iconUrl": "https://h5-static.aoneroom.com/ssrStatic/club/public/_nuxt/logo.DMnCL3zY.svg",
+    "fileHash": "sha256-OhH95/ufjMfh4HQMOTVWTVAAt/oATH5f5MY7My4kqeY=",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/msujoy149/Movie-Flick",
+    "fileSize": 97157,
+    "status": 1,
+    "language": "hi",
+    "authors": [
+      "NivinCNC",
+      "Movie-Flick"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 51,
+    "internalName": "MovieBox",
+    "description": "Multi Language Movies and Series Provider",
+    "url": "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/MovieBox.cs3",
+    "name": "MovieBox"
+  }
 ]
