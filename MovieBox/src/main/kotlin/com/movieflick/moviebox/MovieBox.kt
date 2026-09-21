@@ -103,6 +103,12 @@ class MovieBox : MainAPI() {
         "Referer" to referer
     )
 
+    /** Exact browser-style TV player referer used by MovieBox H5. */
+    private fun websitePlayReferer(subjectId: String, detailPath: String): String {
+        val cleanPath = detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
+        return "$mainUrl/play/$cleanPath?id=${URLEncoder.encode(subjectId, "UTF-8")}&scene=&page_from=type_filter_tv&type=/movie/detail&tab=tv"
+    }
+
     /*
      * ------------------------------------------------------------
      * HOME
@@ -1626,7 +1632,7 @@ class MovieBox : MainAPI() {
         params: Map<String, String>,
         referer: String = "$mainUrl/"
     ): JsonNode? {
-        ensureWebsiteSession(referer)
+        ensureWebsiteSession()
 
         val query = params.entries.joinToString("&") { (key, value) ->
             "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
@@ -1650,7 +1656,7 @@ class MovieBox : MainAPI() {
 
         // Refresh once if the short-lived website token/session has expired.
         websiteCookies.clear()
-        ensureWebsiteSession(referer)
+        ensureWebsiteSession()
         return request()
     }
 
