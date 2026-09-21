@@ -344,6 +344,9 @@ class MovieBox : MainAPI() {
 
         for (variant in variants) {
             val encoded = URLEncoder.encode(variant, "UTF-8")
+            // This is the actual MovieBox search-result route observed on the site.
+            routes.add("/search-result?keyword=$encoded")
+            // Keep the older route shapes only as fallbacks.
             routes.add("/search?q=$encoded")
             routes.add("/search?query=$encoded")
             routes.add("/search?keyword=$encoded")
@@ -670,7 +673,11 @@ class MovieBox : MainAPI() {
         )
         val year = document?.let { extractYear(rawTitle + " " + title, it) }
         val imdbRating = extractImdbRating(rawTitle, document)
-        val imdbText = imdbRating?.let { "IMDb ${formatRating(it)}" }
+        val plotText = firstNonBlank(
+            subjectData?.plot,
+            extractDetailPlot(document)
+        )
+        val imdbScore = Score.from10(imdbRating)
 
         if (contentType == TvType.TvSeries) {
             val subjectId = urlSubjectId
@@ -689,7 +696,8 @@ class MovieBox : MainAPI() {
                 episodes = episodes
             ) {
                 posterUrl = poster
-                plot = imdbText
+                plot = plotText
+                score = imdbScore
                 this.year = year
             }
         }
@@ -707,7 +715,8 @@ class MovieBox : MainAPI() {
             dataUrl = playbackData
         ) {
             posterUrl = poster
-            plot = imdbText
+            plot = plotText
+            score = imdbScore
             this.year = year
         }
     }
@@ -1340,7 +1349,8 @@ class MovieBox : MainAPI() {
         val seasons: Map<Int, Int> = emptyMap(),
         val imdbRating: Double? = null,
         val poster: String? = null,
-        val subjectType: Int? = null
+        val subjectType: Int? = null,
+        val plot: String? = null
     )
 
     /*
@@ -1474,13 +1484,18 @@ class MovieBox : MainAPI() {
             ?.toDoubleOrNull()
             ?.takeIf { it in 0.0..10.0 }
 
+        val plot = cleanPlotText(
+            text(subject.get("description"))
+        )
+
         return WebsiteSubjectData(
             subjectId = subjectId,
             detailPath = detailPath,
             seasons = seasonCounts,
             imdbRating = rating,
             poster = poster,
-            subjectType = int(subject.get("subjectType"))
+            subjectType = int(subject.get("subjectType")),
+            plot = plot
         )
     }
 
@@ -2651,7 +2666,9 @@ class MovieBox : MainAPI() {
                     )
 
                     null -> listOf(
-                        Regex("""(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&\-]*)?""")
+                        // Search-result cards on the current site can point directly to /play/<slug>.
+                        Regex("""(?i)/play/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&+\-]*)?"""),
+                        Regex("""(?i)/(?:film|movies|tv-series|animated-series)/[A-Za-z0-9._~%\-]+(?:\?[A-Za-z0-9._%=&+\-]*)?""")
                     )
 
                     else -> emptyList()
@@ -3127,9 +3144,11 @@ class MovieBox : MainAPI() {
     private fun languageRank(text: String): Int {
         val normalized = normalizeSearch(text)
         if (Regex("""\b(hindi|hindi dubbed|hindi audio|dubbed in hindi)\b""").containsMatchIn(normalized) || text.contains("हिन्दी") || text.contains("हिंदी")) return 1
-        if (Regex("""\b(bangla|bengali|bangla dubbed|bangla audio)\b""").containsMatchIn(normalized) || text.contains("বাংলা") || text.contains("বাঙ্গালী")) return 2
-        if (Regex("""(?i)(?:\[|\(|-|\s)(english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\b""").containsMatchIn(normalized)) return 3
-        return 4
+        // Search priority requested by the user:
+        // Hindi -> main/unlabelled -> Bengali/Bangla -> other languages.
+        if (Regex("""\b(bangla|bengali|bangla dubbed|bangla audio)\b""").containsMatchIn(normalized) || text.contains("বাংলা") || text.contains("বাঙ্গালী")) return 3
+        if (Regex("""(?i)(?:\[|\(|-|\s)(english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\b""").containsMatchIn(normalized)) return 4
+        return 2
     }
 
     private fun searchScore(
@@ -3997,6 +4016,60 @@ class MovieBox : MainAPI() {
 
         value = value.replace(Regex("(?i)\\s+online\\s*$"), "")
         return value.trim(' ', '|', '-')
+    }
+
+    /**
+     * Extract the real synopsis/plot, not the generic SEO description.
+     * The current MovieBox Nuxt subject object is the primary source; this
+     * DOM fallback handles pages where the SSR object is incomplete.
+     */
+    private fun extractDetailPlot(document: Document?): String? {
+        if (document == null) return null
+
+        val candidates = ArrayList<String>()
+
+        document.select(".line-3").forEach { element ->
+            val value = cleanPlotText(element.text())
+            if (!value.isNullOrBlank()) candidates += value
+        }
+
+        document.select(
+            ".description, .description-content, .film-description, .film-description-content"
+        ).forEach { element ->
+            val value = cleanPlotText(element.text())
+            if (!value.isNullOrBlank()) candidates += value
+        }
+
+        document.select("[class*=description]").forEach { element ->
+            val value = cleanPlotText(element.text())
+            if (!value.isNullOrBlank()) candidates += value
+        }
+
+        return candidates
+            .filter { it.length >= 25 }
+            .distinct()
+            .maxByOrNull { it.length }
+    }
+
+    private fun cleanPlotText(value: String?): String? {
+        val text = value
+            ?.replace(Regex("\\s+"), " ")
+            ?.replace("&amp;", "&")
+            ?.replace("&quot;", "\"")
+            ?.replace("&#39;", "'")
+            ?.replace("&lt;", "<")
+            ?.replace("&gt;", ">")
+            ?.trim()
+            ?: return null
+
+        if (text.isBlank()) return null
+
+        // Reject the site's generic SEO boilerplate when encountered as a fallback.
+        if (Regex("(?i)^watch .+ online on movieboxonline\\.").containsMatchIn(text) &&
+            text.contains("streaming details", true)
+        ) return null
+
+        return text
     }
 
     private fun extractImdbRating(rawTitle: String, document: Document?): Double? {
