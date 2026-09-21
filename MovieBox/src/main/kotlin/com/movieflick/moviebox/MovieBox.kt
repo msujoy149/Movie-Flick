@@ -1,7 +1,7 @@
 package com.movieflick.moviebox
 
 import android.content.Context
-import dalvik.system.DexClassLoader
+import dalvik.system.PathClassLoader
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import java.io.File
@@ -39,7 +39,7 @@ class MovieBox(private val appContext: Context) : MainAPI() {
 
     override var mainUrl: String = "https://movieboxonline.net"
     override var name: String = "MovieBox"
-    override var lang: String = "ta"
+    override var lang: String = "hi"
 
     override val hasMainPage: Boolean = true
     override val hasQuickSearch: Boolean = true
@@ -55,9 +55,14 @@ class MovieBox(private val appContext: Context) : MainAPI() {
      * network work.
      */
     override val mainPage: List<MainPageData> by lazy(LazyThreadSafetyMode.PUBLICATION) {
-        firstWorkingDelegate()?.let { delegate ->
-            readProperty(delegate.provider, "getMainPage") as? List<MainPageData>
-        } ?: emptyList()
+        delegates
+            .filterNotNull()
+            .asSequence()
+            .mapNotNull { delegate ->
+                readProperty(delegate.provider, "getMainPage") as? List<MainPageData>
+            }
+            .firstOrNull { it.isNotEmpty() }
+            ?: emptyList()
     }
 
     private data class Delegate(
@@ -70,8 +75,7 @@ class MovieBox(private val appContext: Context) : MainAPI() {
     )
 
     private data class LoadedAsset(
-        val dexFile: File,
-        val optimizedDir: File
+        val pluginFile: File
     )
 
     private val ownerByUrl = ConcurrentHashMap<String, Int>()
@@ -104,6 +108,8 @@ class MovieBox(private val appContext: Context) : MainAPI() {
     private companion object {
         const val GLOBAL_CLASS = "com.cncverse.MovieBoxProvider"
         const val INDIA_CLASS = "com.cncverse.MovieBoxProviderIN"
+        const val GLOBAL_PLUGIN_CLASS = "com.cncverse.MovieBoxProviderPlugin"
+        const val INDIA_PLUGIN_CLASS = "com.cncverse.MovieBoxProviderINPlugin"
 
         const val GLOBAL_ASSET = "moviebox_global.bin"
         const val INDIA_ASSET = "moviebox_in.bin"
@@ -358,25 +364,44 @@ class MovieBox(private val appContext: Context) : MainAPI() {
         dexName: String
     ): Delegate? {
         return runCatching {
-            val loaded = extractDex(assetName, dexName)
-            val classLoader = DexClassLoader(
-                loaded.dexFile.absolutePath,
-                loaded.optimizedDir.absolutePath,
-                null,
+            val loaded = extractPlugin(assetName, dexName)
+
+            // CloudStream itself loads .cs3 files with PathClassLoader.  Use the
+            // same mechanism here instead of extracting classes.dex and nesting
+            // a second DexClassLoader inside the host plugin.
+            val classLoader = PathClassLoader(
+                loaded.pluginFile.absolutePath,
                 appContext.classLoader
             )
 
-            val clazz = classLoader.loadClass(className)
-            val constructor = clazz.getDeclaredConstructor().apply { isAccessible = true }
-            val instance = constructor.newInstance()
-            require(instance is MainAPI) {
-                "$className is not a CloudStream MainAPI"
+            var provider = instantiateProvider(classLoader, className)
+
+            // Some provider builds initialise important state from their own
+            // Plugin.load() path.  If a directly-created provider has no home
+            // definition, reproduce that initialisation path and retrieve the
+            // MainAPI registered by the embedded plugin.
+            if (provider != null && embeddedMainPage(provider).isEmpty()) {
+                val pluginClassName = when (id) {
+                    0 -> GLOBAL_PLUGIN_CLASS
+                    else -> INDIA_PLUGIN_CLASS
+                }
+                provider = runCatching {
+                    val pluginClass = classLoader.loadClass(pluginClassName)
+                    val plugin = pluginClass.getDeclaredConstructor().apply {
+                        isAccessible = true
+                    }.newInstance()
+                    val loadMethod = plugin.javaClass.methods.firstOrNull { method ->
+                        method.name == "load" &&
+                            method.parameterTypes.size == 1 &&
+                            method.parameterTypes[0] == Context::class.java
+                    }
+                    loadMethod?.invoke(plugin, appContext)
+                    findMainApi(plugin)
+                }.getOrNull() ?: provider
             }
 
-            // The original provider's init() normally gets called by the
-            // CloudStream plugin manager. Because we are delegating to it from
-            // one facade, explicitly initialise the embedded provider.
-            instance.init()
+            val finalProvider = provider ?: error("Unable to instantiate $className")
+            runCatching { finalProvider.init() }
 
             Delegate(
                 id = id,
@@ -384,44 +409,101 @@ class MovieBox(private val appContext: Context) : MainAPI() {
                 assetName = assetName,
                 dexName = dexName,
                 loader = classLoader,
-                provider = instance
+                provider = finalProvider
             )
         }.getOrNull()
     }
 
-    private fun extractDex(assetName: String, dexName: String): LoadedAsset {
-        val optimizedDir = File(appContext.cacheDir, "moviebox-dex-opt")
-        if (!optimizedDir.exists()) optimizedDir.mkdirs()
-
-        val dexFile = File(optimizedDir, dexName)
-
-        // The assets are bundled in this plugin with the original .cs3 ZIP
-        // bytes. Extract only classes.dex for DexClassLoader.
-        appContext.assets.open(assetName).use { assetInput ->
-            val temp = File(optimizedDir, "$dexName.tmp")
-            FileOutputStream(temp).use { output ->
-                assetInput.copyTo(output, DEFAULT_BUFFER)
-                output.fd.sync()
+    private fun instantiateProvider(
+        classLoader: ClassLoader,
+        className: String
+    ): MainAPI? {
+        return runCatching {
+            val clazz = classLoader.loadClass(className)
+            val constructor = clazz.getDeclaredConstructor().apply { isAccessible = true }
+            constructor.newInstance().let { instance ->
+                require(instance is MainAPI) {
+                    "$className is not a CloudStream MainAPI"
+                }
+                instance
             }
+        }.getOrNull()
+    }
 
-            ZipFile(temp).use { zip ->
-                val entry = zip.getEntry("classes.dex")
-                    ?: error("$assetName does not contain classes.dex")
-                zip.getInputStream(entry).use { input ->
-                    FileOutputStream(dexFile).use { output ->
-                        input.copyTo(output, DEFAULT_BUFFER)
-                        output.fd.sync()
+    private fun embeddedMainPage(provider: MainAPI): List<MainPageData> {
+        return readProperty(provider, "getMainPage") as? List<MainPageData> ?: emptyList()
+    }
+
+    private fun findMainApi(root: Any): MainAPI? {
+        val visited = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<Any, Boolean>()
+        )
+        return findMainApiRecursive(root, visited, 0)
+    }
+
+    private fun findMainApiRecursive(
+        value: Any?,
+        visited: MutableSet<Any>,
+        depth: Int
+    ): MainAPI? {
+        if (value == null || depth > 3 || !visited.add(value)) return null
+        if (value is MainAPI) return value
+
+        var current: Class<*>? = value.javaClass
+        while (current != null && current != Any::class.java) {
+            for (field in current.declaredFields) {
+                if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
+                runCatching {
+                    field.isAccessible = true
+                    val fieldValue = field.get(value)
+                    when (fieldValue) {
+                        is MainAPI -> return fieldValue
+                        is Iterable<*> -> fieldValue.forEach { item ->
+                            val found = findMainApiRecursive(item, visited, depth + 1)
+                            if (found != null) return found
+                        }
+                        is Array<*> -> fieldValue.forEach { item ->
+                            val found = findMainApiRecursive(item, visited, depth + 1)
+                            if (found != null) return found
+                        }
                     }
                 }
             }
+            current = current.superclass
+        }
+        return null
+    }
 
-            temp.delete()
+    private fun extractPlugin(assetName: String, fileName: String): LoadedAsset {
+        val pluginDir = File(
+            appContext.getExternalFilesDir(null) ?: appContext.filesDir,
+            "moviebox-runtime"
+        )
+        if (!pluginDir.exists()) pluginDir.mkdirs()
+
+        val pluginFile = File(pluginDir, fileName.replace(".dex", ".cs3"))
+        val tempFile = File(pluginDir, "${pluginFile.name}.tmp")
+
+        // Keep the embedded artifact byte-for-byte identical to the original
+        // provider .cs3. This lets PathClassLoader treat it like a normal
+        // CloudStream plugin artifact.
+        appContext.assets.open(assetName).use { input ->
+            FileOutputStream(tempFile).use { output ->
+                input.copyTo(output, DEFAULT_BUFFER)
+                output.fd.sync()
+            }
         }
 
-        return LoadedAsset(
-            dexFile = dexFile,
-            optimizedDir = optimizedDir
-        )
+        if (!tempFile.renameTo(pluginFile)) {
+            tempFile.copyTo(pluginFile, overwrite = true)
+            tempFile.delete()
+        }
+
+        require(pluginFile.length() > 0L) {
+            "Embedded MovieBox plugin asset is empty: $assetName"
+        }
+
+        return LoadedAsset(pluginFile)
     }
 
     // ---------------------------------------------------------------------
