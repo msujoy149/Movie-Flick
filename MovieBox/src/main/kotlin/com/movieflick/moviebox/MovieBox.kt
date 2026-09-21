@@ -63,7 +63,8 @@ class MovieBox : MainAPI() {
         val url: String,
         val poster: String?,
         val type: TvType,
-        val languageRank: Int = 4
+        val languageRank: Int = 4,
+        val subjectId: String? = null
     )
 
     private data class MirrorPage(
@@ -260,36 +261,74 @@ class MovieBox : MainAPI() {
         val value = query.trim()
         if (value.isBlank()) return emptyList()
 
-        val api = searchApi(value, 1, 12)
-        if (api.isNotEmpty()) {
-            return rankSearchResults(value, api).take(8)
+        val collected = LinkedHashMap<String, SiteItem>()
+
+        runCatching {
+            searchWebsiteH5(value, 24).forEach {
+                collected.putIfAbsent(contentKey(it.url), it)
+            }
         }
 
-        return runCatching {
-            rankSearchResults(
-                value,
-                searchNative(mainUrl, value).take(20)
-            ).take(8)
-        }.getOrDefault(emptyList())
+        runCatching {
+            searchApi(value, 1, 24).forEach {
+                collected.putIfAbsent(contentKey(it.url), it)
+            }
+        }
+
+        runCatching {
+            searchNative(mainUrl, value).take(24).forEach {
+                collected.putIfAbsent(contentKey(it.url), it)
+            }
+        }
+
+        if (collected.size < 8) {
+            runCatching {
+                searchSitemap(mainUrl, value).take(24).forEach {
+                    collected.putIfAbsent(contentKey(it.url), it)
+                }
+            }
+        }
+
+        return rankSearchResults(value, collected.values.toList()).take(8)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val original = query.trim()
         if (original.isBlank()) return emptyList()
 
-        val apiResults = searchApi(original, 1, SEARCH_RESULT_LIMIT)
-        if (apiResults.isNotEmpty()) {
-            return rankSearchResults(original, apiResults)
-        }
+        val collected = LinkedHashMap<String, SiteItem>()
 
-        for (domain in domains) {
-            val nativeItems = searchNative(domain, original)
-            if (nativeItems.isNotEmpty()) {
-                return rankSearchResults(original, nativeItems)
+        runCatching {
+            searchWebsiteH5(original, SEARCH_RESULT_LIMIT).forEach {
+                collected.putIfAbsent(contentKey(it.url), it)
             }
         }
 
-        return emptyList()
+        runCatching {
+            searchApi(original, 1, SEARCH_RESULT_LIMIT).forEach {
+                collected.putIfAbsent(contentKey(it.url), it)
+            }
+        }
+
+        for (domain in domains) {
+            runCatching {
+                searchNative(domain, original).forEach {
+                    collected.putIfAbsent(contentKey(it.url), it)
+                }
+            }
+        }
+
+        if (collected.size < SEARCH_RESULT_LIMIT) {
+            for (domain in domains) {
+                runCatching {
+                    searchSitemap(domain, original).forEach {
+                        collected.putIfAbsent(contentKey(it.url), it)
+                    }
+                }
+            }
+        }
+
+        return rankSearchResults(original, collected.values.toList())
     }
 
     private suspend fun searchNative(
@@ -543,79 +582,91 @@ class MovieBox : MainAPI() {
         val path = pathFromUrl(url)
         if (path.isBlank()) return null
 
+        val contentType = typeFromPath(path)
+        val slug = contentSlug(path)
+        val urlSubjectId = Regex("(?i)[?&]id=(\\d{8,25})\\b")
+            .find(url)?.groupValues?.getOrNull(1)
+
         val candidatePaths = linkedSetOf<String>().apply {
-            add(path)
-            when {
-                path.startsWith("/film/") -> {
-                    add("/movies/" + path.removePrefix("/film/"))
-                    derivedPlayPath(path)?.let(::add)
+            when (contentType) {
+                TvType.TvSeries -> {
+                    slug?.takeIf { it.isNotBlank() }?.let { add("/play/$it") }
+                    add(path)
                 }
-                path.startsWith("/movies/") -> {
-                    add("/film/" + path.removePrefix("/movies/"))
-                    add("/play/" + path.removePrefix("/movies/"))
-                }
-                path.startsWith("/tv-series/") || path.startsWith("/animated-series/") -> {
-                    val slug = path.substringAfterLast('/')
-                    if (slug.isNotBlank()) {
-                        add("/play/$slug")
-                    }
-                }
-                path.startsWith("/play/") -> {
-                    val slug = path.removePrefix("/play/")
-                    if (slug.isNotBlank()) {
-                        add("/film/$slug")
-                        add("/movies/$slug")
-                        add("/tv-series/$slug")
-                        add("/animated-series/$slug")
+                else -> {
+                    add(path)
+                    when {
+                        path.startsWith("/film/") -> {
+                            add("/movies/" + path.removePrefix("/film/"))
+                            derivedPlayPath(path)?.let(::add)
+                        }
+                        path.startsWith("/movies/") -> {
+                            add("/film/" + path.removePrefix("/movies/"))
+                            add("/play/" + path.removePrefix("/movies/"))
+                        }
+                        path.startsWith("/animated-series/") -> {
+                            slug?.takeIf { it.isNotBlank() }?.let { add("/play/$it") }
+                        }
+                        path.startsWith("/play/") -> {
+                            val playSlug = path.removePrefix("/play/")
+                            if (playSlug.isNotBlank()) {
+                                add("/film/$playSlug")
+                                add("/movies/$playSlug")
+                                add("/tv-series/$playSlug")
+                                add("/animated-series/$playSlug")
+                            }
+                        }
                     }
                 }
             }
         }
 
         var page: MirrorPage? = null
+        var document: Document? = null
         for (candidate in candidatePaths) {
-            page = fetchMirrorPage(candidate)
-            if (page != null) break
+            val candidatePage = fetchMirrorPage(candidate) ?: continue
+            if (page == null) page = candidatePage
+            document = candidatePage.document
+            if (extractWebsiteSubjectData(document, path, titleHintFromDocument(document)) != null) {
+                page = candidatePage
+                break
+            }
         }
 
-        var document = page?.document
         if (document == null) {
             contentSlug(path)?.let { document = fetchBackendDetailDocument(it) }
         }
 
-        val title = cleanTitle(
-            firstNonBlank(
-                document?.selectFirst("meta[property=og:title]")?.attr("content"),
-                document?.selectFirst("h1")?.text(),
-                document?.selectFirst(".film-name")?.text(),
-                document?.title()
-            ).orEmpty()
-        ).ifBlank { titleFromContentPath(path) }
+        val rawTitle = firstNonBlank(
+            document?.selectFirst("meta[property=og:title]")?.attr("content"),
+            document?.selectFirst("h1")?.text(),
+            document?.selectFirst(".film-name")?.text(),
+            document?.title()
+        ).orEmpty()
 
+        val title = cleanDisplayTitle(rawTitle).ifBlank { cleanDisplayTitle(titleFromContentPath(path)) }
         if (title.isBlank()) return null
 
+        val subjectData = document?.let { extractWebsiteSubjectData(it, path, title) }
         val poster = firstUsefulUrl(
             document?.selectFirst("meta[property=og:image]")?.attr("content"),
             document?.selectFirst("meta[name=twitter:image]")?.attr("content"),
-            document?.selectFirst(".film-poster img, .movie-card img, img")?.let(::extractImageUrl)
+            document?.selectFirst(".film-poster img, .movie-card img, img")?.let(::extractImageUrl),
+            subjectData?.poster
         )
+        val year = document?.let { extractYear(rawTitle + " " + title, it) }
+        val imdbRating = extractImdbRating(rawTitle, document)
+        val imdbText = imdbRating?.let { "IMDb ${formatRating(it)}" }
 
-        val plot = firstNonBlank(
-            document?.selectFirst("meta[property=og:description]")?.attr("content"),
-            document?.selectFirst(".description, .film-description, .description-content")?.text()
-        )
-
-        val year = document?.let { extractYear(title, it) }
-        val type = typeFromPath(path)
-
-        if (type == TvType.TvSeries) {
-            val subjectId = findApiSubjectId(title)
-            val detailPath = contentSlug(path).orEmpty()
-            val episodes = if (!subjectId.isNullOrBlank()) {
-                fetchApiEpisodes(subjectId, title, detailPath)
-            } else {
-                emptyList()
-            }
+        if (contentType == TvType.TvSeries) {
+            val subjectId = subjectData?.subjectId
+                ?: urlSubjectId
+                ?: findWebsiteSubjectId(title, contentType)
+                ?: findApiSubjectId(title)
+            val detailPath = subjectData?.detailPath ?: contentSlug(path).orEmpty()
+            val episodes = if (!subjectId.isNullOrBlank() && detailPath.isNotBlank()) {
+                fetchWebsiteEpisodes(subjectId, detailPath, subjectData, document)
+            } else emptyList()
 
             return newTvSeriesLoadResponse(
                 name = title,
@@ -624,22 +675,37 @@ class MovieBox : MainAPI() {
                 episodes = episodes
             ) {
                 posterUrl = poster
-                this.plot = plot
+                plot = imdbText
                 this.year = year
             }
         }
 
+        val subjectId = subjectData?.subjectId ?: urlSubjectId
+        val detailPath = subjectData?.detailPath ?: contentSlug(path).orEmpty()
+        val playbackData = if (!subjectId.isNullOrBlank() && detailPath.isNotBlank()) {
+            "mbxcontent||$subjectId||$detailPath"
+        } else canonicalUrl(path)
+
         return newMovieLoadResponse(
             name = title,
             url = canonicalUrl(path),
-            type = type,
-            dataUrl = canonicalUrl(path)
+            type = contentType,
+            dataUrl = playbackData
         ) {
             posterUrl = poster
-            this.plot = plot
+            plot = imdbText
             this.year = year
         }
     }
+
+    private fun titleHintFromDocument(document: Document): String =
+        cleanDisplayTitle(
+            firstNonBlank(
+                document.selectFirst("meta[property=og:title]")?.attr("content"),
+                document.selectFirst("h1")?.text(),
+                document.title()
+            ).orEmpty()
+        )
 
     /*
      * ------------------------------------------------------------
@@ -661,59 +727,36 @@ class MovieBox : MainAPI() {
 
         if (rawData.startsWith("mbxepisode||")) {
             val parts = rawData.split("||")
-
-            // New verified format:
-            // mbxepisode||subjectId||detailPath||season||episode
             if (parts.size >= 5) {
-                val subjectId = parts[1]
-                val detailPath = parts[2]
-                val season = parts[3].toIntOrNull() ?: 1
-                val episode = parts[4].toIntOrNull() ?: 1
-
                 return resolveWebsitePlayback(
-                    subjectId = subjectId,
-                    detailPath = detailPath,
-                    season = season,
-                    episode = episode,
+                    subjectId = parts[1],
+                    detailPath = parts[2],
+                    season = parts[3].toIntOrNull() ?: 1,
+                    episode = parts[4].toIntOrNull() ?: 1,
                     subtitleCallback = subtitleCallback,
                     callback = callback
                 )
             }
 
-            // Backward compatibility for previously generated episode entries.
+            // Backward compatibility for older cached episode entries.
             if (parts.size >= 4) {
-                val subjectId = parts[1]
-                val season = parts[2].toIntOrNull() ?: 1
-                val episode = parts[3].toIntOrNull() ?: 1
-                val derivedDetailPath = rawData
-                    .substringAfter("mbxepisode||", "")
-                    .substringAfter("||", "")
-                    .let { contentSlug(it).orEmpty() }
-
-                if (derivedDetailPath.isNotBlank()) {
-                    return resolveWebsitePlayback(
-                        subjectId = subjectId,
-                        detailPath = derivedDetailPath,
-                        season = season,
-                        episode = episode,
-                        subtitleCallback = subtitleCallback,
-                        callback = callback
-                    )
-                }
-
                 return resolveApiPlayback(
-                    subjectId,
-                    season,
-                    episode,
-                    subtitleCallback,
-                    callback
+                    subjectId = parts[1],
+                    season = parts[2].toIntOrNull() ?: 1,
+                    episode = parts[3].toIntOrNull() ?: 1,
+                    subtitleCallback = subtitleCallback,
+                    callback = callback
                 )
             }
         }
 
-        // Movie/anime public-page fallback. Signed media is only used when it is
-        // already exposed by the public player response; no private signing
-        // secret or authentication bypass is generated here.
+        if (rawData.startsWith("mbxcontent||")) {
+            val parts = rawData.split("||")
+            if (parts.size >= 3) {
+                if (resolveWebsiteMoviePlayback(parts[1], parts[2], subtitleCallback, callback)) return true
+            }
+        }
+
         val pageUrl = rawData.substringBefore("||").trim()
         val pagePath = pathFromUrl(pageUrl)
         if (pagePath.isBlank()) return false
@@ -724,13 +767,9 @@ class MovieBox : MainAPI() {
             if (pagePath.startsWith("/film/")) {
                 candidateUrls.add(canonicalUrl("/movies/" + pagePath.removePrefix("/film/")))
             }
-            contentSlug(pagePath)?.let { slug ->
-                candidateUrls.add(canonicalUrl("/play/$slug"))
-            }
+            contentSlug(pagePath)?.let { candidateUrls.add(canonicalUrl("/play/$it")) }
             for (candidateUrl in candidateUrls) {
-                if (resolvePublicPageCandidate(candidateUrl, pageUrl, subtitleCallback, callback)) {
-                    return true
-                }
+                if (resolvePublicPageCandidate(candidateUrl, pageUrl, subtitleCallback, callback)) return true
             }
         }
         return false
@@ -980,7 +1019,7 @@ class MovieBox : MainAPI() {
 
     private fun apiItemFromNode(node: JsonNode, forcedType: TvType? = null): SiteItem? {
         val title = cleanTitle(
-            nodeText(node, "title", "name").orEmpty()
+            nodeText(node, "title", "name", "postTitle", "subjectTitle").orEmpty()
         )
         if (title.isBlank()) return null
 
@@ -1020,12 +1059,21 @@ class MovieBox : MainAPI() {
             nodeText(node, "poster", "cover", "image", "thumbnail")
         )
 
+        val resultUrl = buildString {
+            append(canonicalUrl(slug))
+            if (!id.isNullOrBlank()) {
+                append("?id=")
+                append(URLEncoder.encode(id, "UTF-8"))
+            }
+        }
+
         return SiteItem(
             title = title,
-            url = canonicalUrl(slug),
+            url = resultUrl,
             poster = poster,
             type = type,
-            languageRank = languageRank(title)
+            languageRank = languageRank(title),
+            subjectId = id
         )
     }
 
@@ -1091,6 +1139,61 @@ class MovieBox : MainAPI() {
         return nodes.mapNotNull { apiItemFromNode(it) }
     }
 
+    /** Current MovieBox H5 search BFF used by the website. */
+    private suspend fun searchWebsiteH5(
+        query: String,
+        pageSize: Int = SEARCH_RESULT_LIMIT
+    ): List<SiteItem> {
+        val endpoint = "$mainUrl/wefeed-h5api-bff/subject/everyone-search"
+        val variants = listOf(
+            mapOf("keyword" to query, "page" to "0", "perPage" to pageSize.toString()),
+            mapOf("q" to query, "page" to "0", "perPage" to pageSize.toString()),
+            mapOf("query" to query, "page" to "0", "perPage" to pageSize.toString()),
+            mapOf("keyword" to query, "page" to "1", "pageSize" to pageSize.toString()),
+            mapOf("q" to query, "page" to "1", "pageSize" to pageSize.toString())
+        )
+
+        for (params in variants) {
+            val queryString = params.entries.joinToString("&") { (key, value) ->
+                "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+            }
+            val response = runCatching {
+                app.get(
+                    addCacheBuster("$endpoint?$queryString"),
+                    headers = apiHeaders().toMutableMap().apply {
+                        this["Accept"] = "application/json"
+                        this["Content-Type"] = "application/json"
+                        this["X-Request-Lang"] = "en"
+                        this["X-Client-Info"] = "{\"timezone\":\"UTC\"}"
+                        this["Origin"] = mainUrl
+                        this["Referer"] = "$mainUrl/"
+                    }
+                )
+            }.getOrNull() ?: continue
+            if (response.code !in 200..399) continue
+            val json = runCatching { jsonMapper.readTree(response.text) }.getOrNull() ?: continue
+            val nodes = ArrayList<JsonNode>()
+            collectJsonObjects(json, nodes)
+            val items = nodes.mapNotNull { apiItemFromNode(it) }
+            if (items.isNotEmpty()) return items
+        }
+        return emptyList()
+    }
+
+    private suspend fun findWebsiteSubjectId(
+        title: String,
+        preferredType: TvType? = null
+    ): String? {
+        val items = searchWebsiteH5(title, 20)
+        return items
+            .filter { preferredType == null || it.type == preferredType }
+            .filter { !it.subjectId.isNullOrBlank() }
+            .map { it.subjectId!! to searchScore(title, it.title) }
+            .filter { it.second >= 0.55 }
+            .maxByOrNull { it.second }
+            ?.first
+    }
+
     private suspend fun findApiSubjectId(title: String): String? {
         val json = apiGetJson(
             ApiConfig.JSON_SEARCH,
@@ -1126,10 +1229,347 @@ class MovieBox : MainAPI() {
         ).toInt().coerceAtLeast(0)
     }
 
+    private data class WebsiteSubjectData(
+        val subjectId: String,
+        val detailPath: String,
+        val seasons: Map<Int, Int> = emptyMap(),
+        val imdbRating: Double? = null,
+        val poster: String? = null
+    )
+
+    private fun extractWebsiteSubjectData(
+        document: Document,
+        contentPath: String,
+        title: String
+    ): WebsiteSubjectData? {
+        val decoded = document.html()
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        if (decoded.isBlank()) return null
+
+        val detailPath = contentSlug(contentPath).orEmpty()
+        val normalizedTitle = normalizeSearch(title)
+        val candidates = ArrayList<Pair<String, Int>>()
+
+        val subjectRegex = Regex(
+            """(?i)(?:[\"']?subjectId[\"']?|subject_id)\s*[:=]\s*[\"']?(\d{8,25})"""
+        )
+
+        fun addCandidate(id: String, position: Int, scoreBase: Int) {
+            val start = max(0, position - 16000)
+            val end = min(decoded.length, position + 16000)
+            val window = decoded.substring(start, end)
+            var score = scoreBase
+            if (detailPath.isNotBlank() && window.contains(detailPath, true)) score += 14
+            if (normalizedTitle.isNotBlank() && normalizeSearch(window).contains(normalizedTitle)) score += 10
+            if (window.contains("resource", true)) score += 6
+            if (window.contains("seasons", true)) score += 7
+            if (window.contains("maxEp", true)) score += 6
+            if (window.contains("epNum", true)) score += 4
+            candidates.add(id to score)
+        }
+
+        subjectRegex.findAll(decoded).forEach { match ->
+            val id = match.groupValues[1]
+            addCandidate(id, match.range.first, 0)
+        }
+
+        // Player/detail query URLs are also strong identity hints.
+        Regex("(?i)[?&]id=(\\d{8,25})\\b").findAll(decoded).forEach { match ->
+            val start = max(0, match.range.first - 9000)
+            val end = min(decoded.length, match.range.first + 9000)
+            val window = decoded.substring(start, end)
+            if (detailPath.isNotBlank() && window.contains(detailPath, true)) {
+                candidates.add(match.groupValues[1] to 32)
+            }
+        }
+
+        val bestId = candidates
+            .groupBy { it.first }
+            .maxByOrNull { (_, list) -> list.maxOf { it.second } }
+            ?.key
+            ?: return null
+
+        val bestContext = subjectRegex.findAll(decoded)
+            .firstOrNull { it.groupValues[1] == bestId }
+            ?.let {
+                val start = max(0, it.range.first - 40000)
+                val end = min(decoded.length, it.range.first + 40000)
+                decoded.substring(start, end)
+            }
+            ?: decoded
+
+        val localSeasonCounts = parseSeasonCounts(bestContext)
+        val seasonCounts = if (localSeasonCounts.isNotEmpty()) localSeasonCounts else parseSeasonCounts(decoded)
+        val rating = parseImdbRatingFromText(bestContext)
+        val poster = firstUsefulUrl(
+            Regex("""(?i)["'](?:poster|cover|image|thumbnail)["']\s*[:=]\s*["'](https?://[^"']+)["']""")
+                .find(bestContext)?.groupValues?.getOrNull(1),
+            Regex("""(?i)https?://[^\"'\s]+(?:jpg|jpeg|png|webp)(?:\?[^\"'\s]*)?""")
+                .find(bestContext)?.value
+        )
+
+        return WebsiteSubjectData(
+            subjectId = bestId,
+            detailPath = detailPath,
+            seasons = seasonCounts,
+            imdbRating = rating,
+            poster = poster
+        )
+    }
+
+    private fun parseSeasonCounts(context: String): Map<Int, Int> {
+        val counts = LinkedHashMap<Int, Int>()
+        val countRegex = Regex(
+            """(?i)["']?(?:maxEp|maxEpisode|episodeCount|episodesAvailable|totalEpisode|allEp)["']?\s*[:=]\s*["']?(\d{1,4})"""
+        )
+        val epRegex = Regex(
+            """(?i)["']?epNum["']?\s*[:=]\s*["']?(\d{1,4})"""
+        )
+        val seasonRegex = Regex(
+            """(?i)["']?(?:seasonNumber|season|se)["']?\s*[:=]\s*["']?(\d{1,3})"""
+        )
+
+        fun seasonNear(position: Int): Int {
+            val start = max(0, position - 3500)
+            val prefix = context.substring(start, position)
+            return seasonRegex.findAll(prefix)
+                .lastOrNull()?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?.takeIf { it > 0 } ?: 1
+        }
+
+        countRegex.findAll(context).forEach { match ->
+            val count = match.groupValues[1].toIntOrNull() ?: return@forEach
+            if (count > 0) {
+                val season = seasonNear(match.range.first)
+                counts[season] = maxOf(counts[season] ?: 0, count)
+            }
+        }
+
+        epRegex.findAll(context).forEach { match ->
+            val ep = match.groupValues[1].toIntOrNull() ?: return@forEach
+            if (ep > 0) {
+                val season = seasonNear(match.range.first)
+                counts[season] = maxOf(counts[season] ?: 0, ep)
+            }
+        }
+
+        return counts.filterValues { it > 0 }
+    }
+
+    private fun parseImdbRatingFromText(text: String): Double? {
+        Regex("""(?i)\bIMDb\s*[:|\-]?\s*(\d+(?:\.\d+)?)\b""")
+            .find(text)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+            ?.takeIf { it in 0.0..10.0 }?.let { return it }
+
+        Regex("""(?i)["'](?:ratingValue|rating)["']\s*[:=]\s*["']?(\d+(?:\.\d+)?)""")
+            .find(text)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+            ?.takeIf { it in 0.0..10.0 }?.let { return it }
+
+        return null
+    }
+
+    private suspend fun fetchWebsiteEpisodes(
+        subjectId: String,
+        detailPath: String,
+        metadata: WebsiteSubjectData?,
+        fallbackDocument: Document?
+    ): List<Episode> {
+        val counts = LinkedHashMap<Int, Int>()
+        metadata?.seasons?.forEach { (season, count) ->
+            if (count > 0) counts[season] = count
+        }
+
+        if (counts.isEmpty() && fallbackDocument != null) {
+            extractWebsiteSubjectData(fallbackDocument, detailPath, "")?.seasons?.forEach { (season, count) ->
+                if (count > 0) counts[season] = count
+            }
+        }
+
+        if (counts.isEmpty()) {
+            for (season in 1..20) {
+                val count = discoverEpisodeCount(subjectId, detailPath, season, 100)
+                if (count > 0) {
+                    counts[season] = count
+                } else if (season > 1 && counts.isNotEmpty()) {
+                    break
+                }
+            }
+        }
+
+        if (counts.isEmpty()) return emptyList()
+
+        return counts.toSortedMap().flatMap { (season, count) ->
+            (1..count).map { episode ->
+                newEpisode(
+                    data = "mbxepisode||$subjectId||$detailPath||$season||$episode"
+                ) {
+                    name = "Episode $episode"
+                    this.season = season
+                    this.episode = episode
+                }
+            }
+        }
+    }
+
+    private suspend fun discoverEpisodeCount(
+        subjectId: String,
+        detailPath: String,
+        season: Int,
+        maxProbe: Int
+    ): Int {
+        if (!websiteEpisodeHasResource(subjectId, detailPath, season, 1)) return 0
+
+        var low = 1
+        var high = 2
+        while (high <= maxProbe && websiteEpisodeHasResource(subjectId, detailPath, season, high)) {
+            low = high
+            high *= 2
+        }
+
+        if (high > maxProbe) {
+            high = maxProbe
+            if (websiteEpisodeHasResource(subjectId, detailPath, season, high)) return high
+        }
+
+        var left = low + 1
+        var right = high - 1
+        var best = low
+        while (left <= right) {
+            val mid = (left + right) ushr 1
+            if (websiteEpisodeHasResource(subjectId, detailPath, season, mid)) {
+                best = mid
+                left = mid + 1
+            } else {
+                right = mid - 1
+            }
+        }
+        return best
+    }
+
+    private suspend fun websiteEpisodeHasResource(
+        subjectId: String,
+        detailPath: String,
+        season: Int,
+        episode: Int
+    ): Boolean {
+        val json = websitePlayGet(
+            mapOf(
+                "subjectId" to subjectId,
+                "se" to season.toString(),
+                "ep" to episode.toString(),
+                "detailPath" to detailPath
+            )
+        ) ?: return false
+
+        val data = json.path("data")
+        if (data.isMissingNode || data.isNull) return false
+        if (!data.path("hasResource").asBoolean(false)) return false
+        if (data.path("vipLocked").asBoolean(false)) return false
+        return data.path("streams").isArray && data.path("streams").size() > 0
+    }
+
+    /** Verified from the browser Network trace supplied by the user. */
+    private suspend fun resolveWebsitePlayback(
+        subjectId: String,
+        detailPath: String,
+        season: Int,
+        episode: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (subjectId.isBlank() || detailPath.isBlank()) return false
+
+        val json = websitePlayGet(
+            mapOf(
+                "subjectId" to subjectId,
+                "se" to season.toString(),
+                "ep" to episode.toString(),
+                "detailPath" to detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
+            )
+        ) ?: return false
+
+        val found = linkedMapOf<String, MediaSource>()
+        collectStreamSources(json, found)
+        collectApiSubtitles(json, subtitleCallback)
+
+        val playable = found.values
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+            .sortedWith(
+                compareByDescending<MediaSource> { it.quality }
+                    .thenByDescending { it.declaredDurationSeconds }
+                    .thenByDescending { it.declaredSize }
+            )
+
+        if (playable.isEmpty()) return false
+        playable.forEach { emitSource(it.copy(referer = "$mainUrl/"), callback) }
+        return true
+    }
+
+    private suspend fun websitePlayGet(params: Map<String, String>): JsonNode? {
+        val query = params.entries.joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+        val url = "$mainUrl/wefeed-h5api-bff/subject/play?$query"
+
+        val response = runCatching {
+            app.get(
+                url,
+                headers = apiHeaders().toMutableMap().apply {
+                    this["Accept"] = "application/json"
+                    this["X-Request-Lang"] = "en"
+                    this["X-Client-Info"] = "{\"timezone\":\"UTC\"}"
+                    this["Origin"] = mainUrl
+                    this["Referer"] = "$mainUrl/"
+                    this["Sec-Fetch-Dest"] = "empty"
+                    this["Sec-Fetch-Mode"] = "cors"
+                    this["Sec-Fetch-Site"] = "same-origin"
+                }
+            )
+        }.getOrNull() ?: return null
+
+        if (response.code !in 200..399) return null
+        val json = runCatching { jsonMapper.readTree(response.text) }.getOrNull() ?: return null
+        return if (json.path("code").asInt(-1) == 0) json else null
+    }
+
+    private suspend fun resolveWebsiteMoviePlayback(
+        subjectId: String,
+        detailPath: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (subjectId.isBlank() || detailPath.isBlank()) return false
+        val json = websitePlayGet(
+            mapOf(
+                "subjectId" to subjectId,
+                "detailPath" to detailPath.trim().trimStart('/').substringBefore('?').substringBefore('#')
+            )
+        ) ?: return false
+
+        val found = linkedMapOf<String, MediaSource>()
+        collectStreamSources(json, found)
+        collectApiSubtitles(json, subtitleCallback)
+
+        val playable = found.values
+            .filter { looksLikePlayableMedia(it.url) }
+            .filterNot { isObviousTrailerOrPreview(it.url) }
+            .sortedWith(
+                compareByDescending<MediaSource> { it.quality }
+                    .thenByDescending { it.declaredDurationSeconds }
+                    .thenByDescending { it.declaredSize }
+            )
+        playable.forEach { emitSource(it.copy(referer = "$mainUrl/"), callback) }
+        return playable.isNotEmpty()
+    }
+
     private suspend fun fetchApiEpisodes(
         subjectId: String,
-        seriesTitle: String,
-        detailPath: String
+        seriesTitle: String
     ): List<Episode> {
         val requests = listOf(
             ApiConfig.JSON_SEASON_INFO to mapOf("subjectId" to subjectId),
@@ -1149,7 +1589,7 @@ class MovieBox : MainAPI() {
             .sortedWith(compareBy<EpisodeInfoHolder> { it.season }.thenBy { it.episode })
             .map { info ->
                 newEpisode(
-                    data = "mbxepisode||$subjectId||$detailPath||${info.season}||${info.episode}"
+                    data = "mbxepisode||$subjectId||${info.season}||${info.episode}"
                 ) {
                     name = info.title.ifBlank { "Episode ${info.episode}" }
                     season = info.season
@@ -1206,101 +1646,6 @@ class MovieBox : MainAPI() {
             }
         } else if (node.isArray) {
             node.forEach { child -> collectEpisodeObjects(child, out, inheritedSeason) }
-        }
-    }
-
-    /**
-     * Verified MovieBox website playback resolver.
-     *
-     * Browser evidence shows that the website calls:
-     *   /wefeed-h5api-bff/subject/play
-     * with subjectId + se + ep + detailPath, and the JSON response directly
-     * contains the signed MP4 streams for that exact episode.
-     *
-     * We intentionally request the endpoint once without a synthetic quality
-     * parameter. The server returns the available streams for the episode; we
-     * then emit each valid resolution from that response.
-     */
-    private suspend fun resolveWebsitePlayback(
-        subjectId: String,
-        detailPath: String,
-        season: Int,
-        episode: Int,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val normalizedDetailPath = detailPath
-            .trim()
-            .trimStart('/')
-            .substringBefore('?')
-            .substringBefore('#')
-
-        if (subjectId.isBlank() || normalizedDetailPath.isBlank()) {
-            return false
-        }
-
-        val params = linkedMapOf(
-            "subjectId" to subjectId,
-            "se" to season.toString(),
-            "ep" to episode.toString(),
-            "detailPath" to normalizedDetailPath
-        )
-
-        val json = websitePlayGet(params) ?: return false
-        val found = linkedMapOf<String, MediaSource>()
-
-        collectStreamSources(json, found)
-        collectApiSubtitles(json, subtitleCallback)
-
-        val playable = found.values
-            .filter { looksLikePlayableMedia(it.url) }
-            .filterNot { isObviousTrailerOrPreview(it.url) }
-            .sortedWith(
-                compareByDescending<MediaSource> { it.quality }
-                    .thenByDescending { it.declaredDurationSeconds }
-                    .thenByDescending { it.declaredSize }
-                    .thenBy { it.url }
-            )
-
-        if (playable.isEmpty()) return false
-
-        playable.forEach { source ->
-            emitSource(source.copy(referer = "$mainUrl/"), callback)
-        }
-
-        return true
-    }
-
-    private suspend fun websitePlayGet(
-        params: Map<String, String>
-    ): JsonNode? {
-        val query = params.entries.joinToString("&") { (key, value) ->
-            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
-        }
-
-        val url = if (query.isBlank()) {
-            "$mainUrl/wefeed-h5api-bff/subject/play"
-        } else {
-            "$mainUrl/wefeed-h5api-bff/subject/play?$query"
-        }
-
-        val response = runCatching {
-            app.get(
-                url,
-                headers = apiHeaders().toMutableMap().apply {
-                    this["Accept"] = "application/json"
-                    this["Referer"] = "$mainUrl/"
-                    this["Origin"] = mainUrl
-                }
-            )
-        }.getOrNull() ?: return null
-
-        if (response.code !in 200..399) return null
-
-        return runCatching {
-            jsonMapper.readTree(response.text)
-        }.getOrNull()?.takeIf {
-            nodeText(it, "code") == null || nodeText(it, "code") == "0" || it.path("code").asInt(-1) == 0
         }
     }
 
@@ -1414,110 +1759,34 @@ class MovieBox : MainAPI() {
         if (node == null) return
 
         if (node.isObject) {
-            // MovieBox website playback responses expose streams as:
-            // data.streams[].{url,resolutions,size,duration,codecName,...}
-            val directUrl = nodeText(node, "url", "videoAddress", "src")
-            if (!directUrl.isNullOrBlank() && looksLikePlayableMedia(directUrl)) {
-                val url = normalizeMediaUrl(directUrl, mainUrl)
-                if (url != null) {
-                    val resolutionText = nodeText(
-                        node,
-                        "resolutions",
-                        "resolution",
-                        "quality",
-                        "definition"
-                    ).orEmpty()
-                    val localQuality = qualityFromText(resolutionText)
-                    val localSize = nodeLong(node, "size", "fileSize", "contentLength")
-                    val localDuration = nodeLong(
-                        node,
-                        "duration",
-                        "durationSeconds"
-                    )
-
-                    val existing = out[url]
-                    out[url] = MediaSource(
-                        url = url,
-                        quality = maxOf(
-                            existing?.quality ?: Qualities.Unknown.value,
-                            localQuality
-                        ),
-                        label = if (localQuality > 0) {
-                            "${localQuality}p"
-                        } else {
-                            "MovieBox Stream"
-                        },
-                        referer = "$mainUrl/",
-                        declaredSize = maxOf(
-                            existing?.declaredSize ?: -1L,
-                            localSize
-                        ),
-                        declaredDurationSeconds = maxOf(
-                            existing?.declaredDurationSeconds ?: -1L,
-                            localDuration
-                        )
-                    )
-                }
-            }
-
             val localQuality = nodeText(
                 node,
-                "quality",
-                "definition",
-                "resolution",
-                "resolutions",
-                "name",
-                "label"
+                "quality", "definition", "resolution", "name", "label"
             ).orEmpty()
             val localSize = nodeLong(node, "size", "fileSize", "contentLength")
             val localDuration = nodeLong(node, "duration", "durationSeconds")
 
             node.fields().forEachRemaining { (key, child) ->
-                // Avoid recursively re-processing the direct URL field after
-                // it has already been handled above.
-                if (key.equals("url", true) ||
-                    key.equals("videoAddress", true) ||
-                    key.equals("src", true)
-                ) {
-                    return@forEachRemaining
-                }
-
                 if (child.isTextual && looksLikePlayableMedia(child.asText())) {
-                    val url = normalizeMediaUrl(child.asText(), mainUrl)
-                        ?: return@forEachRemaining
-                    val quality = qualityFromText(
-                        "$localQuality $context $key $url"
-                    )
-                    val existing = out[url]
+                    val url = normalizeMediaUrl(child.asText(), mainUrl) ?: return@forEachRemaining
+                    val quality = qualityFromText("$localQuality $context $url")
                     out[url] = MediaSource(
                         url = url,
-                        quality = maxOf(
-                            existing?.quality ?: Qualities.Unknown.value,
-                            quality
-                        ),
+                        quality = quality,
                         label = if (quality > 0) "${quality}p" else "MovieBox Stream",
-                        referer = "$mainUrl/",
-                        declaredSize = maxOf(
-                            existing?.declaredSize ?: -1L,
-                            localSize
-                        ),
+                        referer = mainUrl,
+                        declaredSize = maxOf(out[url]?.declaredSize ?: -1L, localSize),
                         declaredDurationSeconds = maxOf(
-                            existing?.declaredDurationSeconds ?: -1L,
+                            out[url]?.declaredDurationSeconds ?: -1L,
                             localDuration
                         )
                     )
                 } else {
-                    collectStreamSources(
-                        child,
-                        out,
-                        "$context $key $localQuality"
-                    )
+                    collectStreamSources(child, out, "$context $key $localQuality")
                 }
             }
         } else if (node.isArray) {
-            node.forEach { child ->
-                collectStreamSources(child, out, context)
-            }
+            node.forEach { child -> collectStreamSources(child, out, context) }
         }
     }
 
@@ -2541,114 +2810,47 @@ class MovieBox : MainAPI() {
         query: String,
         items: List<SiteItem>
     ): List<SearchResponse> {
-
         return items
-            .map { item ->
-
-                val score =
-                    searchScore(
-                        query,
-                        item.title
-                    )
-
-                Triple(
-                    item,
-                    score,
-                    item.languageRank
-                )
-            }
-            .filter {
-                it.second >= 0.42
-            }
+            .map { item -> Triple(item, searchScore(query, item.title), languageRank(item.title)) }
+            .filter { it.second >= 0.42 }
             .sortedWith(
-                /*
-                 * Language priority is absolute:
-                 *
-                 * 1 = Hindi
-                 * 2 = English
-                 * 3 = Bangla
-                 * 4 = Other
-                 *
-                 * Relevance is used only inside the same language
-                 * group. This guarantees Hindi appears before English
-                 * and Bangla when matching results exist.
-                 */
-                compareBy<
-                    Triple<
-                        SiteItem,
-                        Double,
-                        Int
-                    >
-                > {
-                    it.third
-                }.thenByDescending {
-                    it.second
-                }.thenBy {
-                    it.first.title
-                        .lowercase(
-                            Locale.ROOT
-                        )
-                }
+                compareBy<Triple<SiteItem, Double, Int>> {
+                    if (isCoreTitleMatch(query, it.first.title)) 0 else 1
+                }.thenBy { it.third }
+                    .thenByDescending { it.second }
+                    .thenBy { it.first.title.lowercase(Locale.ROOT) }
             )
-            .take(
-                SEARCH_RESULT_LIMIT
-            )
-            .map {
-                it.first.toSearchResponse()
-            }
+            .distinctBy { contentKey(it.first.url) }
+            .take(SEARCH_RESULT_LIMIT)
+            .map { it.first.toSearchResponse() }
     }
 
-    private fun languageRank(
-        text: String
-    ): Int {
+    private fun isCoreTitleMatch(query: String, title: String): Boolean {
+        val base = normalizeSearch(baseTitleForSearch(title))
+        val q = normalizeSearch(query)
+        if (base.isBlank() || q.isBlank()) return false
+        if (base == q || base.contains(q)) return true
+        val compactBase = base.replace(" ", "")
+        val compactQuery = q.replace(" ", "")
+        if (compactQuery.isNotBlank() && compactBase.contains(compactQuery)) return true
+        return stringSimilarity(base, q) >= 0.72
+    }
 
-        val normalized =
-            normalizeSearch(text)
-
-        /*
-         * Hindi
-         */
-        if (
+    private fun baseTitleForSearch(title: String): String {
+        return title.trim().replace(
             Regex(
-                """\b(hindi|hindi dubbed|hindi audio|dubbed in hindi)\b"""
-            ).containsMatchIn(
-                normalized
-            ) ||
-            text.contains("हिन्दी") ||
-            text.contains("हिंदी")
-        ) {
-            return 1
-        }
+                """(?i)\s*(?:\[(?:hindi|bengali|bangla|english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\]|\((?:hindi|bengali|bangla|english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\)|[-–]\s*(?:hindi|bengali|bangla|english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese))\s*$"""
+            ),
+            ""
+        ).trim()
+    }
 
-        /*
-         * English
-         */
-        if (
-            Regex(
-                """\b(english|eng|english audio)\b"""
-            ).containsMatchIn(
-                normalized
-            )
-        ) {
-            return 2
-        }
-
-        /*
-         * Bangla
-         */
-        if (
-            Regex(
-                """\b(bangla|bengali|bangla dubbed|bangla audio)\b"""
-            ).containsMatchIn(
-                normalized
-            ) ||
-            text.contains("বাংলা") ||
-            text.contains("বাঙ্গালী")
-        ) {
-            return 3
-        }
-
-        return 4
+    private fun languageRank(text: String): Int {
+        val normalized = normalizeSearch(text)
+        if (Regex("""\b(hindi|hindi dubbed|hindi audio|dubbed in hindi)\b""").containsMatchIn(normalized) || text.contains("हिन्दी") || text.contains("हिंदी")) return 1
+        if (Regex("""\b(bangla|bengali|bangla dubbed|bangla audio)\b""").containsMatchIn(normalized) || text.contains("বাংলা") || text.contains("বাঙ্গালী")) return 3
+        if (Regex("""(?i)(?:\[|\(|-|\s)(english|eng|tamil|telugu|malayalam|kannada|spanish|french|arabic|japanese|korean|chinese)\b""").containsMatchIn(normalized)) return 4
+        return 2
     }
 
     private fun searchScore(
@@ -3469,26 +3671,39 @@ class MovieBox : MainAPI() {
             .trim()
     }
 
-    private fun cleanTitle(
-        raw: String
-    ): String {
+    private fun cleanTitle(raw: String): String = cleanDisplayTitle(raw)
 
-        return raw
-            .replace(
-                Regex(
-                    """\s+"""
-                ),
-                " "
-            )
+    private fun cleanDisplayTitle(raw: String): String {
+        var value = raw.replace(Regex("\\s+"), " ").trim()
+        if (value.isBlank()) return value
+
+        value = value
+            .replace(Regex("(?i)^\\s*(?:watch|stream)\\s+"), "")
+            .replace(Regex("(?i)\\s*\\|\\s*moviebox(?:online)?(?:\\s*\\|.*)?$"), "")
+            .replace(Regex("(?i)\\s*(?:\\||-)\\s*IMDb\\s*[:\\-]?\\s*\\d+(?:\\.\\d+)?(?:\\s*\\|.*)?$"), "")
+            .replace(Regex("(?i)\\s+online(?:\\s*\\|.*)?$"), "")
+            .replace(Regex("(?i)\\s*\\|\\s*IMDb\\s*[:\\-]?\\s*\\d+(?:\\.\\d+)?$"), "")
             .trim()
-            .removeSuffix(
-                "| MovieBox"
-            )
-            .removeSuffix(
-                "- MovieBox"
-            )
-            .trim()
+
+        if (raw.contains("MovieBox", true) || raw.contains("IMDb", true) || Regex("(?i)\\bonline\\b").containsMatchIn(raw)) {
+            value = value.replace(Regex("\\s*\\((?:19|20)\\d{2}\\)\\s*$"), "")
+        }
+
+        value = value.replace(Regex("(?i)\\s+online\\s*$"), "")
+        return value.trim(' ', '|', '-')
     }
+
+    private fun extractImdbRating(rawTitle: String, document: Document?): Double? {
+        parseImdbRatingFromText(rawTitle)?.let { return it }
+        document?.let { doc ->
+            parseImdbRatingFromText(doc.html())?.let { return it }
+            doc.selectFirst("[itemprop=ratingValue]")?.attr("content")?.toDoubleOrNull()?.takeIf { it in 0.0..10.0 }?.let { return it }
+        }
+        return null
+    }
+
+    private fun formatRating(value: Double): String =
+        if (value % 1.0 == 0.0) value.toInt().toString() else String.format(Locale.ROOT, "%.1f", value)
 
     private fun firstNonBlank(
         vararg values: String?
@@ -3633,7 +3848,7 @@ class MovieBox : MainAPI() {
 
         val match =
             Regex(
-                """(?i)\b(2160|1440|1080|720|576|480|360)(?:p|\s*px)?\b"""
+                """(?i)(2160|1440|1080|720|576|480|360)p"""
             ).find(text)
 
         return match
