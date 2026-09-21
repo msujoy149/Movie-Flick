@@ -83,6 +83,16 @@ class MovieBox : MainAPI() {
         val declaredDurationSeconds: Long = -1L
     )
 
+    private data class NuxtSeasonInfo(
+        val season: Int,
+        val episodeCount: Int
+    )
+
+    private data class NuxtTvInfo(
+        val subjectId: String?,
+        val seasons: List<NuxtSeasonInfo>
+    )
+
     private fun browserHeaders(
         referer: String = "$mainUrl/"
     ) = mapOf(
@@ -609,11 +619,41 @@ class MovieBox : MainAPI() {
         val type = typeFromPath(path)
 
         if (type == TvType.TvSeries) {
-            val subjectId = findApiSubjectId(title)
-            val episodes = if (!subjectId.isNullOrBlank()) {
-                fetchApiEpisodes(subjectId, title)
-            } else {
-                emptyList()
+            /*
+             * The current MovieBox website already ships the real series
+             * subject + season metadata inside its Nuxt SSR payload.
+             *
+             * Example from the live page source: the resource object contains
+             * `seasons`, each season has `se` and `maxEp`, and the resolution
+             * entries also expose `epNum`. This is the authoritative place to
+             * build a dynamic CloudStream episode list.
+             *
+             * The old implementation depended on a second external search/API
+             * call to discover the subject first. When that call returned no
+             * useful result, CloudStream received an empty list and displayed
+             * "No Episodes found" even though the website showed all episodes.
+             */
+            val nuxtInfo = document?.let(::parseNuxtTvInfo)
+            val subjectId =
+                nuxtInfo?.subjectId?.takeIf { it.isNotBlank() }
+                    ?: findApiSubjectId(title)
+
+            val episodes = when {
+                !subjectId.isNullOrBlank() &&
+                    !nuxtInfo?.seasons.isNullOrEmpty() ->
+                    buildDynamicEpisodes(
+                        subjectId = subjectId,
+                        seasons = nuxtInfo?.seasons.orEmpty()
+                    )
+
+                !subjectId.isNullOrBlank() ->
+                    fetchApiEpisodes(
+                        subjectId = subjectId,
+                        seriesTitle = title
+                    )
+
+                else ->
+                    emptyList()
             }
 
             return newTvSeriesLoadResponse(
@@ -1119,6 +1159,289 @@ class MovieBox : MainAPI() {
         val episode: Int,
         val title: String = ""
     )
+
+    /*
+     * ------------------------------------------------------------
+     * NUXT SSR TV EPISODE DISCOVERY
+     * ------------------------------------------------------------
+     *
+     * MovieBox's current web app serializes its page state in the
+     * `__NUXT_DATA__` script using devalue-style reference indexes.
+     * The series resource looks like:
+     *
+     *   {"seasons": <ref>, ...}
+     *   -> [{"se": <ref>, "maxEp": <ref>,
+     *       "allEp": <ref>, "resolutions": <ref>}]
+     *
+     * `maxEp` and the resolution `epNum` values are the dynamic episode
+     * counts for each season. We use those counts directly so a series with
+     * 5, 6, 8, 12, 20, 40, 50, etc. episodes is represented correctly.
+     *
+     * No hard-coded episode count is used. When the page contains no SSR
+     * metadata, the existing API fallback remains available.
+     */
+    private fun parseNuxtTvInfo(
+        document: Document
+    ): NuxtTvInfo? {
+        val script =
+            document.selectFirst(
+                "script[data-nuxt-data=nuxt-app]"
+            )
+                ?: document.selectFirst(
+                    "script#__NUXT_DATA__"
+                )
+                ?: document.selectFirst(
+                    "script[id=__NUXT_DATA__]"
+                )
+                ?: return null
+
+        val raw =
+            script.data()
+                .trim()
+                .ifBlank { script.html().trim() }
+
+        if (raw.isBlank()) return null
+
+        val root = parseNuxtJsonArray(raw) ?: return null
+
+        /*
+         * The useful page payload is the object containing both `subject`
+         * and `resource`. Searching the root table avoids relying on a
+         * version-specific numeric index such as 10.
+         */
+        val container =
+            (0 until root.size())
+                .asSequence()
+                .map { root.get(it) }
+                .firstOrNull { node ->
+                    node.isObject &&
+                        node.has("subject") &&
+                        node.has("resource")
+                }
+                ?: return null
+
+        val subject =
+            devalueRefNode(
+                root,
+                container.get("subject")
+            ) ?: return null
+
+        val resource =
+            devalueRefNode(
+                root,
+                container.get("resource")
+            ) ?: return null
+
+        if (!subject.isObject || !resource.isObject) {
+            return null
+        }
+
+        val subjectId =
+            devalueRefText(
+                root,
+                subject.get("subjectId")
+            )
+
+        val seasonsNode =
+            devalueRefNode(
+                root,
+                resource.get("seasons")
+            )
+
+        if (seasonsNode == null || !seasonsNode.isArray) {
+            return NuxtTvInfo(
+                subjectId = subjectId,
+                seasons = emptyList()
+            )
+        }
+
+        val seasons =
+            seasonsNode
+                .mapIndexedNotNull { index, seasonRef ->
+                    val seasonNode =
+                        devalueRefNode(
+                            root,
+                            seasonRef
+                        ) ?: return@mapIndexedNotNull null
+
+                    if (!seasonNode.isObject) {
+                        return@mapIndexedNotNull null
+                    }
+
+                    val seasonNumber =
+                        devalueRefInt(
+                            root,
+                            seasonNode.get("se")
+                        )
+                            ?.takeIf { it > 0 }
+                            ?: (index + 1)
+
+                    val maxEpisode =
+                        devalueRefInt(
+                            root,
+                            seasonNode.get("maxEp")
+                        )
+                            ?: 0
+
+                    val allEpisode =
+                        devalueRefInt(
+                            root,
+                            seasonNode.get("allEp")
+                        )
+                            ?: 0
+
+                    val resolutionEpisodeCount =
+                        devalueRefNode(
+                            root,
+                            seasonNode.get("resolutions")
+                        )
+                            ?.takeIf { it.isArray }
+                            ?.mapNotNull { resolutionRef ->
+                                val resolutionNode =
+                                    devalueRefNode(
+                                        root,
+                                        resolutionRef
+                                    ) ?: return@mapNotNull null
+
+                                devalueRefInt(
+                                    root,
+                                    resolutionNode.get("epNum")
+                                )
+                            }
+                            ?.maxOrNull()
+                            ?: 0
+
+                    val count =
+                        maxOf(
+                            maxEpisode,
+                            allEpisode,
+                            resolutionEpisodeCount
+                        )
+
+                    if (count <= 0) {
+                        null
+                    } else {
+                        NuxtSeasonInfo(
+                            season = seasonNumber,
+                            episodeCount = count
+                        )
+                    }
+                }
+                .distinctBy { it.season }
+                .sortedBy { it.season }
+
+        return NuxtTvInfo(
+            subjectId = subjectId,
+            seasons = seasons
+        )
+    }
+
+    private fun parseNuxtJsonArray(
+        raw: String
+    ): JsonNode? {
+        runCatching {
+            jsonMapper.readTree(raw)
+        }.getOrNull()?.let { parsed ->
+            if (parsed.isArray) return parsed
+        }
+
+        /*
+         * Some saved/source-copied HTML snapshots contain an extra backslash
+         * before punctuation such as `:` or `_`. The real network response
+         * does not require this cleanup, but keeping the fallback makes the
+         * parser tolerant of those snapshots too.
+         */
+        val cleaned =
+            raw.replace(
+                Regex(
+                    """\\(?!["\\/bfnrtu])"""
+                ),
+                ""
+            )
+
+        return runCatching {
+            jsonMapper.readTree(cleaned)
+        }.getOrNull()?.takeIf { it.isArray }
+    }
+
+    private fun devalueRefNode(
+        root: JsonNode,
+        reference: JsonNode?
+    ): JsonNode? {
+        if (!root.isArray || reference == null) return null
+        if (!reference.isIntegralNumber) return null
+
+        val index = reference.asInt()
+        if (index < 0 || index >= root.size()) return null
+
+        return root.get(index)
+    }
+
+    private fun devalueRefText(
+        root: JsonNode,
+        reference: JsonNode?
+    ): String? {
+        val value =
+            devalueRefNode(
+                root,
+                reference
+            ) ?: return null
+
+        return when {
+            value.isTextual -> value.asText().trim().takeIf { it.isNotBlank() }
+            value.isNumber || value.isBoolean -> value.asText()
+            else -> null
+        }
+    }
+
+    private fun devalueRefInt(
+        root: JsonNode,
+        reference: JsonNode?
+    ): Int? {
+        val value =
+            devalueRefNode(
+                root,
+                reference
+            ) ?: return null
+
+        return when {
+            value.isIntegralNumber -> value.asInt()
+            value.isNumber -> value.asDouble().toInt()
+            value.isTextual -> value.asText().trim().toIntOrNull()
+            else -> null
+        }
+    }
+
+    private fun buildDynamicEpisodes(
+        subjectId: String,
+        seasons: List<NuxtSeasonInfo>
+    ): List<Episode> {
+        return seasons
+            .flatMap { seasonInfo ->
+                (1..seasonInfo.episodeCount).map { episodeNumber ->
+                    newEpisode(
+                        data =
+                            "mbxepisode||$subjectId||${seasonInfo.season}||$episodeNumber"
+                    ) {
+                        name =
+                            "Episode " +
+                                episodeNumber
+                                    .toString()
+                                    .padStart(2, '0')
+
+                        season = seasonInfo.season
+                        episode = episodeNumber
+                    }
+                }
+            }
+            .sortedWith(
+                compareBy<Episode> {
+                    it.season ?: Int.MAX_VALUE
+                }.thenBy {
+                    it.episode ?: Int.MAX_VALUE
+                }
+            )
+    }
 
     private fun collectEpisodeObjects(
         node: JsonNode?,
