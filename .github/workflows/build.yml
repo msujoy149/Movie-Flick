@@ -40,7 +40,10 @@ jobs:
 
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install             "platform-tools"             "platforms;android-35"             "build-tools;35.0.0"
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -61,32 +64,109 @@ jobs:
           gradle make makePluginsJson --no-daemon
 
       - name: Prepare builds
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
+          set -euo pipefail
+
           rm -rf "$GITHUB_WORKSPACE/build-output"
           mkdir -p "$GITHUB_WORKSPACE/build-output"
 
-          find "$GITHUB_WORKSPACE/src" -type f -name "*.cs3" -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
-
-          if [ -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
-            cp "$GITHUB_WORKSPACE/src/build/plugins.json" "$GITHUB_WORKSPACE/build-output/plugins.json"
-          else
+          if [ ! -f "$GITHUB_WORKSPACE/src/build/plugins.json" ]; then
             echo "ERROR: plugins.json was not generated"
             exit 1
           fi
 
-          cat > "$GITHUB_WORKSPACE/build-output/repo.json" <<'EOF'
-          {
-            "name": "movieflick",
-            "description": "movieflick CloudStream Extensions | 149",
-            "manifestVersion": 1,
-            "pluginLists": [
-              "https://raw.githubusercontent.com/msujoy149/Movie-Flick/builds/plugins.json"
-            ]
-          }
-          EOF
+          # Copy all normal Gradle-built plugins except the temporary
+          # MovieBox artifact; MovieBox is published from the proven
+          # prebuilt provider below.
+          find "$GITHUB_WORKSPACE/src" \
+            -type f \
+            -name "*.cs3" \
+            ! -path "$GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3" \
+            -exec cp {} "$GITHUB_WORKSPACE/build-output/" \;
 
+          PREBUILT="$GITHUB_WORKSPACE/src/MovieBox/MovieBoxPrebuilt.cs3"
+          PUBLISHED="$GITHUB_WORKSPACE/build-output/MovieBox.cs3"
+
+          if [ ! -f "$PREBUILT" ]; then
+            echo "ERROR: Missing $PREBUILT"
+            exit 1
+          fi
+
+          cp -f "$PREBUILT" "$PUBLISHED"
+          cp "$GITHUB_WORKSPACE/src/build/plugins.json" \
+             "$GITHUB_WORKSPACE/build-output/plugins.json"
+
+          # Rebuild only the MovieBox entry in plugins.json so the
+          # published metadata points at our direct MovieBox.cs3.
+          python3 - "$GITHUB_WORKSPACE/build-output/plugins.json" "$PUBLISHED" "$GITHUB_REPOSITORY" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          plugins_path = pathlib.Path(sys.argv[1])
+          cs3_path = pathlib.Path(sys.argv[2])
+          repository = sys.argv[3]
+
+          plugins = json.loads(plugins_path.read_text(encoding="utf-8"))
+
+          plugins = [
+              p for p in plugins
+              if p.get("internalName") not in {
+                  "MovieBox",
+                  "MovieBoxProvider",
+                  "MovieBoxProviderIN",
+              }
+          ]
+
+          raw = cs3_path.read_bytes()
+          file_hash = (
+              "sha256-"
+              + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii")
+          )
+
+          plugins.append({
+              "iconUrl": "https://h5-static.aoneroom.com/ssrStatic/club/public/_nuxt/logo.DMnCL3zY.svg",
+              "fileHash": file_hash,
+              "apiVersion": 1,
+              "repositoryUrl": f"https://github.com/{repository}",
+              "fileSize": len(raw),
+              "status": 1,
+              "language": "hi",
+              "authors": ["NivinCNC", "Movie-Flick"],
+              "tvTypes": ["Movie", "TvSeries"],
+              "version": 51,
+              "internalName": "MovieBox",
+              "description": "Multi Language Movies and Series Provider",
+              "url": f"https://raw.githubusercontent.com/{repository}/builds/MovieBox.cs3",
+              "name": "MovieBox",
+          })
+
+          plugins_path.write_text(
+              json.dumps(plugins, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          echo "=== MovieBox entry ==="
+          python3 - "$GITHUB_WORKSPACE/build-output/plugins.json" <<'PY'
+          import json
+          import sys
+
+          plugins = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          for p in plugins:
+              if p.get("internalName") == "MovieBox":
+                  print(json.dumps(p, ensure_ascii=False, indent=2))
+                  break
+          else:
+              raise SystemExit("ERROR: MovieBox entry missing")
+          PY
+
+          echo "=== build-output ==="
           ls -lah "$GITHUB_WORKSPACE/build-output"
-          cat "$GITHUB_WORKSPACE/build-output/repo.json"
 
       - name: Prepare builds branch
         run: |
@@ -110,12 +190,10 @@ jobs:
         run: |
           cp -f "$GITHUB_WORKSPACE/build-output/"* "$GITHUB_WORKSPACE/builds/"
           cd "$GITHUB_WORKSPACE/builds"
-          ls -lah
 
           if [ -f "repo.json" ]; then echo "✓ repo.json found"; else echo "✗ repo.json missing"; exit 1; fi
           if [ -f "plugins.json" ]; then echo "✓ plugins.json found"; else echo "✗ plugins.json missing"; exit 1; fi
-
-          cat repo.json
+          if [ -f "MovieBox.cs3" ]; then echo "✓ MovieBox.cs3 found"; else echo "✗ MovieBox.cs3 missing"; exit 1; fi
 
       - name: Push builds
         run: |
